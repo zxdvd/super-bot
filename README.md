@@ -1,0 +1,43 @@
+# Super Bot
+
+持久的 Bot 管理任务、组织执行、检查成果，并通过 Dashboard 让人知道哪里需要自己处理。
+
+**聊天表达意图；面板展示事实；程序维护状态；模型负责判断。**
+
+当前已有本地开发预览：Bot 与任务账本、创建/补全/暂停、搜索分页、原生会话入口。任务自动执行仍在接入。首个交付形态是 DSH Web 插件，固定验证版本 `0.2.2-rc.1`；Desktop `0.2.1-rc.5` 尚未完成兼容验证。Super Bot 是独立产品，不属于 `dsh-plugins` 搜索插件集合。
+
+## 产品边界
+
+- Bot 是长期身份；Task 是责任对象；Run 是一次尝试；执行 Session 可以替换。
+- 默认人工最终验收；Bot 可以检查证据并提出最多两次自动返工。
+- 单用户、单宿主、本地 SQLite；多个 Bot、普通原生任务 Session、需要人工处理的事项优先展示。
+- 当前以 DSH 提供模型执行、工具、原生聊天与审批。未来可能成为独立 App/Web；本轮不实现第二个运行时、独立服务器或云端部署。
+
+领域逻辑不依赖 DSH `Context`、Session 类型和客户端组件。DSH 是第一个执行适配与产品入口，不是产品身份；独立 App/Web 仍需另行实现宿主、认证、执行适配和数据迁移，不能承诺只换 UI 即完成迁移。
+
+## 从这里开始
+
+- [实施路线](ROADMAP.md)：阶段目标和退出条件。
+- [本轮提案](specs/changes/2026-11-super-bot-mvp/README.md)：范围、验收、依赖与设计决策。
+- [逐项任务](specs/changes/2026-11-super-bot-mvp/tasks.md)：按可演示闭环推进，每项有验证方法。
+- [研究证据](specs/changes/2026-11-super-bot-mvp/evidence.md)：已读源码、本机检查与待验证能力。
+- [原始设计基线](docs/design-baseline.md)：用户提供的 v0.1 输入快照；后续实现契约以本轮 Spec 为准。
+- [协作规则](AGENTS.md)。
+
+## 本地开发预览
+
+需要 Node `>=24.9`，当前验证 Node `24.21.0`。在仓库中运行：
+
+```sh
+npm ci
+npm run check
+npm run dev
+```
+
+`dev` 使用仓库 `.runtime/dsh` 下的独立 home/profile，监听 `127.0.0.1:3081`。从终端启动链接进入后点击左侧 Super Bot。它不复用日常 DSH 的会话或模型凭证。退出用 Ctrl-C；再次运行保留任务数据。数据库默认在 `$DSH_HOME/super-bot/ledger.sqlite`，不要同时用多个宿主打开同一数据库。
+
+- `npm run check`：类型检查、核心账本测试、Host/Client 构建。
+- `npm run smoke`：测试宿主运行时检查真实状态、WAL、未认证访问与跨域拒绝。
+- `npm pack --dry-run`：核对分发清单；运行数据和契约测试插件不进入安装包。
+
+Node 用 fnm 管理时，可用 `fnm exec --using=24.21.0 npm run dev`，无需改变机器默认版本。完整执行流程和可靠性门槛见任务清单；目前不能把保存任务理解为已经开始自动工作。

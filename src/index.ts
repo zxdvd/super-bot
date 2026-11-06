@@ -1,0 +1,85 @@
+import type { Context } from '@deepseek-ai/cordis';
+import Schema from '@deepseek-ai/schemastery';
+import type {} from '@deepseek-ai/dsh-client-connection';
+import type {} from '@deepseek-ai/dsh-api-session-controller';
+import type {} from '@deepseek-ai/dsh-workspace';
+import { SessionId } from '@deepseek-ai/dsh-session/types';
+import { createRequire } from 'node:module';
+import { homedir } from 'node:os';
+import { join } from 'node:path';
+import { mkdir } from 'node:fs/promises';
+import { Store } from './store.ts';
+import { AppError, requiredText, optionalText, type WorkspaceStatus, type NewBot, type NewTask, type ControlMode } from './model.ts';
+
+export const name = 'super-bot';
+export const inject = ['connection', 'sessionController', 'workspaceRegistry'];
+export const Config = Schema.object({ dataDir: Schema.string().description('Super Bot 本地数据目录') });
+
+export function apply(ctx: Context, config: { dataDir?: string } = {}): void {
+  const dataDir = config.dataDir ?? join(process.env.DSH_HOME ?? join(homedir(), '.dsh'), 'super-bot');
+  const store = new Store(join(dataDir, 'ledger.sqlite'));
+  ctx.effect(() => () => store.close());
+  const require = createRequire(import.meta.url);
+  const runtime = require('@deepseek-ai/dsh-agent/package.json').version as string;
+  const startedAt = Date.now();
+  let creating: Promise<string> | undefined;
+
+  const status = (): WorkspaceStatus => ({ product: 'Super Bot', version: '0.1.0', runtime,
+    ...store.sqliteInfo(), startedAt, savedSessionId: store.get('probeSession') });
+
+  async function invoke(endpoint: string, payload: Record<string, unknown>) {
+    try {
+      if (endpoint === 'status') return { ok: true, value: status() };
+      if (endpoint === 'bot.list') return { ok: true, value: store.listBots() };
+      if (endpoint === 'bot.create') return { ok: true, value: store.createBot(requiredText(payload.requestId,'请求标识',200),payload as unknown as NewBot) };
+      if (endpoint === 'task.create') return { ok: true, value: store.createTask(requiredText(payload.requestId,'请求标识',200),payload as unknown as NewTask) };
+      if (endpoint === 'task.list') return { ok: true, value: store.listTasks({
+        botId: requiredText(payload.botId,'Bot 标识',200), q: optionalText(payload.q,'搜索',200),
+        lifecycle: optionalText(payload.lifecycle,'状态',30), limit: payload.limit as number | undefined, offset: payload.offset as number | undefined,
+      }) };
+      if (endpoint === 'task.detail') return { ok: true, value: store.taskDetail(requiredText(payload.id,'任务标识',200)) };
+      if (endpoint === 'task.control') return { ok: true, value: store.controlTask(requiredText(payload.requestId,'请求标识',200),
+        requiredText(payload.id,'任务标识',200),payload.expectedRowVersion as number,payload.mode as ControlMode) };
+      if (endpoint === 'task.revise') return { ok: true, value: store.reviseTask(requiredText(payload.requestId,'请求标识',200),
+        requiredText(payload.id,'任务标识',200),payload.expectedRowVersion as number,payload as unknown as NewTask) };
+      if (endpoint === 'create-probe-session') {
+        const cwd = join(dataDir, 'probe-workspace');
+        await mkdir(cwd, { recursive: true });
+        const workspace = await ctx.workspaceRegistry.create(cwd, 'Super Bot 验证');
+        const existing = store.get('probeSession');
+        if (existing) {
+          await workspace.attachSession(SessionId(existing));
+          return { ok: true, value: { sessionId: existing } };
+        }
+        if (store.get('probeCreating') && !creating) throw new AppError('recovery', '上次创建结果待核对，尚未重新创建。');
+        creating ??= (async () => {
+          store.set('probeCreating', 'true');
+          const { sessionId } = await ctx.sessionController.create({ workspaceId: workspace.id });
+          store.set('probeSession', sessionId);
+          return sessionId;
+        })().finally(() => { creating = undefined; });
+        return { ok: true, value: { sessionId: await creating } };
+      }
+      throw new AppError('not-found', '未知操作。');
+    } catch (error) {
+      return { ok: false, error: { code: error instanceof AppError ? error.code : 'internal',
+        message: error instanceof AppError ? error.message : '操作未完成，请检查宿主日志并核对状态。', details: {} } };
+    }
+  }
+  // Exact routes are authenticated and owner-only by DSH Connection on every carrier.
+  // Do not take its sole shared-RPC interceptor (that belongs to the API Gateway).
+  ctx.effect(() => ctx.connection.fetch.register({
+    path: '/api/super-bot', methods: ['POST'], requestBody: 'buffered',
+    fetch: async request => {
+      let body: unknown;
+      try { body = await request.json(); } catch { return new Response('Invalid JSON', { status: 400 }); }
+      const envelope = body as { type?: string; rpcId?: string; method?: string; payload?: Record<string,unknown> } | null;
+      if (!envelope || envelope.type !== 'client-request' || typeof envelope.rpcId !== 'string'
+        || envelope.method !== 'super-bot' || typeof envelope.payload?.action !== 'string') {
+        return new Response('Invalid command envelope', { status: 400 });
+      }
+      return Response.json({ type: 'server-response', rpcId: envelope.rpcId,
+        result: await invoke(envelope.payload.action, envelope.payload) });
+    },
+  }));
+}
