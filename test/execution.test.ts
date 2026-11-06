@@ -196,6 +196,27 @@ test('manager binding is durable, its wake is claimed once, and another bot cann
     assert.equal(reviewed.lifecycle,'review');assert.equal(store.runResult(run.id)?.humanAcceptedAt,null);
   }finally{store.close();}
 });
+test('manager queue counts all work, prioritizes human responses, and rotates between bots',()=>{
+  const store=new Store(':memory:');try {
+    const bots=['one','two','three'].map(key=>store.createBot(key,{name:key,instructions:'Synthetic'}));
+    for(const bot of bots){const m=store.beginManager(`m:${bot.id}`,bot.id,`/tmp/${bot.id}`);store.confirmManager(m.id,m.requestedSessionId);}
+    const first=bots[0]!;
+    for(let n=0;n<25;n++)store.enqueueManager(first.id,`bulk:${n}`,'New task',null);
+    store.enqueueManager(first.id,'human-answer','Human answer',null,10);
+    assert.equal(store.managerInfo(first.id).pending,27);assert.equal(store.pendingManagerEvents(first.id).length,10);
+    assert.equal(store.pendingManagerEvents(first.id)[0]?.id,'manager-event:human-answer');
+    store.claimManagerEvent('manager-event:human-answer','msg','{}');
+    assert.deepEqual(store.managerOrder().map(bot=>bot.id),[bots[1]!.id,bots[2]!.id,first.id]);
+    store.db.exec("CREATE TEMP TRIGGER cursor_failure BEFORE INSERT ON metadata WHEN NEW.key='managerCursor' BEGIN SELECT RAISE(ABORT,'injected cursor failure'); END");
+    const secondEvent=store.pendingManagerEvents(bots[1]!.id)[0]!;
+    assert.throws(()=>store.claimManagerEvent(secondEvent.id,'failed-msg','{}'),/cursor failure/);
+    assert.equal(store.pendingManagerEvents(bots[1]!.id)[0]?.state,'pending');assert.equal(store.managerWakeCount(bots[1]!.id,0),0);
+    store.managerProblem(first.id,'Unavailable');const original=store.managerInfo(first.id).problem;
+    store.managerProblem(first.id,'Unavailable');assert.deepEqual(store.managerInfo(first.id).problem,original);
+    store.managerProblem(first.id,'');assert.equal(store.managerInfo(first.id).problem,null);
+    assert.equal(store.managerInfo(first.id).pending,26);
+  }finally{store.close();}
+});
 test('manager automatic rework is capped at two and authorized acceptance never impersonates a human',()=>{
   const store=new Store(':memory:');try {
     const task=prepared(store,'auto','/tmp/auto','bot');

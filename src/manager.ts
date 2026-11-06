@@ -134,27 +134,45 @@ export class Managers {
     return next;
   }
   private pumping=false;
+  private retryAfter=new Map<string,number>();
+  private monitorWake(botId:string,eventId:string,agent:Agent,message:UserMessage):void {
+    const timeout=setTimeout(()=>{
+      agent.inbox.remove(message.id);agent.cancel({kind:'user'},{keepInbox:true});
+      if(!this.closed)this.store.managerProblem(botId,'自动管理达到 5 分钟上限，已请求停止；请检查最新账本。');
+    },5*60*1000);timeout.unref();
+    const done=agent.whenIdle().catch(()=>{
+      if(!this.closed)this.store.managerProblem(botId,'自动管理未正常结束，请打开管理会话核对。');
+    }).finally(()=>{clearTimeout(timeout);if(!this.closed)this.store.managerEventUnknown(eventId);this.waking.delete(botId);});
+    this.waking.set(botId,done);
+  }
   private async pump():Promise<void> {
     if(this.closed||this.pumping)return;this.pumping=true;
     try {
-      for(const bot of this.store.listBots()) {
+      for(const bot of this.store.managerOrder()) {
         if(this.closed)break;if(this.waking.size>=2)break;
+        if((this.retryAfter.get(bot.id)??0)>Date.now())continue;
+        try {
         const manager=this.store.activeManager(bot.id);if(!manager?.sessionId||manager.state!=='ready'||this.waking.has(bot.id))continue;
         const event=this.store.pendingManagerEvents(bot.id)[0];if(!event)continue;
         if(this.store.managerWakeCount(bot.id,Date.now()-60*60*1000)>=20)continue;
-        if(JSON.parse(event.payload).reason.startsWith('容量等待')&&this.store.heldRuns().length>=2)continue;
+        if(event.id.startsWith('manager-event:capacity:')&&this.store.heldRuns().length>=2)continue;
         const resolved=await this.ctx.sessionController.resolveAgent(SessionId(manager.sessionId));
-        if(this.closed)break;if('error' in resolved)continue;const agent=resolved.agent;this.attachScope(agent);
+        if(this.closed)break;if('error' in resolved)throw new AppError('manager-unavailable','管理会话暂不可用；请打开管理会话核对。');const agent=resolved.agent;this.attachScope(agent);
         this.authority(agent.id,manager.id);
         if(agent.status!=='idle'||agent.inbox.nextTurn.length||agent.inbox.nextStep.length||!agent.model.current())continue;
         const message=createUserMessage({source:{kind:'super-bot-manager',botId:bot.id,managerId:manager.id,eventId:event.id},content:[{type:'text',text:`Important task event: ${JSON.parse(event.payload).reason}\nTask: ${event.taskId??'all current work'}\nRead current ledger state. Do not assume the event is still current. Do not manufacture new tasks. Finish after useful bounded work; do not poll.`}]});
         if(!this.store.claimManagerEvent(event.id,message.id,JSON.stringify(message)))continue;
-        agent.followup(message);
-        const timeout=setTimeout(()=>{agent.inbox.remove(message.id);agent.cancel({kind:'user'},{keepInbox:true});},5*60*1000);timeout.unref();
-        const done=agent.whenIdle().catch(()=>{}).finally(()=>{clearTimeout(timeout);if(!this.closed)this.store.managerEventUnknown(event.id);this.waking.delete(bot.id);});
-        this.waking.set(bot.id,done);
+        this.store.managerProblem(bot.id,'');this.retryAfter.delete(bot.id);
+        try {agent.followup(message);}
+        catch {
+          this.store.managerEventUnknown(event.id);agent.inbox.remove(message.id);agent.cancel({kind:'user'},{keepInbox:true});
+          this.monitorWake(bot.id,event.id,agent,message);
+          throw new AppError('manager-delivery','管理通知回执未确认，已请求停止且不会重发该通知。请读取最新账本核对。');
+        }
+        this.monitorWake(bot.id,event.id,agent,message);
+        }catch(error){if(!this.closed){this.store.managerProblem(bot.id,error instanceof AppError?error.message:'自动管理暂不可用，请打开管理会话核对。');this.retryAfter.set(bot.id,Date.now()+30000);}}
       }
-    }catch { /* The ledger/UI remains usable. An unclaimed event is retried on the next bounded tick. */ }
+    }catch { /* A ledger read failure cannot justify delivering any notification. */ }
     finally{this.pumping=false;}
   }
   async dispose():Promise<void> {

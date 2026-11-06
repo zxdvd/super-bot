@@ -159,3 +159,10 @@ ELECTRON_RUN_AS_NODE=1 '/Applications/DeepSeek Harness.app/Contents/MacOS/DeepSe
 - 独立第 13 轮使用无网络假模型的 `APPROVAL_PROBE`，由测试插件对一次真实 write 注入 ask。原生 UI 三分支均通过：Reject 后 failed/无成果；Allow once 后写入 132 字节、ready→人工待验收；等待审批时停止，原生审批撤回、write 在 dispatch 前 aborted、任务暂停。
 - `node scripts/smoke-approvals.mjs c64d40a7-f06b-41fa-9758-cfd40f08f5df` 回读三任务：allowed-once / cancelled / rejected 均有持久事件，无 open approval；拒绝/停止时磁盘不存在 result.md；允许成果 humanAcceptedAt 为 null。
 - 试用发现 DSH `workspace-changes` 把同期父 Git 工作树中的产品源码编辑列入原生 diff。目标包 README 明确此行为；模型实际 write 已被拒绝，未发生越界写入。测试夹具增加独立 Git 边界，产品不擅自初始化用户仓库。独立第 14 轮在等待审批期间同期修改 README/Spec/evidence，再 Allow once；原生变更列表与文件选择菜单均只有 result.md（+4/-0），不含父仓库源码/文档。审批事件中文准确显示仅允许本次、已拒绝、已撤回，无 console warn/error。
+
+## 管理队列与自动返工（2026-11-07 04:25）
+
+- `npm run check`：27 项测试通过。修复通知统计被 LIMIT 10 截断，测试 27 条待处理通知准确显示；增加轮转游标、用户回答/返工/恢复优先队列和可见的管理错误。管理通知 claim 与游标写入同事务；普通 progress 不唤醒。
+- 真实契约探针共 11 项：新增三个真实 Manager Session 的故障对照，一个解析失败、一个 followup 接受后丢回执、一个正常。失败 Bot 不挡住后者；未知通知取消且同一通知不二次 followup，无 Worker 任务被重新执行。
+- `node scripts/smoke-manager-rework.mjs`：一次自动返工产生两轮/新成果（176 字节）；无限返工夹具只产生三轮（最多两次返工）后暂停转人。更换 Manager 后显式恢复，仍不能重置同一目标版本的返工额度。
+- 独立第 15 轮 UI：新 Bot 的两任务分别真实 2 turn/6 steps 与 3 turn/9 steps；原生 Manager 11 turn 中实际 detail 读取文件和 review: rework，工作台关闭期间继续，额度任务 rowVersion 12 保持稳定，无循环。百项夹具统计与分页抽查通过，无 console error。暂停验收任务的标签补为“待验收 · 已暂停”，并解释只暂停自动管理。

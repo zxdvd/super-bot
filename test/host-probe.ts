@@ -16,6 +16,7 @@ import { promisify } from 'node:util';
 import { join } from 'node:path';
 import { Store } from '../src/store.ts';
 import { DshExecution } from '../src/dsh.ts';
+import { Managers } from '../src/manager.ts';
 import { SessionId } from '@deepseek-ai/dsh-session/types';
 
 declare module '@deepseek-ai/dsh-llm' {
@@ -49,14 +50,19 @@ class ProbeAdapter extends LlmAdapter {
         const foreign=text.match(/CROSS_BOT:([^\s]+)/)?.[1];
         if(foreign)plan={action:'detail',taskId:foreign};
         else if(trigger?.source?.kind==='user'&&text.includes('MANAGER_PROBE'))plan={action:'create',goal:'Manager 生成合成说明',scope:'专用任务目录，不访问网络',acceptance:'result.md 包含两项事实并已回读'};
-        else if(trigger?.source?.kind==='super-bot-manager')plan={action:'list'};
+        else if(trigger?.source?.kind==='super-bot-manager'){const target=text.match(/\nTask: ([a-f0-9-]{36})\n/)?.[1];plan=target?{action:'detail',taskId:target}:{action:'list'};}
       }else if(prior.action==='list'&&value?.items) {
         const tasks=value.items as {id:string;rowVersion:number;status:string;controlMode:string;managerReviewed?:boolean}[];
         const review=tasks.find(t=>t.status==='review'&&t.controlMode==='auto'&&!t.managerReviewed);
         const queued=tasks.find(t=>t.status==='unscheduled'&&t.controlMode==='auto');
         if(review)plan={action:'detail',taskId:review.id};else if(queued)plan={action:'dispatch',taskId:queued.id,expectedRowVersion:queued.rowVersion};
       }else if((prior.action==='create'||value?.prepared)&&value?.task)plan={action:'dispatch',taskId:value.task.id,expectedRowVersion:value.task.rowVersion};
-      else if(prior.action==='detail'&&value?.result&&value?.task?.lifecycle==='review')plan={action:'review',taskId:value.task.id,expectedRowVersion:value.task.rowVersion,resultId:value.result.id,verdict:'accept',note:'已通过 detail 读取文件内容：含标题、两项事实，并有回读记录。默认提交用户最终验收。'};
+      else if(prior.action==='detail'&&value?.task?.controlMode==='auto') {
+        if(value.result&&value.task.lifecycle==='review') {
+          const rework=String(value.task.goal).includes('MANAGER_REWORK_LOOP')||(String(value.task.goal).includes('MANAGER_REWORK_PROBE')&&!JSON.stringify(value.files).includes('修订'));
+          plan={action:'review',taskId:value.task.id,expectedRowVersion:value.task.rowVersion,resultId:value.result.id,verdict:rework?'rework':'accept',note:rework?'请补充修订说明后重新提交。':'已通过 detail 读取文件内容：含标题、两项事实，并有回读记录。默认提交用户最终验收。'};
+        }else if(value.task.status==='unscheduled')plan={action:'dispatch',taskId:value.task.id,expectedRowVersion:value.task.rowVersion};
+      }
       if(plan) {
         const id=ToolCallId(randomUUID()),args=JSON.stringify(plan);
         yield {type:'block-start',index:0,blockType:'tool-call'};yield {type:'tool-call-delta',index:0,id,name:'super_bot_manage',argumentsDelta:args};
@@ -270,6 +276,46 @@ export function apply(ctx:Context) {
         assert.equal(resolved.agent.inbox.nextTurn.length,0);
         checks.push('real inbox acceptance followed by lost receipt cancels owned input and replay never sends twice');
       }finally{await execution?.dispose();faultLedger.close();}
+      const managerLedger=new Store(join(home!,'super-bot',`manager-receipt-${randomUUID()}.sqlite`));
+      const managerAgents:Agent[]=[];const wakeCalls=new Map<string,number>();let failedSession='',lostSession='';
+      const managerFacade=new Proxy(ctx,{get(target,key){
+        if(key==='sessionController')return new Proxy(target.sessionController,{get(controller,method){
+          if(method==='resolveAgent')return async(id:SessionId)=>{
+            if(id===failedSession)throw new Error('Synthetic manager unavailable');
+            const resolved=await controller.resolveAgent(id);if('error' in resolved)return resolved;
+            return {agent:new Proxy(resolved.agent,{get(agent,field){
+              if(field==='followup')return (message:Parameters<Agent['followup']>[0])=>{wakeCalls.set(agent.id,(wakeCalls.get(agent.id)??0)+1);agent.followup(message);if(agent.id===lostSession)throw new Error('Synthetic manager receipt loss');};
+              const value=Reflect.get(agent,field,agent);return typeof value==='function'?value.bind(agent):value;
+            }})};
+          };
+          const value=Reflect.get(controller,method,controller);return typeof value==='function'?value.bind(controller):value;
+        }});
+        return Reflect.get(target,key,target);
+      }});
+      const managerExecution=new DshExecution(managerFacade,managerLedger,join(home!,'super-bot','manager-fault'));
+      const managers=new Managers(managerFacade,managerLedger,managerExecution,join(home!,'super-bot','manager-fault'));
+      const observe=ctx.on('session/event',(session,event)=>{
+        if(event.type==='user/message'&&event.data.source.kind==='super-bot-manager'&&managerLedger.managerForSession(session.id))managerLedger.managerEventEntered(event.data.source.eventId,event.data.id);
+      });
+      try {
+        const bots=[];
+        for(let n=0;n<3;n++) {
+          const bot=managerLedger.createBot(`bot-${n}`,{name:`Manager fault ${n}`,instructions:'Synthetic notification receipt only'});bots.push(bot);
+          const binding=await managers.prepare(`prepare-${n}`,bot.id);const resolved=await ctx.sessionController.resolveAgent(SessionId(binding.sessionId!));assert.ok('agent' in resolved);
+          resolved.agent.model.select({provider,model:'deterministic'});managerAgents.push(resolved.agent);
+        }
+        failedSession=managerAgents[0]!.id;lostSession=managerAgents[1]!.id;
+        // Trigger the actual pump without registering a second global management tool.
+        await (managers as unknown as {pump():Promise<void>}).pump();
+        await bounded(Promise.all(managerAgents.map(agent=>agent.whenIdle())),'manager receipt fault');
+        assert.equal(wakeCalls.get(failedSession)??0,0);assert.equal(wakeCalls.get(lostSession),1);assert.equal(wakeCalls.get(managerAgents[2]!.id),1);
+        assert.equal(managerLedger.managerInfo(bots[0]!.id).pending,1);assert.ok(managerLedger.managerInfo(bots[0]!.id).problem);
+        assert.equal(managerLedger.managerInfo(bots[1]!.id).uncertain,1);assert.ok(managerLedger.managerInfo(bots[1]!.id).problem);
+        assert.equal(managerLedger.managerInfo(bots[2]!.id).pending,0);assert.equal(managerLedger.managerInfo(bots[2]!.id).problem,null);
+        await (managers as unknown as {pump():Promise<void>}).pump();assert.equal(wakeCalls.get(lostSession),1);
+        assert.equal(managerAgents[1]!.inbox.nextTurn.length,0);assert.equal(managerLedger.db.prepare('SELECT count(*) AS n FROM tasks').get()?.n,0);
+        checks.push('one unavailable manager does not block others; lost notification receipt cancels and never resends');
+      }finally{observe();await managers.dispose();await managerExecution.dispose();managerLedger.close();}
       const result={ok:true,checks,sessionIds:agents.map(a=>a.id),at:new Date().toISOString()};
       await writeFile(join(home!,'super-bot','contract-probe-result.json'),JSON.stringify(result,null,2));
       return result;

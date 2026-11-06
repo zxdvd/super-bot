@@ -1,9 +1,13 @@
 /** Authenticate only against the dedicated host URL; never print credentials. */
 import { readFile } from 'node:fs/promises';
 import assert from 'node:assert/strict';
+import { setTimeout as delay } from 'node:timers/promises';
 export async function hostClient(logPath='.runtime/host.log') {
-  const log=await readFile(logPath,'utf8');
-  const match=log.match(/dsh web: (http:\/\/127\.0\.0\.1:\d+\/\?token=\S+)/);
+  let match;
+  for(let n=0;n<100;n++) {
+    let log='';try{log=await readFile(logPath,'utf8');}catch(error){if(error.code!=='ENOENT')throw error;}
+    match=log.match(/dsh web: (http:\/\/127\.0\.0\.1:\d+\/\?token=\S+)/);if(match)break;await delay(100);
+  }
   assert.ok(match,'dedicated host has not announced a URL');
   const base=new URL(match[1]).origin;const cookies=new Map();let url=match[1];
   for(let n=0;n<5;n++) {
