@@ -145,3 +145,10 @@ ELECTRON_RUN_AS_NODE=1 '/Applications/DeepSeek Harness.app/Contents/MacOS/DeepSe
 - 面板备份恢复到新的 `.runtime/restored-lifecycle`，使用 `SUPER_BOT_DATA_DIR` 启动实际宿主；`node scripts/smoke-restored.mjs`：15 Bot / 128 Task 与备份一致，112 未完成任务暂停并待核对、管理 pending 事件为 0，27 个当前成果文件哈希一致、40 个会话可读取且 idle。随后停止副本宿主并切回原始账本。恢复没有复制 DSH/成果文件，本轮沿用隔离 home 和原成果目录。
 
 运行中热卸载、真实模型质量及此前未覆盖的审批/历史授权仍未验证；上述结果不扩展为所有 T01～T20 已通过。
+
+## 工作台恢复与任务控制（2026-11-07 04:10）
+
+- 独立试用第 11 轮：切换原生会话、刷新重开与短暂停机重连后，Bot / 搜索 / 未完成筛选 / 第三页 / 选中任务均保留；跨 Bot 和筛选移除任务时清除旧详情。离线提示改为中文，写操作禁用，在线自动恢复。SB-04 的百项查询与离线验证完成。
+- `npm run check`：25 项核心测试通过。增加取消保留历史/丢弃未发输入、运行中和未知资源占用时拒绝取消/解绑、解绑暂停并允许新目标版本/新代数；过期报告记录一次审计，重复过期报告不改当前成果。
+- `node scripts/smoke-controls.mjs`：真实 Host 解除关联后原生会话保留，旧 prepare 请求不会重新关联；修改目标后 Session 和目录均更新，generation/taskRevision 为 2；取消待验收任务保留 Result 且 humanAcceptedAt 为 null；执行中取消/解绑拒绝，停止收敛后可取消。
+- 独立第 12 轮 UI 通过：两步解绑、历史链接、修改目标版本 2、新目录/会话；取消待验收后成果保留且无接受按钮；STOP_PROBE 执行中禁用取消/解绑，停止后可取消。两项合成任务均已取消，无 console warn/error；已有 Session 的历史授权关联仍未实现。

@@ -19,6 +19,49 @@ function entered(store:Store,key='1') {
 }
 const ready={kind:'ready' as const,summary:'说明已生成',checks:'两项事实均在文档中',evidence:[{path:'/tmp/result.md',sha256:'synthetic',bytes:30}]};
 
+test('cancelling settled work discards pending answers without accepting results or deleting history',()=>{
+  const store=new Store(':memory:');try {
+    const {task,run}=entered(store);store.workerReport(run.id,'ask',{kind:'waiting',summary:'还需要什么？'});store.settleRun(run.id);
+    const attention=store.taskDetail(task.id).attentions.find(a=>a.state==='open')!;
+    const answer=store.respondAttention('answer',attention.id,store.getTask(task.id).rowVersion,'不再继续');
+    const version=store.getTask(task.id).rowVersion;const cancelled=store.cancelTask('cancel',task.id,version);
+    assert.equal(cancelled.lifecycle,'cancelled');assert.equal(store.cancelTask('cancel',task.id,version).id,task.id);
+    assert.equal(store.db.prepare('SELECT state FROM inputs WHERE id=?').get(answer.id)?.state,'discarded');
+    assert.equal(store.taskDetail(task.id).attentions.filter(a=>['open','responding'].includes(a.state)).length,0);
+    assert.equal(store.activeBinding(task.id)?.sessionId,run.sessionId);assert.equal(store.getRun(run.id).state,'settled');
+    assert.throws(()=>store.reserveRun('late-dispatch',task.id,cancelled.rowVersion));
+  }finally{store.close();}
+});
+test('cancel and detach refuse live or uncertain resource ownership',()=>{
+  const store=new Store(':memory:');try {
+    const {task,run}=entered(store);
+    assert.throws(()=>store.cancelTask('cancel',task.id,store.getTask(task.id).rowVersion),/停止执行/);
+    assert.throws(()=>store.detachSession('detach',task.id,store.getTask(task.id).rowVersion),/停止执行/);
+    store.runRecovery(run.id,'receipt unknown');
+    assert.throws(()=>store.cancelTask('cancel',task.id,store.getTask(task.id).rowVersion),/停止执行/);
+    assert.throws(()=>store.detachSession('detach',task.id,store.getTask(task.id).rowVersion),/停止执行/);
+    assert.equal(store.heldRuns().length,1);assert.equal(store.getTask(task.id).lifecycle,'open');
+    store.resolveRunRecovery('recover',task.id,store.getTask(task.id).rowVersion);
+    assert.equal(store.cancelTask('cancel',task.id,store.getTask(task.id).rowVersion).lifecycle,'cancelled');
+  }finally{store.close();}
+});
+test('detach preserves binding history, pauses work, and allows a new goal and generation',()=>{
+  const store=new Store(':memory:');try {
+    const task=prepared(store);const old=store.activeBinding(task.id)!;
+    const detached=store.detachSession('detach',task.id,task.rowVersion);
+    assert.equal(detached.sessionId,null);assert.equal(detached.controlMode,'paused');assert.equal(store.activeBinding(task.id),null);
+    assert.equal(store.detachSession('detach',task.id,task.rowVersion).id,task.id);
+    assert.equal(store.taskDetail(task.id).bindingHistory[0]?.sessionId,old.sessionId);
+    assert.equal(store.bindingReceipt('bnd:1',task.id,1)?.state,'released');
+    const revised=store.reviseTask('revise',task.id,detached.rowVersion,{goal:'新的说明目标',scope:'新的专用目录',acceptance:'新内容'});
+    assert.equal(revised.taskRevision,2);
+    const replacement=store.beginBinding('replace',task.id,revised.rowVersion,'/tmp/new-generation');
+    assert.equal(replacement.generation,2);assert.notEqual(replacement.requestedSessionId,old.sessionId);
+    assert.equal(store.getBinding(old.id).state,'released');
+    assert.equal(store.nativeIntervention(old.sessionId!,'old-message'),false);
+  }finally{store.close();}
+});
+
 test('ready is a candidate until execution converges and the user accepts exact evidence',()=>{
   const store=new Store(':memory:');try {
     const {task,run}=entered(store);const report=store.workerReport(run.id,'tool-1',ready);
@@ -53,6 +96,9 @@ test('manual native intervention invalidates candidate review and late reports',
     assert.equal(store.getTask(task.id).controlMode,'manual');assert.equal(store.getTask(task.id).lifecycle,'open');
     assert.throws(()=>store.acceptResult('accept',task.id,store.getTask(task.id).rowVersion,report.resultId!),/不能验收/);
     assert.throws(()=>store.workerReport(run.id,'late',ready),/执行或目标已改变/);
+    assert.throws(()=>store.workerReport(run.id,'late',ready),/执行或目标已改变/);
+    assert.equal(store.db.prepare("SELECT count(*) AS n FROM events WHERE kind='work.report-stale' AND taskId=?").get(task.id)?.n,1);
+    assert.equal(store.db.prepare('SELECT count(*) AS n FROM results WHERE taskId=?').get(task.id)?.n,1);
   }finally{store.close();}
 });
 test('stop request does not release resources until convergence and refuses late ready',()=>{

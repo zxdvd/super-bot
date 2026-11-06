@@ -143,15 +143,28 @@ export class DshExecution {
     }
     return this.store.resolveRunRecovery(requestId,taskId,rowVersion);
   }
+  async endTaskLink(action:'task.cancel'|'session.detach',requestId:string,taskId:string,rowVersion:number) {
+    const receipt=this.store.commandReceipt<import('./model.ts').Task>(requestId,action,{taskId,expectedRowVersion:rowVersion});if(receipt)return receipt;
+    const binding=this.store.activeBinding(taskId);
+    if(binding?.sessionId) {
+      const resolved=await this.ctx.sessionController.resolveAgent(SessionId(binding.sessionId));
+      if('error' in resolved)throw new AppError('session-unavailable','无法核对原生会话，请恢复会话后再操作。');
+      this.assertQuiet(resolved.agent);
+    }
+    return action==='task.cancel'?this.store.cancelTask(requestId,taskId,rowVersion):this.store.detachSession(requestId,taskId,rowVersion);
+  }
   async dispose():Promise<void> {
     this.disposed=true;
     for(const [id,{agent}]of this.running){this.store.runRecovery(id,'插件退出时执行尚未核对，重新启用后请核对原生会话。');const input=this.store.getRunInput(id);if(input.messageId)agent.inbox.remove(input.messageId as UserMessage['id']);agent.cancel({kind:'user'},{keepInbox:true});}
     await Promise.allSettled([...this.running.values()].map(r=>r.done));
   }
   async prepareSession(requestId:string,taskId:string,rowVersion:number):Promise<Binding> {
+    const receipt=this.store.bindingReceipt(requestId,taskId,rowVersion);
+    if(receipt?.state==='ready'||receipt?.state==='released')return receipt;
     // Validate the ID through the ledger before using it as a directory segment.
     const task=this.store.getTask(taskId);
-    const cwd=join(this.dataDir,'workspaces',task.id);await mkdir(cwd,{recursive:true});
+    const generation=this.store.nextBindingGeneration(taskId);
+    const cwd=this.store.activeBinding(taskId)?.cwd??join(this.dataDir,'workspaces',generation===1?task.id:`${task.id}-g${generation}`);await mkdir(cwd,{recursive:true});
     const b=this.store.beginBinding(requestId,taskId,rowVersion,await realpath(cwd));
     const current=this.store.getBinding(b.id);if(current.state==='ready')return current;
     const active=this.creating.get(b.id);if(active)return active;

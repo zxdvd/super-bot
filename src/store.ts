@@ -210,9 +210,9 @@ export class Store {
     const managerReviewed=!!(run&&this.db.prepare("SELECT 1 FROM reviews JOIN results ON results.id=reviews.resultId WHERE results.runId=? AND reviews.actor LIKE 'manager:%' LIMIT 1").get(run.id));
     return {...task,status,managerReviewed};
   }
-  taskDetail(id: string): { task: Task; binding: Binding | null; run:Run|null; input:RunInput|null; result:Result|null; attentions: Attention[]; events: { id: number; kind: string; data: string; createdAt: number }[] } {
+  taskDetail(id: string): { task: Task; binding: Binding | null; bindingHistory:Binding[]; run:Run|null; input:RunInput|null; result:Result|null; attentions: Attention[]; events: { id: number; kind: string; data: string; createdAt: number }[] } {
     const run=this.latestRun(id);
-    return { task: this.getTask(id), binding: this.activeBinding(id),run,input:this.pendingInput(id)??(run?this.getRunInput(run.id):null),result:run?this.runResult(run.id):null,
+    return { task: this.getTask(id), binding: this.activeBinding(id),bindingHistory:this.db.prepare("SELECT * FROM bindings WHERE taskId=? AND state='released' ORDER BY generation DESC").all(id) as unknown as Binding[],run,input:this.pendingInput(id)??(run?this.getRunInput(run.id):null),result:run?this.runResult(run.id):null,
       attentions: this.db.prepare('SELECT * FROM attentions WHERE taskId=? ORDER BY createdAt,id').all(id) as unknown as Attention[],
       events: this.db.prepare('SELECT id,kind,data,createdAt FROM events WHERE taskId=? ORDER BY id DESC LIMIT 50').all(id) as unknown as { id: number; kind: string; data: string; createdAt: number }[],
     };
@@ -259,13 +259,20 @@ export class Store {
     const binding=this.db.prepare('SELECT * FROM bindings WHERE id=?').get(id) as unknown as Binding | undefined;
     if(!binding)throw new AppError('not-found','会话关联不存在。');return {...binding};
   }
+  nextBindingGeneration(taskId:string):number {return Number(this.db.prepare('SELECT coalesce(max(generation),0)+1 AS n FROM bindings WHERE taskId=?').get(taskId)?.n);}
+  bindingReceipt(requestId:string,taskId:string,expectedRowVersion:number):Binding|undefined {
+    const row=this.db.prepare('SELECT result FROM requests WHERE id=?').get(requestId) as {result:string}|undefined;if(!row)return;
+    const previous=JSON.parse(row.result) as Binding;
+    const receipt=this.commandReceipt<Binding>(requestId,'session.prepare',{taskId,expectedRowVersion,cwd:previous.cwd});
+    return receipt?this.getBinding(receipt.id):undefined;
+  }
   beginBinding(requestId: string, taskId: string, expectedRowVersion: number, cwd: string): Binding {
     return this.command(requestId,'session.prepare',{taskId,expectedRowVersion,cwd},()=>{
       const task=this.getTask(taskId);
       if(task.rowVersion!==expectedRowVersion)throw new AppError('version-conflict','任务已经更新，请刷新后再准备会话。');
       if(task.lifecycle!=='open'||!task.scope||!task.acceptance)throw new AppError('not-ready','请先补全任务范围和验收条件。');
       const existing=this.activeBinding(taskId);if(existing)return existing;
-      const generation=Number(this.db.prepare('SELECT coalesce(max(generation),0)+1 AS n FROM bindings WHERE taskId=?').get(taskId)?.n);
+      const generation=this.nextBindingGeneration(taskId);
       const binding:Binding={id:randomUUID(),taskId,generation,taskRevision:task.taskRevision,requestedSessionId:`session-${randomUUID()}`,sessionId:null,cwd,state:'creating',createdAt:Date.now()};
       this.db.prepare('INSERT INTO bindings(id,taskId,generation,taskRevision,requestedSessionId,sessionId,cwd,state,createdAt) VALUES (?,?,?,?,?,?,?,?,?)').run(binding.id,taskId,generation,task.taskRevision,binding.requestedSessionId,null,cwd,'creating',binding.createdAt);
       this.db.prepare('INSERT INTO outbox(id,kind,taskId,payload,createdAt) VALUES (?,?,?,?,?)').run(`binding:${binding.id}`,'session.create',taskId,JSON.stringify({bindingId:binding.id}),Date.now());
@@ -395,9 +402,12 @@ export class Store {
     if(!['progress','waiting','ready','blocked','failed'].includes(report.kind))throw new AppError('invalid-report','报告类型无效。');
     const payload={runId,callId,kind:report.kind,summary,checks:optionalText(report.checks,'验收说明'),evidence:report.evidence??[]};
     if(report.kind==='ready'&&(!payload.checks||payload.evidence.length===0))throw new AppError('evidence-required','提交成果必须有验收说明和文件证据。');
-    return this.command(`report:${runId}:${callId}`,'worker.report',payload,()=>{
+    const outcome=this.command(`report:${runId}:${callId}`,'worker.report',payload,()=>{
       const run=this.getRun(runId);const task=this.getTask(run.taskId);const b=this.activeBinding(task.id);
-      if(run.finishedAt!==null||run.state==='cancelling'||task.taskRevision!==run.taskRevision||b?.id!==run.bindingId||task.controlMode==='manual')throw new AppError('report-stale','当前执行或目标已改变，报告未成为当前成果。');
+      if(run.finishedAt!==null||run.state==='cancelling'||task.taskRevision!==run.taskRevision||b?.id!==run.bindingId||task.controlMode==='manual') {
+        this.event('work.report-stale',task.id,{runId,callId,kind:report.kind,summary,taskRevision:run.taskRevision});
+        return {accepted:false as const};
+      }
       if(this.getRunInput(runId).state!=='entered')throw new AppError('input-unconfirmed','尚无输入进入上下文的证据。');
       if(this.db.prepare("SELECT 1 FROM reports WHERE runId=? AND kind!='progress'").get(runId))throw new AppError('report-ended','本次执行已经提交最终报告。');
       this.db.prepare('INSERT INTO reports VALUES (?,?,?,?,?)').run(`${runId}:${callId}`,runId,report.kind,JSON.stringify(payload),Date.now());
@@ -407,6 +417,8 @@ export class Store {
       this.db.prepare('INSERT INTO results VALUES (?,?,?,?,?,?,?,?,NULL)').run(resultId,runId,task.id,run.taskRevision,summary,payload.checks,JSON.stringify(payload.evidence),Date.now());
       return {accepted:true as const,resultId};
     });
+    if(!outcome.accepted)throw new AppError('report-stale','当前执行或目标已改变，报告未成为当前成果。');
+    return outcome;
   }
   settleRun(id:string):void {
     if(this.getRun(id).finishedAt!==null)return;
@@ -549,6 +561,36 @@ export class Store {
       this.db.prepare('UPDATE tasks SET controlMode=?,rowVersion=rowVersion+1,updatedAt=? WHERE id=?').run(mode,Date.now(),id);
       if(mode==='auto')this.enqueueManager(task.botId,`resume:${id}:${task.rowVersion+1}`,'任务恢复自动管理，请读取最新状态。',id);
       this.event('task.control',id,{ mode }); return this.getTask(id);
+    });
+  }
+  private assertTaskSettled(taskId:string):void {
+    if(this.db.prepare('SELECT 1 FROM runs LEFT JOIN resources ON resources.runId=runs.id WHERE runs.taskId=? AND (runs.finishedAt IS NULL OR resources.runId IS NOT NULL)').get(taskId))throw new AppError('run-active','请先停止执行并完成恢复核对，当前占用尚未释放。');
+    if(this.db.prepare("SELECT 1 FROM attentions WHERE taskId=? AND kind='recovery' AND state='open'").get(taskId))throw new AppError('needs-attention','请先完成待核对事项。');
+    const binding=this.activeBinding(taskId);if(binding&&binding.state!=='ready')throw new AppError('session-recovery','请先核对会话创建结果。');
+  }
+  private discardPendingWork(taskId:string):void {
+    this.db.prepare("UPDATE inputs SET state='discarded' WHERE taskId=? AND state IN ('accepted','enqueued','unknown')").run(taskId);
+    this.db.prepare("UPDATE outbox SET state='superseded' WHERE taskId=? AND state='pending'").run(taskId);
+    this.db.prepare("UPDATE attentions SET state='stale' WHERE taskId=? AND state IN ('open','responding')").run(taskId);
+  }
+  detachSession(requestId:string,taskId:string,expectedRowVersion:number):Task {
+    return this.command(requestId,'session.detach',{taskId,expectedRowVersion},()=>{
+      const task=this.getTask(taskId);if(task.rowVersion!==expectedRowVersion)throw new AppError('version-conflict','任务已经更新，请刷新后解除关联。');
+      if(task.lifecycle!=='open')throw new AppError('task-ended','仅未完成任务可以解除关联；待验收成果请先返工或取消任务。');
+      this.assertTaskSettled(taskId);const binding=this.activeBinding(taskId);if(!binding)throw new AppError('not-found','没有当前执行会话。');
+      this.db.prepare("UPDATE bindings SET state='released' WHERE id=?").run(binding.id);
+      this.discardPendingWork(taskId);
+      this.db.prepare("UPDATE tasks SET sessionId=NULL,controlMode='paused',rowVersion=rowVersion+1,updatedAt=? WHERE id=?").run(Date.now(),taskId);
+      this.event('session.detached',taskId,{bindingId:binding.id,sessionId:binding.sessionId});return this.getTask(taskId);
+    });
+  }
+  cancelTask(requestId:string,taskId:string,expectedRowVersion:number):Task {
+    return this.command(requestId,'task.cancel',{taskId,expectedRowVersion},()=>{
+      const task=this.getTask(taskId);if(task.rowVersion!==expectedRowVersion)throw new AppError('version-conflict','任务已经更新，请刷新后取消。');
+      if(!['open','review'].includes(task.lifecycle))throw new AppError('task-ended','任务已经结束。');
+      this.assertTaskSettled(taskId);this.discardPendingWork(taskId);
+      this.db.prepare("UPDATE tasks SET lifecycle='cancelled',controlMode='paused',rowVersion=rowVersion+1,updatedAt=? WHERE id=?").run(Date.now(),taskId);
+      this.event('task.cancelled',taskId,{});return this.getTask(taskId);
     });
   }
   sqliteInfo(): { sqliteVersion: string; journalMode: string } {
