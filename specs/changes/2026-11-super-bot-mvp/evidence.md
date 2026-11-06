@@ -210,8 +210,16 @@ ELECTRON_RUN_AS_NODE=1 '/Applications/DeepSeek Harness.app/Contents/MacOS/DeepSe
 独立第 19 轮 UI 完成：启用 Manager 后完整任务可初始暂停，期间无 Binding/模型执行；忙碌会话不给关联，空闲会话双授权才允许提交；关联后保持暂停和原 1 turn/1 step。恢复自动管理后 Manager 自动执行至人工待验收，原生 2 turns/4 steps、132 字节成果，历史只有一份，console warn/error 为空。SB-05 新建/已有授权/解绑/历史保留路径已具备实际证据。
 
 
-## ready 与未收敛后台活动（2026-11-07 05:03）
+## ready 与未收敛后台活动（2026-11-07 05:01）
 
 - `smoke-background.mjs` 在真实报告工具前建立合成 DSH Job（没有外部进程）；Worker 写/读/ready 后 Agent 已 idle，但 Job 仍 running。产品 Run 转 interrupted/recovery，Result 只作不可验收候选，不能接受或释放占用。
 - 请求 Job kill 后状态仍 stopping，恢复继续拒绝；测试明确完成 Job 后，人工核对才使任务暂停。旧 ready 不因后来空闲而自动恢复为可验收成果。
 - 配合 11 项契约、实际取消超时、丢回执、重启、文件证据和独立 UI，SB-02/06～09 的文件任务纵切完成；仍保留支持矩阵中的限制，真实模型质量归 SB-15。
+
+
+## Manager 预算实测（2026-11-07 05:09）
+
+- `smoke-manager-budget.mjs steps`：自动管理轮次模型恰好 12 步，随后停止；增加程序侧可见原因，工作台不再只在原生错误日志里得知预算耗尽。任务保持暂停，没有 Worker Run。
+- `smoke-manager-budget.mjs hourly`：实际 20 次自动唤醒后，其余 6 条通知保持 pending；等待期间模型调用不再增长。更换 Manager 后计数仍 20、新会话自动调用为 0、pending 变 7，不通过换会话绕过预算。
+- `smoke-manager-budget.mjs time-start/time-verify`：使用真实墙钟，300,877 ms 后自动轮次取消并回到 idle，5 分钟原因在面板可查询；暂停任务始终未派发。当前 5 分钟限制针对自动唤醒轮次，原生手动管理对话受 12 步限制但没有该自动轮次计时器。
+- 本次产品变更仅为 12 步原因的可见反馈；部署前 `npm run check` 36 项通过，独立 UI 第 20 轮复验中。

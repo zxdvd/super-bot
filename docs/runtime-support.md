@@ -17,7 +17,7 @@
 | 人工接管 | 已验证 | 原生用户输入撤销旧 Run 授权；收敛前限制不解除；旧 driver 空闲后允许新人工轮次使用原生工具。旧 Stop 回执不取消新工作。`smoke-handoff.mjs` |
 | 普通停止与未知停止 | 已验证 | cancel 回执不算结束；真实 10 秒不响应取消转恢复；迟到收敛不伪造成功。`smoke:execution`、`smoke-stop-timeout.mjs` |
 | Worker 预算 | 已验证 | 每 Run 最多 40 步或 10 分钟；实际 40 步和 600,026 ms 计时通过。预算后暂停并核对，不自动重试。`smoke-budget.mjs` |
-| Manager 约束 | 部分已验证 | 单 Bot 一轮、全局两轮、每轮 12 步/5 分钟、每小时 20 次自动唤醒；有限返工和公平队列已验证，所有计时/额度的宿主故障排列仍待补齐 |
+| Manager 约束 | 部分已验证 | 单 Bot 一轮、全局两轮；实际 12 步、自动轮次 5 分钟、每小时 20 次唤醒及换会话不重置额度均通过 `smoke-manager-budget.mjs`。手动管理对话受 12 步限制，没有自动轮次计时器；全局两轮并发的专门压力用例待补 |
 | 两个 Worker 容量 | 已验证 | 同 Bot 两项实际同时运行；第三项不创建 Run，另一个 Bot 的 Manager 等待名额，释放后才派发。`smoke-capacity.mjs` |
 | 后台作业收敛 | 已验证契约；产品能力有限 | Agent idle 不代表 job 停止，kill accepted 不代表 settled。合成 job 探针及 `smoke-background.mjs` 实际 ready→恢复门槛验证；不开放业务 Shell |
 | 重启与未知投递 | 已验证主要窗口 | 实际 SIGKILL、投递后丢回执、Manager 通知丢回执均不自动重放责任。`smoke-restart.mjs`、`probe:run` |

@@ -55,8 +55,13 @@ class ProbeAdapter extends LlmAdapter {
       const last=calls.at(-1);const prior=last?.type==='tool-call'?JSON.parse(last.arguments) as Record<string,unknown>:null;
       let value:Record<string,any>|undefined;
       for(const message of later.filter(m=>m.role==='tool'))for(const block of message.content)if(block.type==='text')try{value=JSON.parse(block.text);}catch{}
+      if(value?.task?.goal==='MANAGER_TIME_PROBE') {
+        await new Promise<void>(resolve=>{if(options.signal?.aborted)resolve();else options.signal?.addEventListener('abort',()=>resolve(),{once:true});});
+        options.signal?.throwIfAborted();
+      }
       let plan:Record<string,unknown>|null=null;
-      if(!prior) {
+      if(value?.task?.goal==='MANAGER_STEP_PROBE')plan={action:'detail',taskId:value.task.id};
+      else if(!prior) {
         const foreign=text.match(/CROSS_BOT:([^\s]+)/)?.[1];
         if(foreign)plan={action:'detail',taskId:foreign};
         else if(trigger?.source?.kind==='user'&&text.includes('MANAGER_PROBE'))plan={action:'create',goal:'Manager 生成合成说明',scope:'专用任务目录，不访问网络',acceptance:'result.md 包含两项事实并已回读'};

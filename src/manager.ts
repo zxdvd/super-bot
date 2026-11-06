@@ -96,7 +96,11 @@ export class Managers {
     let turn=-1,steps=0;
     const budget=agent.ctx.on('agent/pre-step',async(payload,next)=>{
       if(payload.turn!==turn){turn=payload.turn;steps=0;}
-      if(++steps>12)throw new AppError('manager-budget','单次管理轮次已达 12 步上限，请检查账本后继续。');
+      if(++steps>12) {
+        const active=this.store.managerForSession(agent.id);
+        if(active)this.store.managerProblem(active.botId,'单次管理轮次已达 12 步上限，请检查账本后继续。');
+        throw new AppError('manager-budget','单次管理轮次已达 12 步上限，请检查账本后继续。');
+      }
       return next();
     });
     const prompt=agent.ctx.systemPrompt.section({name:'super-bot-manager',order:9000,interpolate:false,text:()=>{
