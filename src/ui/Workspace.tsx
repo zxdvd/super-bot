@@ -112,11 +112,13 @@ export function Workspace({ api }: { api:WorkspaceApi }) {
   const savedView=useRef(rememberedView());const pendingSelection=useRef('');
   const [managerInfo,setManagerInfo]=useState<{binding:ManagerBinding|null;pending:number;uncertain:number;hourlyWakes:number;problem:{message:string;at:number}|null}>();
   const [backupInfo,setBackupInfo]=useState<BackupInfo>();
+  const backupNotice=useRef<HTMLDivElement>(null);
   const [status,setStatus]=useState<WorkspaceStatus>(); const [bots,setBots]=useState<Bot[]>([]);
   const [botId,setBotId]=useState(''); const [page,setPage]=useState<TaskPage>(); const [selected,setSelected]=useState('');
   const [detail,setDetail]=useState<Detail>(); const [query,setQuery]=useState(''); const [filter,setFilter]=useState(''); const [offset,setOffset]=useState(0);
   const [online,setOnline]=useState(false);const [loading,setLoading]=useState(true);const [error,setError]=useState('');const [connectionError,setConnectionError]=useState('');const [busy,setBusy]=useState(false);
   const [form,setForm]=useState<'bot'|'bot-edit'|'task'|'edit'|null>(null); const [refresh,setRefresh]=useState(0); const [synced,setSynced]=useState(0);
+  useEffect(()=>{if(backupInfo)backupNotice.current?.scrollIntoView({block:'nearest'});},[backupInfo]);
   useEffect(()=>{if(botId)try{sessionStorage.setItem('super-bot:view',JSON.stringify({botId,selected,query,filter,offset}));}catch{/* Browser storage is optional. */}},[botId,selected,query,filter,offset]);
   useEffect(()=>{
     const controller=new AbortController(); let timer:ReturnType<typeof setTimeout>; let failures=0;
@@ -155,7 +157,7 @@ export function Workspace({ api }: { api:WorkspaceApi }) {
   return <div className="sb"><style>{styles}</style><div className="sb-wrap">
     <header className="sb-header"><div><div className="eyebrow">BOT WORKSPACE</div><h1>Super Bot</h1></div><div className="connection"><span className={`dot ${online?'':'offline'}`}/>{loading?'连接中…':online?'宿主在线':'宿主离线'}{synced>0&&<span className="muted">· {time(synced)}</span>}</div></header>
     {(error||connectionError)&&<div className="notice error" role="alert"><span>{error||connectionError}</span><button onClick={()=>{setError('');setConnectionError('');setRefresh(n=>n+1);}}>刷新状态</button></div>}
-    {backupInfo&&<div className="notice"><div><strong>账本备份已保存</strong><p style={{overflowWrap:'anywhere'}}>{backupInfo.path}</p><p className="muted">{backupInfo.scope}</p></div><button onClick={()=>setBackupInfo(undefined)}>关闭</button></div>}
+    {backupInfo&&<div className="notice" ref={backupNotice} role="status"><div><strong>账本备份已保存</strong><p style={{overflowWrap:'anywhere'}}>{backupInfo.path}</p><p className="muted">{backupInfo.scope}</p></div><button onClick={()=>setBackupInfo(undefined)}>关闭</button></div>}
     {!online&&!loading&&<div className="notice">{synced?'当前显示上次同步的快照。':'尚未读取到工作台数据。'}重新连接前，操作暂不可用。</div>}
     {loading?<div className="empty">正在读取工作台…</div>:<>
       {bots.length>0&&<div className="toolbar"><select aria-label="选择 Bot" disabled={busy} value={botId} onChange={e=>pickBot(e.target.value)}>{bots.map(b=><option key={b.id} value={b.id}>{b.name}</option>)}</select><button disabled={!online||busy} onClick={()=>setForm(form==='bot'?null:'bot')}>＋ 新 Bot</button><span className="spacer"/><button className="primary" disabled={!online||busy||!bot} onClick={()=>setForm(form==='task'?null:'task')}>＋ 新任务</button></div>}

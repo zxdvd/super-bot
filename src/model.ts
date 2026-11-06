@@ -6,7 +6,6 @@ export interface WorkspaceStatus {
   sqliteVersion: string;
   journalMode: string;
   startedAt: number;
-  savedSessionId: string | null;
 }
 
 export class AppError extends Error {

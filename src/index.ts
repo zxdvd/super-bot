@@ -3,11 +3,9 @@ import Schema from '@deepseek-ai/schemastery';
 import type {} from '@deepseek-ai/dsh-client-connection';
 import type {} from '@deepseek-ai/dsh-api-session-controller';
 import type {} from '@deepseek-ai/dsh-workspace';
-import { SessionId } from '@deepseek-ai/dsh-session/types';
 import { createRequire } from 'node:module';
 import { homedir } from 'node:os';
 import { join,resolve } from 'node:path';
-import { mkdir } from 'node:fs/promises';
 import { Store } from './store.ts';
 import { DshExecution } from './dsh.ts';
 import { Managers } from './manager.ts';
@@ -29,10 +27,8 @@ export function apply(ctx: Context, config: { dataDir?: string } = {}): void {
   const require = createRequire(import.meta.url);
   const runtime = require('@deepseek-ai/dsh-agent/package.json').version as string;
   const startedAt = Date.now();
-  let creating: Promise<string> | undefined;
-
   const status = (): WorkspaceStatus => ({ product: 'Super Bot', version: '0.1.0', runtime,
-    ...store.sqliteInfo(), startedAt, savedSessionId: store.get('probeSession') });
+    ...store.sqliteInfo(), startedAt });
 
   async function invoke(endpoint: string, payload: Record<string, unknown>) {
     try {
@@ -65,24 +61,6 @@ export function apply(ctx: Context, config: { dataDir?: string } = {}): void {
         requiredText(payload.id,'任务标识',200),payload.expectedRowVersion as number,payload.mode as ControlMode) };
       if (endpoint === 'task.revise') return { ok: true, value: store.reviseTask(requiredText(payload.requestId,'请求标识',200),
         requiredText(payload.id,'任务标识',200),payload.expectedRowVersion as number,payload as unknown as NewTask) };
-      if (endpoint === 'create-probe-session') {
-        const cwd = join(dataDir, 'probe-workspace');
-        await mkdir(cwd, { recursive: true });
-        const workspace = await ctx.workspaceRegistry.create(cwd, 'Super Bot 验证');
-        const existing = store.get('probeSession');
-        if (existing) {
-          await workspace.attachSession(SessionId(existing));
-          return { ok: true, value: { sessionId: existing } };
-        }
-        if (store.get('probeCreating') && !creating) throw new AppError('recovery', '上次创建结果待核对，尚未重新创建。');
-        creating ??= (async () => {
-          store.set('probeCreating', 'true');
-          const { sessionId } = await ctx.sessionController.create({ workspaceId: workspace.id });
-          store.set('probeSession', sessionId);
-          return sessionId;
-        })().finally(() => { creating = undefined; });
-        return { ok: true, value: { sessionId: await creating } };
-      }
       throw new AppError('not-found', '未知操作。');
     } catch (error) {
       return { ok: false, error: { code: error instanceof AppError ? error.code : 'internal',

@@ -292,3 +292,10 @@ ELECTRON_RUN_AS_NODE=1 '/Applications/DeepSeek Harness.app/Contents/MacOS/DeepSe
 - `test/backups.test.ts` 新增 3 项故障用例，先复现失败，再修复通过；`npm run check` 52 核心 + 8 适配测试、类型检查与构建全部通过。独立代码复核未发现阻塞。
 - candidate-5 实际 tgz 停机安装于 3082；`smoke-backup-retry.mjs` 在首次快照后新增合成 Bot，再移除清单重试，计数与文件哈希保持原快照；临时移开 SQLite 后返回 backup-unavailable，最后原文件/清单保留。原安装包生命周期任务与备份的 retained 检查再次通过。
 - 独立文档审阅修正：回答/返工保存后的 Manager 自动安排与手动开始条件、从原生菜单复制 Session ID 的步骤、旧报告保留但文件版本不自动备份的区别。UI 提示同步；修改后的类型检查/构建通过。真实账号/模型判断与最终个人体验仍留待用户。
+
+
+## 安装包备份反馈复验（2026-11-07 06:34）
+
+- 独立 UI 第 28 轮确认 candidate-5 在线、原任务与原生会话可打开、返回仍选中任务、一次备份成功且范围清楚，console warn/error 为空。发现页脚操作后的成功提示在屏幕外。
+- 成功提示加入 status 语义，并在新备份返回时滚入可视区域；没有自动重试备份。candidate-6 实际 tgz 的独立 UI 第 29 轮从页脚点击后不手动滚动，路径、范围与关闭按钮均自动完整可见，关闭正常，无控制台告警。截图位于 `.runtime/ui29-backup-auto-visible.png`。
+- 移除初期最小插件留下的 create-probe-session 产品 API 与无使用者的 savedSessionId 状态字段；不删除已有原生会话或元数据。真实安装包 status 正常、旧临时接口返回 not-found；类型检查/构建通过。契约测试插件继续单独存在于开发 profile，不随产品包交付。
