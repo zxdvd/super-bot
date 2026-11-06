@@ -31,16 +31,18 @@ const toolName = 'super_bot_probe_report';
 const scopedToolName='super_bot_scoped_probe';
 
 class ProbeAdapter extends LlmAdapter {
-  calls: {sessionId?: string;purpose?:string; ids: string[]; tools: string[]}[] = [];
+  calls: {sessionId?: string;purpose?:string;ids:string[];tools:string[];markers:string[]}[] = [];
   approvalWrites=new Set<string>();
   readyWithJob=new Set<string>();
   scopedAttempts=new Map<string,number>();
+  managerAttempts=new Map<string,Record<string,unknown>[]>();
+  heldManagerInputs=new Set<string>();
   stalled=new Map<string,{release:()=>void;signal?:AbortSignal}>();
   async listModels() { return [{provider,id:'deterministic',name:'Super Bot 测试模型（无网络）'}]; }
   async resolveModel(p:string,m:string) { return {provider:p,id:m,name:m,context:{contextWindow:200000},defaultMaxTokens:1000}; }
   async *stream(options: GenerateOptions): AsyncIterable<StreamChunk> {
     options.signal?.throwIfAborted();
-    this.calls.push({sessionId:options.sessionId,purpose:options.purpose,ids:options.messages.flatMap(m=>m.id?[m.id]:[]),tools:(options.tools??[]).map(t=>t.name)});
+    this.calls.push({sessionId:options.sessionId,purpose:options.purpose,ids:options.messages.flatMap(m=>m.id?[m.id]:[]),tools:(options.tools??[]).map(t=>t.name),markers:[...new Set(JSON.stringify(options.messages).match(/SB_MATERIAL_[A-Z0-9_]+/g)??[])]});
     const scopedInput=options.messages.findLast(message=>message.role==='user'&&(message.source?.kind==='user'||message.source?.kind==='super-bot'));
     if(scopedInput&&options.tools?.some(tool=>tool.name===scopedToolName)&&scopedInput.content.some(block=>block.type==='text'&&block.text.includes('SCOPED_TOOL_PROBE'))&&!options.messages.slice(options.messages.indexOf(scopedInput)+1).some(message=>message.content.some(block=>block.type==='tool-call'&&block.name===scopedToolName))) {
       if(options.sessionId)this.scopedAttempts.set(options.sessionId,(this.scopedAttempts.get(options.sessionId)??0)+1);
@@ -58,6 +60,13 @@ class ProbeAdapter extends LlmAdapter {
       if(value?.task?.goal==='MANAGER_TIME_PROBE') {
         await new Promise<void>(resolve=>{if(options.signal?.aborted)resolve();else options.signal?.addEventListener('abort',()=>resolve(),{once:true});});
         options.signal?.throwIfAborted();
+      }
+      const holdKey=`${options.sessionId}:${trigger?.id}`;
+      if(!this.heldManagerInputs.has(holdKey)&&(value?.task?.goal==='MANAGER_HOLD_PROBE'||value?.task?.goal==='MANAGER_STALE_PROBE'||(value?.task?.goal==='MANAGER_STALE_REVIEW_PROBE'&&value.result))) {
+        assert.ok(options.sessionId);
+        this.heldManagerInputs.add(holdKey);
+        await new Promise<void>(release=>this.stalled.set(options.sessionId!,{release,signal:options.signal}));
+        this.stalled.delete(options.sessionId);options.signal?.throwIfAborted();
       }
       let plan:Record<string,unknown>|null=null;
       if(value?.task?.goal==='MANAGER_STEP_PROBE')plan={action:'detail',taskId:value.task.id};
@@ -79,6 +88,7 @@ class ProbeAdapter extends LlmAdapter {
         }else if(value.task.status==='unscheduled')plan={action:'dispatch',taskId:value.task.id,expectedRowVersion:value.task.rowVersion};
       }
       if(plan) {
+        if(options.sessionId){const attempts=this.managerAttempts.get(options.sessionId)??[];attempts.push(plan);this.managerAttempts.set(options.sessionId,attempts);}
         const id=ToolCallId(randomUUID()),args=JSON.stringify(plan);
         yield {type:'block-start',index:0,blockType:'tool-call'};yield {type:'tool-call-delta',index:0,id,name:'super_bot_manage',argumentsDelta:args};
         yield {type:'block-end',index:0,block:{type:'tool-call',id,name:'super_bot_manage',arguments:args}};yield {type:'finish',reason:{kind:'tool-calls'}};return;
@@ -415,7 +425,7 @@ export function apply(ctx:Context) {
       if(body.action==='inspect-session') {
         assert.ok(body.sessionId);const resolved=await ctx.sessionController.resolveAgent(SessionId(body.sessionId));assert.ok('agent' in resolved);
         assert.ok(resolved.agent.session.header.cwd?.startsWith(join(home!,'super-bot')+'/'));
-        return Response.json({ok:true,sessionId:resolved.agent.id,status:resolved.agent.status,pending:resolved.agent.inbox.nextTurn.length+resolved.agent.inbox.nextStep.length,stalled:adapter.stalled.has(resolved.agent.id),stalledAborted:adapter.stalled.get(resolved.agent.id)?.signal?.aborted??false,historyMessageIds:resolved.agent.session.snapshotEvents().filter(event=>event.type==='user/message').map(event=>event.data.id),modelSteps:adapter.calls.filter(call=>call.sessionId===body.sessionId&&(!call.purpose||call.purpose==='conversation')).length,scopedProbeCalls:scopedCalls.get(resolved.agent.id)??0,scopedProbeAttempts:adapter.scopedAttempts.get(resolved.agent.id)??0,
+        return Response.json({ok:true,sessionId:resolved.agent.id,status:resolved.agent.status,pending:resolved.agent.inbox.nextTurn.length+resolved.agent.inbox.nextStep.length,stalled:adapter.stalled.has(resolved.agent.id),stalledAborted:adapter.stalled.get(resolved.agent.id)?.signal?.aborted??false,managerAttempts:adapter.managerAttempts.get(resolved.agent.id)??[],materialMarkers:adapter.calls.filter(call=>call.sessionId===body.sessionId&&(!call.purpose||call.purpose==='conversation')).at(-1)?.markers??[],historyMessageIds:resolved.agent.session.snapshotEvents().filter(event=>event.type==='user/message').map(event=>event.data.id),modelSteps:adapter.calls.filter(call=>call.sessionId===body.sessionId&&(!call.purpose||call.purpose==='conversation')).length,scopedProbeCalls:scopedCalls.get(resolved.agent.id)??0,scopedProbeAttempts:adapter.scopedAttempts.get(resolved.agent.id)??0,
           productTools:ctx.tools.definitions().map(tool=>tool.name).filter(name=>['super_bot_report','super_bot_manage'].includes(name))});
       }
       if(body.action==='select-test-model'||body.action==='native-prompt') {

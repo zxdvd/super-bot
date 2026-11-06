@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { existsSync, realpathSync } from 'node:fs';
+import { constants,existsSync, realpathSync } from 'node:fs';
 import { open } from 'node:fs/promises';
 import { dirname, isAbsolute, relative, resolve, sep } from 'node:path';
 import { AppError, type Evidence } from './model.ts';
@@ -22,7 +22,7 @@ async function inspectFiles(cwd:string,paths:unknown,previewBytes=0):Promise<Ins
     try{canonical=containedPath(cwd,path);}catch(error){if(error instanceof AppError)throw error;throw new AppError('evidence-unavailable','任务成果目录无法读取，请恢复目录后再核对。');}
     const maximum=Math.min(10*1024*1024,20*1024*1024-total);
     try {
-      const file=await open(canonical,'r');
+      const file=await open(canonical,constants.O_RDONLY|constants.O_NONBLOCK);
       try {
         const metadata=await file.stat();
         if(!metadata.isFile()||metadata.size>maximum)throw new AppError('evidence-size','证据需为普通文件，单个不超过 10 MB、合计不超过 20 MB。');

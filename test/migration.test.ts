@@ -27,6 +27,7 @@ function assertUpgraded(file:string) {
   const store=new Store(file);try {
     assert.equal(store.db.prepare('PRAGMA user_version').get()?.user_version,version);
     assert.equal(store.getTask('task').goal,'Existing goal');assert.equal(store.getBot('bot').name,'Old Bot');
+    assert.equal(store.getTask('task').botConfigRevision,1);assert.equal(store.taskBotContext('task').instructions,'Synthetic responsibility');assert.deepEqual(store.taskBotContext('task').materials,[]);
     assert.equal(store.db.prepare('SELECT messageId,attentionId FROM inputs WHERE id=?').get('input')?.messageId,null);
     const binding=store.beginBinding('prepare','task',1,'/tmp/synthetic-upgraded-task');
     store.confirmBinding(binding.id,binding.requestedSessionId);

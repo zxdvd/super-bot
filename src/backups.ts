@@ -26,7 +26,7 @@ async function writeBackup(store:Store,dataDir:string,key:string):Promise<Backup
     info={path,manifestPath,createdAt:new Date().toISOString(),schema:Number(snapshot.prepare('PRAGMA user_version').get()?.user_version),counts:{bots:count('bots'),tasks:count('tasks'),results:count('results')},
       sessions:snapshot.prepare('SELECT sessionId FROM bindings WHERE sessionId IS NOT NULL UNION SELECT sessionId FROM managers WHERE sessionId IS NOT NULL').all().map(r=>String(r.sessionId)),
       artifactDirectories:snapshot.prepare('SELECT cwd FROM bindings UNION SELECT cwd FROM managers').all().map(r=>String(r.cwd)),
-      scope:'仅含 SQLite 账本、成果索引和审计。DSH 会话、模型凭证与成果文件不在此备份中；请按清单单独保留。'};
+      scope:'含 SQLite 账本、参考文本快照、成果索引和审计。DSH 会话、模型凭证与成果文件不在此备份中；请按清单单独保留。'};
   }finally{snapshot.close();}
   await rename(pending,path);await chmod(path,0o600);await writeFile(manifestPath+'.partial',JSON.stringify(info,null,2),{mode:0o600});await rename(manifestPath+'.partial',manifestPath);
   store.recordBackup(key,path);

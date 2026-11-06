@@ -20,7 +20,11 @@ export interface Bot {
   configRevision: number;
   managerSessionId: string | null;
   createdAt: number;
+  materials:ReferenceInfo[];
 }
+export interface ReferenceInfo {path:string;sha256:string;bytes:number}
+export interface ReferenceMaterial extends ReferenceInfo {text:string}
+export interface TaskBotContext {instructions:string;materials:ReferenceMaterial[]}
 export type Lifecycle = 'open' | 'review' | 'completed' | 'cancelled';
 export type ControlMode = 'auto' | 'paused' | 'manual';
 export interface Task {
@@ -39,6 +43,7 @@ export interface Task {
   updatedAt: number;
   status: 'unscheduled' | 'needs-input' | 'approval' | 'paused' | 'manual' | 'completed' | 'cancelled' | 'review' | 'queued' | 'running' | 'stopping' | 'recovery';
   managerReviewed?:boolean;
+  botConfigRevision:number;
 }
 export interface TaskPage {
   items: Task[];
@@ -48,7 +53,13 @@ export interface TaskPage {
   snapshotVersion: number;
   counts: { all: number; open: number; review: number; completed: number; cancelled: number };
 }
-export interface NewBot { name: string; instructions: string }
+export interface NewBot { name: string; instructions: string;referencePaths?:string[] }
+export function botDraft(input:NewBot):NewBot {
+  const paths=input.referencePaths??[];
+  if(!Array.isArray(paths)||paths.length>4)throw new AppError('invalid-input','最多指定四份本地参考文本。');
+  const referencePaths=[...new Set(paths.map(path=>requiredText(path,'参考文本路径',2000)))];
+  return {name:requiredText(input.name,'Bot 名称',80),instructions:requiredText(input.instructions,'Bot 职责'),...(referencePaths.length?{referencePaths}:{})};
+}
 export interface NewTask { botId: string; goal: string; scope: string; acceptance: string; reviewPolicy: 'human' | 'bot'; startPaused?:boolean }
 export interface Binding {
   id: string; taskId: string; generation: number; taskRevision: number;

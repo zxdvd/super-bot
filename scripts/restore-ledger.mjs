@@ -10,7 +10,7 @@ assert.ok(sourceArgument&&destinationArgument,'Usage: node scripts/restore-ledge
 const source=resolve(sourceArgument),destination=resolve(destinationArgument);
 function inspect(file) {const db=new DatabaseSync(file,{readOnly:true});try{assert.equal(db.prepare('PRAGMA integrity_check').get().integrity_check,'ok');return {schema:db.prepare('PRAGMA user_version').get().user_version,bots:db.prepare('SELECT count(*) AS n FROM bots').get().n,tasks:db.prepare('SELECT count(*) AS n FROM tasks').get().n,results:db.prepare('SELECT count(*) AS n FROM results').get().n};}finally{db.close();}}
 const before=inspect(source);
-assert.equal(before.schema,schemaVersion,'Use the plugin version matching this backup before restoring');
+assert.ok(before.schema>=6&&before.schema<=schemaVersion,'This restore supports schema 6 through the current version; use the matching older plugin for earlier backups');
 await mkdir(destination,{mode:0o700});
 const target=join(destination,'ledger.sqlite');await copyFile(source,target,constants.COPYFILE_EXCL);await chmod(target,0o600);
 assert.deepEqual(inspect(target),before);

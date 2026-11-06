@@ -12,7 +12,7 @@ import { Store } from './store.ts';
 import { DshExecution } from './dsh.ts';
 import { Managers } from './manager.ts';
 import { createLedgerBackup } from './backups.ts';
-import { AppError, requiredText, optionalText, type WorkspaceStatus, type NewBot, type NewTask, type ControlMode } from './model.ts';
+import { AppError, requiredText, optionalText,type WorkspaceStatus, type NewBot, type NewTask, type ControlMode } from './model.ts';
 
 export const name = 'super-bot';
 export const inject = ['connection', 'sessionController', 'workspaceRegistry','agents','tools','jobs','systemPrompt','workingDirectory'];
@@ -42,7 +42,8 @@ export function apply(ctx: Context, config: { dataDir?: string } = {}): void {
       if (endpoint === 'manager.prepare') return {ok:true,value:await managers.prepare(requiredText(payload.requestId,'请求标识',200),requiredText(payload.botId,'Bot 标识',200))};
       if (endpoint === 'manager.replace') return {ok:true,value:await managers.replace(requiredText(payload.requestId,'请求标识',200),requiredText(payload.botId,'Bot 标识',200),payload.expectedGeneration as number)};
       if (endpoint === 'manager.status') return {ok:true,value:store.managerInfo(requiredText(payload.botId,'Bot 标识',200))};
-      if (endpoint === 'bot.create') return { ok: true, value: store.createBot(requiredText(payload.requestId,'请求标识',200),payload as unknown as NewBot) };
+      if (endpoint === 'bot.create') return {ok:true,value:await managers.createBot(requiredText(payload.requestId,'请求标识',200),payload as unknown as NewBot)};
+      if (endpoint === 'bot.update') return {ok:true,value:await managers.updateBot(requiredText(payload.requestId,'请求标识',200),requiredText(payload.id,'Bot 标识',200),payload.expectedRevision as number,payload as unknown as NewBot)};
       if (endpoint === 'task.create') return { ok: true, value: store.createTask(requiredText(payload.requestId,'请求标识',200),payload as unknown as NewTask) };
       if (endpoint === 'task.list') return { ok: true, value: store.listTasks({
         botId: requiredText(payload.botId,'Bot 标识',200), q: optionalText(payload.q,'搜索',200),

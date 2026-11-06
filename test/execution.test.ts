@@ -301,6 +301,37 @@ test('replacing a manager keeps tasks and immediately revokes the previous sessi
     assert.throws(()=>store.releaseManager('stale',task.botId,1),/已经改变/);
   }finally{store.close();}
 });
+
+test('restarting and replacing Manager cannot reset automatic rework allowance',()=>{
+  const directory=mkdtempSync(join(tmpdir(),'super-bot-rework-')),file=join(directory,'ledger.sqlite');let store=new Store(file);
+  try {
+    const task=prepared(store,'persisted-rework',join(directory,'work'),'bot');
+    for(let round=0;round<3;round++) {
+      const previous=store.activeManager(task.botId);if(previous)store.releaseManager(`replace-${round}`,task.botId,previous.generation);
+      const manager=store.beginManager(`manager-${round}`,task.botId,join(directory,'manager'));store.confirmManager(manager.id,manager.requestedSessionId);
+      const run=store.reserveRun(`run-${round}`,task.id,store.getTask(task.id).rowVersion);
+      store.saveRunMessage(run.id,`message-${round}`,'{}');store.claimDispatch(run.id);store.inputEntered(run.id,`message-${round}`,round);
+      const report=store.workerReport(run.id,`report-${round}`,ready);store.settleRun(run.id);
+      store.managerReview(`review-${round}`,task.botId,task.id,store.getTask(task.id).rowVersion,report.resultId!,'rework','请补充证据');
+      store.close();store=new Store(file);
+      assert.equal(store.getTask(task.id).lifecycle,round<2?'open':'review');
+      assert.equal(store.getTask(task.id).controlMode,round<2?'auto':'paused');
+    }
+    assert.match(store.taskDetail(task.id).attentions.find(a=>a.state==='open')!.question,/已达 2 次/);
+    assert.throws(()=>store.reserveRun('extra-run',task.id,store.getTask(task.id).rowVersion),/暂停|自动/);
+  }finally{store.close();rmSync(directory,{recursive:true,force:true});}
+});
+
+test('enabling a Manager queues each eligible existing task without duplicating pending responsibility',()=>{
+  const store=new Store(':memory:');try {
+    const bot=store.createBot('bot',{name:'Existing backlog',instructions:'Own files'});
+    const tasks=Array.from({length:4},(_,n)=>store.createTask(`task-${n}`,{botId:bot.id,goal:`Existing task ${n}`,scope:'Own directory',acceptance:'Read result',reviewPolicy:'human',startPaused:n===3}));
+    const manager=store.beginManager('manager',bot.id,'/tmp/backlog-manager');store.confirmManager(manager.id,manager.requestedSessionId);
+    assert.equal(store.managerInfo(bot.id).pending,3);assert.deepEqual(new Set(store.pendingManagerEvents(bot.id).map(event=>event.taskId)),new Set(tasks.slice(0,3).map(task=>task.id)));
+    store.releaseManager('replace',bot.id,manager.generation);const replacement=store.beginManager('replacement',bot.id,'/tmp/backlog-manager');store.confirmManager(replacement.id,replacement.requestedSessionId);
+    assert.equal(store.managerInfo(bot.id).pending,3);
+  }finally{store.close();}
+});
 test('evidence hashes detect changed content and outside symlink paths',async()=>{
   const root=mkdtempSync(join(tmpdir(),'super-bot-evidence-'));const outside=mkdtempSync(join(tmpdir(),'super-bot-outside-'));
   try {

@@ -15,6 +15,7 @@ import { join,isAbsolute } from 'node:path';
 import { AppError,requiredText,optionalText,type Binding,type Run,type WorkReport,type ExistingSessionGrant,type ExistingSessionPreview } from './model.ts';
 import type { Store } from './store.ts';
 import { collectEvidence,containedPath,verifyEvidence } from './evidence.ts';
+import { materialPrompt } from './materials.ts';
 
 declare module '@deepseek-ai/dsh-llm' {
   interface MessageSourceMap {'super-bot':{kind:'super-bot';taskId:string;runId:string;inputId:string;taskRevision:number;generation:number}}
@@ -114,11 +115,11 @@ export class DshExecution {
     authorize();
     const run=this.store.reserveRun(requestId,taskId,rowVersion);
     if(this.running.has(run.id)||run.finishedAt!==null)return this.store.getRun(run.id);
-    const task=this.store.getTask(taskId);const bot=this.store.getBot(task.botId);
+    const task=this.store.getTask(taskId);const botContext=this.store.taskBotContext(taskId);
     let input=this.store.getRunInput(run.id);
     if(!input.messageJson) {
       const supplement=input.kind==='answer'||input.kind==='rework'?`\nAdditional user input (${input.kind}): ${input.content}`:'';
-      const message=createUserMessage({source:{kind:'super-bot',taskId,runId:run.id,inputId:run.inputId,taskRevision:run.taskRevision,generation:run.generation},content:[{type:'text',text:`You are executing one Super Bot task.\nBot responsibility: ${bot.instructions}\nGoal: ${task.goal}\nAuthorized scope: ${task.scope}\nAcceptance criteria: ${task.acceptance}\nWorking directory: ${b.cwd}${supplement}\nUse only read/write/edit in this directory, always with absolute file_path values. Do not change working directories. Shell and subagents are not enabled in this preview.\nReport with super_bot_report. Use waiting to ask a necessary question. For ready provide files and checks explaining every acceptance criterion. Never claim the task is accepted; the user decides.`}]});
+      const message=createUserMessage({source:{kind:'super-bot',taskId,runId:run.id,inputId:run.inputId,taskRevision:run.taskRevision,generation:run.generation},content:[{type:'text',text:`You are executing one Super Bot task.\nBot configuration revision: ${task.botConfigRevision}\nBot responsibility: ${botContext.instructions}${materialPrompt(botContext.materials)}\nGoal: ${task.goal}\nAuthorized scope: ${task.scope}\nAcceptance criteria: ${task.acceptance}\nWorking directory: ${b.cwd}${supplement}\nUse only read/write/edit in this directory, always with absolute file_path values. Do not change working directories. Shell and subagents are not enabled in this preview.\nReport with super_bot_report. Use waiting to ask a necessary question. For ready provide files and checks explaining every acceptance criterion. Never claim the task is accepted; the user decides.`}]});
       input=this.store.saveRunMessage(run.id,message.id,JSON.stringify(message));
     }
     const releaseMask=agent.ctx.tools.restrict({allow:['read','write','edit','super_bot_report']});

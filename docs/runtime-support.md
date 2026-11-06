@@ -7,6 +7,7 @@
 | 安装、启动、原生会话导航 | 已验证 | 官方插件安装；单独 Web profile；停机卸载/重装保留数据。独立 UI 多轮通过 |
 | 准备新的任务会话 | 已验证 | 预分配 Session ID、持久创建意图；丢回执后只核对同一个会话。`probe:run` |
 | 关联已有普通会话 | 已验证 API 与 UI | 双授权、有效目录检查、关联后暂停；已有归属拒绝。`smoke-attach.mjs` 包含并发竞争和普通 fork |
+| Bot 配置与参考资料 | 已验证 API 与 UI | 配置版本、最多 4 个本地 UTF-8 文本快照；旧任务保持原配置，变更撤销旧 Manager。`smoke-bot-config.mjs` 含并发重复请求、源文件变化和启用前任务积压 |
 | 部分会话历史授权 | 不提供 | 原生模型仍能读取既有上下文；仅支持明确授权整段历史，或另建全新会话 |
 | 输入送达与消费 | 已验证；存在宿主限制 | accepted/enqueued/entered 分开。已 claim 后取消可能丢失 Inbox 项且无 user/message，转人工核对，不推断已消费。`probe:run` |
 | 文件任务工具范围 | 已验证 | read/write/edit 与报告；绝对路径、实际目录、符号链接检查；额外 scoped 工具再由执行 guard 拒绝。`smoke-directory.mjs`、`smoke-scoped-tools.mjs` |
@@ -17,11 +18,12 @@
 | 人工接管 | 已验证 | 原生用户输入撤销旧 Run 授权；收敛前限制不解除；旧 driver 空闲后允许新人工轮次使用原生工具。旧 Stop 回执不取消新工作。`smoke-handoff.mjs` |
 | 普通停止与未知停止 | 已验证 | cancel 回执不算结束；真实 10 秒不响应取消转恢复；迟到收敛不伪造成功。`smoke:execution`、`smoke-stop-timeout.mjs` |
 | Worker 预算 | 已验证 | 每 Run 最多 40 步或 10 分钟；实际 40 步和 600,026 ms 计时通过。预算后暂停并核对，不自动重试。`smoke-budget.mjs` |
-| Manager 约束 | 部分已验证 | 单 Bot 一轮、全局两轮；实际 12 步、自动轮次 5 分钟、每小时 20 次唤醒及换会话不重置额度均通过 `smoke-manager-budget.mjs`。手动管理对话受 12 步限制，没有自动轮次计时器；全局两轮并发的专门压力用例待补 |
+| Manager 约束 | 已验证 | 单 Bot 一轮、全局两轮；实际 12 步、自动轮次 5 分钟、每小时 20 次唤醒及换会话不重置额度均通过 `smoke-manager-budget.mjs`。手动管理对话受 12 步限制，没有自动轮次计时器；`smoke-manager-capacity.mjs` 真实两轮占位、第三轮排队与释放后进入通过 |
+| Manager 迟到命令 | 已验证 | 模型读取后暂停，用户改目标或在 Worker 原生输入；迟到 dispatch/review 被拒绝。`smoke-manager-stale.mjs` |
 | 两个 Worker 容量 | 已验证 | 同 Bot 两项实际同时运行；第三项不创建 Run，另一个 Bot 的 Manager 等待名额，释放后才派发。`smoke-capacity.mjs` |
 | 后台作业收敛 | 已验证契约；产品能力有限 | Agent idle 不代表 job 停止，kill accepted 不代表 settled。合成 job 探针及 `smoke-background.mjs` 实际 ready→恢复门槛验证；不开放业务 Shell |
 | 重启与未知投递 | 已验证主要窗口 | 实际 SIGKILL、投递后丢回执、Manager 通知丢回执均不自动重放责任。`smoke-restart.mjs`、`probe:run` |
-| 账本迁移和恢复 | 已验证主要窗口 | schema 2→6、失败回滚、未提交升级进程中断、一致性快照、新目录恢复。`npm test`、`smoke-restored.mjs` |
+| 账本迁移和恢复 | 已验证主要窗口 | schema 2→7、实际 schema 6→7、失败回滚、未提交升级进程中断、一致性快照、新目录恢复。`npm test`、`smoke-restored.mjs` |
 | Dashboard 离线 | 已验证 | 仅保留快照并禁用变更；重连不重放操作，恢复筛选和位置。100 项分页通过 |
 | 运行中热卸载/热替换 | 未验证 | 目前使用停止宿主→卸载/更新→重启的操作方式 |
 | Desktop | 未验证 | 本机 `0.2.1-rc.5` 未接入验证；当前安装包目标是 Web rc.1 |

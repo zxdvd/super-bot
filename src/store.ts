@@ -3,7 +3,7 @@ import { mkdirSync } from 'node:fs';
 import { dirname,relative,isAbsolute,sep } from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
 import schemaVersion from '../schema-version.json' with {type:'json'};
-import { AppError, requiredText, optionalText, taskStatus, type Bot, type Task, type NewBot, type NewTask, type TaskPage, type ControlMode, type Attention, type Binding, type Run, type RunInput, type WorkReport, type Result,type ManagerBinding,type ManagerEvent,type ExistingSessionGrant } from './model.ts';
+import { AppError, requiredText, optionalText, taskStatus, type Bot, type Task, type NewBot, type NewTask, type TaskPage, type ControlMode, type Attention, type Binding, type Run, type RunInput, type WorkReport, type Result,type ManagerBinding,type ManagerEvent,type ExistingSessionGrant,type ReferenceMaterial,type TaskBotContext,botDraft } from './model.ts';
 
 /** One local database. Business transactions will live here, not in the UI/adapter. */
 export class Store {
@@ -65,6 +65,11 @@ export class Store {
       const inputColumns=this.db.prepare('PRAGMA table_info(inputs)').all().map(row=>row.name);
       if(!inputColumns.includes('messageId'))this.db.exec('ALTER TABLE inputs ADD COLUMN messageId TEXT; ALTER TABLE inputs ADD COLUMN messageJson TEXT;');
       if(!inputColumns.includes('attentionId'))this.db.exec('ALTER TABLE inputs ADD COLUMN attentionId TEXT REFERENCES attentions(id);');
+      const botColumns=this.db.prepare('PRAGMA table_info(bots)').all().map(row=>row.name);
+      if(!botColumns.includes('materials'))this.db.exec("ALTER TABLE bots ADD COLUMN materials TEXT NOT NULL DEFAULT '[]';");
+      const taskColumns=this.db.prepare('PRAGMA table_info(tasks)').all().map(row=>row.name);
+      if(!taskColumns.includes('botConfigRevision'))this.db.exec('ALTER TABLE tasks ADD COLUMN botConfigRevision INTEGER NOT NULL DEFAULT 1; UPDATE tasks SET botConfigRevision=(SELECT configRevision FROM bots WHERE bots.id=tasks.botId);');
+      if(!taskColumns.includes('botContext'))this.db.exec("ALTER TABLE tasks ADD COLUMN botContext TEXT NOT NULL DEFAULT '{}'; UPDATE tasks SET botContext=json_object('instructions',(SELECT instructions FROM bots WHERE bots.id=tasks.botId),'materials',json((SELECT materials FROM bots WHERE bots.id=tasks.botId)));");
       this.db.exec(`PRAGMA user_version=${schemaVersion}; COMMIT;`);
     } catch (error) {
       this.db.close();
@@ -106,19 +111,46 @@ export class Store {
   private event(kind: string, taskId: string | null, data: unknown): void {
     this.db.prepare('INSERT INTO events(taskId,kind,data,createdAt) VALUES (?,?,?,?)').run(taskId, kind, JSON.stringify(data), Date.now());
   }
-  createBot(requestId: string, input: NewBot): Bot {
-    const payload = { name: requiredText(input.name, 'Bot 名称', 80), instructions: requiredText(input.instructions, 'Bot 职责') };
-    return this.command(requestId, 'bot.create', payload, () => {
-      const bot: Bot = { id: randomUUID(), ...payload, configRevision: 1, managerSessionId: null, createdAt: Date.now() };
-      this.db.prepare('INSERT INTO bots(id,name,instructions,createdAt) VALUES (?,?,?,?)').run(bot.id, bot.name, bot.instructions, bot.createdAt);
-      this.event('bot.created', null, { botId: bot.id }); return bot;
+  createBot(requestId: string, input: NewBot,materials:ReferenceMaterial[]=[]): Bot {
+    const payload=botDraft(input);
+    return this.command(requestId,'bot.create',payload,()=>{
+      this.assertMaterials(payload,materials);
+      const id=randomUUID();
+      this.db.prepare('INSERT INTO bots(id,name,instructions,materials,createdAt) VALUES (?,?,?,?,?)').run(id,payload.name,payload.instructions,JSON.stringify(materials),Date.now());
+      this.event('bot.created',null,{botId:id});return this.getBot(id);
     });
   }
-  listBots(): Bot[] { return this.db.prepare('SELECT * FROM bots ORDER BY createdAt,id').all() as unknown as Bot[]; }
-  getBot(id: string): Bot {
-    const bot = this.db.prepare('SELECT * FROM bots WHERE id=?').get(id) as unknown as Bot | undefined;
-    if (!bot) throw new AppError('not-found', 'Bot 不存在。');
-    return bot;
+  private assertMaterials(input:NewBot,materials:ReferenceMaterial[]):void {
+    if(JSON.stringify(input.referencePaths??[])!==JSON.stringify(materials.map(material=>material.path)))throw new AppError('material-snapshot','参考文本尚未完整读取，未保存配置。');
+  }
+  private botFromRow(row:Record<string,unknown>):Bot {
+    const materials=JSON.parse(String(row.materials)) as ReferenceMaterial[];
+    return {...row,materials:materials.map(({text: _text,...info})=>info)} as unknown as Bot;
+  }
+  listBots(): Bot[] {return this.db.prepare('SELECT * FROM bots ORDER BY createdAt,id').all().map(row=>this.botFromRow(row));}
+  getBot(id:string):Bot {
+    const row=this.db.prepare('SELECT * FROM bots WHERE id=?').get(id);
+    if(!row)throw new AppError('not-found','Bot 不存在。');return this.botFromRow(row);
+  }
+  currentBotContext(botId:string):TaskBotContext {
+    const bot=this.getBot(botId),row=this.db.prepare('SELECT materials FROM bots WHERE id=?').get(botId)!;
+    return {instructions:bot.instructions,materials:JSON.parse(String(row.materials)) as ReferenceMaterial[]};
+  }
+  taskBotContext(taskId:string):TaskBotContext {
+    const row=this.db.prepare('SELECT botContext FROM tasks WHERE id=?').get(taskId);
+    if(!row)throw new AppError('not-found','任务不存在。');return JSON.parse(String(row.botContext)) as TaskBotContext;
+  }
+  updateBot(requestId:string,botId:string,expectedRevision:number,input:NewBot,materials:ReferenceMaterial[]):Bot {
+    const payload={botId,expectedRevision,...botDraft(input)};
+    return this.command(requestId,'bot.update',payload,()=>{
+      this.assertMaterials(payload,materials);const bot=this.getBot(botId),before=this.currentBotContext(botId);
+      if(bot.configRevision!==expectedRevision)throw new AppError('version-conflict','Bot 配置已经更新，请刷新后再保存。');
+      if(bot.name===payload.name&&bot.instructions===payload.instructions&&before.materials.length===materials.length&&before.materials.every((old,i)=>{const next=materials[i]!;return old.path===next.path&&old.sha256===next.sha256&&old.bytes===next.bytes&&old.text===next.text;}))return bot;
+      this.db.prepare("UPDATE managers SET state='released' WHERE botId=? AND state!='released'").run(botId);
+      this.db.prepare('UPDATE bots SET name=?,instructions=?,materials=?,configRevision=configRevision+1,managerSessionId=NULL WHERE id=?').run(payload.name,payload.instructions,JSON.stringify(materials),botId);
+      this.db.prepare("UPDATE outbox SET state='superseded' WHERE kind='manager.notify' AND state='unknown' AND json_extract(payload,'$.botId')=?").run(botId);
+      this.event('bot.updated',null,{botId,configRevision:bot.configRevision+1,referencePaths:payload.referencePaths??[]});return this.getBot(botId);
+    });
   }
   activeManager(botId:string):ManagerBinding|null {
     const row=this.db.prepare("SELECT * FROM managers WHERE botId=? AND state!='released'").get(botId) as unknown as ManagerBinding|undefined;return row?{...row}:null;
@@ -144,7 +176,14 @@ export class Store {
       this.db.prepare("UPDATE managers SET state='ready',sessionId=? WHERE id=?").run(sessionId,id);
       this.db.prepare('UPDATE bots SET managerSessionId=? WHERE id=?').run(sessionId,manager.botId);
       this.db.prepare("UPDATE outbox SET state='done' WHERE id=?").run(`manager-create:${id}`);
-      this.enqueueManager(manager.botId,`init:${id}`,'管理会话已准备好，请从账本恢复当前工作。',null);
+      let actionable=0;
+      for(const row of this.db.prepare("SELECT id FROM tasks WHERE botId=? AND controlMode='auto' AND lifecycle IN ('open','review') ORDER BY createdAt,id").all(manager.botId)) {
+        const task=this.getTask(String(row.id));
+        if(task.status!=='unscheduled'&&!(task.status==='review'&&!task.managerReviewed))continue;
+        actionable++;
+        if(!this.db.prepare("SELECT 1 FROM outbox WHERE kind='manager.notify' AND state='pending' AND taskId=? AND json_extract(payload,'$.botId')=?").get(task.id,manager.botId))this.enqueueManager(manager.botId,`backlog:${id}:${task.id}`,'管理会话已准备好，请从账本恢复这项现有工作。',task.id);
+      }
+      if(!actionable)this.enqueueManager(manager.botId,`init:${id}`,'管理会话已准备好，请从账本恢复当前工作。',null);
       this.event('manager.ready',null,{botId:manager.botId,sessionId});return this.activeManager(manager.botId)!;
     });
   }
@@ -194,10 +233,10 @@ export class Store {
       scope: optionalText(input.scope, '任务范围'), acceptance: optionalText(input.acceptance, '验收条件'), reviewPolicy: input.reviewPolicy,...(input.startPaused?{startPaused:true}:{}) };
     if (!['human', 'bot'].includes(payload.reviewPolicy)) throw new AppError('invalid-input', '请选择有效的验收方式。');
     return this.command(requestId, 'task.create', payload, () => {
-      this.getBot(payload.botId);
+      const bot=this.getBot(payload.botId),context=this.currentBotContext(payload.botId);
       const id = randomUUID(), now = Date.now();
-      this.db.prepare('INSERT INTO tasks(id,botId,goal,scope,acceptance,reviewPolicy,controlMode,createdAt,updatedAt) VALUES (?,?,?,?,?,?,?,?,?)')
-        .run(id, payload.botId, payload.goal, payload.scope, payload.acceptance, payload.reviewPolicy,payload.startPaused?'paused':'auto',now,now);
+      this.db.prepare('INSERT INTO tasks(id,botId,goal,scope,acceptance,reviewPolicy,controlMode,createdAt,updatedAt,botConfigRevision,botContext) VALUES (?,?,?,?,?,?,?,?,?,?,?)')
+        .run(id, payload.botId, payload.goal, payload.scope, payload.acceptance, payload.reviewPolicy,payload.startPaused?'paused':'auto',now,now,bot.configRevision,JSON.stringify(context));
       this.db.prepare('INSERT INTO inputs(id,taskId,kind,content,createdAt) VALUES (?,?,?,?,?)')
         .run(randomUUID(), id, 'goal', payload.goal, now);
       this.event('task.created', id, { taskRevision: 1 });
@@ -212,7 +251,8 @@ export class Store {
     if (!task) throw new AppError('not-found', '任务不存在。');
     return this.decorateTask(task);
   }
-  private decorateTask(task:Task):Task {
+  private decorateTask(row:Task):Task {
+    const {botContext:_context,...task}=row as Task&{botContext?:string};
     let status=taskStatus(task);const run=this.latestRun(task.id);
     if(task.lifecycle==='open'||task.lifecycle==='review') {
       if(this.db.prepare("SELECT 1 FROM attentions WHERE taskId=? AND kind='recovery' AND state='open'").get(task.id))status='recovery';
