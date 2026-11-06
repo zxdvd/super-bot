@@ -8,7 +8,7 @@ import { mkdir,realpath } from 'node:fs/promises';
 import { join } from 'node:path';
 import { AppError,requiredText,optionalText,type ManagerBinding,type NewBot,type Bot,botDraft } from './model.ts';
 import type { Store } from './store.ts';
-import type { DshExecution } from './dsh.ts';
+import { selectedModel,modelFailureNote,type DshExecution } from './dsh.ts';
 import { previewEvidence } from './evidence.ts';
 import { readMaterials,materialPrompt } from './materials.ts';
 
@@ -68,7 +68,7 @@ export class Managers {
           if(!binding.sessionId)throw new AppError('session-recovery','执行会话需要核对，不能自动重建。');
           const resolved=await this.ctx.sessionController.resolveAgent(SessionId(binding.sessionId));authorize();
           if('error' in resolved)throw new AppError('session-unavailable','执行会话不可用。');
-          if(!resolved.agent.model.current()) {
+          if(!selectedModel(this.ctx,resolved.agent)) {
             const model=exec.agent.model.current();if(!model)throw new AppError('model-required','管理会话没有模型。');resolved.agent.model.select(model);
           }
           try{return {run:await this.execution.dispatch(requestId,task.id,task.rowVersion,authorize)};}
@@ -97,6 +97,10 @@ export class Managers {
     for(const agent of this.ctx.agents.list())this.attachScope(agent);
     this.ctx.on('session/event',(_session,event)=>{
       if(this.closed)return;
+      if(event.type==='turn/end'&&event.data.reason.kind==='error') {
+        const manager=this.store.managerForSession(_session.id);
+        if(manager?.state==='ready'&&!this.store.managerInfo(manager.botId).problem)this.store.managerProblem(manager.botId,modelFailureNote(event.data.reason.error.code));
+      }
       if(event.type==='user/message'&&event.data.source.kind==='super-bot-manager') {
         const source=event.data.source;
         if(this.store.activeManager(source.botId)?.id===source.managerId)this.store.managerEventEntered(source.eventId,event.data.id);
@@ -186,8 +190,8 @@ export class Managers {
     if('error' in resolved)throw new AppError('manager-unavailable','无法核对旧管理会话，尚未更换。');
     const agent=resolved.agent;if(agent.status!=='idle'||agent.inbox.nextTurn.length||agent.inbox.nextStep.length)throw new AppError('manager-busy','管理会话正在工作，请等待结束或在原生会话停止后再更换。');
     this.store.releaseManager(requestId,botId,expectedGeneration);
-    const next=await this.prepare(`${requestId}:new`,botId);const model=agent.model.current();
-    if(model&&next.sessionId){const created=await this.ctx.sessionController.resolveAgent(SessionId(next.sessionId));if('agent' in created&&!created.agent.model.current())created.agent.model.select(model);}
+    const next=await this.prepare(`${requestId}:new`,botId);const model=selectedModel(this.ctx,agent);
+    if(model&&next.sessionId){const created=await this.ctx.sessionController.resolveAgent(SessionId(next.sessionId));if('agent' in created&&!selectedModel(this.ctx,created.agent))created.agent.model.select(model);}
     return next;
   }
   private pumping=false;
@@ -218,7 +222,8 @@ export class Managers {
         const resolved=await this.ctx.sessionController.resolveAgent(SessionId(manager.sessionId));
         if(this.closed)break;if('error' in resolved)throw new AppError('manager-unavailable','管理会话暂不可用；请打开管理会话核对。');const agent=resolved.agent;this.attachScope(agent);
         this.authority(agent.id,manager.id);
-        if(agent.status!=='idle'||agent.inbox.nextTurn.length||agent.inbox.nextStep.length||!agent.model.current())continue;
+        if(agent.status!=='idle'||agent.inbox.nextTurn.length||agent.inbox.nextStep.length)continue;
+        if(!selectedModel(this.ctx,agent)){this.store.managerProblem(bot.id,'请打开管理对话，明确选择并配置模型；任务通知已保留，尚未自动调用模型。');continue;}
         const message=createUserMessage({source:{kind:'super-bot-manager',botId:bot.id,managerId:manager.id,eventId:event.id},content:[{type:'text',text:`Important task event: ${JSON.parse(event.payload).reason}\nTask: ${event.taskId??'all current work'}\nRead current ledger state. Do not assume the event is still current. Do not manufacture new tasks. Finish after useful bounded work; do not poll.`}]});
         if(!this.store.claimManagerEvent(event.id,message.id,JSON.stringify(message)))continue;
         this.store.managerProblem(bot.id,'');this.retryAfter.delete(bot.id);

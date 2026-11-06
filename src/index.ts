@@ -15,7 +15,7 @@ import { createLedgerBackup } from './backups.ts';
 import { AppError, requiredText, optionalText,type WorkspaceStatus, type NewBot, type NewTask, type ControlMode } from './model.ts';
 
 export const name = 'super-bot';
-export const inject = ['connection', 'sessionController', 'workspaceRegistry','agents','tools','jobs','systemPrompt','workingDirectory'];
+export const inject = ['connection', 'sessionController', 'workspaceRegistry','agents','tools','jobs','systemPrompt','workingDirectory','sessionProjections'];
 export const Config = Schema.object({ dataDir: Schema.string().description('Super Bot 本地数据目录') });
 
 export function apply(ctx: Context, config: { dataDir?: string } = {}): void {

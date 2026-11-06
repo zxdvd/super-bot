@@ -6,6 +6,7 @@ import type {} from '@deepseek-ai/dsh-tools';
 import type {} from '@deepseek-ai/dsh-jobs';
 import type {} from '@deepseek-ai/dsh-user-approval';
 import type {} from '@deepseek-ai/dsh-working-directory';
+import type {} from '@deepseek-ai/dsh-session-projection';
 import type { Agent } from '@deepseek-ai/dsh-agent';
 import { createUserMessage,freezeMessage,type UserMessage } from '@deepseek-ai/dsh-llm';
 import { SessionId } from '@deepseek-ai/dsh-session/types';
@@ -19,6 +20,18 @@ import { materialPrompt } from './materials.ts';
 
 declare module '@deepseek-ai/dsh-llm' {
   interface MessageSourceMap {'super-bot':{kind:'super-bot';taskId:string;runId:string;inputId:string;taskRevision:number;generation:number}}
+}
+
+/** Host defaults are not a model selection made for this conversation. */
+export function selectedModel(ctx:Context,agent:Agent) {
+  return ctx.sessionProjections.snapshot(agent.session,['modelSelection']).values.modelSelection?.next??undefined;
+}
+export function modelFailureNote(code:string):string {
+  if(code==='MISSING_CREDENTIAL')return '模型缺少登录或 API Key。请打开原生会话配置模型账号，再核对并继续；本次没有自动重试。';
+  if(['INVALID_CREDENTIAL','AUTHENTICATION','AUTH'].includes(code))return '模型认证失败。请在原生会话检查模型账号，再核对并继续；本次没有自动重试。';
+  if(['QUOTA','ACCOUNT_QUOTA'].includes(code))return '模型账号额度不足。请检查原生模型设置与额度；本次没有自动重试。';
+  if(code==='NO_ADAPTER')return '所选模型提供方当前不可用。请打开原生会话重新选择模型；本次没有自动重试。';
+  return '原生模型执行失败。请打开对应会话查看错误、核对文件与执行状态后再继续；本次没有自动重试。';
 }
 
 export class DshExecution {
@@ -47,6 +60,10 @@ export class DshExecution {
     },{when:({agent})=>this.store.heldRuns().some(r=>r.sessionId===agent.id&&r.finishedAt===null)}));
     this.ctx.on('session/event',(session,event)=>{
       if(this.disposed)return;
+      if(event.type==='turn/end'&&event.data.reason.kind==='error') {
+        const run=this.store.heldRuns().find(r=>r.sessionId===session.id&&r.finishedAt===null);
+        if(run)this.store.runRecovery(run.id,modelFailureNote(event.data.reason.error.code));
+      }
       if(event.type==='working-directory/change') {
         const run=this.store.heldRuns().find(r=>r.sessionId===session.id&&r.finishedAt===null);
         if(run&&event.data.cwd!==this.store.getBinding(run.bindingId).cwd) {
@@ -115,7 +132,7 @@ export class DshExecution {
     const resolved=await this.ctx.sessionController.resolveAgent(SessionId(b.sessionId));
     if('error' in resolved)throw new AppError('session-unavailable','执行会话暂不可用，请核对。');
     const agent=resolved.agent;this.assertQuiet(agent);this.assertDirectory(agent,b.cwd);
-    if(!agent.model.current())throw new AppError('model-required','请先打开任务会话选择模型，再回来开始执行。');
+    if(!selectedModel(this.ctx,agent))throw new AppError('model-required','请先打开任务会话，明确选择并配置模型，再回来开始执行。宿主默认路由不算已选择。');
     authorize();
     const run=this.store.reserveRun(requestId,taskId,rowVersion);
     if(this.running.has(run.id)||run.finishedAt!==null)return this.store.getRun(run.id);

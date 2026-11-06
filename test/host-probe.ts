@@ -1,6 +1,6 @@
 /** Deterministic adapter inside the real, isolated DSH host. Never shipped in lib/. */
 import type { Context } from '@deepseek-ai/cordis';
-import { LlmAdapter, createUserMessage, ToolCallId, type GenerateOptions, type StreamChunk } from '@deepseek-ai/dsh-llm';
+import { LlmAdapter,LlmError, createUserMessage, ToolCallId, type GenerateOptions, type StreamChunk } from '@deepseek-ai/dsh-llm';
 import type { Agent } from '@deepseek-ai/dsh-agent';
 import type {} from '@deepseek-ai/dsh-tools';
 import type {} from '@deepseek-ai/dsh-api-session-controller';
@@ -25,7 +25,7 @@ declare module '@deepseek-ai/dsh-llm' {
   }
 }
 export const name = 'super-bot-probe';
-export const inject = ['llm','tools','sessionController','workspaceRegistry','connection','agents','jobs','workingDirectory'];
+export const inject = ['llm','tools','sessionController','workspaceRegistry','connection','agents','jobs','workingDirectory','sessionProjections'];
 const provider = 'super-bot-probe';
 const toolName = 'super_bot_probe_report';
 const scopedToolName='super_bot_scoped_probe';
@@ -57,6 +57,7 @@ class ProbeAdapter extends LlmAdapter {
       const last=calls.at(-1);const prior=last?.type==='tool-call'?JSON.parse(last.arguments) as Record<string,unknown>:null;
       let value:Record<string,any>|undefined;
       for(const message of later.filter(m=>m.role==='tool'))for(const block of message.content)if(block.type==='text')try{value=JSON.parse(block.text);}catch{}
+      if(value?.task?.goal==='MANAGER_MODEL_FAILURE_PROBE')throw new LlmError('Synthetic missing credential; no provider request was made','MISSING_CREDENTIAL');
       if(value?.task?.goal==='MANAGER_TIME_PROBE') {
         await new Promise<void>(resolve=>{if(options.signal?.aborted)resolve();else options.signal?.addEventListener('abort',()=>resolve(),{once:true});});
         options.signal?.throwIfAborted();
@@ -104,6 +105,7 @@ class ProbeAdapter extends LlmAdapter {
     }
     if(workInput) {
       const body=workInput.content.filter(b=>b.type==='text').map(b=>b.text).join('');
+      if(body.includes('Goal: MODEL_FAILURE_PROBE'))throw new LlmError('Synthetic missing credential; no provider request was made','MISSING_CREDENTIAL');
       if(body.includes('Goal: UNRESPONSIVE_MODEL_PROBE')) {
         assert.ok(options.sessionId);
         await new Promise<void>(release=>this.stalled.set(options.sessionId!,{release,signal:options.signal}));

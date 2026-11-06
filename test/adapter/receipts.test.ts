@@ -15,7 +15,7 @@ function fixture(failPreparation=false){
  const directory=mkdtempSync(join(tmpdir(),'super-bot-adapter-')),store=new Store(':memory:');
  const bot=store.createBot('bot',{name:'Bot',instructions:'Files'}),binding=store.beginManager('manager',bot.id,directory);store.confirmManager(binding.id,binding.requestedSessionId);
  let execute:Handler=()=>{throw Error('Not installed');};let preparations=0,dispatches=0,verifications=0;
- const ctx={effect:(callback:()=>unknown)=>callback(),on:()=>()=>{},agents:{list:()=>[]},tools:{register:(tool:{execute:Handler})=>{execute=tool.execute;return ()=>{};}},sessionController:{resolveAgent:async()=>({agent:{model:{current:()=>({provider:'fake',model:'fake'})}}})}} as unknown as Context;
+ const ctx={sessionProjections:{snapshot:()=>({values:{modelSelection:{next:{provider:'fake',model:'fake'}}}})},effect:(callback:()=>unknown)=>callback(),on:()=>()=>{},agents:{list:()=>[]},tools:{register:(tool:{execute:Handler})=>{execute=tool.execute;return ()=>{};}},sessionController:{resolveAgent:async()=>({agent:{model:{current:()=>({provider:'fake',model:'fake'})}}})}} as unknown as Context;
  const execution={prepareSession:async(requestId:string,taskId:string,version:number)=>{preparations++;const b=store.beginBinding(requestId,taskId,version,directory);store.claimBindingCreation(b.id);if(failPreparation){store.bindingRecovery(b.id);throw Error('Creation receipt lost');}return store.confirmBinding(b.id,b.requestedSessionId);},dispatch:async(requestId:string,taskId:string,version:number,authorize:()=>void)=>{dispatches++;authorize();return store.reserveRun(requestId,taskId,version);},verifyResult:async(taskId:string)=>{verifications++;const d=store.taskDetail(taskId);await verifyEvidence(d.binding!.cwd,d.result!.evidence);}} as unknown as DshExecution;
  const managers=new Managers(ctx,store,execution,directory);managers.install();
  return {store,bot,binding,directory,counts:()=>({preparations,dispatches,verifications}),call:(callId:string,args:Record<string,unknown>)=>execute(args,{agent:{id:binding.requestedSessionId},callId,signal:new AbortController().signal}),close:async()=>{await managers.dispose();store.close();rmSync(directory,{recursive:true,force:true});}};
@@ -85,13 +85,14 @@ test('Worker committed report retries do not reread changed files or bypass ende
 
 test('reinstalled execution adapter cannot revive authority while the old Agent remains active',async()=>{
  const directory=realpathSync(mkdtempSync(join(tmpdir(),'super-bot-live-reload-'))),store=new Store(':memory:');const handlers:Handler[]=[];let guard:(args:any)=>unknown=()=>undefined,deliveries=0,release!:()=>void;
- const idle=new Promise<void>(resolve=>{release=resolve;});
+ const idle=new Promise<void>(resolve=>{release=resolve;});let selection:{provider:string;model:string}|null=null;
  const agent:any={id:'synthetic-worker',status:'idle',model:{current:()=>({provider:'fake',model:'fake'})},inbox:{nextTurn:[],nextStep:[],remove:()=>{}},ctx:{tools:{restrict:()=>()=>{},guard:(callback:(args:any)=>unknown)=>{guard=callback;return ()=>{};}},on:()=>()=>{}},whenIdle:()=>idle,followup:()=>{deliveries++;agent.status='running';},cancel:()=>{agent.status='idle';release();}};
- const ctx={effect:(callback:()=>unknown)=>callback(),on:()=>()=>{},tools:{register:(tool:{execute:Handler})=>{handlers.push(tool.execute);return ()=>{};}},sessionController:{resolveAgent:async()=>({agent})},workingDirectory:{get:()=>directory},jobs:{list:()=>[]},agents:{list:()=>[]}} as unknown as Context;
+ const ctx={sessionProjections:{snapshot:()=>({values:{modelSelection:{next:selection}}})},effect:(callback:()=>unknown)=>callback(),on:()=>()=>{},tools:{register:(tool:{execute:Handler})=>{handlers.push(tool.execute);return ()=>{};}},sessionController:{resolveAgent:async()=>({agent})},workingDirectory:{get:()=>directory},jobs:{list:()=>[]},agents:{list:()=>[]}} as unknown as Context;
  const old=new DshExecution(ctx,store,directory),replacement=new DshExecution(ctx,store,directory);old.install();
  try{
   const bot=store.createBot('bot',{name:'Bot',instructions:'Files'}),task=store.createTask('task',{botId:bot.id,goal:'Facts',scope:'Own directory',acceptance:'Read facts',reviewPolicy:'human'});
   const binding=store.beginBinding('binding',task.id,task.rowVersion,directory);store.claimBindingCreation(binding.id);store.confirmBinding(binding.id,binding.requestedSessionId);agent.id=binding.requestedSessionId;
+  await assert.rejects(old.dispatch('unselected',task.id,store.getTask(task.id).rowVersion),{code:'model-required'});assert.equal(store.latestRun(task.id),null);assert.equal(deliveries,0);selection={provider:'fake',model:'fake'};
   const run=await old.dispatch('dispatch',task.id,store.getTask(task.id).rowVersion);store.inputEntered(run.id,store.getRunInput(run.id).messageId!,1);
   replacement.install();assert.equal(agent.status,'running');assert.equal(store.getTask(task.id).status,'recovery');assert.equal(store.heldRuns().length,1);
   assert.match(String(guard({name:'write',arguments:{file_path:join(directory,'result.md')}})),/no longer/);

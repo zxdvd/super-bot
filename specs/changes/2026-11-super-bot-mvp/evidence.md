@@ -255,3 +255,13 @@ ELECTRON_RUN_AS_NODE=1 '/Applications/DeepSeek Harness.app/Contents/MacOS/DeepSe
 - `test/adapter/receipts.test.ts` 单独运行，不混入无 DSH 的核心账本测试。8 项覆盖准备/派发/各类验收成功后重试、同调用异参冲突、删除成果后的已提交回执、结束后的报告权限拒绝，以及 Fake 原 Agent 仍 active 时重新安装 adapter 的授权撤销/不重派/不释放。最后一项不代表真实宿主热卸载已验证。
 - `npm run check`：49 项核心测试、8 项适配测试、类型检查和构建通过。修复后真实 `probe:run` 11 项再次通过；真实 Manager 返工与大文件转人工回归通过。
 - 独立 UI 第 22 轮通过：新 Manager 标题含 Bot 名、管理 3/4 和配置 2/3；更名同步管理 Workspace，旧标题保留，两项任务始终暂停，console warn/error 为空。
+
+
+## 实际安装包与首次运行修复（2026-11-07 06:04）
+
+- npm pack 的产品包仅包含 Host/Client 构建、manifest、schema、README/运行能力表和恢复脚本；无测试模型、数据库、日志、node_modules 或凭证。新建 `.runtime/package-test` / `super-bot-package-test`，用实际 tgz 安装并启动 3082；认证、拒绝跨域与 WAL 检查通过。
+- 独立 UI 第 23 轮验证包资产和原生导航正常，但发现 DSH 默认 route 使 `model.current()` 非空：未选模型也派发，原生报缺凭证，工作台仅泛化待核对。没有配置账号或成功调用真实模型；留下合成失败任务，未自动恢复。
+- 修复使用 DSH 官方 `sessionProjections.snapshot(...,['modelSelection'])`，只读取模型选择投影；默认 fallback 不作为选定模型。Manager 给新 Worker 显式继承所选模型，更换 Manager 也保留实际选择。未选时不消费管理事件、不创建 Run。
+- Worker 和 Manager 订阅原生 turn/end 结构化错误码，将缺凭证、认证失败、额度不足/无提供方映射成明确步骤；不保存提供方原始错误正文，不自动重试。既有 12 步预算原因不会被泛化错误覆盖。
+- `npm run check` 49 核心 + 8 适配测试通过；`smoke-model-errors.mjs` 使用合成 MISSING_CREDENTIAL、真实原生错误事件验证两类提示与未选模型零调用；Manager 全闭环/更换与 12 步预算回归通过。
+- candidate-2 tgz 停机更新后，`smoke-package.mjs prepare` 验证未选任务无 Run、普通会话/Manager 创建、一致性备份幂等和参考 A 文本快照（磁盘后来变 B）；UI 第 24 轮复验中。
