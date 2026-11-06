@@ -64,8 +64,11 @@
     "@deepseek-ai/dsh-client-ui-sidebar": "0.2.2-rc.1",
     "@deepseek-ai/dsh-client-ui-workspace": "0.2.2-rc.1",
     "@deepseek-ai/dsh-jobs": "0.2.2-rc.1",
+    "@deepseek-ai/dsh-llm": "0.2.2-rc.1",
     "@deepseek-ai/dsh-session": "0.2.2-rc.1",
+    "@deepseek-ai/dsh-system-prompt": "0.2.2-rc.1",
     "@deepseek-ai/dsh-tools": "0.2.2-rc.1",
+    "@deepseek-ai/dsh-user-approval": "0.2.2-rc.1",
     "@deepseek-ai/dsh-workspace": "0.2.2-rc.1",
     "@deepseek-ai/schemastery": "3.19.0",
     "@types/node": "22.20.0",
@@ -73,9 +76,7 @@
     "esbuild": "0.27.2",
     "react": "18.3.1",
     "tsx": "4.21.0",
-    "typescript": "6.0.3",
-    "@deepseek-ai/dsh-llm": "0.2.2-rc.1",
-    "@deepseek-ai/dsh-system-prompt": "0.2.2-rc.1"
+    "typescript": "6.0.3"
   },
   "peerDependencies": {
     "@deepseek-ai/cordis": "4.1.0",
@@ -87,11 +88,12 @@
     "@deepseek-ai/dsh-client-ui-sidebar": "0.2.2-rc.1",
     "@deepseek-ai/dsh-client-ui-workspace": "0.2.2-rc.1",
     "@deepseek-ai/dsh-jobs": "0.2.2-rc.1",
-    "@deepseek-ai/dsh-session": "0.2.2-rc.1",
-    "@deepseek-ai/dsh-tools": "0.2.2-rc.1",
-    "@deepseek-ai/schemastery": "3.19.0",
-    "@deepseek-ai/dsh-workspace": "0.2.2-rc.1",
     "@deepseek-ai/dsh-llm": "0.2.2-rc.1",
-    "@deepseek-ai/dsh-system-prompt": "0.2.2-rc.1"
+    "@deepseek-ai/dsh-session": "0.2.2-rc.1",
+    "@deepseek-ai/dsh-system-prompt": "0.2.2-rc.1",
+    "@deepseek-ai/dsh-tools": "0.2.2-rc.1",
+    "@deepseek-ai/dsh-user-approval": "0.2.2-rc.1",
+    "@deepseek-ai/dsh-workspace": "0.2.2-rc.1",
+    "@deepseek-ai/schemastery": "3.19.0"
   }
 }

@@ -203,6 +203,7 @@ export class Store {
     if(task.lifecycle==='open'||task.lifecycle==='review') {
       if(this.db.prepare("SELECT 1 FROM attentions WHERE taskId=? AND kind='recovery' AND state='open'").get(task.id))status='recovery';
       else if(run?.state==='cancelling')status='stopping';
+      else if(this.db.prepare("SELECT 1 FROM attentions WHERE taskId=? AND kind='approval' AND state='open'").get(task.id))status='approval';
       else if(run?.state==='running')status='running';
       else if(run?.state==='queued')status='queued';
       else if(this.db.prepare("SELECT 1 FROM attentions WHERE taskId=? AND kind='input' AND state='open'").get(task.id))status='needs-input';
@@ -327,6 +328,7 @@ export class Store {
     this.command(`native:${sessionId}:${messageId}`,'task.native',{sessionId,messageId},()=>{
       this.db.prepare("UPDATE tasks SET controlMode='manual',lifecycle='open',rowVersion=rowVersion+1,updatedAt=? WHERE id=?").run(Date.now(),task.id);
       this.db.prepare("UPDATE attentions SET state='stale' WHERE taskId=? AND kind='review' AND state='open'").run(task.id);
+      this.db.prepare("UPDATE attentions SET state='stale' WHERE taskId=? AND kind='approval' AND state='open'").run(task.id);
       const run=this.latestRun(task.id);
       if(run&&run.finishedAt===null) {
         const note='原生会话已人工介入，旧执行授权终止。请核对原生会话后结束本次尝试。';
@@ -389,8 +391,27 @@ export class Store {
       const run=this.getRun(id);if(run.finishedAt!==null)return {};
       this.db.prepare("UPDATE runs SET state='interrupted',finishedAt=?,note=? WHERE id=?").run(Date.now(),note,id);
       this.db.prepare("UPDATE inputs SET state='unknown' WHERE id=? AND state!='entered'").run(run.inputId);
+      this.db.prepare("UPDATE attentions SET state='stale' WHERE taskId=? AND kind='approval' AND state='open'").run(run.taskId);
       this.db.prepare('INSERT OR IGNORE INTO attentions(id,taskId,kind,question,taskRevision,createdAt) VALUES (?,?,?,?,?,?)').run(`run:${id}`,run.taskId,'recovery',note,run.taskRevision,Date.now());
       this.event('run.recovery',run.taskId,{runId:id,note});return {};
+    });
+  }
+  nativeApprovalAsked(runId:string,requestId:string,toolName:string,reason:string):void {
+    this.command(`approval-asked:${requestId}`,'approval.asked',{runId,requestId,toolName,reason},()=>{
+      const run=this.getRun(runId);if(run.finishedAt!==null)return {};
+      this.db.prepare('INSERT OR IGNORE INTO attentions(id,taskId,kind,question,taskRevision,state,createdAt) VALUES (?,?,?,?,?,?,?)').run(`approval:${requestId}`,run.taskId,'approval',`原生工具 ${toolName} 等待审批。${reason?`\n${reason}`:''}\n请打开任务会话处理；工作台不代替原生批准或拒绝。`,run.taskRevision,'open',Date.now());
+      this.db.prepare('UPDATE tasks SET rowVersion=rowVersion+1,updatedAt=? WHERE id=?').run(Date.now(),run.taskId);
+      this.event('approval.asked',run.taskId,{runId,requestId,toolName});return {};
+    });
+  }
+  nativeApprovalDecided(sessionId:string,requestId:string,outcome:string):void {
+    const attention=this.db.prepare('SELECT * FROM attentions WHERE id=?').get(`approval:${requestId}`) as unknown as Attention|undefined;
+    if(!attention||this.activeBinding(attention.taskId)?.sessionId!==sessionId)return;
+    this.command(`approval-decided:${requestId}`,'approval.decided',{sessionId,requestId,outcome},()=>{
+      // A decision does not settle the Run or prove the requested effect has finished.
+      this.db.prepare("UPDATE attentions SET state='resolved' WHERE id=? AND state='open'").run(attention.id);
+      this.db.prepare('UPDATE tasks SET rowVersion=rowVersion+1,updatedAt=? WHERE id=?').run(Date.now(),attention.taskId);
+      this.event('approval.decided',attention.taskId,{requestId,outcome});return {};
     });
   }
   runResult(runId:string):Result|null {
@@ -424,6 +445,7 @@ export class Store {
     if(this.getRun(id).finishedAt!==null)return;
     this.command(`settle:${id}`,'run.settle',{id},()=>{
       const run=this.getRun(id);const task=this.getTask(run.taskId);
+      if(this.db.prepare("SELECT 1 FROM attentions WHERE taskId=? AND kind='approval' AND state='open'").get(task.id))throw new AppError('approval-pending','原生审批尚未得到结果，不能确认执行结束。');
       const last=this.db.prepare("SELECT kind,data FROM reports WHERE runId=? AND kind!='progress' ORDER BY createdAt DESC LIMIT 1").get(id) as {kind:WorkReport['kind'];data:string}|undefined;
       if(!last||this.getRunInput(id).state!=='entered'||task.controlMode==='manual')throw new AppError('no-result','执行已空闲，但没有可确认的最终报告。');
       const report=JSON.parse(last.data) as WorkReport;const failed=last.kind==='blocked'||last.kind==='failed';
@@ -466,6 +488,7 @@ export class Store {
       const run=this.getRun(id);if(run.state!=='cancelling')throw new AppError('stop-not-requested','没有停止请求。');
       this.db.prepare("UPDATE runs SET state='cancelled',finishedAt=?,note='已核对停止' WHERE id=?").run(Date.now(),id);
       this.db.prepare("UPDATE inputs SET state='discarded' WHERE id=? AND state!='entered'").run(run.inputId);
+      this.db.prepare("UPDATE attentions SET state='stale' WHERE taskId=? AND kind='approval' AND state='open'").run(run.taskId);
       const input=this.getRunInput(id);if(input.attentionId&&input.state==='discarded')this.db.prepare("UPDATE attentions SET state='open' WHERE id=? AND state='responding'").run(input.attentionId);
       this.db.prepare('DELETE FROM resources WHERE runId=?').run(id);
       this.db.prepare('UPDATE tasks SET rowVersion=rowVersion+1,updatedAt=? WHERE id=?').run(Date.now(),run.taskId);
@@ -518,6 +541,7 @@ export class Store {
         const input=this.getRunInput(run.id);if(input.attentionId&&input.state==='discarded')this.db.prepare("UPDATE attentions SET state='open' WHERE id=? AND state='responding'").run(input.attentionId);
       }
       this.db.prepare("UPDATE attentions SET state='resolved' WHERE id=? AND kind='recovery'").run(`restore:${taskId}`);
+      this.db.prepare("UPDATE attentions SET state='stale' WHERE taskId=? AND kind='approval' AND state='open'").run(taskId);
       this.db.prepare("UPDATE tasks SET controlMode='paused',rowVersion=rowVersion+1,updatedAt=? WHERE id=?").run(Date.now(),taskId);
       this.event('run.recovery-confirmed',taskId,{runId:run?.id??null,actor:'user'});return this.getTask(taskId);
     });

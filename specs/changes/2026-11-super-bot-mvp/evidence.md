@@ -152,3 +152,10 @@ ELECTRON_RUN_AS_NODE=1 '/Applications/DeepSeek Harness.app/Contents/MacOS/DeepSe
 - `npm run check`：25 项核心测试通过。增加取消保留历史/丢弃未发输入、运行中和未知资源占用时拒绝取消/解绑、解绑暂停并允许新目标版本/新代数；过期报告记录一次审计，重复过期报告不改当前成果。
 - `node scripts/smoke-controls.mjs`：真实 Host 解除关联后原生会话保留，旧 prepare 请求不会重新关联；修改目标后 Session 和目录均更新，generation/taskRevision 为 2；取消待验收任务保留 Result 且 humanAcceptedAt 为 null；执行中取消/解绑拒绝，停止收敛后可取消。
 - 独立第 12 轮 UI 通过：两步解绑、历史链接、修改目标版本 2、新目录/会话；取消待验收后成果保留且无接受按钮；STOP_PROBE 执行中禁用取消/解绑，停止后可取消。两项合成任务均已取消，无 console warn/error；已有 Session 的历史授权关联仍未实现。
+
+## 原生审批（2026-11-07 04:18）
+
+- 阅读目标安装包 `dsh-user-approval` / `dsh-client-ui-approval` 的 README、类型与实际事件契约，接入 asked/decided 审计。`npm run check`：26 项测试通过；审批结果不等同于 Run 收敛，跨 Session 决定无效，重启失效审批不重发。
+- 独立第 13 轮使用无网络假模型的 `APPROVAL_PROBE`，由测试插件对一次真实 write 注入 ask。原生 UI 三分支均通过：Reject 后 failed/无成果；Allow once 后写入 132 字节、ready→人工待验收；等待审批时停止，原生审批撤回、write 在 dispatch 前 aborted、任务暂停。
+- `node scripts/smoke-approvals.mjs c64d40a7-f06b-41fa-9758-cfd40f08f5df` 回读三任务：allowed-once / cancelled / rejected 均有持久事件，无 open approval；拒绝/停止时磁盘不存在 result.md；允许成果 humanAcceptedAt 为 null。
+- 试用发现 DSH `workspace-changes` 把同期父 Git 工作树中的产品源码编辑列入原生 diff。目标包 README 明确此行为；模型实际 write 已被拒绝，未发生越界写入。测试夹具增加独立 Git 边界，产品不擅自初始化用户仓库。独立第 14 轮在等待审批期间同期修改 README/Spec/evidence，再 Allow once；原生变更列表与文件选择菜单均只有 result.md（+4/-0），不含父仓库源码/文档。审批事件中文准确显示仅允许本次、已拒绝、已撤回，无 console warn/error。

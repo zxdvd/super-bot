@@ -4,6 +4,7 @@ import type {} from '@deepseek-ai/dsh-api-session-controller';
 import type {} from '@deepseek-ai/dsh-workspace';
 import type {} from '@deepseek-ai/dsh-tools';
 import type {} from '@deepseek-ai/dsh-jobs';
+import type {} from '@deepseek-ai/dsh-user-approval';
 import type { Agent } from '@deepseek-ai/dsh-agent';
 import { createUserMessage,freezeMessage,type UserMessage } from '@deepseek-ai/dsh-llm';
 import { SessionId } from '@deepseek-ai/dsh-session/types';
@@ -39,6 +40,11 @@ export class DshExecution {
     },{when:({agent})=>this.store.heldRuns().some(r=>r.sessionId===agent.id&&r.finishedAt===null)}));
     this.ctx.on('session/event',(session,event)=>{
       if(this.disposed)return;
+      if(event.type==='approval/asked') {
+        const run=this.store.heldRuns().find(r=>r.sessionId===session.id&&r.finishedAt===null);
+        if(run)this.store.nativeApprovalAsked(run.id,event.data.id,event.data.toolName,event.data.reason??'');
+      }
+      if(event.type==='approval/decided')this.store.nativeApprovalDecided(session.id,event.data.id,event.data.outcome);
       if(event.type==='user/message'&&event.data.source.kind==='super-bot') {
         const source=event.data.source;
         if(this.store.heldRuns().some(r=>r.id===source.runId&&r.sessionId===session.id&&r.inputId===source.inputId))this.store.inputEntered(source.runId,event.data.id,event.seq);

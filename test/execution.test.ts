@@ -19,6 +19,23 @@ function entered(store:Store,key='1') {
 }
 const ready={kind:'ready' as const,summary:'说明已生成',checks:'两项事实均在文档中',evidence:[{path:'/tmp/result.md',sha256:'synthetic',bytes:30}]};
 
+test('native approval decisions resolve only their attention and never imply execution completion',()=>{
+  const store=new Store(':memory:');try {
+    const {task,run}=entered(store);
+    store.nativeApprovalAsked(run.id,'approval-1','write','Synthetic write');store.nativeApprovalAsked(run.id,'approval-1','write','Synthetic write');
+    assert.equal(store.getTask(task.id).status,'approval');assert.equal(store.heldRuns().length,1);
+    store.workerReport(run.id,'ready',ready);assert.throws(()=>store.settleRun(run.id),/原生审批/);
+    store.nativeApprovalDecided('other-session','approval-1','allowed-once');assert.equal(store.getTask(task.id).status,'approval');
+    store.nativeApprovalDecided(run.sessionId,'approval-1','rejected');store.nativeApprovalDecided(run.sessionId,'approval-1','rejected');
+    assert.equal(store.getTask(task.id).status,'running');assert.equal(store.heldRuns().length,1);
+    assert.equal(store.db.prepare("SELECT count(*) AS n FROM events WHERE kind='approval.decided'").get()?.n,1);
+    assert.equal(store.getTask(task.id).lifecycle,'open');
+    store.nativeApprovalAsked(run.id,'approval-2','write','Another request');
+    store.runRecovery(run.id,'Host restarted');assert.equal(store.taskDetail(task.id).attentions.find(a=>a.id==='approval:approval-2')?.state,'stale');
+    assert.equal(store.getTask(task.id).status,'recovery');assert.equal(store.heldRuns().length,1);
+  }finally{store.close();}
+});
+
 test('cancelling settled work discards pending answers without accepting results or deleting history',()=>{
   const store=new Store(':memory:');try {
     const {task,run}=entered(store);store.workerReport(run.id,'ask',{kind:'waiting',summary:'还需要什么？'});store.settleRun(run.id);

@@ -23,6 +23,7 @@ try {
     restored.prepare('INSERT OR REPLACE INTO attentions(id,taskId,kind,question,taskRevision,state,createdAt) VALUES (?,?,?,?,?,?,?)').run(`restore:${task.id}`,task.id,'recovery','账本已从备份恢复；备份之后可能发生过执行。请核对原生会话、文件及外部效果，再决定是否继续。',task.taskRevision,'open',now);
   }
   restored.prepare("UPDATE runs SET state='interrupted',finishedAt=?,note='从备份恢复，执行效果待核对' WHERE finishedAt IS NULL").run(now);
+  restored.prepare("UPDATE attentions SET state='stale' WHERE kind='approval' AND state='open'").run();
   restored.prepare("UPDATE outbox SET state='unknown' WHERE state='sending' OR (kind='manager.notify' AND state='pending')").run();
   restored.prepare("INSERT INTO metadata(key,value) VALUES ('restoredAt',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value").run(String(now));
   restored.prepare('INSERT INTO events(taskId,kind,data,createdAt) VALUES (NULL,?,?,?)').run('ledger.restored',JSON.stringify({source}),now);

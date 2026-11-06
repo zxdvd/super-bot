@@ -10,6 +10,9 @@ import type { JobOutcome } from '@deepseek-ai/dsh-jobs';
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import { mkdir, writeFile } from 'node:fs/promises';
+import { existsSync } from 'node:fs';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
 import { join } from 'node:path';
 import { Store } from '../src/store.ts';
 import { DshExecution } from '../src/dsh.ts';
@@ -27,6 +30,7 @@ const toolName = 'super_bot_probe_report';
 
 class ProbeAdapter extends LlmAdapter {
   calls: {sessionId?: string;purpose?:string; ids: string[]; tools: string[]}[] = [];
+  approvalWrites=new Set<string>();
   async listModels() { return [{provider,id:'deterministic',name:'Super Bot 测试模型（无网络）'}]; }
   async resolveModel(p:string,m:string) { return {provider:p,id:m,name:m,context:{contextWindow:200000},defaultMaxTokens:1000}; }
   async *stream(options: GenerateOptions): AsyncIterable<StreamChunk> {
@@ -72,9 +76,12 @@ class ProbeAdapter extends LlmAdapter {
       const later=options.messages.slice(options.messages.indexOf(workInput)+1);
       const calls=later.flatMap(m=>m.content.filter(b=>b.type==='tool-call').map(b=>b.name));
       const file=join(cwd,'result.md');
+      const approvalProbe=body.includes('Goal: APPROVAL_PROBE');
+      if(approvalProbe&&!calls.includes('write')&&options.sessionId)this.approvalWrites.add(options.sessionId);
       const hasAnswer=options.messages.some(m=>m.content.some(b=>b.type==='text'&&b.text.includes('Additional user input (answer):')));
       const needsAnswer=body.includes('Goal: ASK_PROBE')&&!hasAnswer;
-      const planned=needsAnswer&&!calls.includes('super_bot_report')?{name:'super_bot_report',args:{kind:'waiting',summary:'请说明文档面向谁？'}}:
+      const planned=approvalProbe&&calls.includes('write')&&!existsSync(file)&&!calls.includes('super_bot_report')?{name:'super_bot_report',args:{kind:'failed',summary:'审批路径结束，写入没有生成文件；请核对原生审批结果。'}}:
+        needsAnswer&&!calls.includes('super_bot_report')?{name:'super_bot_report',args:{kind:'waiting',summary:'请说明文档面向谁？'}}:
         !calls.includes('write')?{name:'write',args:{file_path:file,content:'# 合成成果\n\n事实一：这份文档由隔离测试模型生成。\n事实二：测试没有访问网络或使用模型凭证。\n'+(body.includes('Additional user input (rework):')?'\n修订：已按返工要求补充说明。\n':'')}}:
         !calls.includes('read')?{name:'read',args:{file_path:file}}:
         !calls.includes('super_bot_report')?{name:'super_bot_report',args:{kind:'ready',summary:'已生成并回读两项事实的说明文件。',checks:'result.md 包含标题和两项事实；已用原生 read 工具回读核对。',files:[file]}}:null;
@@ -117,7 +124,17 @@ export function apply(ctx:Context) {
   const home=process.env.DSH_HOME;
   if (!home?.endsWith('/super-bot/.runtime/dsh')) throw new Error('Probe requires the dedicated Super Bot test home');
   const adapter=new ProbeAdapter();
+  // The dev home is nested in the source repository. Bound native turn diffs to
+  // each synthetic workspace, so concurrent product edits are not attributed to it.
+  ctx.on('agent/created',async({agent})=>{
+    const cwd=agent.session.header.cwd;
+    if(cwd?.startsWith(join(home!,'super-bot')+'/')&&!existsSync(join(cwd,'.git')))await promisify(execFile)('git',['init','--quiet','--template=','--initial-branch=main',cwd],{timeout:5000,maxBuffer:65536});
+  });
   ctx.effect(()=>ctx.llm.registerAdapter([provider],adapter));
+  ctx.on('tools/pre-execute',async(exec,next)=>{
+    if(exec.name==='write'&&exec.agent&&adapter.approvalWrites.delete(exec.agent.id))return {kind:'ask',reason:'Super Bot 合成审批探针：仅在本任务目录写入 result.md，不访问网络。'};
+    return next();
+  });
   const allowed=new Set<string>(); const executed:string[]=[];
   ctx.effect(()=>ctx.tools.register({name:toolName,description:'Synthetic identity probe; no external effects.',
     parameters:{type:'object',properties:{},additionalProperties:false},

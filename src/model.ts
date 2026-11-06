@@ -37,7 +37,7 @@ export interface Task {
   sessionId: string | null;
   createdAt: number;
   updatedAt: number;
-  status: 'unscheduled' | 'needs-input' | 'paused' | 'manual' | 'completed' | 'cancelled' | 'review' | 'queued' | 'running' | 'stopping' | 'recovery';
+  status: 'unscheduled' | 'needs-input' | 'approval' | 'paused' | 'manual' | 'completed' | 'cancelled' | 'review' | 'queued' | 'running' | 'stopping' | 'recovery';
   managerReviewed?:boolean;
 }
 export interface TaskPage {
