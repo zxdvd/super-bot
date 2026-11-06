@@ -208,3 +208,10 @@ ELECTRON_RUN_AS_NODE=1 '/Applications/DeepSeek Harness.app/Contents/MacOS/DeepSe
 - 上述变更后 `probe:run` 的 11 项契约再次通过。真实模型、Desktop、运行中热卸载仍未验证。
 
 独立第 19 轮 UI 完成：启用 Manager 后完整任务可初始暂停，期间无 Binding/模型执行；忙碌会话不给关联，空闲会话双授权才允许提交；关联后保持暂停和原 1 turn/1 step。恢复自动管理后 Manager 自动执行至人工待验收，原生 2 turns/4 steps、132 字节成果，历史只有一份，console warn/error 为空。SB-05 新建/已有授权/解绑/历史保留路径已具备实际证据。
+
+
+## ready 与未收敛后台活动（2026-11-07 05:03）
+
+- `smoke-background.mjs` 在真实报告工具前建立合成 DSH Job（没有外部进程）；Worker 写/读/ready 后 Agent 已 idle，但 Job 仍 running。产品 Run 转 interrupted/recovery，Result 只作不可验收候选，不能接受或释放占用。
+- 请求 Job kill 后状态仍 stopping，恢复继续拒绝；测试明确完成 Job 后，人工核对才使任务暂停。旧 ready 不因后来空闲而自动恢复为可验收成果。
+- 配合 11 项契约、实际取消超时、丢回执、重启、文件证据和独立 UI，SB-02/06～09 的文件任务纵切完成；仍保留支持矩阵中的限制，真实模型质量归 SB-15。

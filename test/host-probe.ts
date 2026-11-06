@@ -33,6 +33,7 @@ const scopedToolName='super_bot_scoped_probe';
 class ProbeAdapter extends LlmAdapter {
   calls: {sessionId?: string;purpose?:string; ids: string[]; tools: string[]}[] = [];
   approvalWrites=new Set<string>();
+  readyWithJob=new Set<string>();
   scopedAttempts=new Map<string,number>();
   stalled=new Map<string,{release:()=>void;signal?:AbortSignal}>();
   async listModels() { return [{provider,id:'deterministic',name:'Super Bot 测试模型（无网络）'}]; }
@@ -101,6 +102,7 @@ class ProbeAdapter extends LlmAdapter {
       const later=options.messages.slice(options.messages.indexOf(workInput)+1);
       const calls=later.flatMap(m=>m.content.filter(b=>b.type==='tool-call').map(b=>b.name));
       const file=join(cwd,'result.md');
+      if(body.includes('Goal: READY_WITH_JOB_PROBE')&&options.sessionId)this.readyWithJob.add(options.sessionId);
       const approvalProbe=body.includes('Goal: APPROVAL_PROBE');
       if(approvalProbe&&!calls.includes('write')&&options.sessionId)this.approvalWrites.add(options.sessionId);
       const hasAnswer=options.messages.some(m=>m.content.some(b=>b.type==='text'&&b.text.includes('Additional user input (answer):')));
@@ -150,6 +152,7 @@ export function apply(ctx:Context) {
   if (!home?.endsWith('/super-bot/.runtime/dsh')) throw new Error('Probe requires the dedicated Super Bot test home');
   const adapter=new ProbeAdapter();
   const scopedCalls=new Map<string,number>();
+  const readyJobs=new Map<string,{id:ReturnType<Context['jobs']['start']>;finish:(outcome:JobOutcome)=>void}>();
   // The dev home is nested in the source repository. Bound native turn diffs to
   // each synthetic workspace, so concurrent product edits are not attributed to it.
   ctx.on('agent/created',async({agent})=>{
@@ -159,6 +162,11 @@ export function apply(ctx:Context) {
   ctx.effect(()=>ctx.llm.registerAdapter([provider],adapter));
   ctx.on('tools/pre-execute',async(exec,next)=>{
     if(exec.name==='write'&&exec.agent&&adapter.approvalWrites.delete(exec.agent.id))return {kind:'ask',reason:'Super Bot 合成审批探针：仅在本任务目录写入 result.md，不访问网络。'};
+    if(exec.name==='super_bot_report'&&exec.agent&&adapter.readyWithJob.delete(exec.agent.id)) {
+      let finish!:(outcome:JobOutcome)=>void;
+      const id=ctx.jobs.start({kind:'bash',label:'Ready but background effect unsettled (synthetic, no process)',owner:exec.agent.id,run:()=>({cancel:()=>{},done:new Promise<JobOutcome>(resolve=>{finish=resolve;})})});
+      readyJobs.set(exec.agent.id,{id,finish});
+    }
     return next();
   });
   const allowed=new Set<string>(); const executed:string[]=[];
@@ -344,6 +352,12 @@ export function apply(ctx:Context) {
   ctx.effect(()=>ctx.connection.fetch.register({path:'/api/super-bot-probe',methods:['POST'],requestBody:'buffered',
     fetch:async request=>{try{
       const body=await request.json() as {action?:string;sessionId?:string;text?:string};
+      if(body.action==='ready-job-status'||body.action==='ready-job-cancel'||body.action==='ready-job-finish') {
+        assert.ok(body.sessionId);const job=readyJobs.get(body.sessionId);assert.ok(job);
+        if(body.action==='ready-job-cancel')ctx.jobs.kill(job.id,SessionId(body.sessionId),'Synthetic late settlement');
+        if(body.action==='ready-job-finish'){job.finish({status:'killed'});await ctx.jobs.wait(job.id,1000,SessionId(body.sessionId));}
+        return Response.json({ok:true,status:ctx.jobs.get(job.id,SessionId(body.sessionId)).status});
+      }
       if(body.action==='queue-native'||body.action==='attempt-scoped-probe') {
         assert.ok(body.sessionId);const resolved=await ctx.sessionController.resolveAgent(SessionId(body.sessionId));assert.ok('agent' in resolved);const agent=resolved.agent;
         assert.ok(agent.session.header.cwd?.startsWith(join(home!,'super-bot')+'/'));assert.equal(agent.model.current()?.provider,provider);

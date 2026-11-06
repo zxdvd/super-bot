@@ -19,7 +19,7 @@
 | Worker 预算 | 已验证 | 每 Run 最多 40 步或 10 分钟；实际 40 步和 600,026 ms 计时通过。预算后暂停并核对，不自动重试。`smoke-budget.mjs` |
 | Manager 约束 | 部分已验证 | 单 Bot 一轮、全局两轮、每轮 12 步/5 分钟、每小时 20 次自动唤醒；有限返工和公平队列已验证，所有计时/额度的宿主故障排列仍待补齐 |
 | 两个 Worker 容量 | 已验证 | 同 Bot 两项实际同时运行；第三项不创建 Run，另一个 Bot 的 Manager 等待名额，释放后才派发。`smoke-capacity.mjs` |
-| 后台作业收敛 | 已验证契约；产品能力有限 | Agent idle 不代表 job 停止，kill accepted 不代表 settled。合成 job 探针验证；不开放业务 Shell |
+| 后台作业收敛 | 已验证契约；产品能力有限 | Agent idle 不代表 job 停止，kill accepted 不代表 settled。合成 job 探针及 `smoke-background.mjs` 实际 ready→恢复门槛验证；不开放业务 Shell |
 | 重启与未知投递 | 已验证主要窗口 | 实际 SIGKILL、投递后丢回执、Manager 通知丢回执均不自动重放责任。`smoke-restart.mjs`、`probe:run` |
 | 账本迁移和恢复 | 已验证主要窗口 | schema 2→6、失败回滚、未提交升级进程中断、一致性快照、新目录恢复。`npm test`、`smoke-restored.mjs` |
 | Dashboard 离线 | 已验证 | 仅保留快照并禁用变更；重连不重放操作，恢复筛选和位置。100 项分页通过 |
