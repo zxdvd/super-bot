@@ -2,7 +2,7 @@ import { DatabaseSync } from 'node:sqlite';
 import { mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
-import { AppError, requiredText, optionalText, taskStatus, type Bot, type Task, type NewBot, type NewTask, type TaskPage, type ControlMode, type Attention, type Binding, type Run, type RunInput, type WorkReport, type Result } from './model.ts';
+import { AppError, requiredText, optionalText, taskStatus, type Bot, type Task, type NewBot, type NewTask, type TaskPage, type ControlMode, type Attention, type Binding, type Run, type RunInput, type WorkReport, type Result,type ManagerBinding,type ManagerEvent } from './model.ts';
 
 /** One local database. Business transactions will live here, not in the UI/adapter. */
 export class Store {
@@ -13,7 +13,7 @@ export class Store {
     try {
       this.db.exec('PRAGMA busy_timeout=100; PRAGMA foreign_keys=ON; PRAGMA locking_mode=EXCLUSIVE;');
       const version = this.db.prepare('PRAGMA user_version').get() as { user_version: number };
-      if (version.user_version > 5) throw new AppError('schema-newer', '数据库来自更新版本，请升级插件。');
+      if (version.user_version > 6) throw new AppError('schema-newer', '数据库来自更新版本，请升级插件。');
       this.db.exec('PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;');
       this.db.exec(`BEGIN IMMEDIATE;
         CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -57,11 +57,13 @@ export class Store {
         CREATE TABLE IF NOT EXISTS reports (id TEXT PRIMARY KEY,runId TEXT NOT NULL REFERENCES runs(id),kind TEXT NOT NULL,data TEXT NOT NULL,createdAt INTEGER NOT NULL);
         CREATE TABLE IF NOT EXISTS results (id TEXT PRIMARY KEY,runId TEXT NOT NULL UNIQUE REFERENCES runs(id),taskId TEXT NOT NULL REFERENCES tasks(id),taskRevision INTEGER NOT NULL,summary TEXT NOT NULL,checks TEXT NOT NULL,evidence TEXT NOT NULL,createdAt INTEGER NOT NULL,humanAcceptedAt INTEGER);
         CREATE TABLE IF NOT EXISTS reviews (id TEXT PRIMARY KEY,resultId TEXT NOT NULL REFERENCES results(id),actor TEXT NOT NULL,verdict TEXT NOT NULL,note TEXT NOT NULL,createdAt INTEGER NOT NULL);
+        CREATE TABLE IF NOT EXISTS managers (id TEXT PRIMARY KEY,botId TEXT NOT NULL REFERENCES bots(id),generation INTEGER NOT NULL,configRevision INTEGER NOT NULL,requestedSessionId TEXT NOT NULL UNIQUE,sessionId TEXT UNIQUE,cwd TEXT NOT NULL,state TEXT NOT NULL,createdAt INTEGER NOT NULL,UNIQUE(botId,generation));
+        CREATE UNIQUE INDEX IF NOT EXISTS managers_active ON managers(botId) WHERE state!='released';
         `);
       const inputColumns=this.db.prepare('PRAGMA table_info(inputs)').all().map(row=>row.name);
       if(!inputColumns.includes('messageId'))this.db.exec('ALTER TABLE inputs ADD COLUMN messageId TEXT; ALTER TABLE inputs ADD COLUMN messageJson TEXT;');
       if(!inputColumns.includes('attentionId'))this.db.exec('ALTER TABLE inputs ADD COLUMN attentionId TEXT REFERENCES attentions(id);');
-      this.db.exec('PRAGMA user_version=5; COMMIT;');
+      this.db.exec('PRAGMA user_version=6; COMMIT;');
     } catch (error) {
       this.db.close();
       if ((error as { errcode?: number }).errcode === 5) throw new AppError('host-active', '另一宿主正在使用此工作台，请先关闭该宿主。');
@@ -116,6 +118,62 @@ export class Store {
     if (!bot) throw new AppError('not-found', 'Bot 不存在。');
     return bot;
   }
+  activeManager(botId:string):ManagerBinding|null {
+    const row=this.db.prepare("SELECT * FROM managers WHERE botId=? AND state!='released'").get(botId) as unknown as ManagerBinding|undefined;return row?{...row}:null;
+  }
+  managerForSession(sessionId:string):ManagerBinding|null {
+    const row=this.db.prepare("SELECT * FROM managers WHERE requestedSessionId=? AND state!='released'").get(sessionId) as unknown as ManagerBinding|undefined;return row?{...row}:null;
+  }
+  beginManager(requestId:string,botId:string,cwd:string):ManagerBinding {
+    return this.command(requestId,'manager.prepare',{botId,cwd},()=>{
+      const bot=this.getBot(botId),existing=this.activeManager(botId);if(existing)return existing;
+      const generation=Number(this.db.prepare('SELECT coalesce(max(generation),0)+1 AS n FROM managers WHERE botId=?').get(botId)?.n);
+      const manager:ManagerBinding={id:randomUUID(),botId,generation,configRevision:bot.configRevision,requestedSessionId:`session-${randomUUID()}`,sessionId:null,cwd,state:'creating',createdAt:Date.now()};
+      this.db.prepare('INSERT INTO managers VALUES (?,?,?,?,?,?,?,?,?)').run(manager.id,botId,generation,bot.configRevision,manager.requestedSessionId,null,cwd,'creating',manager.createdAt);
+      this.db.prepare('INSERT INTO outbox(id,kind,payload,createdAt) VALUES (?,?,?,?)').run(`manager-create:${manager.id}`,'manager.create',JSON.stringify({managerId:manager.id}),Date.now());
+      this.event('manager.preparing',null,{botId,managerId:manager.id});return manager;
+    });
+  }
+  claimManagerCreation(id:string):boolean{return this.db.prepare("UPDATE outbox SET state='sending',attempts=attempts+1 WHERE id=? AND state='pending'").run(`manager-create:${id}`).changes===1;}
+  confirmManager(id:string,sessionId:string):ManagerBinding {
+    return this.command(`manager-confirm:${id}`,'manager.confirm',{id,sessionId},()=>{
+      const manager=this.db.prepare('SELECT * FROM managers WHERE id=?').get(id) as unknown as ManagerBinding|undefined;
+      if(!manager||manager.state==='released'||manager.requestedSessionId!==sessionId)throw new AppError('manager-stale','管理会话不一致或已经失效。');
+      this.db.prepare("UPDATE managers SET state='ready',sessionId=? WHERE id=?").run(sessionId,id);
+      this.db.prepare('UPDATE bots SET managerSessionId=? WHERE id=?').run(sessionId,manager.botId);
+      this.db.prepare("UPDATE outbox SET state='done' WHERE id=?").run(`manager-create:${id}`);
+      this.enqueueManager(manager.botId,`init:${id}`,'管理会话已准备好，请从账本恢复当前工作。',null);
+      this.event('manager.ready',null,{botId:manager.botId,sessionId});return this.activeManager(manager.botId)!;
+    });
+  }
+  enqueueManager(botId:string,key:string,reason:string,taskId:string|null):void {
+    if(!this.getBot(botId).managerSessionId)return;
+    this.db.prepare('INSERT OR IGNORE INTO outbox(id,kind,taskId,payload,createdAt) VALUES (?,?,?,?,?)').run(`manager-event:${key}`,'manager.notify',taskId,JSON.stringify({botId,reason,taskId}),Date.now());
+  }
+  pendingManagerEvents(botId:string):ManagerEvent[] {
+    return this.db.prepare("SELECT id,taskId,payload,state,createdAt FROM outbox WHERE kind='manager.notify' AND state='pending' AND json_extract(payload,'$.botId')=? ORDER BY createdAt,id LIMIT 10").all(botId) as unknown as ManagerEvent[];
+  }
+  claimManagerEvent(id:string,messageId:string,messageJson:string):boolean {
+    return this.db.prepare("UPDATE outbox SET state='sending',attempts=attempts+1,payload=json_set(payload,'$.messageId',?,'$.messageJson',?,'$.deliveredAt',?) WHERE id=? AND state='pending'").run(messageId,messageJson,Date.now(),id).changes===1;
+  }
+  managerEventEntered(id:string,messageId:string):void {
+    this.db.prepare("UPDATE outbox SET state='done' WHERE id=? AND state='sending' AND json_extract(payload,'$.messageId')=?").run(id,messageId);
+  }
+  managerEventUnknown(id:string):void {this.db.prepare("UPDATE outbox SET state='unknown' WHERE id=? AND state='sending'").run(id);}
+  managerWakeCount(botId:string,since:number):number {
+    return Number(this.db.prepare("SELECT count(*) AS n FROM outbox WHERE kind='manager.notify' AND state!='pending' AND json_extract(payload,'$.deliveredAt')>=? AND json_extract(payload,'$.botId')=?").get(since,botId)?.n);
+  }
+  resetUnconfirmedManagerEvents():void {this.db.prepare("UPDATE outbox SET state='unknown' WHERE kind='manager.notify' AND state='sending'").run();}
+  managerInfo(botId:string) {return {binding:this.activeManager(botId),pending:this.pendingManagerEvents(botId).length,uncertain:Number(this.db.prepare("SELECT count(*) AS n FROM outbox WHERE kind='manager.notify' AND state='unknown' AND json_extract(payload,'$.botId')=?").get(botId)?.n),hourlyWakes:this.managerWakeCount(botId,Date.now()-3600000)};}
+  releaseManager(requestId:string,botId:string,expectedGeneration:number):ManagerBinding {
+    return this.command(requestId,'manager.replace',{botId,expectedGeneration},()=>{
+      const manager=this.activeManager(botId);if(!manager||manager.generation!==expectedGeneration)throw new AppError('manager-stale','管理会话已经改变，请刷新。');
+      this.db.prepare("UPDATE managers SET state='released' WHERE id=?").run(manager.id);
+      this.db.prepare('UPDATE bots SET managerSessionId=NULL WHERE id=?').run(botId);
+      this.db.prepare("UPDATE outbox SET state='superseded' WHERE kind='manager.notify' AND state='unknown' AND json_extract(payload,'$.botId')=?").run(botId);
+      this.event('manager.replaced',null,{botId,oldSessionId:manager.sessionId});return manager;
+    });
+  }
   createTask(requestId: string, input: NewTask): Task {
     const payload: NewTask = { botId: requiredText(input.botId, 'Bot 标识', 200), goal: requiredText(input.goal, '任务目标'),
       scope: optionalText(input.scope, '任务范围'), acceptance: optionalText(input.acceptance, '验收条件'), reviewPolicy: input.reviewPolicy };
@@ -128,6 +186,7 @@ export class Store {
       this.db.prepare('INSERT INTO inputs(id,taskId,kind,content,createdAt) VALUES (?,?,?,?,?)')
         .run(randomUUID(), id, 'goal', payload.goal, now);
       this.event('task.created', id, { taskRevision: 1 });
+      this.enqueueManager(payload.botId,`created:${id}`,'有新任务，请检查授权范围与验收条件后安排。',id);
       if (!payload.scope || !payload.acceptance) this.db.prepare('INSERT INTO attentions(id,taskId,kind,question,taskRevision,createdAt) VALUES (?,?,?,?,?,?)')
         .run(randomUUID(),id,'input','请补充任务范围和验收条件，然后再安排执行。',1,now);
       return this.getTask(id);
@@ -147,7 +206,8 @@ export class Store {
       else if(run?.state==='queued')status='queued';
       else if(this.db.prepare("SELECT 1 FROM attentions WHERE taskId=? AND kind='input' AND state='open'").get(task.id))status='needs-input';
     }
-    return {...task,status};
+    const managerReviewed=!!(run&&this.db.prepare("SELECT 1 FROM reviews JOIN results ON results.id=reviews.resultId WHERE results.runId=? AND reviews.actor LIKE 'manager:%' LIMIT 1").get(run.id));
+    return {...task,status,managerReviewed};
   }
   taskDetail(id: string): { task: Task; binding: Binding | null; run:Run|null; input:RunInput|null; result:Result|null; attentions: Attention[]; events: { id: number; kind: string; data: string; createdAt: number }[] } {
     const run=this.latestRun(id);
@@ -359,6 +419,7 @@ export class Store {
       const kind=last.kind==='ready'?'review':last.kind==='waiting'?'input':'recovery';
       this.db.prepare('INSERT OR IGNORE INTO attentions(id,taskId,kind,question,taskRevision,createdAt) VALUES (?,?,?,?,?,?)').run(`run:${id}`,run.taskId,kind,last.kind==='ready'?'成果与执行已核对，请检查证据并验收。':report.summary,run.taskRevision,Date.now());
       this.db.prepare('UPDATE tasks SET lifecycle=?,rowVersion=rowVersion+1,updatedAt=? WHERE id=?').run(last.kind==='ready'?'review':'open',Date.now(),run.taskId);
+      this.enqueueManager(task.botId,`settled:${id}`,`执行已结束，报告类型 ${last.kind}。请读当前账本和成果，不要重放旧输入。`,task.id);
       this.event('run.settled',run.taskId,{runId:id,kind:last.kind});return {};
     });
   }
@@ -411,6 +472,7 @@ export class Store {
       this.db.prepare('INSERT INTO outbox(id,kind,taskId,payload,createdAt) VALUES (?,?,?,?,?)').run(`input:${id}`,'input.deliver',task.id,JSON.stringify({inputId:id}),Date.now());
       this.db.prepare("UPDATE attentions SET state='responding' WHERE id=?").run(attentionId);
       this.db.prepare('UPDATE tasks SET rowVersion=rowVersion+1,updatedAt=? WHERE id=?').run(Date.now(),task.id);
+      this.enqueueManager(task.botId,`answer:${id}`,'用户回答已保存，请核对管理方式后继续。',task.id);
       this.event('attention.answered',task.id,{attentionId,inputId:id});return this.pendingInput(task.id)!;
     });
   }
@@ -426,6 +488,7 @@ export class Store {
       this.db.prepare('INSERT INTO outbox(id,kind,taskId,payload,createdAt) VALUES (?,?,?,?,?)').run(`input:${inputId}`,'input.deliver',taskId,JSON.stringify({inputId}),Date.now());
       this.db.prepare("UPDATE attentions SET state='resolved' WHERE taskId=? AND kind='review' AND state='open'").run(taskId);
       this.db.prepare("UPDATE tasks SET lifecycle='open',rowVersion=rowVersion+1,updatedAt=? WHERE id=?").run(Date.now(),taskId);
+      this.enqueueManager(task.botId,`user-rework:${inputId}`,'用户返工要求已保存，请核对管理方式后继续。',taskId);
       this.event('result.rejected',taskId,{resultId,inputId});return this.getTask(taskId);
     });
   }
@@ -442,6 +505,36 @@ export class Store {
       this.event('run.recovery-confirmed',taskId,{runId:run.id,actor:'user'});return this.getTask(taskId);
     });
   }
+  managerReview(requestId:string,botId:string,taskId:string,expectedRowVersion:number,resultId:string,verdict:'accept'|'rework'|'human',text:string):Task {
+    const note=requiredText(text,'验收判断');
+    return this.command(requestId,'manager.review',{botId,taskId,expectedRowVersion,resultId,verdict,note},()=>{
+      const task=this.getTask(taskId),run=this.latestRun(taskId),result=run?this.runResult(run.id):null;
+      if(task.botId!==botId)throw new AppError('scope','只能处理自己负责的任务。');
+      if(task.rowVersion!==expectedRowVersion||task.controlMode!=='auto'||task.lifecycle!=='review'||!result||result.id!==resultId||result.taskRevision!==task.taskRevision||run?.state!=='settled')throw new AppError('review-stale','任务状态、授权或成果已经改变，管理判断未应用。');
+      if(this.heldRuns().some(r=>r.taskId===taskId))throw new AppError('run-active','执行尚未收敛。');
+      if(this.db.prepare("SELECT 1 FROM attentions WHERE taskId=? AND state='open' AND kind!='review'").get(taskId))throw new AppError('needs-attention','还有其他待办需要处理。');
+      let decision:string=verdict;
+      const reworks=Number(this.db.prepare("SELECT count(*) AS n FROM reviews JOIN results ON results.id=reviews.resultId WHERE results.taskId=? AND results.taskRevision=? AND reviews.actor=? AND reviews.verdict='rework'").get(taskId,task.taskRevision,`manager:${botId}`)?.n);
+      if(verdict==='rework'&&reworks>=2)decision='human';
+      if(verdict==='accept'&&task.reviewPolicy==='human')decision='human';
+      this.db.prepare('INSERT INTO reviews VALUES (?,?,?,?,?,?)').run(randomUUID(),resultId,`manager:${botId}`,decision,note,Date.now());
+      if(decision==='accept') {
+        this.db.prepare("UPDATE tasks SET lifecycle='completed',rowVersion=rowVersion+1,updatedAt=? WHERE id=?").run(Date.now(),taskId);
+        this.db.prepare("UPDATE attentions SET state='resolved' WHERE taskId=? AND kind='review' AND state='open'").run(taskId);
+      }else if(decision==='rework') {
+        const inputId=randomUUID();this.db.prepare('INSERT INTO inputs(id,taskId,kind,content,createdAt) VALUES (?,?,?,?,?)').run(inputId,taskId,'rework',note,Date.now());
+        this.db.prepare('INSERT INTO outbox(id,kind,taskId,payload,createdAt) VALUES (?,?,?,?,?)').run(`input:${inputId}`,'input.deliver',taskId,JSON.stringify({inputId}),Date.now());
+        this.db.prepare("UPDATE attentions SET state='resolved' WHERE taskId=? AND kind='review' AND state='open'").run(taskId);
+        this.db.prepare("UPDATE tasks SET lifecycle='open',rowVersion=rowVersion+1,updatedAt=? WHERE id=?").run(Date.now(),taskId);
+        this.enqueueManager(botId,`rework:${inputId}`,'返工要求已保存，可以在容量允许时继续。',taskId);
+      }else {
+        this.db.prepare("UPDATE attentions SET question=? WHERE taskId=? AND kind='review' AND state='open'").run((verdict==='rework'&&reworks>=2?'自动返工已达 2 次，请你判断。\n':'Bot 已检查，请你最终判断。\n')+note,taskId);
+        this.db.prepare('UPDATE tasks SET rowVersion=rowVersion+1,updatedAt=? WHERE id=?').run(Date.now(),taskId);
+        if(verdict==='rework'&&reworks>=2)this.db.prepare("UPDATE tasks SET controlMode='paused' WHERE id=?").run(taskId);
+      }
+      this.event('manager.reviewed',taskId,{resultId,decision,note});return this.getTask(taskId);
+    });
+  }
   controlTask(requestId: string, id: string, expectedRowVersion: number, mode: ControlMode): Task {
     if (!['auto','paused','manual'].includes(mode)) throw new AppError('invalid-input', '控制模式无效。');
     return this.command(requestId, 'task.control', { id, expectedRowVersion, mode }, () => {
@@ -449,6 +542,7 @@ export class Store {
       if (task.rowVersion !== expectedRowVersion) throw new AppError('version-conflict', '任务已经更新，请刷新后再操作。');
       if (task.lifecycle === 'completed' || task.lifecycle === 'cancelled') throw new AppError('task-ended', '任务已结束。');
       this.db.prepare('UPDATE tasks SET controlMode=?,rowVersion=rowVersion+1,updatedAt=? WHERE id=?').run(mode,Date.now(),id);
+      if(mode==='auto')this.enqueueManager(task.botId,`resume:${id}:${task.rowVersion+1}`,'任务恢复自动管理，请读取最新状态。',id);
       this.event('task.control',id,{ mode }); return this.getTask(id);
     });
   }

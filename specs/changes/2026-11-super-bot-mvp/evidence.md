@@ -121,3 +121,15 @@ ELECTRON_RUN_AS_NODE=1 '/Applications/DeepSeek Harness.app/Contents/MacOS/DeepSe
 当前 Worker 阶段只放行专用目录 read/write/edit 与报告工具；Shell/子 Agent 尚未开放。真实模型、外部副作用、完整原生审批和故障注入仍待验证。后台作业探针证明了查询/停止契约，不宣称任意外部进程已可可靠停止。Manager 尚未接入。
 
 独立试用第 7 轮：UI 完成回答/返工/接受，原生文件 132→176 字节且新增修订说明；STOP_PROBE 原生显示 Stopped，面板暂停且未完成；完成按钮与筛选详情修复复验通过，无 console error/warn。
+
+
+## 持久 Manager 与百项工作台（2026-11-07 03:49）
+
+- schema 6 新增 Manager 绑定历史；管理事件复用 Outbox，发送前持久化消息身份，重启后未知发送不重放。重要事件自动唤醒，progress 不入队。Manager 的所有业务工具调用按真实 Agent 身份解析 Bot，不接受模型填写身份。
+- `npm run check`：21 项核心测试通过。新增 Manager 创建/事件 claim、跨 Bot Review 拒绝、默认人验收保持 review、显式授权自动完成且 humanAcceptedAt 为 null、自动返工 2 次后暂停转人、管理会话替换立即撤销旧身份。
+- `npm run smoke:manager`：真实宿主自动消费新任务事件→安排 Worker→读取实际文件→Review；human 保持待验收，bot 授权完成；普通问候不建任务，管理聊天创建任务；另一 Bot 的任务读取拒绝；替换管理会话后原账本工作仍在，旧会话 tools 为空且不能创建任务。
+- 测试中发现 DSH 会发出无工具的辅助标题请求；探针改为按 `purpose` 区分 conversation 与辅助调用，不把辅助请求误判为 Manager 丢失工具。业务实现没有因此放宽工具权限。
+- 独立试用第 8 轮：完全经 UI 验证普通问候、管理聊天建任务、默认人工验收、显式 Bot 验收；关闭面板后继续执行，原生 detail 输出包含实际文件全文。第 9 轮：更换管理会话保留原两项任务和旧会话；返回/刷新保持所选 Bot。
+- `node scripts/seed-ui.mjs` 经产品 API 创建 100 条合成记录，不直接改库：90 未完成（50 待安排、30 暂停、10 缺条件）、5 待验收、5 完成。独立试用四页各 25 项，100 个唯一 ID，无重复遗漏；计数、搜索重置分页、各筛选和跨 Bot 切换均通过。
+
+当前仍是文件工作预览，真实模型质量、完整原生审批、既有 Session 历史授权、Shell 外部进程、通知故障/迁移备份等未完成的验收不勾选。独立试用发现的分页范围提示属于后续小改进。

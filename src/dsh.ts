@@ -57,7 +57,7 @@ export class DshExecution {
     if(this.ctx.jobs.list(agent.id).some(job=>job.owner===agent.id&&['running','stopping'].includes(job.status)))throw new AppError('job-active','后台工作尚未停止，不能开始或确认执行结束。');
     if(this.ctx.agents.list().some(child=>this.ctx.agents.isOwnedBy(child.id,agent)))throw new AppError('child-active','会话仍有子 Agent，需要先核对。');
   }
-  async dispatch(requestId:string,taskId:string,rowVersion:number):Promise<Run> {
+  async dispatch(requestId:string,taskId:string,rowVersion:number,authorize:()=>void=()=>{}):Promise<Run> {
     if(this.disposed)throw new AppError('unavailable','插件正在退出。');
     const receipt=this.store.commandReceipt<Run>(requestId,'task.dispatch',{taskId,expectedRowVersion:rowVersion});
     if(receipt)return this.store.getRun(receipt.id);
@@ -66,6 +66,7 @@ export class DshExecution {
     if('error' in resolved)throw new AppError('session-unavailable','执行会话暂不可用，请核对。');
     const agent=resolved.agent;this.assertQuiet(agent);
     if(!agent.model.current())throw new AppError('model-required','请先打开任务会话选择模型，再回来开始执行。');
+    authorize();
     const run=this.store.reserveRun(requestId,taskId,rowVersion);
     if(this.running.has(run.id)||run.finishedAt!==null)return this.store.getRun(run.id);
     const task=this.store.getTask(taskId);const bot=this.store.getBot(task.botId);
@@ -100,12 +101,16 @@ export class DshExecution {
   async accept(requestId:string,taskId:string,rowVersion:number,resultId:string) {
     const receipt=this.store.commandReceipt<import('./model.ts').Task>(requestId,'result.accept',{taskId,expectedRowVersion:rowVersion,resultId});
     if(receipt)return receipt;
+    await this.verifyResult(taskId,resultId);
+    return this.store.acceptResult(requestId,taskId,rowVersion,resultId);
+  }
+  async verifyResult(taskId:string,resultId:string) {
     const detail=this.store.taskDetail(taskId);
     if(!detail.result||detail.result.id!==resultId||!detail.binding?.sessionId)throw new AppError('result-stale','当前成果不存在或已经改变。');
     const resolved=await this.ctx.sessionController.resolveAgent(SessionId(detail.binding.sessionId));
     if('error' in resolved)throw new AppError('session-unavailable','无法核对原生会话，暂未验收。');
     this.assertQuiet(resolved.agent);await verifyEvidence(detail.binding.cwd,detail.result.evidence);this.assertQuiet(resolved.agent);
-    return this.store.acceptResult(requestId,taskId,rowVersion,resultId);
+    return detail;
   }
   async stop(requestId:string,taskId:string,rowVersion:number) {
     const receipt=this.store.requestStop(requestId,taskId,rowVersion);const active=this.running.get(receipt.runId);

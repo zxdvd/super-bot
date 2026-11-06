@@ -46,7 +46,9 @@
     "probe:build": "node scripts/build-probe.mjs",
     "probe:run": "node scripts/probe.mjs",
     "smoke:execution": "node scripts/smoke-execution.mjs",
-    "smoke:workflow": "node scripts/smoke-workflow.mjs"
+    "smoke:workflow": "node scripts/smoke-workflow.mjs",
+    "smoke:manager": "node scripts/smoke-manager.mjs",
+    "seed:ui": "node scripts/seed-ui.mjs"
   },
   "devDependencies": {
     "@deepseek-ai/cordis": "4.1.0",
@@ -69,7 +71,8 @@
     "react": "18.3.1",
     "tsx": "4.21.0",
     "typescript": "6.0.3",
-    "@deepseek-ai/dsh-llm": "0.2.2-rc.1"
+    "@deepseek-ai/dsh-llm": "0.2.2-rc.1",
+    "@deepseek-ai/dsh-system-prompt": "0.2.2-rc.1"
   },
   "peerDependencies": {
     "@deepseek-ai/cordis": "4.1.0",
@@ -85,6 +88,7 @@
     "@deepseek-ai/dsh-tools": "0.2.2-rc.1",
     "@deepseek-ai/schemastery": "3.19.0",
     "@deepseek-ai/dsh-workspace": "0.2.2-rc.1",
-    "@deepseek-ai/dsh-llm": "0.2.2-rc.1"
+    "@deepseek-ai/dsh-llm": "0.2.2-rc.1",
+    "@deepseek-ai/dsh-system-prompt": "0.2.2-rc.1"
   }
 }

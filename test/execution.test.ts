@@ -6,9 +6,9 @@ import { join } from 'node:path';
 import { Store } from '../src/store.ts';
 import { collectEvidence,verifyEvidence,containedPath } from '../src/evidence.ts';
 
-function prepared(store:Store,key='1',cwd=`/tmp/task-${key}`) {
+function prepared(store:Store,key='1',cwd=`/tmp/task-${key}`,reviewPolicy:'human'|'bot'='human') {
   const bot=store.createBot(`b:${key}`,{name:`Bot ${key}`,instructions:'文件工作'});
-  const task=store.createTask(`t:${key}`,{botId:bot.id,goal:'写一个说明文件',scope:'任务目录',acceptance:'说明包含两项事实',reviewPolicy:'human'});
+  const task=store.createTask(`t:${key}`,{botId:bot.id,goal:'写一个说明文件',scope:'任务目录',acceptance:'说明包含两项事实',reviewPolicy});
   const binding=store.beginBinding(`bnd:${key}`,task.id,1,cwd);store.claimBindingCreation(binding.id);store.confirmBinding(binding.id,binding.requestedSessionId);
   return store.getTask(task.id);
 }
@@ -114,6 +114,54 @@ test('rework preserves task revision but invalidates old acceptance and uses a d
     assert.throws(()=>store.acceptResult('old',task.id,revised.rowVersion,result.resultId!),/不能验收/);
     const next=store.reserveRun('rework',task.id,revised.rowVersion);assert.notEqual(next.id,run.id);
     assert.equal(store.getRunInput(next.id).kind,'rework');assert.equal(store.getRunInput(next.id).content,'补充一段解释');
+  }finally{store.close();}
+});
+test('manager binding is durable, its wake is claimed once, and another bot cannot review its result',()=>{
+  const store=new Store(':memory:');try {
+    const {task,run}=entered(store);const manager=store.beginManager('manager',task.botId,'/tmp/manager');
+    assert.deepEqual(store.beginManager('manager',task.botId,'/tmp/manager'),manager);
+    assert.equal(store.claimManagerCreation(manager.id),true);assert.equal(store.claimManagerCreation(manager.id),false);
+    store.confirmManager(manager.id,manager.requestedSessionId);
+    const event=store.pendingManagerEvents(task.botId)[0];assert.ok(event);
+    assert.equal(store.claimManagerEvent(event.id,'wake','{}'),true);assert.equal(store.claimManagerEvent(event.id,'wake','{}'),false);
+    assert.equal(store.managerWakeCount(task.botId,Date.now()-10000),1);
+    store.managerEventEntered(event.id,'wrong');assert.equal(store.managerInfo(task.botId).uncertain,0);
+    store.managerEventUnknown(event.id);assert.equal(store.managerInfo(task.botId).uncertain,1);
+    const result=store.workerReport(run.id,'report',ready);store.settleRun(run.id);
+    assert.throws(()=>store.managerReview('foreign','other-bot',task.id,store.getTask(task.id).rowVersion,result.resultId!,'accept','looks good'),/自己负责/);
+    const reviewed=store.managerReview('review',task.botId,task.id,store.getTask(task.id).rowVersion,result.resultId!,'accept','read and verified');
+    assert.equal(reviewed.lifecycle,'review');assert.equal(store.runResult(run.id)?.humanAcceptedAt,null);
+  }finally{store.close();}
+});
+test('manager automatic rework is capped at two and authorized acceptance never impersonates a human',()=>{
+  const store=new Store(':memory:');try {
+    const task=prepared(store,'auto','/tmp/auto','bot');
+    for(let i=0;i<3;i++) {
+      const run=store.reserveRun(`run-${i}`,task.id,store.getTask(task.id).rowVersion);
+      store.saveRunMessage(run.id,`msg-${i}`,'{}');store.claimDispatch(run.id);store.inputEntered(run.id,`msg-${i}`,i);
+      const report=store.workerReport(run.id,`report-${i}`,ready);store.settleRun(run.id);
+      const reviewed=store.managerReview(`review-${i}`,task.botId,task.id,store.getTask(task.id).rowVersion,report.resultId!,'rework','补充事实出处');
+      assert.equal(reviewed.lifecycle,i<2?'open':'review');
+    }
+    assert.match(store.taskDetail(task.id).attentions.find(a=>a.state==='open')!.question,/已达 2 次/);
+    const result=store.taskDetail(task.id).result!;
+    assert.throws(()=>store.managerReview('after-cap',task.botId,task.id,store.getTask(task.id).rowVersion,result.id,'accept','又觉得可以'),/管理判断未应用/);
+    const auto=prepared(store,'authorized','/tmp/authorized','bot');const attempt=store.reserveRun('authorized-run',auto.id,auto.rowVersion);
+    store.saveRunMessage(attempt.id,'auto-msg','{}');store.claimDispatch(attempt.id);store.inputEntered(attempt.id,'auto-msg',1);
+    const candidate=store.workerReport(attempt.id,'auto-report',ready);store.settleRun(attempt.id);
+    const accepted=store.managerReview('auto-accept',auto.botId,auto.id,store.getTask(auto.id).rowVersion,candidate.resultId!,'accept','已核对全部验收条件');
+    assert.equal(accepted.lifecycle,'completed');assert.equal(store.taskDetail(task.id).result!.humanAcceptedAt,null);
+  }finally{store.close();}
+});
+test('replacing a manager keeps tasks and immediately revokes the previous session',()=>{
+  const store=new Store(':memory:');try {
+    const task=prepared(store);const first=store.beginManager('first',task.botId,'/tmp/manager');store.confirmManager(first.id,first.requestedSessionId);
+    const old=store.releaseManager('replace',task.botId,first.generation);assert.equal(old.id,first.id);
+    assert.equal(store.managerForSession(first.requestedSessionId),null);assert.equal(store.getTask(task.id).goal,task.goal);
+    const next=store.beginManager('next',task.botId,'/tmp/manager');assert.equal(next.generation,2);
+    store.confirmManager(next.id,next.requestedSessionId);
+    assert.equal(store.getBot(task.botId).managerSessionId,next.requestedSessionId);
+    assert.throws(()=>store.releaseManager('stale',task.botId,1),/已经改变/);
   }finally{store.close();}
 });
 test('evidence hashes detect changed content and outside symlink paths',async()=>{

@@ -10,18 +10,21 @@ import { join } from 'node:path';
 import { mkdir } from 'node:fs/promises';
 import { Store } from './store.ts';
 import { DshExecution } from './dsh.ts';
+import { Managers } from './manager.ts';
 import { AppError, requiredText, optionalText, type WorkspaceStatus, type NewBot, type NewTask, type ControlMode } from './model.ts';
 
 export const name = 'super-bot';
-export const inject = ['connection', 'sessionController', 'workspaceRegistry','agents','tools','jobs'];
+export const inject = ['connection', 'sessionController', 'workspaceRegistry','agents','tools','jobs','systemPrompt'];
 export const Config = Schema.object({ dataDir: Schema.string().description('Super Bot 本地数据目录') });
 
 export function apply(ctx: Context, config: { dataDir?: string } = {}): void {
   const dataDir = config.dataDir ?? join(process.env.DSH_HOME ?? join(homedir(), '.dsh'), 'super-bot');
   const store = new Store(join(dataDir, 'ledger.sqlite'));
   const execution=new DshExecution(ctx,store,dataDir);
-  ctx.effect(() => async () => {await execution.dispose();store.close();});
+  const managers=new Managers(ctx,store,execution,dataDir);
+  ctx.effect(() => async () => {await managers.dispose();await execution.dispose();store.close();});
   execution.install();
+  managers.install();
   const require = createRequire(import.meta.url);
   const runtime = require('@deepseek-ai/dsh-agent/package.json').version as string;
   const startedAt = Date.now();
@@ -34,6 +37,9 @@ export function apply(ctx: Context, config: { dataDir?: string } = {}): void {
     try {
       if (endpoint === 'status') return { ok: true, value: status() };
       if (endpoint === 'bot.list') return { ok: true, value: store.listBots() };
+      if (endpoint === 'manager.prepare') return {ok:true,value:await managers.prepare(requiredText(payload.requestId,'请求标识',200),requiredText(payload.botId,'Bot 标识',200))};
+      if (endpoint === 'manager.replace') return {ok:true,value:await managers.replace(requiredText(payload.requestId,'请求标识',200),requiredText(payload.botId,'Bot 标识',200),payload.expectedGeneration as number)};
+      if (endpoint === 'manager.status') return {ok:true,value:store.managerInfo(requiredText(payload.botId,'Bot 标识',200))};
       if (endpoint === 'bot.create') return { ok: true, value: store.createBot(requiredText(payload.requestId,'请求标识',200),payload as unknown as NewBot) };
       if (endpoint === 'task.create') return { ok: true, value: store.createTask(requiredText(payload.requestId,'请求标识',200),payload as unknown as NewTask) };
       if (endpoint === 'task.list') return { ok: true, value: store.listTasks({

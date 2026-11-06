@@ -4,6 +4,7 @@ import { LlmAdapter, createUserMessage, ToolCallId, type GenerateOptions, type S
 import type { Agent } from '@deepseek-ai/dsh-agent';
 import type {} from '@deepseek-ai/dsh-tools';
 import type {} from '@deepseek-ai/dsh-api-session-controller';
+import type { SessionRequestId } from '@deepseek-ai/dsh-api-session-controller/types';
 import type {} from '@deepseek-ai/dsh-workspace';
 import type { JobOutcome } from '@deepseek-ai/dsh-jobs';
 import assert from 'node:assert/strict';
@@ -25,12 +26,41 @@ const provider = 'super-bot-probe';
 const toolName = 'super_bot_probe_report';
 
 class ProbeAdapter extends LlmAdapter {
-  calls: {sessionId?: string; ids: string[]; tools: string[]}[] = [];
+  calls: {sessionId?: string;purpose?:string; ids: string[]; tools: string[]}[] = [];
   async listModels() { return [{provider,id:'deterministic',name:'Super Bot 测试模型（无网络）'}]; }
   async resolveModel(p:string,m:string) { return {provider:p,id:m,name:m,context:{contextWindow:200000},defaultMaxTokens:1000}; }
   async *stream(options: GenerateOptions): AsyncIterable<StreamChunk> {
     options.signal?.throwIfAborted();
-    this.calls.push({sessionId:options.sessionId,ids:options.messages.flatMap(m=>m.id?[m.id]:[]),tools:(options.tools??[]).map(t=>t.name)});
+    this.calls.push({sessionId:options.sessionId,purpose:options.purpose,ids:options.messages.flatMap(m=>m.id?[m.id]:[]),tools:(options.tools??[]).map(t=>t.name)});
+    if(options.tools?.some(tool=>tool.name==='super_bot_manage')) {
+      const trigger=options.messages.findLast(m=>m.role==='user'&&(m.source?.kind==='user'||m.source?.kind==='super-bot-manager'));
+      const text=trigger?.content.filter(b=>b.type==='text').map(b=>b.text).join('')??'';
+      const later=trigger?options.messages.slice(options.messages.indexOf(trigger)+1):[];
+      const calls=later.flatMap(m=>m.content.filter(b=>b.type==='tool-call'&&b.name==='super_bot_manage'));
+      const last=calls.at(-1);const prior=last?.type==='tool-call'?JSON.parse(last.arguments) as Record<string,unknown>:null;
+      let value:Record<string,any>|undefined;
+      for(const message of later.filter(m=>m.role==='tool'))for(const block of message.content)if(block.type==='text')try{value=JSON.parse(block.text);}catch{}
+      let plan:Record<string,unknown>|null=null;
+      if(!prior) {
+        const foreign=text.match(/CROSS_BOT:([^\s]+)/)?.[1];
+        if(foreign)plan={action:'detail',taskId:foreign};
+        else if(trigger?.source?.kind==='user'&&text.includes('MANAGER_PROBE'))plan={action:'create',goal:'Manager 生成合成说明',scope:'专用任务目录，不访问网络',acceptance:'result.md 包含两项事实并已回读'};
+        else if(trigger?.source?.kind==='super-bot-manager')plan={action:'list'};
+      }else if(prior.action==='list'&&value?.items) {
+        const tasks=value.items as {id:string;rowVersion:number;status:string;controlMode:string;managerReviewed?:boolean}[];
+        const review=tasks.find(t=>t.status==='review'&&t.controlMode==='auto'&&!t.managerReviewed);
+        const queued=tasks.find(t=>t.status==='unscheduled'&&t.controlMode==='auto');
+        if(review)plan={action:'detail',taskId:review.id};else if(queued)plan={action:'dispatch',taskId:queued.id,expectedRowVersion:queued.rowVersion};
+      }else if((prior.action==='create'||value?.prepared)&&value?.task)plan={action:'dispatch',taskId:value.task.id,expectedRowVersion:value.task.rowVersion};
+      else if(prior.action==='detail'&&value?.result&&value?.task?.lifecycle==='review')plan={action:'review',taskId:value.task.id,expectedRowVersion:value.task.rowVersion,resultId:value.result.id,verdict:'accept',note:'已通过 detail 读取文件内容：含标题、两项事实，并有回读记录。默认提交用户最终验收。'};
+      if(plan) {
+        const id=ToolCallId(randomUUID()),args=JSON.stringify(plan);
+        yield {type:'block-start',index:0,blockType:'tool-call'};yield {type:'tool-call-delta',index:0,id,name:'super_bot_manage',argumentsDelta:args};
+        yield {type:'block-end',index:0,block:{type:'tool-call',id,name:'super_bot_manage',arguments:args}};yield {type:'finish',reason:{kind:'tool-calls'}};return;
+      }
+      yield {type:'block-start',index:0,blockType:'text'};yield {type:'text-delta',index:0,text:'确定性管理轮次已结束，请查看工作台。'};
+      yield {type:'block-end',index:0,block:{type:'text',text:'确定性管理轮次已结束，请查看工作台。'}};yield {type:'finish',reason:{kind:'stop'}};return;
+    }
     const workInput=options.messages.findLast(m=>m.role==='user'&&m.source?.kind==='super-bot');
     if(workInput) {
       const body=workInput.content.filter(b=>b.type==='text').map(b=>b.text).join('');
@@ -201,10 +231,18 @@ export function apply(ctx:Context) {
   }
   ctx.effect(()=>ctx.connection.fetch.register({path:'/api/super-bot-probe',methods:['POST'],requestBody:'buffered',
     fetch:async request=>{try{
-      const body=await request.json() as {action?:string;sessionId?:string};
-      if(body.action==='select-test-model') {
+      const body=await request.json() as {action?:string;sessionId?:string;text?:string};
+      if(body.action==='select-test-model'||body.action==='native-prompt') {
         assert.ok(body.sessionId);const resolved=await ctx.sessionController.resolveAgent(SessionId(body.sessionId));
         assert.ok('agent' in resolved);assert.ok(resolved.agent.session.header.cwd?.startsWith(join(home!,'super-bot')+'/'));
+        if(body.action==='native-prompt') {
+          assert.equal(resolved.agent.model.current()?.provider,provider);assert.ok(body.text&&body.text.length<=500);
+          await ctx.sessionController.prompt({requestId:randomUUID() as SessionRequestId,sessionId:resolved.agent.id,mode:'queue',content:[{type:'text',text:body.text}]},new AbortController().signal);
+          await bounded(resolved.agent.whenIdle(),'native synthetic prompt');
+          return Response.json({ok:true,tools:adapter.calls.filter(c=>c.sessionId===body.sessionId&&!c.purpose).at(-1)?.tools,
+            callKinds:adapter.calls.filter(c=>c.sessionId===body.sessionId).slice(-5).map(c=>({purpose:c.purpose??'conversation',tools:c.tools})),
+            refused:resolved.agent.session.snapshotEvents().some(e=>e.type==='tool/result'&&JSON.stringify(e.data).includes('只能查看或管理自己负责的任务'))});
+        }
         resolved.agent.model.select({provider,model:'deterministic'});return Response.json({ok:true});
       }
       return Response.json(await run());

@@ -38,6 +38,7 @@ export interface Task {
   createdAt: number;
   updatedAt: number;
   status: 'unscheduled' | 'needs-input' | 'paused' | 'manual' | 'completed' | 'cancelled' | 'review' | 'queued' | 'running' | 'stopping' | 'recovery';
+  managerReviewed?:boolean;
 }
 export interface TaskPage {
   items: Task[];
@@ -54,6 +55,8 @@ export interface Binding {
   requestedSessionId: string; sessionId: string | null; cwd: string;
   state: 'creating' | 'ready' | 'recovery' | 'released'; createdAt: number;
 }
+export interface ManagerBinding {id:string;botId:string;generation:number;configRevision:number;requestedSessionId:string;sessionId:string|null;cwd:string;state:'creating'|'ready'|'recovery'|'released';createdAt:number}
+export interface ManagerEvent {id:string;taskId:string|null;payload:string;state:string;createdAt:number}
 export interface Run {
   id:string; taskId:string; bindingId:string; sessionId:string; taskRevision:number; generation:number;
   inputId:string; state:'queued'|'running'|'settled'|'failed'|'cancelling'|'cancelled'|'interrupted';
