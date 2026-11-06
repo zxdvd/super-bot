@@ -185,3 +185,11 @@ ELECTRON_RUN_AS_NODE=1 '/Applications/DeepSeek Harness.app/Contents/MacOS/DeepSe
 - `npm run check` 在预算改动后 30 项核心测试通过；真实 `node scripts/smoke-budget.mjs steps` 模型调用恰好 40 次，Run cancelled、原生 idle/空 inbox、无候选，明确核对后仍 paused。
 - 独立第 18 轮 UI 自建任务复验：原生 1 turn/40 steps/Stopped，面板原因清楚；核对后刷新仍 paused，未发生第二轮。大文件本次人工验收标签复验通过，console warn/error 为空。
 - 10 分钟使用实际计时测试，任务已于 04:44 启动；本条写入时尚未到时，不视为通过。精确 Token/费用归因不在本次实现内。
+
+
+## 数据升级故障验证（2026-11-07 04:47）
+
+- 从初始提交 `5ef77cc` 冻结 schema 2 夹具，升级到 schema 6 后 Bot/Task/Input 保留并可准备/派发新的 Run。
+- 人为制造迁移 DDL 失败：新表与版本整体回滚，旧数据仍可读；修复夹具冲突后正常升级。
+- 独立子进程打开 WAL 事务，执行部分 ALTER/新表/版本更新但尚未提交时 SIGKILL；重开仍是完整 schema 2，无半个升级；随后实际 Store 构造可完成升级与 integrity_check。
+- `npm run typecheck` 与 `npm test`：33 项通过。故障测试仅操作系统临时目录，不中断测试宿主或个人数据库。此用例覆盖 SQLite 迁移事务的进程中断，不宣称模拟所有机器断电/磁盘损坏。
