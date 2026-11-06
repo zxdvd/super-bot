@@ -32,4 +32,4 @@
 
 目录限制是应用层约束，不是操作系统沙箱，也不把不同 Bot 作为安全租户。既有原生会话的历史、插件和用户手动操作仍属于当前单用户宿主。
 
-详细过程与版本见 [验收证据](../specs/changes/2026-11-super-bot-mvp/evidence.md)，各场景残余缺口见 [验收矩阵](../specs/changes/2026-11-super-bot-mvp/requirements.md)。运行数据仅在 `.runtime`，不随产品包发布。
+详细过程与版本见 [验收证据](../specs/changes/2026-11-super-bot-mvp/evidence.md)，各场景残余缺口见 [验收矩阵](../specs/changes/2026-11-super-bot-mvp/requirements.md)。本仓库测试数据保存在 `.runtime`，不随产品包发布；安装后的账本位置与外部成果范围见 [README](../README.md)。
