@@ -9,16 +9,19 @@ import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { mkdir } from 'node:fs/promises';
 import { Store } from './store.ts';
+import { DshExecution } from './dsh.ts';
 import { AppError, requiredText, optionalText, type WorkspaceStatus, type NewBot, type NewTask, type ControlMode } from './model.ts';
 
 export const name = 'super-bot';
-export const inject = ['connection', 'sessionController', 'workspaceRegistry'];
+export const inject = ['connection', 'sessionController', 'workspaceRegistry','agents','tools','jobs'];
 export const Config = Schema.object({ dataDir: Schema.string().description('Super Bot 本地数据目录') });
 
 export function apply(ctx: Context, config: { dataDir?: string } = {}): void {
   const dataDir = config.dataDir ?? join(process.env.DSH_HOME ?? join(homedir(), '.dsh'), 'super-bot');
   const store = new Store(join(dataDir, 'ledger.sqlite'));
-  ctx.effect(() => () => store.close());
+  const execution=new DshExecution(ctx,store,dataDir);
+  ctx.effect(() => async () => {await execution.dispose();store.close();});
+  execution.install();
   const require = createRequire(import.meta.url);
   const runtime = require('@deepseek-ai/dsh-agent/package.json').version as string;
   const startedAt = Date.now();
@@ -38,6 +41,14 @@ export function apply(ctx: Context, config: { dataDir?: string } = {}): void {
         lifecycle: optionalText(payload.lifecycle,'状态',30), limit: payload.limit as number | undefined, offset: payload.offset as number | undefined,
       }) };
       if (endpoint === 'task.detail') return { ok: true, value: store.taskDetail(requiredText(payload.id,'任务标识',200)) };
+      if (endpoint === 'task.dispatch') return {ok:true,value:await execution.dispatch(requiredText(payload.requestId,'请求标识',200),requiredText(payload.id,'任务标识',200),payload.expectedRowVersion as number)};
+      if (endpoint === 'task.stop') return {ok:true,value:await execution.stop(requiredText(payload.requestId,'请求标识',200),requiredText(payload.id,'任务标识',200),payload.expectedRowVersion as number)};
+      if (endpoint === 'run.recover') return {ok:true,value:await execution.recover(requiredText(payload.requestId,'请求标识',200),requiredText(payload.id,'任务标识',200),payload.expectedRowVersion as number,payload.acknowledged)};
+      if (endpoint === 'result.accept') return {ok:true,value:await execution.accept(requiredText(payload.requestId,'请求标识',200),requiredText(payload.id,'任务标识',200),payload.expectedRowVersion as number,requiredText(payload.resultId,'成果标识',200))};
+      if (endpoint === 'result.reject') return {ok:true,value:store.rejectResult(requiredText(payload.requestId,'请求标识',200),requiredText(payload.id,'任务标识',200),payload.expectedRowVersion as number,requiredText(payload.resultId,'成果标识',200),requiredText(payload.text,'返工要求'))};
+      if (endpoint === 'attention.respond') return {ok:true,value:store.respondAttention(requiredText(payload.requestId,'请求标识',200),requiredText(payload.attentionId,'待办标识',200),payload.expectedRowVersion as number,requiredText(payload.text,'回答'))};
+      if (endpoint === 'session.prepare') return {ok:true,value:await execution.prepareSession(requiredText(payload.requestId,'请求标识',200),requiredText(payload.id,'任务标识',200),payload.expectedRowVersion as number)};
+      if (endpoint === 'session.reconcile') return {ok:true,value:await execution.reconcileBinding(requiredText(payload.id,'会话关联标识',200))};
       if (endpoint === 'task.control') return { ok: true, value: store.controlTask(requiredText(payload.requestId,'请求标识',200),
         requiredText(payload.id,'任务标识',200),payload.expectedRowVersion as number,payload.mode as ControlMode) };
       if (endpoint === 'task.revise') return { ok: true, value: store.reviseTask(requiredText(payload.requestId,'请求标识',200),

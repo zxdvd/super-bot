@@ -37,7 +37,7 @@ export interface Task {
   sessionId: string | null;
   createdAt: number;
   updatedAt: number;
-  status: 'unscheduled' | 'needs-input' | 'paused' | 'manual' | 'completed' | 'cancelled' | 'review';
+  status: 'unscheduled' | 'needs-input' | 'paused' | 'manual' | 'completed' | 'cancelled' | 'review' | 'queued' | 'running' | 'stopping' | 'recovery';
 }
 export interface TaskPage {
   items: Task[];
@@ -49,9 +49,23 @@ export interface TaskPage {
 }
 export interface NewBot { name: string; instructions: string }
 export interface NewTask { botId: string; goal: string; scope: string; acceptance: string; reviewPolicy: 'human' | 'bot' }
+export interface Binding {
+  id: string; taskId: string; generation: number; taskRevision: number;
+  requestedSessionId: string; sessionId: string | null; cwd: string;
+  state: 'creating' | 'ready' | 'recovery' | 'released'; createdAt: number;
+}
+export interface Run {
+  id:string; taskId:string; bindingId:string; sessionId:string; taskRevision:number; generation:number;
+  inputId:string; state:'queued'|'running'|'settled'|'failed'|'cancelling'|'cancelled'|'interrupted';
+  createdAt:number; finishedAt:number|null; note:string;
+}
+export interface RunInput {id:string; taskId:string; kind:string; content:string; state:string; messageId:string|null; messageJson:string|null; attentionId:string|null; createdAt:number}
+export interface Evidence {path:string;sha256:string;bytes:number}
+export interface WorkReport {kind:'progress'|'waiting'|'ready'|'blocked'|'failed';summary:string;checks?:string;evidence?:Evidence[]}
+export interface Result {id:string;runId:string;taskId:string;taskRevision:number;summary:string;checks:string;evidence:Evidence[];createdAt:number;humanAcceptedAt:number|null}
 export interface Attention {
   id: string; taskId: string; kind: 'input' | 'approval' | 'review' | 'recovery';
-  question: string; taskRevision: number; state: 'open' | 'resolved' | 'stale'; createdAt: number;
+  question: string; taskRevision: number; state: 'open' | 'responding' | 'resolved' | 'stale'; createdAt: number;
 }
 
 export function taskStatus(task: Pick<Task, 'lifecycle' | 'controlMode' | 'scope' | 'acceptance'>): Task['status'] {

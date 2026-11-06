@@ -5,10 +5,14 @@ import type { Agent } from '@deepseek-ai/dsh-agent';
 import type {} from '@deepseek-ai/dsh-tools';
 import type {} from '@deepseek-ai/dsh-api-session-controller';
 import type {} from '@deepseek-ai/dsh-workspace';
+import type { JobOutcome } from '@deepseek-ai/dsh-jobs';
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import { mkdir, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
+import { Store } from '../src/store.ts';
+import { DshExecution } from '../src/dsh.ts';
+import { SessionId } from '@deepseek-ai/dsh-session/types';
 
 declare module '@deepseek-ai/dsh-llm' {
   interface MessageSourceMap {
@@ -16,7 +20,7 @@ declare module '@deepseek-ai/dsh-llm' {
   }
 }
 export const name = 'super-bot-probe';
-export const inject = ['llm','tools','sessionController','workspaceRegistry','connection'];
+export const inject = ['llm','tools','sessionController','workspaceRegistry','connection','agents','jobs'];
 const provider = 'super-bot-probe';
 const toolName = 'super_bot_probe_report';
 
@@ -27,6 +31,31 @@ class ProbeAdapter extends LlmAdapter {
   async *stream(options: GenerateOptions): AsyncIterable<StreamChunk> {
     options.signal?.throwIfAborted();
     this.calls.push({sessionId:options.sessionId,ids:options.messages.flatMap(m=>m.id?[m.id]:[]),tools:(options.tools??[]).map(t=>t.name)});
+    const workInput=options.messages.findLast(m=>m.role==='user'&&m.source?.kind==='super-bot');
+    if(workInput) {
+      const body=workInput.content.filter(b=>b.type==='text').map(b=>b.text).join('');
+      if(body.includes('Goal: STOP_PROBE')) {
+        await new Promise<void>(resolve=>{if(options.signal?.aborted)resolve();else options.signal?.addEventListener('abort',()=>resolve(),{once:true});});
+        options.signal?.throwIfAborted();
+      }
+      const cwd=body.match(/Working directory: (.+)/)?.[1];assert.ok(cwd);
+      const later=options.messages.slice(options.messages.indexOf(workInput)+1);
+      const calls=later.flatMap(m=>m.content.filter(b=>b.type==='tool-call').map(b=>b.name));
+      const file=join(cwd,'result.md');
+      const hasAnswer=options.messages.some(m=>m.content.some(b=>b.type==='text'&&b.text.includes('Additional user input (answer):')));
+      const needsAnswer=body.includes('Goal: ASK_PROBE')&&!hasAnswer;
+      const planned=needsAnswer&&!calls.includes('super_bot_report')?{name:'super_bot_report',args:{kind:'waiting',summary:'请说明文档面向谁？'}}:
+        !calls.includes('write')?{name:'write',args:{file_path:file,content:'# 合成成果\n\n事实一：这份文档由隔离测试模型生成。\n事实二：测试没有访问网络或使用模型凭证。\n'+(body.includes('Additional user input (rework):')?'\n修订：已按返工要求补充说明。\n':'')}}:
+        !calls.includes('read')?{name:'read',args:{file_path:file}}:
+        !calls.includes('super_bot_report')?{name:'super_bot_report',args:{kind:'ready',summary:'已生成并回读两项事实的说明文件。',checks:'result.md 包含标题和两项事实；已用原生 read 工具回读核对。',files:[file]}}:null;
+      if(planned) {
+        const id=ToolCallId(randomUUID()),args=JSON.stringify(planned.args);
+        yield {type:'block-start',index:0,blockType:'tool-call'};
+        yield {type:'tool-call-delta',index:0,id,name:planned.name,argumentsDelta:args};
+        yield {type:'block-end',index:0,block:{type:'tool-call',id,name:planned.name,arguments:args}};
+        yield {type:'finish',reason:{kind:'tool-calls'}};return;
+      }
+    }
     const lastUser = options.messages.filter(m=>m.role==='user'&&m.source?.kind==='super-bot-probe').at(-1);
     const text = lastUser?.content.filter(b=>b.type==='text').map(b=>b.text).join('') ?? '';
     const userIndex=options.messages.indexOf(lastUser!);
@@ -105,6 +134,25 @@ export function apply(ctx:Context) {
       assert.equal(executed.filter(id=>id===outsider.id).length,0);
       assert.ok(outsider.session.snapshotEvents().some(e=>e.type==='tool/result'), JSON.stringify(outsider.session.snapshotEvents()));
       checks.push('another session cannot see or dispatch the worker tool');
+      const child=await worker.ctx.agents.create({sessionId:SessionId(`session-${randomUUID()}`),parentAgent:worker,meta:{cwd,parentSession:worker.id,origin:'subagent',delegationDepth:1},agentOptions:{provider,model:'deterministic'}});
+      try {
+        assert.equal(ctx.agents.isOwnedBy(child.agent.id,worker),true);
+        child.agent.followup(input('CALL_REPORT'));await bounded(child.agent.whenIdle(),'child unauthorized report');
+        assert.ok(adapter.calls.some(c=>c.sessionId===child.agent.id));
+        assert.ok(adapter.calls.filter(c=>c.sessionId===child.agent.id).every(c=>!c.tools.includes(toolName)));
+        assert.equal(executed.filter(id=>id===child.agent.id).length,0);
+        checks.push('child agent inherits restrictions but cannot acquire root report authority');
+      }finally{await child.dispose();}
+      let finishJob!:(result:JobOutcome)=>void;let cancelRequested=false;
+      const jobId=ctx.jobs.start({kind:'bash',label:'Synthetic deferred settlement (no process)',owner:worker.id,
+        run:()=>({cancel:()=>{cancelRequested=true;},done:new Promise<JobOutcome>(resolve=>{finishJob=resolve;})})});
+      try {
+        await worker.whenIdle();assert.equal(ctx.jobs.get(jobId,worker.id).status,'running');
+        assert.equal(ctx.jobs.kill(jobId,worker.id,'probe'),'requested');assert.equal(cancelRequested,true);
+        assert.equal(ctx.jobs.get(jobId,worker.id).status,'stopping');
+        finishJob({status:'killed'});assert.equal((await ctx.jobs.wait(jobId,1000,worker.id)).status,'killed');
+        checks.push('agent idle and job cancel receipt do not imply background work has settled');
+      }finally{finishJob({status:'killed'});}
       const paused=await makeAgent();
       let entered!:()=>void;const atPreparation=new Promise<void>(resolve=>{entered=resolve;});
       const unhook=paused.ctx.on('agent/pre-step',async(payload,next)=>{
@@ -127,12 +175,39 @@ export function apply(ctx:Context) {
       checks.push('targeted input removal preserves unrelated input');
       // The test has no reason to execute this remaining synthetic message.
       paused.inbox.remove(human.id);
+      const ledgerPath=join(home!,'super-bot',`binding-probe-${randomUUID()}.sqlite`);
+      let ledger=new Store(ledgerPath);
+      try {
+        const bot=ledger.createBot('b',{name:'Contract probe',instructions:'Synthetic only'});
+        const task=ledger.createTask('t',{botId:bot.id,goal:'Lost session receipt',scope:'probe directory',acceptance:'one session',reviewPolicy:'human'});
+        const binding=ledger.beginBinding('prepare',task.id,1,cwd);
+        assert.equal(ledger.claimBindingCreation(binding.id),true);
+        const created=await ctx.sessionController.create({workspaceId:workspace.id,sessionId:SessionId(binding.requestedSessionId)});
+        assert.equal(created.sessionId,binding.requestedSessionId);
+        // Deliberately drop the successful receipt before persisting it, then reopen the ledger.
+        ledger.close();ledger=new Store(ledgerPath);
+        assert.equal(ledger.claimBindingCreation(binding.id),false);
+        const execution=new DshExecution(ctx,ledger,join(home!,'super-bot'));
+        const recovered=await execution.reconcileBinding(binding.id);
+        assert.equal(recovered.sessionId,created.sessionId);assert.equal(recovered.state,'ready');
+        assert.deepEqual(await execution.reconcileBinding(binding.id),recovered);
+        assert.equal(ledger.db.prepare('SELECT count(*) AS n FROM bindings').get()?.n,1);
+        checks.push('lost session-create receipt reconciles the preassigned session after ledger restart');
+      }finally{ledger.close();}
       const result={ok:true,checks,sessionIds:agents.map(a=>a.id),at:new Date().toISOString()};
       await writeFile(join(home!,'super-bot','contract-probe-result.json'),JSON.stringify(result,null,2));
       return result;
     } finally {for(const agent of agents){allowed.delete(agent.id);agent.cancel({kind:'user'},{keepInbox:true});}running=false;}
   }
   ctx.effect(()=>ctx.connection.fetch.register({path:'/api/super-bot-probe',methods:['POST'],requestBody:'buffered',
-    fetch:async()=>{try{return Response.json(await run());}catch(error){return Response.json({ok:false,error:String(error),stack:error instanceof Error?error.stack:undefined},{status:500});}},
+    fetch:async request=>{try{
+      const body=await request.json() as {action?:string;sessionId?:string};
+      if(body.action==='select-test-model') {
+        assert.ok(body.sessionId);const resolved=await ctx.sessionController.resolveAgent(SessionId(body.sessionId));
+        assert.ok('agent' in resolved);assert.ok(resolved.agent.session.header.cwd?.startsWith(join(home!,'super-bot')+'/'));
+        resolved.agent.model.select({provider,model:'deterministic'});return Response.json({ok:true});
+      }
+      return Response.json(await run());
+    }catch(error){return Response.json({ok:false,error:String(error),stack:error instanceof Error?error.stack:undefined},{status:500});}},
   }));
 }

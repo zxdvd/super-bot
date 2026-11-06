@@ -99,3 +99,38 @@ test('exclusive database ownership prevents a second host and releases on close'
     first.close(); const next=new Store(file); next.close();
   } finally {rmSync(dir,{recursive:true,force:true});}
 });
+
+test('session creation intent commits once and uncertain delivery never becomes a second creation',()=>{
+  const store=new Store(':memory:');
+  try {
+    const bot=store.createBot('b',{name:'Bot',instructions:'测试'});
+    const task=store.createTask('t',{botId:bot.id,goal:'写文件',scope:'专用目录',acceptance:'文件存在',reviewPolicy:'human'});
+    const binding=store.beginBinding('prepare',task.id,1,'/tmp/synthetic-task');
+    assert.deepEqual(store.beginBinding('prepare',task.id,1,'/tmp/synthetic-task'),binding);
+    assert.equal(store.claimBindingCreation(binding.id),true);
+    assert.equal(store.claimBindingCreation(binding.id),false);
+    store.bindingRecovery(binding.id);store.bindingRecovery(binding.id);
+    assert.equal(store.taskDetail(task.id).attentions.filter(a=>a.state==='open').length,1);
+    assert.equal(store.activeBinding(task.id)?.state,'recovery');
+    assert.throws(()=>store.confirmBinding(binding.id,'wrong-session'),/不同会话/);
+    const confirmed=store.confirmBinding(binding.id,binding.requestedSessionId);
+    assert.equal(confirmed.state,'ready');
+    assert.deepEqual(store.confirmBinding(binding.id,binding.requestedSessionId),confirmed);
+    assert.equal(store.taskDetail(task.id).attentions.filter(a=>a.state==='open').length,0);
+    assert.equal(store.getTask(task.id).sessionId,binding.requestedSessionId);
+    assert.equal(store.db.prepare('SELECT count(*) AS n FROM bindings').get()?.n,1);
+    assert.throws(()=>store.reviseTask('edit',task.id,store.getTask(task.id).rowVersion,{goal:'changed',scope:'scope',acceptance:'accept'}),/先核对执行状态/);
+  } finally {store.close();}
+});
+
+test('failed binding event rolls back intent, outbox and task version together',()=>{
+  const store=new Store(':memory:');
+  try {
+    const bot=store.createBot('b',{name:'Bot',instructions:'测试'});
+    const task=store.createTask('t',{botId:bot.id,goal:'写文件',scope:'专用目录',acceptance:'文件存在',reviewPolicy:'human'});
+    store.db.exec("CREATE TRIGGER reject_binding BEFORE INSERT ON events WHEN NEW.kind='session.preparing' BEGIN SELECT RAISE(ABORT,'binding fault'); END");
+    assert.throws(()=>store.beginBinding('prepare',task.id,1,'/tmp/test'),/binding fault/);
+    assert.equal(store.activeBinding(task.id),null);assert.equal(store.getTask(task.id).rowVersion,1);
+    assert.equal(store.db.prepare('SELECT count(*) AS n FROM outbox').get()?.n,0);
+  }finally{store.close();}
+});

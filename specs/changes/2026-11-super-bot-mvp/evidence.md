@@ -107,3 +107,17 @@ ELECTRON_RUN_AS_NODE=1 '/Applications/DeepSeek Harness.app/Contents/MacOS/DeepSe
 | 定向撤回 pending 输入 | supported：仅删除指定 MessageId，保留其他输入 | 不清空用户收件箱 |
 
 准备阶段取消的测试先失败，反查真实行为后固定为上表契约，不修改上游。后台 job、子 Agent 收敛、原生审批、插件热重载、真实模型成果尚未验证；SB-02 不勾选完成。SB-03 的纯账本交付已验证，执行 Outbox 将随 SB-06 使用。
+
+
+## 文件执行闭环与停止（2026-11-07 03:05）
+
+- 新增持久 Binding / Run / Input / Result / Review；schema 当前 5。Session 创建意图及投递 Outbox 在外部调用前落账；请求回执查询先于运行忙闲检查，重复请求返回同一 Run。
+- `npm run check`：18 项核心测试通过，包含候选与验收分离、资源容量/目录重叠、停止收敛前保留资源、原生介入永久终止旧 Run 授权、回答未进入上下文前不关闭问题、取消回答重新开放问题、返工不修改目标版本、文件哈希及目录 symlink 检查。
+- `node scripts/probe.mjs`：新增真实子 Agent 越权拒绝、作业 running→停止请求→stopping→生产者确认 killed；Agent idle 期间作业仍 running。Session 创建成功但丢弃回执、关闭重开账本后，按预分配 ID 找回同一 Session。探针未启动实际 shell 进程。
+- `npm run smoke:execution`：真实 DSH 的 write/read/super_bot_report 三步生成 132 字节合成文件，输入 entered、Run settled、Task review；修改文件后验收拒绝，恢复后同一成果接受一次。重复派发/验收无重复对象。延迟测试模型 STOP_PROBE 被停止后 Run cancelled、Task paused，未误标完成。
+- `npm run smoke:workflow`：ASK_PROBE 提问→保存一次回答→下一 Run 消费原回答 Input→问题 resolved→ready→人工拒绝并保存返工 Input→新 Run/新 Result→文件增加修订文字→接受；taskRevision 始终 1。
+- 独立试用第 5 轮验证两个任务使用不同目录/会话；第 6 轮仅经 UI 完成模型选择、执行、检查原生 diff、接受、重载。发现并修复完成后控制按钮未禁用、筛选列表移除后残留详情。
+
+当前 Worker 阶段只放行专用目录 read/write/edit 与报告工具；Shell/子 Agent 尚未开放。真实模型、外部副作用、完整原生审批和故障注入仍待验证。后台作业探针证明了查询/停止契约，不宣称任意外部进程已可可靠停止。Manager 尚未接入。
+
+独立试用第 7 轮：UI 完成回答/返工/接受，原生文件 132→176 字节且新增修订说明；STOP_PROBE 原生显示 Stopped，面板暂停且未完成；完成按钮与筛选详情修复复验通过，无 console error/warn。

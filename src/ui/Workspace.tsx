@@ -1,14 +1,14 @@
 import { useEffect, useRef, useState, type FormEvent } from 'react';
-import type { Attention, Bot, NewTask, Task, TaskPage, WorkspaceStatus } from '../model.ts';
+import type { Attention, Binding, Bot, Task, TaskPage, WorkspaceStatus,Run,RunInput,Result } from '../model.ts';
 import { styles } from './styles.ts';
 
 export interface WorkspaceApi {
   call<T>(action: string, payload?: Record<string, unknown>, signal?: AbortSignal): Promise<T>;
   openSession(id: string): void;
 }
-type Detail = { task: Task; attentions: Attention[]; events: { id: number; kind: string; createdAt: number }[] };
-const labels: Record<Task['status'],string> = { unscheduled:'待安排', 'needs-input':'等你补充', paused:'已暂停', manual:'人工接管', completed:'已完成', cancelled:'已取消', review:'待验收' };
-const eventLabels: Record<string,string> = { 'task.created':'创建任务', 'task.revised':'更新目标与验收条件', 'task.control':'更新管理方式' };
+type Detail = { task: Task; binding: Binding | null;run:Run|null;input:RunInput|null;result:Result|null; attentions: Attention[]; events: { id: number; kind: string; createdAt: number }[] };
+const labels: Record<Task['status'],string> = { unscheduled:'待安排', 'needs-input':'等你补充', paused:'已暂停', manual:'人工接管', completed:'已完成', cancelled:'已取消', review:'待验收',queued:'待投递',running:'执行中',stopping:'正在停止',recovery:'待核对' };
+const eventLabels: Record<string,string> = { 'task.created':'创建任务', 'task.revised':'更新目标与验收条件', 'task.control':'更新管理方式', 'session.preparing':'准备执行会话', 'session.ready':'执行会话已关联', 'session.recovery':'会话创建待核对','run.queued':'已接收执行请求','input.entered':'任务输入已进入模型上下文','work.report':'收到工作报告','run.settled':'执行已收敛','run.recovery':'执行需要核对','result.accepted':'用户接受成果','native.intervention':'原生会话人工介入','run.stop-requested':'已请求停止','run.cancelled':'已核对停止','attention.answered':'回答已保存','result.rejected':'返工要求已保存','run.recovery-confirmed':'用户完成恢复核对' };
 const time = (value:number) => new Date(value).toLocaleString('zh-CN',{month:'numeric',day:'numeric',hour:'2-digit',minute:'2-digit'});
 
 function BotForm({ submit, cancel, busy }: { submit:(data:Record<string,unknown>)=>Promise<boolean>; cancel:()=>void; busy:boolean }) {
@@ -43,6 +43,15 @@ function TaskForm({ task, submit, cancel, busy }: { task?:Task; submit:(data:Rec
   </form>;
 }
 
+function ReplyForm({label,busy,submit}:{label:string;busy:boolean;submit:(text:string,requestId:string)=>Promise<boolean>}) {
+  const [text,setText]=useState('');const request=useRef(crypto.randomUUID());
+  return <form className="form" onSubmit={e=>{e.preventDefault();if(text.trim())void submit(text,request.current);}}><label>{label}<textarea required maxLength={10000} value={text} onChange={e=>{setText(e.target.value);request.current=crypto.randomUUID();}}/></label><button disabled={busy||!text.trim()}>保存{label}</button><p className="muted" style={{fontSize:12}}>保存后点击“开始执行”投递。暂停期间会保留输入。</p></form>;
+}
+function RecoveryPanel({busy,confirm}:{busy:boolean;confirm:()=>void}) {
+  const [checked,setChecked]=useState(false);
+  return <div className="attention-box"><p>请打开原生会话，检查文件与可能的外部效果。确认后会释放本次占用，任务保持暂停，不会重放旧输入。</p><label className="check"><input type="checkbox" checked={checked} onChange={e=>setChecked(e.target.checked)}/>我已检查，确认可以结束本次尝试</label><button disabled={busy||!checked} onClick={confirm}>完成核对</button></div>;
+}
+
 export function Workspace({ api }: { api:WorkspaceApi }) {
   const [status,setStatus]=useState<WorkspaceStatus>(); const [bots,setBots]=useState<Bot[]>([]);
   const [botId,setBotId]=useState(''); const [page,setPage]=useState<TaskPage>(); const [selected,setSelected]=useState('');
@@ -60,7 +69,8 @@ export function Workspace({ api }: { api:WorkspaceApi }) {
           selected?api.call<Detail>('task.detail',{id:selected},controller.signal):undefined,
         ]);
         if(controller.signal.aborted)return;
-        setStatus(s);setBots(b);setPage(p);setDetail(d);setOnline(true);setLoading(false);setSynced(Date.now());failures=0;
+        setStatus(s);setBots(b);setPage(p);
+        if(selected&&p&&!p.items.some(t=>t.id===selected)){setSelected('');setDetail(undefined);setForm(null);}else setDetail(d);setOnline(true);setLoading(false);setSynced(Date.now());failures=0;
         if(!botId&&b.length)setBotId(b[0].id);
       } catch(e){if(controller.signal.aborted)return;setOnline(false);setLoading(false);setError(e instanceof Error?e.message:'无法连接宿主。');failures++;}
       timer=setTimeout(pull,Math.min(30000,5000*2**failures));
@@ -80,22 +90,34 @@ export function Workspace({ api }: { api:WorkspaceApi }) {
     {error&&<div className="notice error" role="alert"><span>{error}</span><button onClick={()=>{setError('');setRefresh(n=>n+1);}}>刷新状态</button></div>}
     {!online&&!loading&&<div className="notice">当前显示上次同步的快照。重新连接前，操作暂不可用。</div>}
     {loading?<div className="empty">正在读取工作台…</div>:<>
-      {bots.length>0&&<div className="toolbar"><select aria-label="选择 Bot" value={botId} onChange={e=>pickBot(e.target.value)}>{bots.map(b=><option key={b.id} value={b.id}>{b.name}</option>)}</select><button disabled={!online||busy} onClick={()=>setForm(form==='bot'?null:'bot')}>＋ 新 Bot</button><span className="spacer"/><button className="primary" disabled={!online||busy||!bot} onClick={()=>setForm(form==='task'?null:'task')}>＋ 新任务</button></div>}
+      {bots.length>0&&<div className="toolbar"><select aria-label="选择 Bot" disabled={busy} value={botId} onChange={e=>pickBot(e.target.value)}>{bots.map(b=><option key={b.id} value={b.id}>{b.name}</option>)}</select><button disabled={!online||busy} onClick={()=>setForm(form==='bot'?null:'bot')}>＋ 新 Bot</button><span className="spacer"/><button className="primary" disabled={!online||busy||!bot} onClick={()=>setForm(form==='task'?null:'task')}>＋ 新任务</button></div>}
       {form==='bot'&&<BotForm busy={busy||!online} cancel={()=>{setForm(null);setError('');}} submit={data=>mutate<Bot>('bot.create',data,b=>{pickBot(b.id);setForm(null);})}/>}
       {bots.length===0&&form!=='bot'&&<div className="welcome"><h2>先认识你的第一位 Bot</h2><p className="muted" style={{lineHeight:1.8}}>定义长期职责，再把具体目标交给它。任务与成果会保存在这里。</p><ul><li>不同 Bot，各自负责自己的工作</li><li>任务有明确目标、范围和验收条件</li><li>需要你回答或验收时，集中呈现</li></ul><button className="primary" disabled={!online} onClick={()=>setForm('bot')}>创建第一个 Bot</button></div>}
       {bot&&<>
         <div className="bot-intro"><h2>{bot.name}</h2><p>{bot.instructions}</p></div>
-        <div className="notice"><span>任务账本已可用。自动执行正在接入，当前创建的任务会保存为待安排。</span></div>
+        <div className="notice"><span>当前支持专用目录内的文件任务。准备会话并选择模型后，可手动开始执行；成果默认由你验收。</span></div>
         {(form==='task'||(form==='edit'&&detail))&&<TaskForm key={form==='edit'?detail!.task.id:'new'} task={form==='edit'?detail!.task:undefined} busy={busy||!online} cancel={()=>{setForm(null);setError('');}} submit={data=>mutate<Task>(form==='edit'?'task.revise':'task.create',form==='edit'?{...data,id:detail!.task.id,expectedRowVersion:detail!.task.rowVersion}:{...data,botId},t=>{setSelected(t.id);setForm(null);setOffset(0);setFilter('');setQuery('');})}/>}
         <div className="stats">{([['','全部','all'],['open','未完成','open'],['review','待验收','review'],['completed','已完成','completed'],['cancelled','已取消','cancelled']] as const).map(([value,label,key])=><button key={key} className={filter===value?'active':''} onClick={()=>{setFilter(value);setOffset(0);setSelected('');setDetail(undefined);setForm(null);}}>{label}<strong>{page?.counts[key]??'—'}</strong></button>)}</div>
         <div className="grid"><section className="card" aria-label="任务列表"><div className="card-head"><input aria-label="搜索任务" placeholder="搜索任务目标…" value={query} onChange={e=>{setQuery(e.target.value);setOffset(0);setSelected('');setDetail(undefined);setForm(null);}}/></div>
-          {!page?<div className="empty">读取任务…</div>:page.items.length===0?<div className="empty"><h2>{query||filter?'没有匹配的任务':'还没有任务'}</h2><p>{query||filter?'调整关键词或状态筛选。':'把一个具体目标放进来，先写清怎样算完成。'}</p>{!query&&!filter&&<button disabled={!online} onClick={()=>setForm('task')}>新建任务</button>}</div>:page.items.map(t=><button key={t.id} className={`task ${selected===t.id?'selected':''}`} aria-pressed={selected===t.id} onClick={()=>{setSelected(t.id);setForm(null);}}><div className="task-top"><span className="task-goal">{t.goal}</span><span className={`badge ${t.status==='needs-input'?'attention':''}`}>{labels[t.status]}</span></div><div className="task-meta"><span>{t.reviewPolicy==='human'?'由你最终验收':'Bot 可最终验收'}</span><span>{time(t.updatedAt)}</span></div></button>)}
+          {!page?<div className="empty">读取任务…</div>:page.items.length===0?<div className="empty"><h2>{query||filter?'没有匹配的任务':'还没有任务'}</h2><p>{query||filter?'调整关键词或状态筛选。':'把一个具体目标放进来，先写清怎样算完成。'}</p>{!query&&!filter&&<button disabled={!online} onClick={()=>setForm('task')}>新建任务</button>}</div>:page.items.map(t=><button key={t.id} className={`task ${selected===t.id?'selected':''}`} aria-pressed={selected===t.id} disabled={busy} onClick={()=>{setSelected(t.id);setDetail(undefined);setForm(null);}}><div className="task-top"><span className="task-goal">{t.goal}</span><span className={`badge ${t.status==='needs-input'?'attention':''}`}>{labels[t.status]}</span></div><div className="task-meta"><span>{t.reviewPolicy==='human'?'由你最终验收':'Bot 可最终验收'}</span><span>{time(t.updatedAt)}</span></div></button>)}
           {page&&<footer className="pagination"><span>{page.total} 项任务</span><div><button disabled={offset===0} onClick={()=>{setOffset(Math.max(0,offset-25));setSelected('');setDetail(undefined);}}>上一页</button> <button disabled={offset+25>=page.total} onClick={()=>{setOffset(offset+25);setSelected('');setDetail(undefined);}}>下一页</button></div></footer>}
         </section>
         <section className="card" aria-label="任务详情">{!detail?<div className="empty"><h2>任务的来龙去脉</h2><p>选择任务，查看范围、验收条件、待办和关键事件。</p></div>:<div className="card-body"><p className="detail-goal">{detail.task.goal}</p><span className={`badge ${detail.task.status==='needs-input'?'attention':''}`}>{labels[detail.task.status]}</span>
-          {detail.attentions.filter(a=>a.state==='open').map(a=><div className="attention-box" key={a.id}><strong>需要你补充</strong><br/>{a.question}</div>)}
+          {detail.attentions.filter(a=>a.state==='open'||a.state==='responding').map(a=><div className="attention-box" key={a.id}><strong>{a.kind==='recovery'?'需要核对':a.kind==='review'?'请验收成果':'需要你补充'}</strong><br/>{a.question}{a.state==='responding'?<p>回答已保存，等待投递和进入上下文。</p>:a.kind==='input'&&detail.binding&&<ReplyForm key={a.id} label="回答" busy={!online||busy} submit={(text,requestId)=>mutate('attention.respond',{requestId,attentionId:a.id,expectedRowVersion:detail.task.rowVersion,text})}/>}</div>)}
           <dl><dt>任务范围</dt><dd>{detail.task.scope||'尚未填写'}</dd><dt>验收条件</dt><dd>{detail.task.acceptance||'尚未填写'}</dd><dt>最终验收</dt><dd>{detail.task.reviewPolicy==='human'?'由你确认':'已授权 Bot 验收'}</dd></dl>
-          <div className="actions"><button disabled={!online||busy} onClick={()=>setForm('edit')}>修改任务</button><button disabled={!online||busy} onClick={()=>mutate('task.control',{requestId:crypto.randomUUID(),id:detail.task.id,expectedRowVersion:detail.task.rowVersion,mode:detail.task.controlMode==='auto'?'paused':'auto'})}>{detail.task.controlMode==='auto'?'暂停自动管理':'恢复自动管理'}</button></div>
+          <div className="actions"><button disabled={!online||busy||!!detail.binding} onClick={()=>setForm('edit')}>修改任务</button><button disabled={!online||busy||['completed','cancelled'].includes(detail.task.lifecycle)} onClick={()=>mutate('task.control',{requestId:crypto.randomUUID(),id:detail.task.id,expectedRowVersion:detail.task.rowVersion,mode:detail.task.controlMode==='auto'?'paused':'auto'})}>{detail.task.controlMode==='auto'?'暂停自动管理':'恢复自动管理'}</button></div>
+          {detail.run&&['running','queued','cancelling'].includes(detail.run.state)&&<div className="actions"><button disabled={!online||busy||detail.run.state==='cancelling'} onClick={()=>mutate('task.stop',{requestId:`stop:${detail.run!.id}:${detail.task.rowVersion}`,id:detail.task.id,expectedRowVersion:detail.task.rowVersion})}>{detail.run.state==='cancelling'?'正在核对停止…':'停止当前执行'}</button><span className="muted">停止后任务保留；不会清空你的原生输入。</span></div>}
+          <div className="session-box"><h3>执行会话</h3>
+            {!detail.binding?<><p className="muted">为这个任务创建专用工作目录和原生会话。准备会话不会调用模型。</p><button disabled={!online||busy||detail.task.status==='needs-input'} onClick={()=>mutate('session.prepare',{requestId:`prepare:${detail.task.id}:${detail.task.rowVersion}`,id:detail.task.id,expectedRowVersion:detail.task.rowVersion})}>准备执行会话</button></>:<>
+              <p className="muted" style={{overflowWrap:'anywhere'}}>{detail.binding.cwd}</p>
+              {detail.binding.state==='ready'?<><button onClick={()=>api.openSession(detail.binding!.sessionId!)}>打开任务会话</button> <button className="primary" disabled={!online||busy||detail.task.status!=='unscheduled'} onClick={()=>mutate('task.dispatch',{requestId:`dispatch:${detail.task.id}:${detail.task.rowVersion}`,id:detail.task.id,expectedRowVersion:detail.task.rowVersion})}>开始执行</button><p className="muted" style={{fontSize:12}}>首次执行前，请在任务会话选择模型。会话关联后暂锁定目标，避免执行版本不一致。</p></>:<><p>会话创建需要核对。</p><button disabled={!online||busy} onClick={()=>mutate('session.reconcile',{id:detail.binding!.id})}>核对会话</button></>}
+            </>}
+          </div>
+          {detail.task.status==='recovery'&&detail.run?.finishedAt&&<RecoveryPanel key={detail.task.id} busy={!online||busy} confirm={()=>mutate('run.recover',{requestId:`recover:${detail.run!.id}:${detail.task.rowVersion}`,id:detail.task.id,expectedRowVersion:detail.task.rowVersion,acknowledged:true})}/>}
+          {detail.input&&<p className="muted">任务输入：{({accepted:'已接收',enqueued:'已投递',entered:'已进入上下文',unknown:'送达状态待核对',discarded:'已撤回'} as Record<string,string>)[detail.input.state]??detail.input.state}</p>}
+          {detail.result&&<div className="attention-box"><h3>候选成果</h3><p>{detail.result.summary}</p><p style={{whiteSpace:'pre-wrap'}}>{detail.result.checks}</p><ul>{detail.result.evidence.map(file=><li key={file.path} style={{overflowWrap:'anywhere'}}>{file.path} <span className="muted">（{file.bytes} 字节）</span></li>)}</ul>
+            {detail.task.lifecycle==='completed'?<p>已由你接受。</p>:detail.task.lifecycle==='review'?<><p className="muted">请在任务会话检查文件。接受前会重新核对内容是否改变。</p><button className="primary" disabled={!online||busy||detail.task.lifecycle!=='review'} onClick={()=>mutate('result.accept',{requestId:`accept:${detail.result!.id}:${detail.task.rowVersion}`,id:detail.task.id,expectedRowVersion:detail.task.rowVersion,resultId:detail.result!.id})}>接受此成果并完成任务</button><ReplyForm key={detail.result.id} label="返工要求" busy={!online||busy} submit={(text,requestId)=>mutate('result.reject',{requestId,id:detail.task.id,expectedRowVersion:detail.task.rowVersion,resultId:detail.result!.id,text})}/></>:<p className="muted">这份结果尚不可验收；请查看当前任务状态。</p>}
+          </div>}
           <dl><dt>关键事件</dt><dd>{detail.events.map(e=><div className="event" key={e.id}>{time(e.createdAt)} · {eventLabels[e.kind]??e.kind}</div>)}</dd></dl><div className="muted" style={{fontSize:11}}>目标版本 {detail.task.taskRevision} · 修改 {detail.task.rowVersion}</div>
         </div>}</section></div>
       </>}

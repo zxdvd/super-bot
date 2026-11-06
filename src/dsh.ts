@@ -1,0 +1,160 @@
+/** The only execution adapter. Product state never depends on a DSH object. */
+import type { Context } from '@deepseek-ai/cordis';
+import type {} from '@deepseek-ai/dsh-api-session-controller';
+import type {} from '@deepseek-ai/dsh-workspace';
+import type {} from '@deepseek-ai/dsh-tools';
+import type {} from '@deepseek-ai/dsh-jobs';
+import type { Agent } from '@deepseek-ai/dsh-agent';
+import { createUserMessage,freezeMessage,type UserMessage } from '@deepseek-ai/dsh-llm';
+import { SessionId } from '@deepseek-ai/dsh-session/types';
+import { mkdir, realpath } from 'node:fs/promises';
+import { join } from 'node:path';
+import { AppError,requiredText,optionalText,type Binding,type Run,type WorkReport } from './model.ts';
+import type { Store } from './store.ts';
+import { collectEvidence,containedPath,verifyEvidence } from './evidence.ts';
+
+declare module '@deepseek-ai/dsh-llm' {
+  interface MessageSourceMap {'super-bot':{kind:'super-bot';taskId:string;runId:string;inputId:string;taskRevision:number;generation:number}}
+}
+
+export class DshExecution {
+  private creating=new Map<string,Promise<Binding>>();
+  private running=new Map<string,{agent:Agent;release:()=>void;done:Promise<void>}>();
+  private disposed=false;
+  constructor(private ctx:Context,private store:Store,private dataDir:string) {}
+  install():void {
+    this.ctx.effect(()=>this.ctx.tools.register({name:'super_bot_report',description:'Report progress, a question, a blockage, failure, or ready results to the task ledger. Ready requires files and acceptance checks. A ready report requests human review, it does not complete the task.',
+      parameters:{type:'object',properties:{kind:{type:'string',enum:['progress','waiting','ready','blocked','failed']},summary:{type:'string'},checks:{type:'string'},files:{type:'array',items:{type:'string'},maxItems:10}},required:['kind','summary'],additionalProperties:false},
+      output:{schema:{type:'object',properties:{accepted:{type:'boolean'},resultId:{type:'string'}},required:['accepted'],additionalProperties:false},render:(_args,value)=>[{type:'text',text:JSON.stringify(value)}]},
+      execute:async(args,exec)=>{
+        const run=this.store.heldRuns().find(r=>r.sessionId===exec.agent?.id&&r.finishedAt===null);
+        if(!run)throw new AppError('report-scope','当前会话没有可报告的执行。');
+        const data=args as Record<string,unknown>;const binding=this.store.getBinding(run.bindingId);
+        const report:WorkReport={kind:data.kind as WorkReport['kind'],summary:requiredText(data.summary,'报告内容'),checks:optionalText(data.checks,'验收说明')};
+        if(report.kind==='ready')report.evidence=await collectEvidence(binding.cwd,data.files);
+        exec.signal.throwIfAborted();
+        const result=this.store.workerReport(run.id,exec.callId,report);
+        if(report.kind!=='progress')exec.concludeTurn();return result;
+      },
+    },{when:({agent})=>this.store.heldRuns().some(r=>r.sessionId===agent.id&&r.finishedAt===null)}));
+    this.ctx.on('session/event',(session,event)=>{
+      if(this.disposed)return;
+      if(event.type==='user/message'&&event.data.source.kind==='super-bot') {
+        const source=event.data.source;
+        if(this.store.heldRuns().some(r=>r.id===source.runId&&r.sessionId===session.id&&r.inputId===source.inputId))this.store.inputEntered(source.runId,event.data.id,event.seq);
+      }
+      const messages=event.type==='agent/inbox/spliced'?event.data.inserted:event.type==='user/message'?[event.data]:[];
+      for(const message of messages)if(message.source.kind==='user'&&'rpcId' in message.source) {
+        const changed=this.store.nativeIntervention(session.id,message.id);
+        if(changed)for(const active of this.running.values())if(active.agent.id===session.id){active.agent.cancel({kind:'user'},{keepInbox:true});active.release();}
+      }
+    });
+    // A process restart cannot infer absence of an external effect from an idle fresh Agent.
+    for(const run of this.store.heldRuns())if(run.finishedAt===null)this.store.runRecovery(run.id,'宿主重新加载，需要核对上次输入和执行；没有自动重投。');
+  }
+  private assertQuiet(agent:Agent):void {
+    if(agent.status!=='idle'||agent.inbox.nextTurn.length||agent.inbox.nextStep.length)throw new AppError('session-busy','任务会话有活动或待处理输入，请先在原生会话核对。');
+    if(this.ctx.jobs.list(agent.id).some(job=>job.owner===agent.id&&['running','stopping'].includes(job.status)))throw new AppError('job-active','后台工作尚未停止，不能开始或确认执行结束。');
+    if(this.ctx.agents.list().some(child=>this.ctx.agents.isOwnedBy(child.id,agent)))throw new AppError('child-active','会话仍有子 Agent，需要先核对。');
+  }
+  async dispatch(requestId:string,taskId:string,rowVersion:number):Promise<Run> {
+    if(this.disposed)throw new AppError('unavailable','插件正在退出。');
+    const receipt=this.store.commandReceipt<Run>(requestId,'task.dispatch',{taskId,expectedRowVersion:rowVersion});
+    if(receipt)return this.store.getRun(receipt.id);
+    const b=this.store.activeBinding(taskId);if(!b?.sessionId||b.state!=='ready')throw new AppError('not-ready','请先准备执行会话。');
+    const resolved=await this.ctx.sessionController.resolveAgent(SessionId(b.sessionId));
+    if('error' in resolved)throw new AppError('session-unavailable','执行会话暂不可用，请核对。');
+    const agent=resolved.agent;this.assertQuiet(agent);
+    if(!agent.model.current())throw new AppError('model-required','请先打开任务会话选择模型，再回来开始执行。');
+    const run=this.store.reserveRun(requestId,taskId,rowVersion);
+    if(this.running.has(run.id)||run.finishedAt!==null)return this.store.getRun(run.id);
+    const task=this.store.getTask(taskId);const bot=this.store.getBot(task.botId);
+    let input=this.store.getRunInput(run.id);
+    if(!input.messageJson) {
+      const supplement=input.kind==='answer'||input.kind==='rework'?`\nAdditional user input (${input.kind}): ${input.content}`:'';
+      const message=createUserMessage({source:{kind:'super-bot',taskId,runId:run.id,inputId:run.inputId,taskRevision:run.taskRevision,generation:run.generation},content:[{type:'text',text:`You are executing one Super Bot task.\nBot responsibility: ${bot.instructions}\nGoal: ${task.goal}\nAuthorized scope: ${task.scope}\nAcceptance criteria: ${task.acceptance}\nWorking directory: ${b.cwd}${supplement}\nUse only read/write/edit in this directory. Shell and subagents are not enabled in this preview.\nReport with super_bot_report. Use waiting to ask a necessary question. For ready provide files and checks explaining every acceptance criterion. Never claim the task is accepted; the user decides.`}]});
+      input=this.store.saveRunMessage(run.id,message.id,JSON.stringify(message));
+    }
+    const releaseMask=agent.ctx.tools.restrict({allow:['read','write','edit','super_bot_report']});
+    const releaseGuard=agent.ctx.tools.guard(exec=>{
+      if(this.store.getRun(run.id).finishedAt!==null||this.store.getTask(taskId).controlMode==='manual')return 'This automatic run no longer has task authority.';
+      if(!['read','write','edit'].includes(exec.name))return;
+      try{const args=exec.arguments as {file_path?:unknown};if(typeof args.file_path!=='string')return 'A file_path is required';containedPath(b.cwd,args.file_path);}catch(error){return error instanceof Error?error.message:'File path refused';}
+    });
+    let released=false;const release=()=>{if(released)return;released=true;releaseGuard();releaseMask();};
+    try {
+      if(!this.store.claimDispatch(run.id)){release();this.store.runRecovery(run.id,'投递记录已经发出，但回执不完整。没有重复投递，请核对原生会话。');return this.store.getRun(run.id);}
+      agent.followup(freezeMessage(JSON.parse(input.messageJson!) as UserMessage));
+      this.store.inputEnqueued(run.id);
+      const deadline=setTimeout(()=>{const current=this.store.getTask(taskId);void this.stop(`budget:${run.id}`,taskId,current.rowVersion).catch(()=>this.store.runRecovery(run.id,'执行达到 10 分钟上限，需要核对停止结果。'));},10*60*1000);
+      deadline.unref();
+      const done=agent.whenIdle().then(()=>{
+        if(this.disposed)return;
+        this.assertQuiet(agent);
+        if(this.store.getRun(run.id).state==='cancelling')this.store.settleCancelled(run.id);else this.store.settleRun(run.id);
+      }).catch(error=>{if(!this.disposed)this.store.runRecovery(run.id,error instanceof AppError?error.message:'执行状态待核对，请打开原生会话检查。');}).finally(()=>{clearTimeout(deadline);release();this.running.delete(run.id);});
+      this.running.set(run.id,{agent,release,done});
+      return this.store.getRun(run.id);
+    }catch(error){release();this.store.runRecovery(run.id,'输入投递未能确认，没有自动重投。请核对原生会话。');throw error;}
+  }
+  async accept(requestId:string,taskId:string,rowVersion:number,resultId:string) {
+    const receipt=this.store.commandReceipt<import('./model.ts').Task>(requestId,'result.accept',{taskId,expectedRowVersion:rowVersion,resultId});
+    if(receipt)return receipt;
+    const detail=this.store.taskDetail(taskId);
+    if(!detail.result||detail.result.id!==resultId||!detail.binding?.sessionId)throw new AppError('result-stale','当前成果不存在或已经改变。');
+    const resolved=await this.ctx.sessionController.resolveAgent(SessionId(detail.binding.sessionId));
+    if('error' in resolved)throw new AppError('session-unavailable','无法核对原生会话，暂未验收。');
+    this.assertQuiet(resolved.agent);await verifyEvidence(detail.binding.cwd,detail.result.evidence);this.assertQuiet(resolved.agent);
+    return this.store.acceptResult(requestId,taskId,rowVersion,resultId);
+  }
+  async stop(requestId:string,taskId:string,rowVersion:number) {
+    const receipt=this.store.requestStop(requestId,taskId,rowVersion);const active=this.running.get(receipt.runId);
+    if(!active){if(this.store.getRun(receipt.runId).finishedAt===null)this.store.runRecovery(receipt.runId,'停止请求已记录，但当前宿主没有这个执行句柄，请核对原生会话。');return receipt;}
+    const input=this.store.getRunInput(receipt.runId);
+    if(input.messageId)active.agent.inbox.remove(input.messageId as UserMessage['id']);
+    active.agent.cancel({kind:'user'},{keepInbox:true});
+    for(const job of this.ctx.jobs.list(active.agent.id))if(job.owner===active.agent.id&&['running','stopping'].includes(job.status))this.ctx.jobs.kill(job.id,active.agent.id,'Super Bot stop');
+    const timeout=setTimeout(()=>{if(!this.disposed&&this.store.getRun(receipt.runId).finishedAt===null)this.store.runRecovery(receipt.runId,'停止已请求，但 10 秒内未确认收敛。请核对原生会话与后台工作。');},10000);timeout.unref();
+    void active.done.finally(()=>clearTimeout(timeout));return receipt;
+  }
+  async recover(requestId:string,taskId:string,rowVersion:number,acknowledged:unknown) {
+    if(acknowledged!==true)throw new AppError('confirmation-required','请先检查原生会话、文件和外部效果，再确认核对完成。');
+    const receipt=this.store.commandReceipt<import('./model.ts').Task>(requestId,'run.resolve-recovery',{taskId,expectedRowVersion:rowVersion});if(receipt)return receipt;
+    const run=this.store.latestRun(taskId);if(!run)throw new AppError('not-found','没有待核对的执行。');
+    const resolved=await this.ctx.sessionController.resolveAgent(SessionId(run.sessionId));
+    if('error' in resolved)throw new AppError('session-unavailable','无法读取原生会话，暂未释放执行占用。');
+    this.assertQuiet(resolved.agent);return this.store.resolveRunRecovery(requestId,taskId,rowVersion);
+  }
+  async dispose():Promise<void> {
+    this.disposed=true;
+    for(const [id,{agent}]of this.running){this.store.runRecovery(id,'插件退出时执行尚未核对，重新启用后请核对原生会话。');const input=this.store.getRunInput(id);if(input.messageId)agent.inbox.remove(input.messageId as UserMessage['id']);agent.cancel({kind:'user'},{keepInbox:true});}
+    await Promise.allSettled([...this.running.values()].map(r=>r.done));
+  }
+  async prepareSession(requestId:string,taskId:string,rowVersion:number):Promise<Binding> {
+    // Validate the ID through the ledger before using it as a directory segment.
+    const task=this.store.getTask(taskId);
+    const cwd=join(this.dataDir,'workspaces',task.id);await mkdir(cwd,{recursive:true});
+    const b=this.store.beginBinding(requestId,taskId,rowVersion,await realpath(cwd));
+    const current=this.store.getBinding(b.id);if(current.state==='ready')return current;
+    const active=this.creating.get(b.id);if(active)return active;
+    if(!this.store.claimBindingCreation(b.id))return this.reconcileBinding(b.id);
+    const promise=(async()=>{
+      try {
+        const workspace=await this.ctx.workspaceRegistry.create(b.cwd,`Super Bot · ${task.goal.slice(0,40)}`);
+        const result=await this.ctx.sessionController.create({workspaceId:workspace.id,sessionId:SessionId(b.requestedSessionId)});
+        return this.store.confirmBinding(b.id,result.sessionId);
+      }catch(error){this.store.bindingRecovery(b.id);throw error instanceof AppError?error:new AppError('session-recovery','会话创建结果暂未确认，请在任务详情核对。');}
+      finally{this.creating.delete(b.id);}
+    })();this.creating.set(b.id,promise);return promise;
+  }
+  async reconcileBinding(id:string):Promise<Binding> {
+    const b=this.store.getBinding(id);
+    if(b.state==='ready')return b;
+    const resolved=await this.ctx.sessionController.resolveAgent(SessionId(b.requestedSessionId));
+    if('error' in resolved){this.store.bindingRecovery(id);throw new AppError('session-recovery','尚未找到已申请的会话；保持待核对，没有重复创建。');}
+    const header=resolved.agent.session.header;
+    if(header.parentSession||!header.cwd||await realpath(header.cwd)!==b.cwd){this.store.bindingRecovery(id);throw new AppError('session-mismatch','会话目录或归属不一致，尚未关联。');}
+    const workspace=await this.ctx.workspaceRegistry.create(b.cwd);await workspace.attachSession(SessionId(b.requestedSessionId));
+    return this.store.confirmBinding(id,b.requestedSessionId);
+  }
+}
