@@ -1,9 +1,9 @@
 import { DatabaseSync } from 'node:sqlite';
 import { mkdirSync } from 'node:fs';
-import { dirname } from 'node:path';
+import { dirname,relative,isAbsolute,sep } from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
 import schemaVersion from '../schema-version.json' with {type:'json'};
-import { AppError, requiredText, optionalText, taskStatus, type Bot, type Task, type NewBot, type NewTask, type TaskPage, type ControlMode, type Attention, type Binding, type Run, type RunInput, type WorkReport, type Result,type ManagerBinding,type ManagerEvent } from './model.ts';
+import { AppError, requiredText, optionalText, taskStatus, type Bot, type Task, type NewBot, type NewTask, type TaskPage, type ControlMode, type Attention, type Binding, type Run, type RunInput, type WorkReport, type Result,type ManagerBinding,type ManagerEvent,type ExistingSessionGrant } from './model.ts';
 
 /** One local database. Business transactions will live here, not in the UI/adapter. */
 export class Store {
@@ -189,14 +189,15 @@ export class Store {
     });
   }
   createTask(requestId: string, input: NewTask): Task {
+    if(input.startPaused!==undefined&&typeof input.startPaused!=='boolean')throw new AppError('invalid-input','初始暂停状态必须是布尔值。');
     const payload: NewTask = { botId: requiredText(input.botId, 'Bot 标识', 200), goal: requiredText(input.goal, '任务目标'),
-      scope: optionalText(input.scope, '任务范围'), acceptance: optionalText(input.acceptance, '验收条件'), reviewPolicy: input.reviewPolicy };
+      scope: optionalText(input.scope, '任务范围'), acceptance: optionalText(input.acceptance, '验收条件'), reviewPolicy: input.reviewPolicy,...(input.startPaused?{startPaused:true}:{}) };
     if (!['human', 'bot'].includes(payload.reviewPolicy)) throw new AppError('invalid-input', '请选择有效的验收方式。');
     return this.command(requestId, 'task.create', payload, () => {
       this.getBot(payload.botId);
       const id = randomUUID(), now = Date.now();
-      this.db.prepare('INSERT INTO tasks(id,botId,goal,scope,acceptance,reviewPolicy,createdAt,updatedAt) VALUES (?,?,?,?,?,?,?,?)')
-        .run(id, payload.botId, payload.goal, payload.scope, payload.acceptance, payload.reviewPolicy, now, now);
+      this.db.prepare('INSERT INTO tasks(id,botId,goal,scope,acceptance,reviewPolicy,controlMode,createdAt,updatedAt) VALUES (?,?,?,?,?,?,?,?,?)')
+        .run(id, payload.botId, payload.goal, payload.scope, payload.acceptance, payload.reviewPolicy,payload.startPaused?'paused':'auto',now,now);
       this.db.prepare('INSERT INTO inputs(id,taskId,kind,content,createdAt) VALUES (?,?,?,?,?)')
         .run(randomUUID(), id, 'goal', payload.goal, now);
       this.event('task.created', id, { taskRevision: 1 });
@@ -275,6 +276,24 @@ export class Store {
     if(!binding)throw new AppError('not-found','会话关联不存在。');return {...binding};
   }
   nextBindingGeneration(taskId:string):number {return Number(this.db.prepare('SELECT coalesce(max(generation),0)+1 AS n FROM bindings WHERE taskId=?').get(taskId)?.n);}
+  assertSessionAttachable(taskId:string,sessionId:string):void {
+    const task=this.getTask(taskId);
+    if(task.lifecycle!=='open'||!task.scope||!task.acceptance)throw new AppError('not-ready','请先补全未完成任务的范围和验收条件。');
+    if(this.activeBinding(taskId))throw new AppError('session-attached','任务已有执行会话，请先核对并解除关联。');
+    if(this.db.prepare("SELECT 1 FROM attentions WHERE taskId=? AND kind='recovery' AND state='open'").get(taskId)||this.heldRuns().some(run=>run.taskId===taskId))throw new AppError('needs-recovery','请先完成旧执行的恢复核对。');
+    if(this.db.prepare('SELECT 1 FROM bindings WHERE sessionId=? OR requestedSessionId=?').get(sessionId,sessionId)||this.db.prepare('SELECT 1 FROM managers WHERE sessionId=? OR requestedSessionId=?').get(sessionId,sessionId))throw new AppError('session-owned','该会话已用于 Super Bot 的任务或管理身份。请保留原关联，或准备全新会话。');
+  }
+  attachExistingSession(requestId:string,grant:ExistingSessionGrant):Binding {
+    return this.command(requestId,'session.attach',grant,()=>{
+      if(grant.fullHistoryApproved!==true||grant.directoryApproved!==true)throw new AppError('confirmation-required','请明确授权读取整个会话历史，以及在所示目录内执行文件任务。');
+      this.assertSessionAttachable(grant.taskId,grant.sessionId);const task=this.getTask(grant.taskId);
+      if(task.rowVersion!==grant.expectedRowVersion)throw new AppError('version-conflict','任务已经更新，请重新检查关联信息。');
+      const binding:Binding={id:randomUUID(),taskId:task.id,generation:this.nextBindingGeneration(task.id),taskRevision:task.taskRevision,requestedSessionId:grant.sessionId,sessionId:grant.sessionId,cwd:grant.cwd,state:'ready',createdAt:Date.now()};
+      this.db.prepare('INSERT INTO bindings(id,taskId,generation,taskRevision,requestedSessionId,sessionId,cwd,state,createdAt) VALUES (?,?,?,?,?,?,?,?,?)').run(binding.id,task.id,binding.generation,task.taskRevision,grant.sessionId,grant.sessionId,grant.cwd,'ready',binding.createdAt);
+      this.db.prepare("UPDATE tasks SET sessionId=?,controlMode='paused',rowVersion=rowVersion+1,updatedAt=? WHERE id=?").run(grant.sessionId,Date.now(),task.id);
+      this.event('session.attached',task.id,{bindingId:binding.id,sessionId:grant.sessionId,cwd:grant.cwd,history:'entire-session',directoryApproved:true,actor:'user',taskRevision:task.taskRevision});return binding;
+    });
+  }
   bindingReceipt(requestId:string,taskId:string,expectedRowVersion:number):Binding|undefined {
     const row=this.db.prepare('SELECT result FROM requests WHERE id=?').get(requestId) as {result:string}|undefined;if(!row)return;
     const previous=JSON.parse(row.result) as Binding;
@@ -364,7 +383,8 @@ export class Store {
       const held=this.db.prepare('SELECT resources.*,runs.taskId,tasks.botId FROM resources JOIN runs ON runs.id=resources.runId JOIN tasks ON tasks.id=runs.taskId').all();
       if(held.some(r=>r.taskId===taskId))throw new AppError('run-active','这个任务的上次执行尚未收敛。');
       if(held.length>=2)throw new AppError('capacity','两个执行名额已占用，请等待或核对已有执行。');
-      if(held.some(r=>b.cwd===r.cwd||b.cwd.startsWith(`${r.cwd}/`)||String(r.cwd).startsWith(`${b.cwd}/`)))throw new AppError('resource-conflict','这个工作目录与另一执行重叠。');
+      const contains=(parent:string,child:string)=>{const path=relative(parent,child);return path===''||(!isAbsolute(path)&&path!=='..'&&!path.startsWith(`..${sep}`));};
+      if(held.some(r=>contains(String(r.cwd),b.cwd)||contains(b.cwd,String(r.cwd))))throw new AppError('resource-conflict','这个工作目录与另一执行重叠。');
       const pending=this.pendingInput(taskId);const id=randomUUID(),inputId=pending?.id??randomUUID(),now=Date.now();
       if(!pending)this.db.prepare('INSERT INTO inputs(id,taskId,kind,content,createdAt) VALUES (?,?,?,?,?)').run(inputId,taskId,'dispatch',task.goal,now);
       this.db.prepare('INSERT INTO runs(id,taskId,bindingId,sessionId,taskRevision,generation,inputId,state,createdAt) VALUES (?,?,?,?,?,?,?,?,?)').run(id,taskId,b.id,b.sessionId,task.taskRevision,b.generation,inputId,'queued',now);

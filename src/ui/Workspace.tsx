@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState, type FormEvent } from 'react';
-import type { Attention, Binding, Bot, Task, TaskPage, WorkspaceStatus,Run,RunInput,Result,ManagerBinding } from '../model.ts';
+import type { Attention, Binding, Bot, Task, TaskPage, WorkspaceStatus,Run,RunInput,Result,ManagerBinding,ExistingSessionPreview } from '../model.ts';
 import { styles } from './styles.ts';
 import type { BackupInfo } from '../backups.ts';
 
@@ -9,7 +9,7 @@ export interface WorkspaceApi {
 }
 type Detail = { task: Task; binding: Binding | null;bindingHistory:Binding[];run:Run|null;input:RunInput|null;result:Result|null; attentions: Attention[]; events: { id: number; kind: string; data:string; createdAt: number }[] };
 const labels: Record<Task['status'],string> = { unscheduled:'待安排', 'needs-input':'等你补充', approval:'原生审批待处理', paused:'已暂停', manual:'人工接管', completed:'已完成', cancelled:'已取消', review:'待验收',queued:'待投递',running:'执行中',stopping:'正在停止',recovery:'待核对' };
-const eventLabels: Record<string,string> = { 'task.created':'创建任务', 'task.revised':'更新目标与验收条件', 'task.control':'更新管理方式', 'session.preparing':'准备执行会话', 'session.ready':'执行会话已关联', 'session.recovery':'会话创建待核对','run.budget-reached':'执行已达到预算上限','run.queued':'已接收执行请求','input.entered':'任务输入已进入模型上下文','work.report':'收到工作报告','run.settled':'执行已收敛','run.recovery':'执行需要核对','result.accepted':'用户接受成果','native.intervention':'原生会话人工介入','run.stop-requested':'已请求停止','run.cancelled':'已核对停止','attention.answered':'回答已保存','result.rejected':'返工要求已保存','run.recovery-confirmed':'用户完成恢复核对','manager.reviewed':'Bot 检查成果','task.cancelled':'用户取消任务','session.detached':'解除执行会话关联','work.report-stale':'保留已失效报告的审计','approval.asked':'原生工具请求审批','approval.decided':'原生审批已有结果' };
+const eventLabels: Record<string,string> = { 'task.created':'创建任务', 'task.revised':'更新目标与验收条件', 'task.control':'更新管理方式', 'session.preparing':'准备执行会话', 'session.attached':'用户授权关联已有会话','session.ready':'执行会话已关联', 'session.recovery':'会话创建待核对','run.budget-reached':'执行已达到预算上限','run.queued':'已接收执行请求','input.entered':'任务输入已进入模型上下文','work.report':'收到工作报告','run.settled':'执行已收敛','run.recovery':'执行需要核对','result.accepted':'用户接受成果','native.intervention':'原生会话人工介入','run.stop-requested':'已请求停止','run.cancelled':'已核对停止','attention.answered':'回答已保存','result.rejected':'返工要求已保存','run.recovery-confirmed':'用户完成恢复核对','manager.reviewed':'Bot 检查成果','task.cancelled':'用户取消任务','session.detached':'解除执行会话关联','work.report-stale':'保留已失效报告的审计','approval.asked':'原生工具请求审批','approval.decided':'原生审批已有结果' };
 function eventTitle(event:{kind:string;data:string}):string {
   if(event.kind==='approval.decided')try {
     const outcome=JSON.parse(event.data).outcome as string;
@@ -46,16 +46,18 @@ function BotForm({ submit, cancel, busy }: { submit:(data:Record<string,unknown>
 function TaskForm({ task, submit, cancel, busy }: { task?:Task; submit:(data:Record<string,unknown>)=>Promise<boolean>; cancel:()=>void; busy:boolean }) {
   const [goal,setGoal]=useState(task?.goal??''); const [scope,setScope]=useState(task?.scope??'');
   const [acceptance,setAcceptance]=useState(task?.acceptance??''); const [autoReview,setAutoReview]=useState(task?.reviewPolicy==='bot');
+  const [startPaused,setStartPaused]=useState(false);
   const request=useRef(crypto.randomUUID());
   const [validation,setValidation]=useState('');
   function changed(){request.current=crypto.randomUUID();setValidation('');}
-  async function save(e:FormEvent){e.preventDefault();if(!goal.trim()){setValidation('请填写任务目标，不能只填空格。');return;}await submit({requestId:request.current,goal,scope,acceptance,reviewPolicy:autoReview?'bot':'human'});}
+  async function save(e:FormEvent){e.preventDefault();if(!goal.trim()){setValidation('请填写任务目标，不能只填空格。');return;}await submit({requestId:request.current,goal,scope,acceptance,reviewPolicy:autoReview?'bot':'human',startPaused});}
   return <form className="form" onSubmit={save}><h2>{task?'修改任务':'新任务'}</h2>
     <label htmlFor="sb-task-goal">要完成什么</label><textarea disabled={busy} id="sb-task-goal" autoFocus required maxLength={10000} value={goal} onChange={e=>{changed();setGoal(e.target.value);}} placeholder="描述一个可以独立验收的目标"/>
     <label htmlFor="sb-task-scope">范围与限制</label><textarea disabled={busy} id="sb-task-scope" maxLength={10000} value={scope} onChange={e=>{changed();setScope(e.target.value);}} placeholder="允许修改什么？哪些内容需要保留？"/>
     <label htmlFor="sb-task-acceptance">怎样算完成</label><textarea disabled={busy} id="sb-task-acceptance" maxLength={10000} value={acceptance} onChange={e=>{changed();setAcceptance(e.target.value);}} placeholder="期望看到的成果和验证结果"/>
     <p className="muted" style={{fontSize:12}}>范围或验收条件可以稍后补充；补全前任务不会派发。</p>
     {!task&&<label className="check"><input disabled={busy} type="checkbox" checked={autoReview} onChange={e=>{changed();setAutoReview(e.target.checked);}}/>允许 Bot 最终验收这个低风险任务</label>}
+    {!task&&<label className="check"><input disabled={busy} type="checkbox" checked={startPaused} onChange={e=>{changed();setStartPaused(e.target.checked);}}/>创建后先暂停（稍后安排或关联已有会话）</label>}
     {validation&&<p className="notice error" role="alert">{validation}</p>}
     <div className="actions"><button className="primary" disabled={busy}>{busy?'保存中…':task?'保存修改':'创建任务'}</button><button type="button" disabled={busy} onClick={cancel}>取消</button></div>
   </form>;
@@ -72,6 +74,31 @@ function RecoveryPanel({busy,confirm}:{busy:boolean;confirm:()=>void}) {
 function ConfirmAction({label,explanation,disabled,submit}:{label:string;explanation:string;disabled:boolean;submit:()=>Promise<boolean>}) {
   const [confirming,setConfirming]=useState(false);
   return confirming?<div className="attention-box"><p>{explanation}</p><div className="actions"><button disabled={disabled} onClick={()=>void submit().then(ok=>{if(ok)setConfirming(false);})}>确认{label}</button><button disabled={disabled} onClick={()=>setConfirming(false)}>返回</button></div></div>:<button disabled={disabled} onClick={()=>setConfirming(true)}>{label}</button>;
+}
+
+function ExistingSessionForm({api,busy,task,submit}:{api:WorkspaceApi;busy:boolean;task:Task;submit:(data:Record<string,unknown>)=>Promise<boolean>}) {
+  const [sessionId,setSessionId]=useState('');const [preview,setPreview]=useState<ExistingSessionPreview>();
+  const [history,setHistory]=useState(false);const [directory,setDirectory]=useState(false);
+  const [checking,setChecking]=useState(false);const [error,setError]=useState('');const request=useRef(crypto.randomUUID());
+  async function inspect() {
+    setChecking(true);setError('');setPreview(undefined);setHistory(false);setDirectory(false);request.current=crypto.randomUUID();
+    try{setPreview(await api.call<ExistingSessionPreview>('session.inspect',{id:task.id,sessionId:sessionId.trim()}));}
+    catch(error){setError(error instanceof Error?error.message:'无法检查会话。');}finally{setChecking(false);}
+  }
+  return <details><summary>关联已有原生会话</summary><div className="form">
+    <p className="muted">已有会话会保留整段历史。若不希望模型读取旧内容，请使用上方的新会话。</p>
+    <label htmlFor="sb-existing-session">Session ID</label><input id="sb-existing-session" value={sessionId} maxLength={200} disabled={busy||checking} placeholder="session-…" onChange={event=>{setSessionId(event.target.value);setPreview(undefined);setError('');}}/>
+    <button disabled={busy||checking||!sessionId.trim()} onClick={()=>void inspect()}>{checking?'检查中…':'检查会话与目录'}</button>
+    {error&&<p className="notice error" role="alert">{error}</p>}
+    {preview&&<><p style={{overflowWrap:'anywhere'}}>当前工作目录：{preview.cwd}</p><button disabled={busy} onClick={()=>api.openSession(preview.sessionId)}>查看原会话</button>
+      {!preview.quiet?<p className="notice" role="alert">{preview.reason} 本次未关联；处理后重新检查。</p>:<>
+        <label className="check"><input type="checkbox" disabled={busy} checked={history} onChange={event=>{setHistory(event.target.checked);request.current=crypto.randomUUID();}}/>允许本任务的模型读取整个原生会话历史</label>
+        <label className="check"><input type="checkbox" disabled={busy} checked={directory} onChange={event=>{setDirectory(event.target.checked);request.current=crypto.randomUUID();}}/>允许按本任务范围在上述目录内读取、写入和编辑文件</label>
+        <p className="muted">关联后任务保持暂停，不调用模型、不重放旧消息。核对后再恢复自动管理。</p>
+        <button disabled={busy||!history||!directory} onClick={()=>void submit({requestId:request.current,id:task.id,expectedRowVersion:task.rowVersion,sessionId:preview.sessionId,cwd:preview.cwd,fullHistoryApproved:history,directoryApproved:directory})}>确认关联并保持暂停</button>
+      </>}
+    </>}
+  </div></details>;
 }
 
 export function Workspace({ api }: { api:WorkspaceApi }) {
@@ -127,7 +154,7 @@ export function Workspace({ api }: { api:WorkspaceApi }) {
       {online&&bots.length===0&&form!=='bot'&&<div className="welcome"><h2>先认识你的第一位 Bot</h2><p className="muted" style={{lineHeight:1.8}}>定义长期职责，再把具体目标交给它。任务与成果会保存在这里。</p><ul><li>不同 Bot，各自负责自己的工作</li><li>任务有明确目标、范围和验收条件</li><li>需要你回答或验收时，集中呈现</li></ul><button className="primary" disabled={!online} onClick={()=>setForm('bot')}>创建第一个 Bot</button></div>}
       {bot&&<>
         <div className="bot-intro"><h2>{bot.name}</h2><p>{bot.instructions}</p><button disabled={!online||busy} onClick={()=>bot.managerSessionId?api.openSession(bot.managerSessionId):mutate<{sessionId:string}>('manager.prepare',{requestId:crypto.randomUUID(),botId:bot.id},value=>api.openSession(value.sessionId))}>{bot.managerSessionId?'打开 Bot 管理对话':'启用 Bot 管理对话'}</button><p className="muted" style={{fontSize:12}}>在管理对话选择模型后，Bot 会读取账本并安排完整、未暂停的任务。默认仍由你最终验收。</p>{managerInfo?.binding?.state==='ready'&&<details><summary className="muted">管理会话设置</summary><p className="muted">更换会创建新对话，并从账本恢复工作。旧对话和任务均保留。</p><button disabled={!online||busy} onClick={()=>mutate<{sessionId:string}>('manager.replace',{requestId:`replace:${managerInfo.binding!.id}`,botId:bot.id,expectedGeneration:managerInfo.binding!.generation},value=>api.openSession(value.sessionId))}>更换管理会话</button><p className="muted">待处理通知 {managerInfo.pending} · 本小时自动唤醒 {managerInfo.hourlyWakes}/20</p>{managerInfo.uncertain>0&&<p>有 {managerInfo.uncertain} 条通知送达待核对，请在管理对话读取最新账本。</p>}{managerInfo.hourlyWakes>=20&&<p>本小时自动管理额度已用完；队列保留，仍可在管理对话手动处理。</p>}</details>}{managerInfo?.problem&&<p className="notice" role="alert">{managerInfo.problem.message} · {time(managerInfo.problem.at)}</p>}</div>
-        <div className="notice"><span>当前支持专用目录内的文件任务。准备会话并选择模型后，可手动开始执行；成果默认由你验收。</span></div>
+        <div className="notice"><span>当前支持已授权目录内的文件任务。准备会话并选择模型后，可手动开始执行；成果默认由你验收。</span></div>
         {(form==='task'||(form==='edit'&&detail))&&<TaskForm key={form==='edit'?detail!.task.id:'new'} task={form==='edit'?detail!.task:undefined} busy={busy||!online} cancel={()=>{setForm(null);setError('');}} submit={data=>mutate<Task>(form==='edit'?'task.revise':'task.create',form==='edit'?{...data,id:detail!.task.id,expectedRowVersion:detail!.task.rowVersion}:{...data,botId},t=>{setSelected(t.id);setForm(null);setOffset(0);setFilter('');setQuery('');})}/>}
         <div className="stats">{([['','全部','all'],['open','未完成','open'],['review','待验收','review'],['completed','已完成','completed'],['cancelled','已取消','cancelled']] as const).map(([value,label,key])=><button key={key} className={filter===value?'active':''} disabled={!online||busy} onClick={()=>{setFilter(value);setOffset(0);setSelected('');setDetail(undefined);setForm(null);}}>{label}<strong>{page?.counts[key]??'—'}</strong></button>)}</div>
         <div className="grid"><section className="card" aria-label="任务列表"><div className="card-head"><input disabled={busy} aria-label="搜索任务" placeholder="搜索任务目标…" value={query} onChange={e=>{setQuery(e.target.value);setOffset(0);setSelected('');setDetail(undefined);setForm(null);}}/></div>
@@ -141,7 +168,7 @@ export function Workspace({ api }: { api:WorkspaceApi }) {
           {['open','review'].includes(detail.task.lifecycle)&&<details><summary className="muted">不再需要这个任务？</summary><ConfirmAction key={`cancel:${detail.task.id}:${detail.task.rowVersion}`} label="取消任务" explanation="结束这个任务，未送出的回答与返工要求不再执行。会话、成果和文件保留；取消不会接受成果。执行中或待核对时，请先停止并完成核对。" disabled={!online||busy||['running','queued','stopping','recovery','approval'].includes(detail.task.status)} submit={()=>mutate('task.cancel',{requestId:`cancel:${detail.task.id}:${detail.task.rowVersion}`,id:detail.task.id,expectedRowVersion:detail.task.rowVersion})}/></details>}
           {detail.run&&['running','queued','cancelling'].includes(detail.run.state)&&<div className="actions"><button disabled={!online||busy||detail.run.state==='cancelling'} onClick={()=>mutate('task.stop',{requestId:`stop:${detail.run!.id}:${detail.task.rowVersion}`,id:detail.task.id,expectedRowVersion:detail.task.rowVersion})}>{detail.run.state==='cancelling'?'正在核对停止…':'停止当前执行'}</button><span className="muted">停止后任务保留；不会清空你的原生输入。</span></div>}
           <div className="session-box"><h3>执行会话</h3>
-            {!detail.binding?<><p className="muted">为这个任务创建专用工作目录和原生会话。准备会话不会调用模型。</p><button disabled={!online||busy||detail.task.status==='needs-input'||detail.task.lifecycle!=='open'} onClick={()=>mutate('session.prepare',{requestId:`prepare:${detail.task.id}:${detail.task.rowVersion}`,id:detail.task.id,expectedRowVersion:detail.task.rowVersion})}>准备执行会话</button></>:<>
+            {!detail.binding?<><p className="muted">为这个任务创建专用工作目录和原生会话。准备会话不会调用模型。</p><button disabled={!online||busy||detail.task.status==='needs-input'||detail.task.lifecycle!=='open'} onClick={()=>mutate('session.prepare',{requestId:`prepare:${detail.task.id}:${detail.task.rowVersion}`,id:detail.task.id,expectedRowVersion:detail.task.rowVersion})}>准备执行会话</button>{detail.task.lifecycle==='open'&&detail.task.scope&&detail.task.acceptance&&<ExistingSessionForm key={`${detail.task.id}:${detail.task.rowVersion}`} api={api} task={detail.task} busy={!online||busy} submit={data=>mutate('session.attach',data)}/>}</>:<>
               <p className="muted" style={{overflowWrap:'anywhere'}}>{detail.binding.cwd}</p>
               {detail.binding.state==='ready'?<><button onClick={()=>api.openSession(detail.binding!.sessionId!)}>打开任务会话</button> <button className="primary" disabled={!online||busy||detail.task.status!=='unscheduled'} onClick={()=>mutate('task.dispatch',{requestId:`dispatch:${detail.task.id}:${detail.task.rowVersion}`,id:detail.task.id,expectedRowVersion:detail.task.rowVersion})}>开始执行</button><p className="muted" style={{fontSize:12}}>首次执行前，请在任务会话选择模型。会话关联后暂锁定目标，避免执行版本不一致。</p></>:<><p>会话创建需要核对。</p><button disabled={!online||busy} onClick={()=>mutate('session.reconcile',{id:detail.binding!.id})}>核对会话</button></>}
             </>}

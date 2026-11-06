@@ -108,6 +108,30 @@ test('a replacement binding never presents an old result as its current candidat
   }finally{store.close();}
 });
 
+test('existing Session attachment requires both grants, pauses atomically, and cannot cross identities',()=>{
+  const store=new Store(':memory:');try {
+    const bot=store.createBot('bot',{name:'Existing Session Bot',instructions:'File tasks'});
+    const task=store.createTask('task',{botId:bot.id,goal:'Continue existing work',scope:'Explicit directory',acceptance:'Read result',reviewPolicy:'human'});
+    const grant={taskId:task.id,expectedRowVersion:task.rowVersion,sessionId:'existing-session',cwd:'/tmp/existing-session',fullHistoryApproved:true,directoryApproved:true};
+    assert.throws(()=>store.attachExistingSession('missing-history',{...grant,fullHistoryApproved:false}),/明确授权/);
+    assert.throws(()=>store.attachExistingSession('missing-directory',{...grant,directoryApproved:false}),/明确授权/);
+    assert.throws(()=>store.attachExistingSession('stale',{...grant,expectedRowVersion:0}),/已经更新/);
+    store.db.exec("CREATE TRIGGER reject_attach BEFORE INSERT ON events WHEN NEW.kind='session.attached' BEGIN SELECT RAISE(ABORT,'attach fault'); END");
+    assert.throws(()=>store.attachExistingSession('attach',grant),/attach fault/);assert.equal(store.activeBinding(task.id),null);assert.equal(store.getTask(task.id).rowVersion,1);
+    store.db.exec('DROP TRIGGER reject_attach');
+    const binding=store.attachExistingSession('attach',grant);assert.deepEqual(store.attachExistingSession('attach',grant),binding);
+    assert.equal(store.getTask(task.id).status,'paused');assert.equal(store.latestRun(task.id),null);
+    const event=store.taskDetail(task.id).events.find(event=>event.kind==='session.attached')!;assert.equal(JSON.parse(event.data).history,'entire-session');
+    const otherBot=store.createBot('other',{name:'Other Bot',instructions:'Other work'});
+    const other=store.createTask('other-task',{botId:otherBot.id,goal:'Other task',scope:'Own files',acceptance:'Read result',reviewPolicy:'human'});
+    assert.throws(()=>store.attachExistingSession('steal',{...grant,taskId:other.id}),/已用于/);
+    store.detachSession('detach',task.id,store.getTask(task.id).rowVersion);
+    assert.throws(()=>store.attachExistingSession('steal-history',{...grant,taskId:other.id}),/已用于/);
+    const manager=store.beginManager('manager',otherBot.id,'/tmp/existing-manager');store.confirmManager(manager.id,manager.requestedSessionId);
+    assert.throws(()=>store.attachExistingSession('manager-as-worker',{...grant,taskId:other.id,sessionId:manager.requestedSessionId}),/已用于/);
+  }finally{store.close();}
+});
+
 test('ready is a candidate until execution converges and the user accepts exact evidence',()=>{
   const store=new Store(':memory:');try {
     const {task,run}=entered(store);const report=store.workerReport(run.id,'tool-1',ready);
@@ -302,4 +326,13 @@ test('run budgets persist the reason, retain ownership until stopped, and requir
     const paused=store.resolveRunRecovery('recover',task.id,store.getTask(task.id).rowVersion);
     assert.equal(paused.status,'paused');assert.throws(()=>store.reserveRun('no-auto-retry',task.id,paused.rowVersion),/不能自动执行/);
   }finally{store.close();}
+});
+
+test('directory overlap includes the filesystem root in either acquisition order',()=>{
+  for(const [first,second] of [['/','/tmp/project'],['/tmp/project','/'],['/tmp/project','/tmp/project/nested']]) {
+    const store=new Store(':memory:');try {
+      const a=prepared(store,'a',first),b=prepared(store,'b',second);store.reserveRun('run-a',a.id,a.rowVersion);
+      assert.throws(()=>store.reserveRun('run-b',b.id,b.rowVersion),/目录.*重叠/);assert.equal(store.latestRun(b.id),null);
+    }finally{store.close();}
+  }
 });

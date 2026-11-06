@@ -49,12 +49,17 @@ export interface TaskPage {
   counts: { all: number; open: number; review: number; completed: number; cancelled: number };
 }
 export interface NewBot { name: string; instructions: string }
-export interface NewTask { botId: string; goal: string; scope: string; acceptance: string; reviewPolicy: 'human' | 'bot' }
+export interface NewTask { botId: string; goal: string; scope: string; acceptance: string; reviewPolicy: 'human' | 'bot'; startPaused?:boolean }
 export interface Binding {
   id: string; taskId: string; generation: number; taskRevision: number;
   requestedSessionId: string; sessionId: string | null; cwd: string;
   state: 'creating' | 'ready' | 'recovery' | 'released'; createdAt: number;
 }
+export interface ExistingSessionGrant {
+  taskId:string;expectedRowVersion:number;sessionId:string;cwd:string;
+  fullHistoryApproved:boolean;directoryApproved:boolean;
+}
+export interface ExistingSessionPreview {sessionId:string;cwd:string;quiet:boolean;reason:string}
 export interface ManagerBinding {id:string;botId:string;generation:number;configRevision:number;requestedSessionId:string;sessionId:string|null;cwd:string;state:'creating'|'ready'|'recovery'|'released';createdAt:number}
 export interface ManagerEvent {id:string;taskId:string|null;payload:string;state:string;createdAt:number}
 export interface Run {

@@ -45,6 +45,18 @@ test('commands are idempotent and conflicting reuse is rejected', () => {
   } finally { store.close(); }
 });
 
+test('tasks can start paused without a scheduling race or changing legacy default request hashes',()=>{
+  const store=new Store(':memory:');try {
+    const bot=store.createBot('bot',{name:'Bot',instructions:'Files'});
+    const input={botId:bot.id,goal:'Later task',scope:'Own files',acceptance:'Read result',reviewPolicy:'human' as const};
+    const normal=store.createTask('normal',input);assert.equal(normal.controlMode,'auto');
+    assert.equal(store.createTask('normal',{...input,startPaused:false}).id,normal.id);
+    const paused=store.createTask('paused',{...input,startPaused:true});assert.equal(paused.status,'paused');assert.equal(paused.sessionId,null);
+    assert.equal(store.latestRun(paused.id),null);assert.throws(()=>store.createTask('paused',input),/不同的内容/);
+    assert.equal(store.controlTask('resume',paused.id,paused.rowVersion,'auto').status,'unscheduled');
+  }finally{store.close();}
+});
+
 test('failed audit write rolls back task, input, and idempotency record', () => {
   const store = new Store(':memory:');
   try {

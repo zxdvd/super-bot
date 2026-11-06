@@ -12,7 +12,7 @@ import { SessionId } from '@deepseek-ai/dsh-session/types';
 import { mkdir, realpath } from 'node:fs/promises';
 import { realpathSync } from 'node:fs';
 import { join,isAbsolute } from 'node:path';
-import { AppError,requiredText,optionalText,type Binding,type Run,type WorkReport } from './model.ts';
+import { AppError,requiredText,optionalText,type Binding,type Run,type WorkReport,type ExistingSessionGrant,type ExistingSessionPreview } from './model.ts';
 import type { Store } from './store.ts';
 import { collectEvidence,containedPath,verifyEvidence } from './evidence.ts';
 
@@ -60,8 +60,12 @@ export class DshExecution {
       }
       const messages=event.type==='agent/inbox/spliced'?event.data.inserted:event.type==='user/message'?[event.data]:[];
       for(const message of messages)if(message.source.kind==='user'&&'rpcId' in message.source) {
+        const previous=this.store.heldRuns().find(run=>run.sessionId===session.id&&run.finishedAt===null);
         const changed=this.store.nativeIntervention(session.id,message.id);
-        if(changed)for(const active of this.running.values())if(active.agent.id===session.id){active.agent.cancel({kind:'user'},{keepInbox:true});active.release();}
+        if(changed&&previous) {
+          const active=this.running.get(previous.id),input=this.store.getRunInput(previous.id);
+          if(active){if(input.messageId)active.agent.inbox.remove(input.messageId as UserMessage['id']);active.agent.cancel({kind:'user'},{keepInbox:true});}
+        }
       }
     });
     // A process restart cannot infer absence of an external effect from an idle fresh Agent.
@@ -75,6 +79,28 @@ export class DshExecution {
   private assertDirectory(agent:Agent,cwd:string):void {
     let current:string;try{current=realpathSync(this.ctx.workingDirectory.get(agent.session));}catch{throw new AppError('working-directory-unavailable','原生会话目录不可用，请先恢复目录或解除关联后准备新会话。');}
     if(current!==cwd)throw new AppError('working-directory-changed','原生会话当前目录已改变。请在原生会话恢复任务目录，或解除关联后准备新会话。');
+  }
+  async inspectExistingSession(taskId:string,sessionId:string):Promise<ExistingSessionPreview> {
+    this.store.assertSessionAttachable(taskId,sessionId);
+    const resolved=await this.ctx.sessionController.resolveAgent(SessionId(sessionId));
+    if('error' in resolved)throw new AppError('session-unavailable','找不到可关联的原生会话。请核对 Session ID。');
+    const agent=resolved.agent;
+    if(agent.session.header.origin==='subagent')throw new AppError('session-child','子 Agent 会话不能作为独立任务会话关联。');
+    let cwd:string;try{cwd=await realpath(this.ctx.workingDirectory.get(agent.session));}catch{throw new AppError('working-directory-unavailable','会话当前目录不可用，暂不能关联。');}
+    try{this.assertQuiet(agent);}catch(error){return {sessionId,cwd,quiet:false,reason:error instanceof AppError?error.message:'会话活动暂无法确认。'};}
+    return {sessionId,cwd,quiet:true,reason:''};
+  }
+  async attachExistingSession(requestId:string,grant:ExistingSessionGrant):Promise<Binding> {
+    const receipt=this.store.commandReceipt<Binding>(requestId,'session.attach',grant);
+    if(receipt)return this.store.getBinding(receipt.id);
+    if(grant.fullHistoryApproved!==true||grant.directoryApproved!==true)throw new AppError('confirmation-required','请明确授权读取整个会话历史，以及在所示目录内执行文件任务。');
+    const preview=await this.inspectExistingSession(grant.taskId,grant.sessionId);
+    if(!preview.quiet)throw new AppError('session-busy',preview.reason);
+    if(preview.cwd!==grant.cwd)throw new AppError('working-directory-changed','会话当前目录已改变，请重新检查后授权。');
+    const resolved=await this.ctx.sessionController.resolveAgent(SessionId(grant.sessionId));
+    if('error' in resolved)throw new AppError('session-unavailable','会话暂不可用。');
+    this.assertQuiet(resolved.agent);this.assertDirectory(resolved.agent,grant.cwd);
+    return this.store.attachExistingSession(requestId,grant);
   }
   async dispatch(requestId:string,taskId:string,rowVersion:number,authorize:()=>void=()=>{}):Promise<Run> {
     if(this.disposed)throw new AppError('unavailable','插件正在退出。');
@@ -103,17 +129,23 @@ export class DshExecution {
       if(!['read','write','edit'].includes(exec.name))return;
       try{const args=exec.arguments as {file_path?:unknown};if(typeof args.file_path!=='string'||!isAbsolute(args.file_path))return 'Use an absolute file_path inside the task working directory.';containedPath(b.cwd,args.file_path);}catch(error){return error instanceof Error?error.message:'File path refused';}
     });
-    let steps=0;
+    let steps=0;let deadline:ReturnType<typeof setTimeout>|undefined;
     const releaseBudget=agent.ctx.on('agent/pre-step',async(_payload,next)=>{
       if(++steps>40){await this.stopForBudget(run.id,'steps');throw new AppError('run-budget','执行达到 40 步上限。');}
       return next();
     });
-    let released=false;const release=()=>{if(released)return;released=true;releaseBudget();releaseGuard();releaseMask();};
+    let released=false;const release=()=>{if(released)return;released=true;clearTimeout(deadline);releaseStatus();releaseBudget();releaseGuard();releaseMask();};
+    // DSH publishes idle after the aborted driver converges, before it can wake
+    // queued human work. whenIdle() can follow that new driver, so it is too late
+    // to release an interrupted Run's restrictions for a native handoff.
+    const releaseStatus=agent.ctx.on('agent/status',({status})=>{
+      if(status==='idle'&&this.store.getRun(run.id).finishedAt!==null&&this.store.getTask(taskId).controlMode==='manual'){release();this.running.delete(run.id);}
+    });
     try {
       if(!this.store.claimDispatch(run.id)){release();this.store.runRecovery(run.id,'投递记录已经发出，但回执不完整。没有重复投递，请核对原生会话。');return this.store.getRun(run.id);}
       agent.followup(freezeMessage(JSON.parse(input.messageJson!) as UserMessage));
       this.store.inputEnqueued(run.id);
-      const deadline=setTimeout(()=>{void this.stopForBudget(run.id,'time');},10*60*1000);
+      deadline=setTimeout(()=>{void this.stopForBudget(run.id,'time');},10*60*1000);
       deadline.unref();
       const done=agent.whenIdle().then(()=>{
         if(this.disposed)return;
@@ -156,7 +188,9 @@ export class DshExecution {
     return detail;
   }
   async stop(requestId:string,taskId:string,rowVersion:number) {
-    const receipt=this.store.requestStop(requestId,taskId,rowVersion);const active=this.running.get(receipt.runId);
+    const receipt=this.store.requestStop(requestId,taskId,rowVersion);
+    if(this.store.getRun(receipt.runId).finishedAt!==null)return receipt;
+    const active=this.running.get(receipt.runId);
     if(!active){if(this.store.getRun(receipt.runId).finishedAt===null)this.store.runRecovery(receipt.runId,'停止请求已记录，但当前宿主没有这个执行句柄，请核对原生会话。');return receipt;}
     const input=this.store.getRunInput(receipt.runId);
     if(input.messageId)active.agent.inbox.remove(input.messageId as UserMessage['id']);
@@ -217,7 +251,7 @@ export class DshExecution {
     const resolved=await this.ctx.sessionController.resolveAgent(SessionId(b.requestedSessionId));
     if('error' in resolved){this.store.bindingRecovery(id);throw new AppError('session-recovery','尚未找到已申请的会话；保持待核对，没有重复创建。');}
     const header=resolved.agent.session.header;
-    if(header.parentSession||!header.cwd||await realpath(header.cwd)!==b.cwd){this.store.bindingRecovery(id);throw new AppError('session-mismatch','会话目录或归属不一致，尚未关联。');}
+    if(header.origin==='subagent'||!header.cwd||await realpath(header.cwd)!==b.cwd){this.store.bindingRecovery(id);throw new AppError('session-mismatch','会话目录或归属不一致，尚未关联。');}
     const workspace=await this.ctx.workspaceRegistry.create(b.cwd);await workspace.attachSession(SessionId(b.requestedSessionId));
     return this.store.confirmBinding(id,b.requestedSessionId);
   }

@@ -193,3 +193,18 @@ ELECTRON_RUN_AS_NODE=1 '/Applications/DeepSeek Harness.app/Contents/MacOS/DeepSe
 - 人为制造迁移 DDL 失败：新表与版本整体回滚，旧数据仍可读；修复夹具冲突后正常升级。
 - 独立子进程打开 WAL 事务，执行部分 ALTER/新表/版本更新但尚未提交时 SIGKILL；重开仍是完整 schema 2，无半个升级；随后实际 Store 构造可完成升级与 integrity_check。
 - `npm run typecheck` 与 `npm test`：33 项通过。故障测试仅操作系统临时目录，不中断测试宿主或个人数据库。此用例覆盖 SQLite 迁移事务的进程中断，不宣称模拟所有机器断电/磁盘损坏。
+
+
+## 已有会话、取消边界与实际容量（2026-11-07 04:58）
+
+- 实际 10 分钟计时完成：`smoke-budget.mjs time-verify` 于 600,026 ms 后观察 Run cancelled，原生 idle/空 inbox，无成果；核对后仍暂停。
+- `npm run check`：36 项核心测试通过，新增已有会话双授权/事务回滚/归属冲突、初始暂停与旧请求 hash 兼容，以及根目录双向资源重叠测试。
+- `smoke-attach.mjs`：真实已有会话保留合成历史；待处理输入拒绝关联、目录变化拒绝旧授权、双授权后暂停且无模型调用；显式恢复才执行新的 Input。两个任务并发争同一会话只有一方成功，同请求并发只生成一个 Binding。旧 attach 回执不能复活已解除的关联；实际普通 fork 可关联。
+- 独立代码审查发现根目录资源重叠判断和历史 fork 的 `parentSession` 误判，分别改用 path.relative 包含判断及宿主 origin 字段；不凭父会话字段判断子 Agent。
+- 第二次独立审查发现原生介入过早 release 和旧 Stop 重试可能取消后续人工轮次。现在定向撤回旧输入，取消未收敛前保持 guard；使用 DSH 的 idle 状态边界解除限制和旧执行句柄，不等待会跟随后续人工轮次的 whenIdle；旧 Run 终结后 Stop 仅回原回执。
+- `smoke-handoff.mjs` 真实验证：不响应取消的旧模型仍 active 时，以全新未取消 signal 调用额外工具也被拒绝；原生两条用户输入保留，旧 driver idle 后新人工轮次可执行原生 scoped 工具；重试旧 Stop 没有中断新人工轮次。最后旧 Run 仍 interrupted、须显式核对。
+- `smoke-stop-timeout.mjs`：合成模型故意不响应 abort，10,004 ms 后转 recovery；尚 active 时恢复拒绝；释放模型后虽 idle 仍不成功，明确核对才释放并暂停。
+- `smoke-capacity.mjs`：同 Bot 两个 Worker 确实同时 running；第三任务容量不足时无 Run。另 Bot 的 Manager 保留容量通知；释放一槽后该任务执行并产成果，另一 Worker 同时仍 running。最后清理停止两项合成任务。
+- 上述变更后 `probe:run` 的 11 项契约再次通过。真实模型、Desktop、运行中热卸载仍未验证。
+
+独立第 19 轮 UI 完成：启用 Manager 后完整任务可初始暂停，期间无 Binding/模型执行；忙碌会话不给关联，空闲会话双授权才允许提交；关联后保持暂停和原 1 turn/1 step。恢复自动管理后 Manager 自动执行至人工待验收，原生 2 turns/4 steps、132 字节成果，历史只有一份，console warn/error 为空。SB-05 新建/已有授权/解绑/历史保留路径已具备实际证据。

@@ -34,6 +34,7 @@ class ProbeAdapter extends LlmAdapter {
   calls: {sessionId?: string;purpose?:string; ids: string[]; tools: string[]}[] = [];
   approvalWrites=new Set<string>();
   scopedAttempts=new Map<string,number>();
+  stalled=new Map<string,{release:()=>void;signal?:AbortSignal}>();
   async listModels() { return [{provider,id:'deterministic',name:'Super Bot 测试模型（无网络）'}]; }
   async resolveModel(p:string,m:string) { return {provider:p,id:m,name:m,context:{contextWindow:200000},defaultMaxTokens:1000}; }
   async *stream(options: GenerateOptions): AsyncIterable<StreamChunk> {
@@ -79,9 +80,19 @@ class ProbeAdapter extends LlmAdapter {
       yield {type:'block-start',index:0,blockType:'text'};yield {type:'text-delta',index:0,text:'确定性管理轮次已结束，请查看工作台。'};
       yield {type:'block-end',index:0,block:{type:'text',text:'确定性管理轮次已结束，请查看工作台。'}};yield {type:'finish',reason:{kind:'stop'}};return;
     }
-    const workInput=options.messages.findLast(m=>m.role==='user'&&m.source?.kind==='super-bot');
+    const latestInput=options.messages.findLast(m=>m.role==='user'&&(m.source?.kind==='super-bot'||m.source?.kind==='user'));
+    const workInput=latestInput?.source?.kind==='super-bot'?latestInput:undefined;
+    if(latestInput?.source?.kind==='user'&&latestInput.content.some(block=>block.type==='text'&&block.text.includes('NATIVE_HOLD_PROBE'))) {
+      assert.ok(options.sessionId);await new Promise<void>(release=>this.stalled.set(options.sessionId!,{release,signal:options.signal}));
+      this.stalled.delete(options.sessionId);options.signal?.throwIfAborted();
+    }
     if(workInput) {
       const body=workInput.content.filter(b=>b.type==='text').map(b=>b.text).join('');
+      if(body.includes('Goal: UNRESPONSIVE_MODEL_PROBE')) {
+        assert.ok(options.sessionId);
+        await new Promise<void>(release=>this.stalled.set(options.sessionId!,{release,signal:options.signal}));
+        this.stalled.delete(options.sessionId);options.signal?.throwIfAborted();
+      }
       if(body.includes('Goal: STOP_PROBE')) {
         await new Promise<void>(resolve=>{if(options.signal?.aborted)resolve();else options.signal?.addEventListener('abort',()=>resolve(),{once:true});});
         options.signal?.throwIfAborted();
@@ -333,6 +344,35 @@ export function apply(ctx:Context) {
   ctx.effect(()=>ctx.connection.fetch.register({path:'/api/super-bot-probe',methods:['POST'],requestBody:'buffered',
     fetch:async request=>{try{
       const body=await request.json() as {action?:string;sessionId?:string;text?:string};
+      if(body.action==='queue-native'||body.action==='attempt-scoped-probe') {
+        assert.ok(body.sessionId);const resolved=await ctx.sessionController.resolveAgent(SessionId(body.sessionId));assert.ok('agent' in resolved);const agent=resolved.agent;
+        assert.ok(agent.session.header.cwd?.startsWith(join(home!,'super-bot')+'/'));assert.equal(agent.model.current()?.provider,provider);
+        if(body.action==='queue-native') {
+          assert.ok(body.text&&body.text.length<=500);await ctx.sessionController.prompt({requestId:randomUUID() as SessionRequestId,sessionId:agent.id,mode:'queue',content:[{type:'text',text:body.text}]},new AbortController().signal);
+        }else await ctx.tools.execute({agent,signal:new AbortController().signal,calls:[{type:'tool-call',id:ToolCallId(randomUUID()),name:scopedToolName,arguments:'{}'}]});
+        return Response.json({ok:true,scopedProbeCalls:scopedCalls.get(agent.id)??0});
+      }
+      if(body.action==='release-stalled-model') {
+        assert.ok(body.sessionId);adapter.stalled.get(body.sessionId)?.release();return Response.json({ok:true});
+      }
+      if(body.action==='create-attach-session') {
+        const cwd=join(home!,'super-bot','existing-session-probes',randomUUID());await mkdir(cwd,{recursive:true});
+        const workspace=await ctx.workspaceRegistry.create(cwd,'已有会话授权探针');const created=await ctx.sessionController.create({workspaceId:workspace.id});
+        const resolved=await ctx.sessionController.resolveAgent(created.sessionId);assert.ok('agent' in resolved);const agent=resolved.agent;
+        agent.model.select({provider,model:'deterministic'});
+        const history=input('已有会话的合成历史材料：只供当前授权关联测试，不访问网络。');agent.followup(history);await bounded(agent.whenIdle(),'attachment history');
+        if(body.text==='fork') {
+          const fork=await ctx.sessionController.fork({sessionId:agent.id});return Response.json({ok:true,sessionId:fork.sessionId,cwd,historyMessageId:history.id});
+        }
+        if(body.text==='pending')agent.send(input('ATTACH_PENDING_PROBE'),'next-turn',false);
+        return Response.json({ok:true,sessionId:agent.id,cwd,historyMessageId:history.id});
+      }
+      if(body.action==='clear-attach-pending') {
+        assert.ok(body.sessionId);const resolved=await ctx.sessionController.resolveAgent(SessionId(body.sessionId));assert.ok('agent' in resolved);
+        assert.ok(resolved.agent.session.header.cwd?.startsWith(join(home!,'super-bot','existing-session-probes')+'/'));
+        for(const message of [...resolved.agent.inbox.nextTurn,...resolved.agent.inbox.nextStep])if(message.source.kind==='super-bot-probe'&&message.content.some(block=>block.type==='text'&&block.text==='ATTACH_PENDING_PROBE'))resolved.agent.inbox.remove(message.id);
+        return Response.json({ok:true});
+      }
       if(body.action==='install-scoped-probe') {
         assert.ok(body.sessionId);const resolved=await ctx.sessionController.resolveAgent(SessionId(body.sessionId));assert.ok('agent' in resolved);const agent=resolved.agent;
         assert.ok(agent.session.header.cwd?.startsWith(join(home!,'super-bot')+'/'));assert.equal(agent.model.current()?.provider,provider);
@@ -356,7 +396,7 @@ export function apply(ctx:Context) {
       if(body.action==='inspect-session') {
         assert.ok(body.sessionId);const resolved=await ctx.sessionController.resolveAgent(SessionId(body.sessionId));assert.ok('agent' in resolved);
         assert.ok(resolved.agent.session.header.cwd?.startsWith(join(home!,'super-bot')+'/'));
-        return Response.json({ok:true,sessionId:resolved.agent.id,status:resolved.agent.status,pending:resolved.agent.inbox.nextTurn.length+resolved.agent.inbox.nextStep.length,modelSteps:adapter.calls.filter(call=>call.sessionId===body.sessionId&&(!call.purpose||call.purpose==='conversation')).length,scopedProbeCalls:scopedCalls.get(resolved.agent.id)??0,scopedProbeAttempts:adapter.scopedAttempts.get(resolved.agent.id)??0,
+        return Response.json({ok:true,sessionId:resolved.agent.id,status:resolved.agent.status,pending:resolved.agent.inbox.nextTurn.length+resolved.agent.inbox.nextStep.length,stalled:adapter.stalled.has(resolved.agent.id),stalledAborted:adapter.stalled.get(resolved.agent.id)?.signal?.aborted??false,historyMessageIds:resolved.agent.session.snapshotEvents().filter(event=>event.type==='user/message').map(event=>event.data.id),modelSteps:adapter.calls.filter(call=>call.sessionId===body.sessionId&&(!call.purpose||call.purpose==='conversation')).length,scopedProbeCalls:scopedCalls.get(resolved.agent.id)??0,scopedProbeAttempts:adapter.scopedAttempts.get(resolved.agent.id)??0,
           productTools:ctx.tools.definitions().map(tool=>tool.name).filter(name=>['super_bot_report','super_bot_manage'].includes(name))});
       }
       if(body.action==='select-test-model'||body.action==='native-prompt') {
