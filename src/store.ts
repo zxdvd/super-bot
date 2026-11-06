@@ -155,6 +155,16 @@ export class Store {
   activeManager(botId:string):ManagerBinding|null {
     const row=this.db.prepare("SELECT * FROM managers WHERE botId=? AND state!='released'").get(botId) as unknown as ManagerBinding|undefined;return row?{...row}:null;
   }
+  getManager(id:string):ManagerBinding {
+    const row=this.db.prepare('SELECT * FROM managers WHERE id=?').get(id) as unknown as ManagerBinding|undefined;
+    if(!row)throw new AppError('not-found','管理会话记录不存在。');return {...row};
+  }
+  managerPreparationReceipt(requestId:string,botId:string):ManagerBinding|undefined {
+    const row=this.db.prepare('SELECT result FROM requests WHERE id=?').get(requestId) as {result:string}|undefined;if(!row)return;
+    const previous=JSON.parse(row.result) as ManagerBinding;
+    const receipt=this.commandReceipt<ManagerBinding>(requestId,'manager.prepare',{botId,cwd:previous.cwd});
+    return receipt?this.getManager(receipt.id):undefined;
+  }
   managerForSession(sessionId:string):ManagerBinding|null {
     const row=this.db.prepare("SELECT * FROM managers WHERE requestedSessionId=? AND state!='released'").get(sessionId) as unknown as ManagerBinding|undefined;return row?{...row}:null;
   }

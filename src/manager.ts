@@ -130,9 +130,14 @@ export class Managers {
     let released=false;this.scopes.set(agent.id,{agent,release:()=>{if(released)return;released=true;budget();prompt();guard();mask();}});
   }
   async prepare(requestId:string,botId:string):Promise<ManagerBinding> {
-    const bot=this.store.getBot(botId);const cwd=join(this.dataDir,'managers',bot.id);await mkdir(cwd,{recursive:true});
-    const manager=this.store.beginManager(requestId,botId,await realpath(cwd));
-    const current=this.store.activeManager(botId)!;if(current.state==='ready')return current;
+    if(this.closed)throw new AppError('manager-unavailable','管理器正在退出。');
+    const bot=this.store.getBot(botId),receipt=this.store.managerPreparationReceipt(requestId,botId);
+    if(receipt&&(receipt.state==='ready'||receipt.state==='released'))return receipt;
+    const cwd=receipt?.cwd??join(this.dataDir,'managers',bot.id);await mkdir(cwd,{recursive:true});
+    const canonical=receipt?.cwd??await realpath(cwd);
+    if(this.closed)throw new AppError('manager-unavailable','管理器正在退出。');
+    const manager=receipt??this.store.beginManager(requestId,botId,canonical);
+    const current=this.store.getManager(manager.id);if(current.state==='ready'||current.state==='released')return current;
     const active=this.creating.get(manager.id);if(active)return active;
     const promise=(async()=>{
       try {
@@ -184,15 +189,28 @@ export class Managers {
     });
   }
   async replace(requestId:string,botId:string,expectedGeneration:number):Promise<ManagerBinding> {
+    if(this.closed)throw new AppError('manager-unavailable','管理器正在退出。');
     const receipt=this.store.commandReceipt<ManagerBinding>(requestId,'manager.replace',{botId,expectedGeneration});
-    const manager=receipt??this.store.activeManager(botId);if(!manager?.sessionId)throw new AppError('manager-missing','当前管理会话尚未准备好。');
+    if(receipt) {
+      // Resume only this replacement's preparation. A completed retry must not touch another generation or model choice.
+      const prepared=this.store.managerPreparationReceipt(`${requestId}:new`,botId);
+      if(!prepared&&(this.store.getBot(botId).configRevision!==receipt.configRevision||this.store.activeManager(botId)))throw new AppError('manager-stale','原更换请求已释放旧会话，之后配置或管理会话已经改变；没有再次更换。');
+      return this.prepare(`${requestId}:new`,botId);
+    }
+    const manager=this.store.activeManager(botId);if(!manager?.sessionId)throw new AppError('manager-missing','当前管理会话尚未准备好。');
     const resolved=await this.ctx.sessionController.resolveAgent(SessionId(manager.sessionId));
     if('error' in resolved)throw new AppError('manager-unavailable','无法核对旧管理会话，尚未更换。');
     const agent=resolved.agent;if(agent.status!=='idle'||agent.inbox.nextTurn.length||agent.inbox.nextStep.length)throw new AppError('manager-busy','管理会话正在工作，请等待结束或在原生会话停止后再更换。');
+    if(this.closed)throw new AppError('manager-unavailable','管理器正在退出。');
+    const model=selectedModel(this.ctx,agent);
     this.store.releaseManager(requestId,botId,expectedGeneration);
-    const next=await this.prepare(`${requestId}:new`,botId);const model=selectedModel(this.ctx,agent);
-    if(model&&next.sessionId){const created=await this.ctx.sessionController.resolveAgent(SessionId(next.sessionId));if('agent' in created&&!selectedModel(this.ctx,created.agent))created.agent.model.select(model);}
-    return next;
+    const next=await this.prepare(`${requestId}:new`,botId);
+    if(model&&next.sessionId&&next.state==='ready'){
+      const created=await this.ctx.sessionController.resolveAgent(SessionId(next.sessionId));
+      const current=this.store.activeManager(botId);
+      if(!this.closed&&current?.id===next.id&&current.state==='ready'&&current.configRevision===manager.configRevision&&'agent' in created&&!selectedModel(this.ctx,created.agent))created.agent.model.select(model);
+    }
+    return this.store.getManager(next.id);
   }
   private pumping=false;
   private retryAfter=new Map<string,number>();

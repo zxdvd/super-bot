@@ -299,3 +299,12 @@ ELECTRON_RUN_AS_NODE=1 '/Applications/DeepSeek Harness.app/Contents/MacOS/DeepSe
 - 独立 UI 第 28 轮确认 candidate-5 在线、原任务与原生会话可打开、返回仍选中任务、一次备份成功且范围清楚，console warn/error 为空。发现页脚操作后的成功提示在屏幕外。
 - 成功提示加入 status 语义，并在新备份返回时滚入可视区域；没有自动重试备份。candidate-6 实际 tgz 的独立 UI 第 29 轮从页脚点击后不手动滚动，路径、范围与关闭按钮均自动完整可见，关闭正常，无控制台告警。截图位于 `.runtime/ui29-backup-auto-visible.png`。
 - 移除初期最小插件留下的 create-probe-session 产品 API 与无使用者的 savedSessionId 状态字段；不删除已有原生会话或元数据。真实安装包 status 正常、旧临时接口返回 not-found；类型检查/构建通过。契约测试插件继续单独存在于开发 profile，不随产品包交付。
+
+
+## Manager 更换的历史回执边界（2026-11-07 06:40）
+
+- 独立收尾审查实际复现三条：配置改变后重试旧 prepare 会读空 current；旧 replace 成功后原会话忙碌导致重试误报；更重要的是旧 replace 重试会把 gen1 模型带到新配置的 gen3，使本应等待选模型的会话获得执行能力。
+- 准备回执现在绑定原 Manager ID 并读取其当前状态；ready/released 历史只读返回。更换已释放后的恢复仅对应该请求的 :new；尚无准备记录时要求配置未变且无其他当前 Manager。已提交重试不重新选择模型；中断恢复的新对话必要时由用户显式选择。
+- 首次正常继承在异步 resolve 后重新核对当前 ID、配置、ready 状态和已有选择；配置变化/释放后不选择模型。没有新增表、迁移或泛化调度机制。
+- `test/adapter/manager-lifecycle.test.ts` 5 项覆盖上述顺序、清空选择后重试、释放后中断、同配置另一个准备请求及异步解析期间配置变化；`npm run check` 52 核心 + 13 适配测试、类型检查和构建通过。独立补丁复核通过。
+- `smoke-manager-lifecycle.mjs` 在真实 DSH 以无网络模型跑 gen1→gen2→新配置 gen3，旧请求只返回原代 released；gen3 保留通知、modelSteps 0、自动唤醒不增长、提示选择模型。随后 `smoke:manager` 完整派发/验收/聊天建任务/跨 Bot 拒绝/正常更换回归通过。
