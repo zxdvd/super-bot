@@ -103,12 +103,17 @@ export class DshExecution {
       if(!['read','write','edit'].includes(exec.name))return;
       try{const args=exec.arguments as {file_path?:unknown};if(typeof args.file_path!=='string'||!isAbsolute(args.file_path))return 'Use an absolute file_path inside the task working directory.';containedPath(b.cwd,args.file_path);}catch(error){return error instanceof Error?error.message:'File path refused';}
     });
-    let released=false;const release=()=>{if(released)return;released=true;releaseGuard();releaseMask();};
+    let steps=0;
+    const releaseBudget=agent.ctx.on('agent/pre-step',async(_payload,next)=>{
+      if(++steps>40){await this.stopForBudget(run.id,'steps');throw new AppError('run-budget','执行达到 40 步上限。');}
+      return next();
+    });
+    let released=false;const release=()=>{if(released)return;released=true;releaseBudget();releaseGuard();releaseMask();};
     try {
       if(!this.store.claimDispatch(run.id)){release();this.store.runRecovery(run.id,'投递记录已经发出，但回执不完整。没有重复投递，请核对原生会话。');return this.store.getRun(run.id);}
       agent.followup(freezeMessage(JSON.parse(input.messageJson!) as UserMessage));
       this.store.inputEnqueued(run.id);
-      const deadline=setTimeout(()=>{const current=this.store.getTask(taskId);void this.stop(`budget:${run.id}`,taskId,current.rowVersion).catch(()=>this.store.runRecovery(run.id,'执行达到 10 分钟上限，需要核对停止结果。'));},10*60*1000);
+      const deadline=setTimeout(()=>{void this.stopForBudget(run.id,'time');},10*60*1000);
       deadline.unref();
       const done=agent.whenIdle().then(()=>{
         if(this.disposed)return;
@@ -128,6 +133,13 @@ export class DshExecution {
       }
       throw error;
     }
+  }
+  private async stopForBudget(runId:string,kind:'steps'|'time'):Promise<void> {
+    try {
+      if(!this.store.recordRunBudget(runId,kind))return;
+      const run=this.store.getRun(runId),task=this.store.getTask(run.taskId);
+      await this.stop(`budget-stop:${runId}`,task.id,task.rowVersion);
+    }catch{this.store.runRecovery(runId,'执行预算已用尽，停止结果需要核对；没有自动重试。');}
   }
   async accept(requestId:string,taskId:string,rowVersion:number,resultId:string) {
     const receipt=this.store.commandReceipt<import('./model.ts').Task>(requestId,'result.accept',{taskId,expectedRowVersion:rowVersion,resultId});

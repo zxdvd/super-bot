@@ -485,6 +485,14 @@ export class Store {
       this.event('result.accepted',taskId,{resultId});return this.getTask(taskId);
     });
   }
+  recordRunBudget(id:string,kind:'steps'|'time'):boolean {
+    const run=this.getRun(id);if(run.finishedAt!==null||run.state==='cancelling')return false;
+    return this.command(`budget:${id}`,'run.budget-reached',{id,kind},()=>{
+      const note=kind==='steps'?'执行已达到 40 步上限，请检查进展并拆分任务后再继续。':'执行已达到 10 分钟上限，请检查进展后再继续。';
+      this.db.prepare('UPDATE runs SET note=? WHERE id=?').run(note,id);
+      this.event('run.budget-reached',run.taskId,{runId:id,kind,limit:kind==='steps'?40:600,note});return true;
+    });
+  }
   requestStop(requestId:string,taskId:string,expectedRowVersion:number):{runId:string;requested:true} {
     return this.command(requestId,'task.stop',{taskId,expectedRowVersion},()=>{
       const task=this.getTask(taskId);const run=this.latestRun(taskId);
@@ -500,7 +508,9 @@ export class Store {
     if(this.getRun(id).finishedAt!==null)return;
     this.command(`cancelled:${id}`,'run.cancelled',{id},()=>{
       const run=this.getRun(id);if(run.state!=='cancelling')throw new AppError('stop-not-requested','没有停止请求。');
-      this.db.prepare("UPDATE runs SET state='cancelled',finishedAt=?,note='已核对停止' WHERE id=?").run(Date.now(),id);
+      const budget=this.db.prepare("SELECT 1 FROM events WHERE kind='run.budget-reached' AND taskId=? AND json_extract(data,'$.runId')=?").get(run.taskId,id);
+      this.db.prepare("UPDATE runs SET state='cancelled',finishedAt=?,note=? WHERE id=?").run(Date.now(),budget?run.note:'已核对停止',id);
+      if(budget)this.db.prepare('INSERT OR IGNORE INTO attentions(id,taskId,kind,question,taskRevision,createdAt) VALUES (?,?,?,?,?,?)').run(`run:${id}`,run.taskId,'recovery',`${run.note} 已确认停止；不会自动重试。`,run.taskRevision,Date.now());
       this.db.prepare("UPDATE inputs SET state='discarded' WHERE id=? AND state!='entered'").run(run.inputId);
       this.db.prepare("UPDATE attentions SET state='stale' WHERE taskId=? AND kind='approval' AND state='open'").run(run.taskId);
       const input=this.getRunInput(id);if(input.attentionId&&input.state==='discarded')this.db.prepare("UPDATE attentions SET state='open' WHERE id=? AND state='responding'").run(input.attentionId);

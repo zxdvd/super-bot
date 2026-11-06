@@ -94,7 +94,7 @@ class ProbeAdapter extends LlmAdapter {
       if(approvalProbe&&!calls.includes('write')&&options.sessionId)this.approvalWrites.add(options.sessionId);
       const hasAnswer=options.messages.some(m=>m.content.some(b=>b.type==='text'&&b.text.includes('Additional user input (answer):')));
       const needsAnswer=body.includes('Goal: ASK_PROBE')&&!hasAnswer;
-      const planned=approvalProbe&&calls.includes('write')&&!existsSync(file)&&!calls.includes('super_bot_report')?{name:'super_bot_report',args:{kind:'failed',summary:'审批路径结束，写入没有生成文件；请核对原生审批结果。'}}:
+      const planned=body.includes('Goal: STEP_BUDGET_PROBE')?{name:'read',args:{file_path:join(cwd,'missing-budget-probe.txt')}}:approvalProbe&&calls.includes('write')&&!existsSync(file)&&!calls.includes('super_bot_report')?{name:'super_bot_report',args:{kind:'failed',summary:'审批路径结束，写入没有生成文件；请核对原生审批结果。'}}:
         needsAnswer&&!calls.includes('super_bot_report')?{name:'super_bot_report',args:{kind:'waiting',summary:'请说明文档面向谁？'}}:
         !calls.includes('write')?{name:'write',args:{file_path:body.includes('Goal: RELATIVE_PATH_PROBE')?'result.md':file,content:'# 合成成果\n\n事实一：这份文档由隔离测试模型生成。\n事实二：测试没有访问网络或使用模型凭证。\n'+(body.includes('Additional user input (rework):')?'\n修订：已按返工要求补充说明。\n':'')+(body.includes('Goal: LARGE_RESULT_PROBE')?'\n'+'x'.repeat(16000):'')}}:
         !calls.includes('read')?{name:'read',args:{file_path:file}}:
@@ -356,7 +356,7 @@ export function apply(ctx:Context) {
       if(body.action==='inspect-session') {
         assert.ok(body.sessionId);const resolved=await ctx.sessionController.resolveAgent(SessionId(body.sessionId));assert.ok('agent' in resolved);
         assert.ok(resolved.agent.session.header.cwd?.startsWith(join(home!,'super-bot')+'/'));
-        return Response.json({ok:true,sessionId:resolved.agent.id,status:resolved.agent.status,pending:resolved.agent.inbox.nextTurn.length+resolved.agent.inbox.nextStep.length,scopedProbeCalls:scopedCalls.get(resolved.agent.id)??0,scopedProbeAttempts:adapter.scopedAttempts.get(resolved.agent.id)??0,
+        return Response.json({ok:true,sessionId:resolved.agent.id,status:resolved.agent.status,pending:resolved.agent.inbox.nextTurn.length+resolved.agent.inbox.nextStep.length,modelSteps:adapter.calls.filter(call=>call.sessionId===body.sessionId&&(!call.purpose||call.purpose==='conversation')).length,scopedProbeCalls:scopedCalls.get(resolved.agent.id)??0,scopedProbeAttempts:adapter.scopedAttempts.get(resolved.agent.id)??0,
           productTools:ctx.tools.definitions().map(tool=>tool.name).filter(name=>['super_bot_report','super_bot_manage'].includes(name))});
       }
       if(body.action==='select-test-model'||body.action==='native-prompt') {

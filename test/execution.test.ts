@@ -287,3 +287,19 @@ test('evidence hashes detect changed content and outside symlink paths',async()=
     await assert.rejects(collectEvidence(root,[]),/1～10/);
   }finally{rmSync(root,{recursive:true,force:true});rmSync(outside,{recursive:true,force:true});}
 });
+
+
+test('run budgets persist the reason, retain ownership until stopped, and require explicit recovery',()=>{
+  const store=new Store(':memory:');try {
+    const {task,run}=entered(store);
+    assert.equal(store.recordRunBudget(run.id,'steps'),true);assert.equal(store.recordRunBudget(run.id,'steps'),true);
+    assert.equal(store.db.prepare("SELECT count(*) AS n FROM events WHERE kind='run.budget-reached'").get()?.n,1);
+    store.requestStop('budget-stop',task.id,store.getTask(task.id).rowVersion);
+    assert.equal(store.recordRunBudget(run.id,'time'),false);assert.equal(store.heldRuns().length,1);
+    assert.equal(store.getTask(task.id).status,'stopping');
+    store.settleCancelled(run.id);assert.equal(store.heldRuns().length,0);assert.equal(store.getTask(task.id).status,'recovery');
+    assert.match(store.getRun(run.id).note,/40 步/);assert.equal(store.recordRunBudget(run.id,'steps'),false);
+    const paused=store.resolveRunRecovery('recover',task.id,store.getTask(task.id).rowVersion);
+    assert.equal(paused.status,'paused');assert.throws(()=>store.reserveRun('no-auto-retry',task.id,paused.rowVersion),/不能自动执行/);
+  }finally{store.close();}
+});

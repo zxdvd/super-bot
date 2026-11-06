@@ -68,7 +68,7 @@ ELECTRON_RUN_AS_NODE=1 '/Applications/DeepSeek Harness.app/Contents/MacOS/DeepSe
 
 ## 实现后填写
 
-每个 SB 任务记录：提交/包版本、场景、命令或 UI 操作、实际结果、证据位置、剩余限制。不得只写“测试通过”；Fake 与真实宿主结果分列。T01～T20 当前全部待验证。
+每个 SB 任务记录：提交/包版本、场景、命令或 UI 操作、实际结果、证据位置、剩余限制。不得只写“测试通过”；Fake 与真实宿主结果分列。T01～T20 的最新子场景覆盖与残余缺口见 requirements.md；下方保留各阶段历史证据。
 
 ## 提案 review 与执行决策（2026-11-07 01:45）
 
@@ -175,3 +175,13 @@ ELECTRON_RUN_AS_NODE=1 '/Applications/DeepSeek Harness.app/Contents/MacOS/DeepSe
 - `node scripts/smoke-scoped-tools.mjs`：实际 agent-scoped 合成工具出现在模型工具列表，Worker/Manager 各尝试调用一次，但执行函数计数均为 0；Worker 仍完成正常文件任务。增加执行 guard 后不依赖全局工具列表的筛选能力。
 - `node scripts/smoke-manager-rework.mjs`：复验一次返工/两次额度/更换 Manager 不重置额度，并新增大文件：即使显式 Bot 验收授权，截断预览也只能转人工，不能自动完成。
 - 独立第 16 轮 UI：缺条件任务不派发，补全后新目标版本自动唤醒 Manager 并执行；解绑/新代数不展示旧成果为当前候选，旧会话和文件保留；暂停验收标签通过。发现旧输入标题易误读，已改为历史输入，待第 17 轮复验。
+
+独立第 17 轮 UI 复验通过：16,133 字节成果在 Bot 授权下仍待人工验收，原生 detail 确认 `truncated:true`；新会话显示历史输入、无旧候选；Worker/Manager 额外工具真实拒绝后正常管理/文件流程可继续。console warn/error 为空。列表与详情进一步优先显示“本次需人工验收”，保留原任务授权不变。
+
+
+## 执行预算（2026-11-07 04:46）
+
+- Worker 增加每 Run 40 步上限，跨 turn 不重置；保留原 10 分钟截止。先记录预算原因并停止，确认收敛后才释放资源；转人工核对且保持暂停，不自动重试。
+- `npm run check` 在预算改动后 30 项核心测试通过；真实 `node scripts/smoke-budget.mjs steps` 模型调用恰好 40 次，Run cancelled、原生 idle/空 inbox、无候选，明确核对后仍 paused。
+- 独立第 18 轮 UI 自建任务复验：原生 1 turn/40 steps/Stopped，面板原因清楚；核对后刷新仍 paused，未发生第二轮。大文件本次人工验收标签复验通过，console warn/error 为空。
+- 10 分钟使用实际计时测试，任务已于 04:44 启动；本条写入时尚未到时，不视为通过。精确 Token/费用归因不在本次实现内。
