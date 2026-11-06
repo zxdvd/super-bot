@@ -308,3 +308,10 @@ ELECTRON_RUN_AS_NODE=1 '/Applications/DeepSeek Harness.app/Contents/MacOS/DeepSe
 - 首次正常继承在异步 resolve 后重新核对当前 ID、配置、ready 状态和已有选择；配置变化/释放后不选择模型。没有新增表、迁移或泛化调度机制。
 - `test/adapter/manager-lifecycle.test.ts` 5 项覆盖上述顺序、清空选择后重试、释放后中断、同配置另一个准备请求及异步解析期间配置变化；`npm run check` 52 核心 + 13 适配测试、类型检查和构建通过。独立补丁复核通过。
 - `smoke-manager-lifecycle.mjs` 在真实 DSH 以无网络模型跑 gen1→gen2→新配置 gen3，旧请求只返回原代 released；gen3 保留通知、modelSteps 0、自动唤醒不增长、提示选择模型。随后 `smoke:manager` 完整派发/验收/聊天建任务/跨 Bot 拒绝/正常更换回归通过。
+
+
+## 最后安装包回归与搜索边界（2026-11-07 06:45）
+
+- candidate-7 tgz 的实际 API 再走三代 Manager，旧请求返回 gen2 released、gen3 pending 保留/自动唤醒 0；原安装包任务/会话/备份 retained 检查通过。重建契约插件后，`probe:run` 11 项再次通过。
+- 搜索接口限制 200 字符，但 UI 原来没有对应限制。独立 UI 第 30 轮发现单加 maxLength 时，CUA 两种自动化粘贴路径仍能送入 220 字符，界面误显示离线；输入恰好 200 字符则正常。不把自动化路径等同于已证明人工浏览器粘贴必现。
+- 在组件 onChange 同时截断到 200 后，独立 UI 第 31 轮复用 220 字符输入，DOM value.length=200、宿主在线、正确无匹配，清空后恢复 2 项任务；console warn/error 为空。类型检查与构建通过，未修改业务执行逻辑。
