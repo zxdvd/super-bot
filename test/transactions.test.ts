@@ -8,12 +8,12 @@ import { Store } from '../src/store.ts';
 const ready={kind:'ready' as const,summary:'Saved result',checks:'Two facts',evidence:[{path:'/tmp/synthetic-result.md',sha256:'synthetic',bytes:20}]};
 const tables=['tasks','runs','inputs','resources','reports','results','reviews','attentions','outbox','events','requests'];
 function snapshot(store:Store){return tables.map(table=>[table,store.db.prepare(`SELECT * FROM ${table} ORDER BY rowid`).all()]);}
-function setup(store:Store){
+function setup(store:Store,enter=true){
  const bot=store.createBot('bot',{name:'Transaction fixture',instructions:'Synthetic files'});
  const manager=store.beginManager('manager',bot.id,'/tmp/transaction-manager');store.confirmManager(manager.id,manager.requestedSessionId);
  const task=store.createTask('task',{botId:bot.id,goal:'Write facts',scope:'Own directory',acceptance:'Read facts',reviewPolicy:'bot'});
  const binding=store.beginBinding('binding',task.id,task.rowVersion,'/tmp/transaction-task');store.claimBindingCreation(binding.id);store.confirmBinding(binding.id,binding.requestedSessionId);
- const run=store.reserveRun('run',task.id,store.getTask(task.id).rowVersion);store.saveRunMessage(run.id,'message','{}');store.claimDispatch(run.id);store.inputEntered(run.id,'message',1);
+ const run=store.reserveRun('run',task.id,store.getTask(task.id).rowVersion);store.saveRunMessage(run.id,'message','{}');store.claimDispatch(run.id);store.inputEnqueued(run.id);if(enter)store.inputEntered(run.id,'message',1);
  return {task,run};
 }
 
@@ -49,4 +49,27 @@ test('unknown notification after restart is not replayed and does not alter task
   store.managerEventEntered(event.id,'notify-message');assert.equal(store.db.prepare('SELECT state FROM outbox WHERE id=?').get(event.id)?.state,'unknown');
   assert.deepEqual(store.getTask(task.id),taskBefore);assert.deepEqual(store.getRun(run.id),runBefore);assert.equal(store.managerInfo(task.botId).hourlyWakes,1);
  }finally{store.close();rmSync(dir,{recursive:true,force:true});}
+});
+
+test('ready committed before settlement remains only a candidate across restart recovery',()=>{
+ const dir=mkdtempSync(join(tmpdir(),'super-bot-candidate-')),file=join(dir,'ledger.sqlite');let store=new Store(file);
+ try{
+  const {task,run}=setup(store);const reported=store.workerReport(run.id,'ready',ready);store.close();store=new Store(file);
+  store.runRecovery(run.id,'Host restarted before settlement');
+  assert.equal(store.runResult(run.id)?.id,reported.resultId);assert.equal(store.getTask(task.id).status,'recovery');assert.equal(store.heldRuns().length,1);
+  assert.throws(()=>store.acceptResult('accept',task.id,store.getTask(task.id).rowVersion,reported.resultId!),/不能验收/);
+  assert.throws(()=>store.reserveRun('retry',task.id,store.getTask(task.id).rowVersion),/尚未收敛|待办/);
+  store.settleRun(run.id);assert.equal(store.getTask(task.id).status,'recovery');assert.equal(store.runResult(run.id)?.humanAcceptedAt,null);
+ }finally{store.close();rmSync(dir,{recursive:true,force:true});}
+});
+
+test('entered write failure cannot promote an enqueued input into a valid report',()=>{
+ const store=new Store(':memory:');try{
+  const {task,run}=setup(store,false);
+  // The native user/message is observed, but its durable entered transaction fails.
+  store.db.exec("CREATE TRIGGER fail_entered BEFORE INSERT ON events WHEN NEW.kind='input.entered' BEGIN SELECT RAISE(ABORT,'entered fault'); END");
+  const before=snapshot(store);assert.throws(()=>store.inputEntered(run.id,'message',2),/entered fault/);assert.deepEqual(snapshot(store),before);
+  assert.throws(()=>store.workerReport(run.id,'late-ready',ready),/尚无输入/);
+  store.runRecovery(run.id,'Native message observed but ledger write failed');assert.equal(store.getRunInput(run.id).state,'unknown');assert.equal(store.heldRuns().length,1);assert.equal(store.getTask(task.id).status,'recovery');assert.equal(store.runResult(run.id),null);
+ }finally{store.close();}
 });

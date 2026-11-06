@@ -80,7 +80,7 @@ export interface Run {
 }
 export interface RunInput {id:string; taskId:string; kind:string; content:string; state:string; messageId:string|null; messageJson:string|null; attentionId:string|null; createdAt:number}
 export interface Evidence {path:string;sha256:string;bytes:number}
-export interface WorkReport {kind:'progress'|'waiting'|'ready'|'blocked'|'failed';summary:string;checks?:string;evidence?:Evidence[]}
+export interface WorkReport {kind:'progress'|'waiting'|'ready'|'blocked'|'failed';summary:string;checks?:string;evidence?:Evidence[];requestedFiles?:string[]}
 export interface Result {id:string;runId:string;taskId:string;taskRevision:number;summary:string;checks:string;evidence:Evidence[];createdAt:number;humanAcceptedAt:number|null}
 export interface Attention {
   id: string; taskId: string; kind: 'input' | 'approval' | 'review' | 'recovery';

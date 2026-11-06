@@ -14,10 +14,13 @@ export function containedPath(cwd:string,path:string):string {
   return canonical;
 }
 type InspectedEvidence=Evidence&{text:string;truncated:boolean};
-async function inspectFiles(cwd:string,paths:unknown,previewBytes=0):Promise<InspectedEvidence[]> {
+export function evidencePaths(paths:unknown):string[] {
   if(!Array.isArray(paths)||paths.length<1||paths.length>10||paths.some(p=>typeof p!=='string'))throw new AppError('invalid-evidence','请提供 1～10 个任务目录内的文件路径。');
+  return [...new Set(paths as string[])];
+}
+async function inspectFiles(cwd:string,paths:unknown,previewBytes=0):Promise<InspectedEvidence[]> {
   const evidence:InspectedEvidence[]=[];let total=0;
-  for(const path of new Set(paths as string[])) {
+  for(const path of evidencePaths(paths)) {
     let canonical:string;
     try{canonical=containedPath(cwd,path);}catch(error){if(error instanceof AppError)throw error;throw new AppError('evidence-unavailable','任务成果目录无法读取，请恢复目录后再核对。');}
     const maximum=Math.min(10*1024*1024,20*1024*1024-total);

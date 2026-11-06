@@ -14,7 +14,7 @@ import { realpathSync } from 'node:fs';
 import { join,isAbsolute } from 'node:path';
 import { AppError,requiredText,optionalText,type Binding,type Run,type WorkReport,type ExistingSessionGrant,type ExistingSessionPreview } from './model.ts';
 import type { Store } from './store.ts';
-import { collectEvidence,containedPath,verifyEvidence } from './evidence.ts';
+import { collectEvidence,containedPath,verifyEvidence,evidencePaths } from './evidence.ts';
 import { materialPrompt } from './materials.ts';
 
 declare module '@deepseek-ai/dsh-llm' {
@@ -35,7 +35,11 @@ export class DshExecution {
         if(!run)throw new AppError('report-scope','当前会话没有可报告的执行。');
         const data=args as Record<string,unknown>;const binding=this.store.getBinding(run.bindingId);
         const report:WorkReport={kind:data.kind as WorkReport['kind'],summary:requiredText(data.summary,'报告内容'),checks:optionalText(data.checks,'验收说明')};
-        if(report.kind==='ready')report.evidence=await collectEvidence(binding.cwd,data.files);
+        if(report.kind==='ready')report.requestedFiles=evidencePaths(data.files);
+        exec.signal.throwIfAborted();
+        const receipt=this.store.workerReportReceipt(run.id,exec.callId,report);
+        if(receipt){if(report.kind!=='progress')exec.concludeTurn();return receipt;}
+        if(report.kind==='ready')report.evidence=await collectEvidence(binding.cwd,report.requestedFiles);
         exec.signal.throwIfAborted();
         const result=this.store.workerReport(run.id,exec.callId,report);
         if(report.kind!=='progress')exec.concludeTurn();return result;

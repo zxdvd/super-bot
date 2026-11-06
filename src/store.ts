@@ -340,6 +340,17 @@ export class Store {
     const receipt=this.commandReceipt<Binding>(requestId,'session.prepare',{taskId,expectedRowVersion,cwd:previous.cwd});
     return receipt?this.getBinding(receipt.id):undefined;
   }
+  managerDispatchReceipt(requestId:string,taskId:string,expectedRowVersion:number):{run:Run}|{prepared:Binding}|undefined {
+    const row=this.db.prepare('SELECT result FROM requests WHERE id=?').get(requestId) as {result:string}|undefined;if(!row)return;
+    const saved=JSON.parse(row.result) as Record<string,unknown>;
+    // One management action first prepares a binding, or dispatches an existing one.
+    // Recover its original kind, then validate the exact underlying command hash.
+    if(typeof saved.inputId==='string') {
+      const run=this.commandReceipt<Run>(requestId,'task.dispatch',{taskId,expectedRowVersion})!;
+      return {run};
+    }
+    return {prepared:this.bindingReceipt(requestId,taskId,expectedRowVersion)!};
+  }
   beginBinding(requestId: string, taskId: string, expectedRowVersion: number, cwd: string): Binding {
     return this.command(requestId,'session.prepare',{taskId,expectedRowVersion,cwd},()=>{
       const task=this.getTask(taskId);
@@ -492,10 +503,19 @@ export class Store {
     const row=this.db.prepare('SELECT * FROM results WHERE runId=?').get(runId) as unknown as (Omit<Result,'evidence'>&{evidence:string})|undefined;
     return row?{...row,evidence:JSON.parse(row.evidence)}:null;
   }
+  resultById(id:string):Result|null {
+    const row=this.db.prepare('SELECT * FROM results WHERE id=?').get(id) as unknown as (Omit<Result,'evidence'>&{evidence:string})|undefined;
+    return row?{...row,evidence:JSON.parse(row.evidence)}:null;
+  }
+  workerReportReceipt(runId:string,callId:string,report:WorkReport):{accepted:true;resultId?:string}|undefined {
+    const row=this.db.prepare('SELECT data FROM reports WHERE id=?').get(`${runId}:${callId}`) as {data:string}|undefined;if(!row)return;
+    const saved=JSON.parse(row.data) as {evidence:WorkReport['evidence']};
+    return this.commandReceipt(`report:${runId}:${callId}`,'worker.report',{runId,callId,kind:report.kind,summary:requiredText(report.summary,'报告内容'),checks:optionalText(report.checks,'验收说明'),evidence:saved.evidence??[],...(report.requestedFiles?{requestedFiles:report.requestedFiles}:{})});
+  }
   workerReport(runId:string,callId:string,report:WorkReport):{accepted:true;resultId?:string} {
     const summary=requiredText(report.summary,'报告内容');
     if(!['progress','waiting','ready','blocked','failed'].includes(report.kind))throw new AppError('invalid-report','报告类型无效。');
-    const payload={runId,callId,kind:report.kind,summary,checks:optionalText(report.checks,'验收说明'),evidence:report.evidence??[]};
+    const payload={runId,callId,kind:report.kind,summary,checks:optionalText(report.checks,'验收说明'),evidence:report.evidence??[],...(report.requestedFiles?{requestedFiles:report.requestedFiles}:{})};
     if(report.kind==='ready'&&(!payload.checks||payload.evidence.length===0))throw new AppError('evidence-required','提交成果必须有验收说明和文件证据。');
     const outcome=this.command(`report:${runId}:${callId}`,'worker.report',payload,()=>{
       const run=this.getRun(runId);const task=this.getTask(run.taskId);const b=this.activeBinding(task.id);
@@ -630,9 +650,9 @@ export class Store {
       this.event('run.recovery-confirmed',taskId,{runId:run?.id??null,actor:'user'});return this.getTask(taskId);
     });
   }
-  managerReview(requestId:string,botId:string,taskId:string,expectedRowVersion:number,resultId:string,verdict:'accept'|'rework'|'human',text:string):Task {
+  managerReview(requestId:string,botId:string,taskId:string,expectedRowVersion:number,resultId:string,verdict:'accept'|'rework'|'human',text:string,requested?:{verdict:'accept';note:string}):Task {
     const note=requiredText(text,'验收判断');
-    return this.command(requestId,'manager.review',{botId,taskId,expectedRowVersion,resultId,verdict,note},()=>{
+    return this.command(requestId,'manager.review',{botId,taskId,expectedRowVersion,resultId,verdict,note,...(requested?{requested}:{})},()=>{
       const task=this.getTask(taskId),run=this.latestRun(taskId),result=run?this.runResult(run.id):null;
       if(task.botId!==botId)throw new AppError('scope','只能处理自己负责的任务。');
       if(task.rowVersion!==expectedRowVersion||task.controlMode!=='auto'||task.lifecycle!=='review'||!result||result.id!==resultId||result.taskRevision!==task.taskRevision||run?.state!=='settled')throw new AppError('review-stale','任务状态、授权或成果已经改变，管理判断未应用。');

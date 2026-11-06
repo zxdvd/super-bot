@@ -51,8 +51,15 @@ export class Managers {
           }
           authorize();return {...detail,botContext:this.store.taskBotContext(task.id),files};
         }
-        if(task.rowVersion!==data.expectedRowVersion||task.controlMode!=='auto')throw new AppError('manager-stale','任务已更新或自动管理已暂停，请重新读取。');
+        const current=()=>{if(task.rowVersion!==data.expectedRowVersion||task.controlMode!=='auto')throw new AppError('manager-stale','任务已更新或自动管理已暂停，请重新读取。');};
         if(data.action==='dispatch') {
+          const receipt=this.store.managerDispatchReceipt(requestId,task.id,data.expectedRowVersion as number);
+          if(receipt) {
+            if('run' in receipt)return receipt;
+            if(!['ready','released'].includes(receipt.prepared.state))throw new AppError('session-recovery','此前的会话创建结果需要核对，没有重复创建。');
+            return {prepared:receipt.prepared.state==='ready',task,message:receipt.prepared.state==='released'?'此前的会话关联已解除；此请求没有重新关联。':'此前已准备执行会话；当前状态请以账本为准。'};
+          }
+          current();
           const binding=this.store.activeBinding(task.id);
           if(!binding) {
             await this.execution.prepareSession(requestId,task.id,task.rowVersion);authorize();
@@ -68,13 +75,19 @@ export class Managers {
           catch(error){if(error instanceof AppError&&error.code==='capacity'){this.store.enqueueManager(bot.id,`capacity:${task.id}:${task.rowVersion}`,'容量等待：有名额后再次核对任务并派发。',task.id);return {deferred:true,message:'执行名额已占用，已等待容量通知。不要轮询。'};}throw error;}
         }
         if(data.action==='review') {
-          const detail=this.store.taskDetail(task.id);
-          if(!detail.result||!detail.binding||detail.result.id!==data.resultId)throw new AppError('result-stale','成果已经改变。');
+          const resultId=requiredText(data.resultId,'成果标识',200),saved=this.store.resultById(resultId);
           const verdict=data.verdict;if(!['accept','rework','human'].includes(String(verdict)))throw new AppError('invalid-review','请选择验收判断。');
-          if(verdict==='accept')await this.execution.verifyResult(task.id,detail.result.id);authorize();
-          const partial=verdict==='accept'&&detail.result.evidence.some(file=>file.bytes>12000);
+          const partial=verdict==='accept'&&saved?.evidence.some(file=>file.bytes>12000);
           const note=requiredText(data.note,'验收说明');
-          const result=this.store.managerReview(requestId,bot.id,task.id,task.rowVersion,detail.result.id,partial?'human':verdict as 'accept'|'rework'|'human',partial?`文件超过 12,000 字节的预览范围，仅完整校验哈希，需人工检查全文。模型建议：${note}`.slice(0,10000):note);
+          const decision=partial?'human':verdict as 'accept'|'rework'|'human',explanation=requiredText(partial?`文件超过 12,000 字节的预览范围，仅完整校验哈希，需人工检查全文。模型建议：${note}`.slice(0,10000):note,'验收判断');
+          const requested=partial?{verdict:'accept' as const,note}:undefined;
+          const receipt=this.store.commandReceipt<import('./model.ts').Task>(requestId,'manager.review',{botId:bot.id,taskId:task.id,expectedRowVersion:data.expectedRowVersion,resultId,verdict:decision,note:explanation,...(requested?{requested}:{})});
+          if(receipt)return {task:receipt,humanAcceptanceRequired:receipt.lifecycle==='review'};
+          current();
+          const detail=this.store.taskDetail(task.id);
+          if(!detail.result||!detail.binding||detail.result.id!==resultId)throw new AppError('result-stale','成果已经改变。');
+          if(verdict==='accept')await this.execution.verifyResult(task.id,resultId);authorize();
+          const result=this.store.managerReview(requestId,bot.id,task.id,task.rowVersion,resultId,decision,explanation,requested);
           return {task:result,humanAcceptanceRequired:result.lifecycle==='review'};
         }
         throw new AppError('unknown-action','不支持的管理操作。');

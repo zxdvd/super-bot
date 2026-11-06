@@ -15,7 +15,7 @@
 
 领域逻辑不依赖 DSH `Context`、Session 类型和客户端组件。DSH 是第一个执行适配与产品入口，不是产品身份；独立 App/Web 仍需另行实现宿主、认证、执行适配和数据迁移，不能承诺只换 UI 即完成迁移。
 
-## 从这里开始
+## 源码仓库导航
 
 - [实施路线](ROADMAP.md)：阶段目标和退出条件。
 - [本轮提案](specs/changes/2026-11-super-bot-mvp/README.md)：范围、验收、依赖与设计决策。
@@ -24,6 +24,28 @@
 - [运行能力与降级](docs/runtime-support.md)：当前支持范围、限制和复验命令。
 - [原始设计基线](docs/design-baseline.md)：用户提供的 v0.1 输入快照；后续实现契约以本轮 Spec 为准。
 - [协作规则](AGENTS.md)。
+
+## 安装本地预览包
+
+此预览包固定用于 DSH Web `0.2.2-rc.1` 和 Node `>=24.9`。已有兼容 DSH 的用户可直接使用收到的 tgz；尚未安装 DSH 时可运行 `npm install -g @deepseek-ai/dsh@0.2.2-rc.1`。开发者先在源码仓库构建并打包：
+
+```sh
+npm ci
+npm run check
+npm pack
+```
+
+用独立数据目录和 profile 安装生成的 `zxdvd-super-bot-0.1.0.tgz`：
+
+```sh
+DSH_HOME=/absolute/path/super-bot-home dsh --profile super-bot --from-default-profile web --dump-config > /dev/null
+DSH_HOME=/absolute/path/super-bot-home dsh plugin --profile super-bot add /absolute/path/zxdvd-super-bot-0.1.0.tgz
+DSH_HOME=/absolute/path/super-bot-home dsh --profile super-bot --no-open --port 3081
+```
+
+上面的 `--from-default-profile web` **仅用于全新 profile 的首次初始化**；更新现有 profile 时只运行 plugin add 和启动命令，不要重复初始化。
+
+首次运行保留终端打印的登录链接，打开后进入左侧 Super Bot。独立 home 不继承日常模型账号；在原生会话选择并配置你自己的模型。产品安装包不包含测试模型。升级前先备份、停止该宿主，再安装新包并启动；不要同时打开同一账本。下方的构建、测试命令只适用于源码仓库，不在已安装的插件目录运行。
 
 ## 本地开发预览
 
@@ -37,11 +59,11 @@ npm run dev
 
 `dev` 使用仓库 `.runtime/dsh` 下的独立 home/profile，监听 `127.0.0.1:3081`。从终端启动链接进入后点击左侧 Super Bot。它不复用日常 DSH 的会话或模型凭证。退出用 Ctrl-C；再次运行保留任务数据。数据库默认在 `$DSH_HOME/super-bot/ledger.sqlite`，不要同时用多个宿主打开同一数据库。
 
-- `npm run check`：类型检查、核心账本测试、Host/Client 构建。
+- `npm run check`：类型检查、核心账本测试、DSH 适配层测试、Host/Client 构建。`npm test` 单独运行不依赖 DSH 的账本测试。
 - `npm run smoke`：测试宿主运行时检查真实状态、WAL、未认证访问与跨域拒绝。
 - `npm pack --dry-run`：核对分发清单；运行数据和契约测试插件不进入安装包。
 
-Node 用 fnm 管理时，可用 `fnm exec --using=24.21.0 npm run dev`，无需改变机器默认版本。完整执行流程和可靠性门槛见任务清单。创建任务只保存目标；“开始执行”才调用原生会话中选定的模型。当前 Worker 只开放任务目录内的 read/write/edit 和结构化报告，不开放 Shell/子 Agent；每次执行最多 40 步或 10 分钟（先到者触发），全局最多 2 个未收敛任务。暂停只阻止后续派发，停止会请求取消并核对收敛。预算耗尽后保留原因并转人工核对，不自动重试。原生当前工作目录改变会停止本轮授权并要求核对；文件工具必须使用任务目录内的绝对路径。执行时另行拒绝会话额外注册的工具，不只依赖工具列表筛选。
+Node 用 fnm 管理时，可用 `fnm exec --using=24.21.0 npm run dev`，无需改变机器默认版本。完整执行流程和可靠性门槛见任务清单。未启用 Manager 时，创建任务只保存目标，“开始执行”才调用原生会话中选定的模型。启用 Manager 后，完整且未暂停的任务会自动安排执行；需要先核对时，请在创建表单选择“先暂停”。当前 Worker 只开放任务目录内的 read/write/edit 和结构化报告，不开放 Shell/子 Agent；每次执行最多 40 步或 10 分钟（先到者触发），全局最多 2 个未收敛任务。暂停只阻止后续派发，停止会请求取消并核对收敛。预算耗尽后保留原因并转人工核对，不自动重试。原生当前工作目录改变会停止本轮授权并要求核对；文件工具必须使用任务目录内的绝对路径。执行时另行拒绝会话额外注册的工具，不只依赖工具列表筛选。
 
 
 ## 当前可试用流程
@@ -88,7 +110,9 @@ Bot 之间轮流获得自动管理机会；同一 Bot 的用户回答、人工�
 npm run restore:ledger -- /absolute/path/backup.sqlite /absolute/path/new-super-bot-data
 ```
 
-恢复脚本检查完整性和 schema，拒绝覆盖现有目录。恢复后的未完成任务全部暂停并产生待核对事项，旧管理通知不自动重放；备份之后真实文件或会话可能已经变化，需要逐项核对。原账本与备份不会被修改。当前 schema 为 7，恢复脚本接受 schema 6～7 的备份；schema 6 在新宿主首次打开时事务升级。其他版本会拒绝，需先使用对应版本处理。升级前应先备份；旧插件不能打开已升级账本。回退时停止宿主，使用旧版插件和升级前的备份恢复到新目录，不能覆盖或降级当前数据库。
+如果只有 tgz，先解包，然后用 `node /absolute/path/package/scripts/restore-ledger.mjs /absolute/path/backup.sqlite /absolute/path/new-super-bot-data` 调用包内脚本。
+
+恢复脚本检查完整性和 schema，拒绝覆盖现有目录。恢复后的未完成任务全部暂停并产生待核对事项，旧管理通知不自动重放；备份之后真实文件或会话可能已经变化，需要逐项核对。原账本与备份不会被修改。当前 schema 为 7，恢复脚本接受 schema 6～7 的备份；schema 6 在新宿主首次打开时事务升级。其他版本会拒绝，需先使用对应版本处理。升级前应先备份；旧插件不能打开已升级账本。回退时停止宿主，使用旧版插件、对应旧版恢复脚本和升级前的备份恢复到新目录，不能覆盖或降级当前数据库。
 
 启动宿主时设置 `SUPER_BOT_DATA_DIR=/absolute/path/new-super-bot-data`，或在插件配置中设置 `dataDir`（配置优先）。继续使用原 DSH home，或先恢复对应会话与成果目录；仅修改数据目录不会搬迁那些文件。切回原账本时，停止宿主并撤销该设置。不要同时运行两个宿主操作同一组会话/成果。
 

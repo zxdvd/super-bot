@@ -244,3 +244,14 @@ ELECTRON_RUN_AS_NODE=1 '/Applications/DeepSeek Harness.app/Contents/MacOS/DeepSe
 - 初次迟到命令夹具会在工具拒绝后再次挂起，是合成模型复用旧 tool 结果导致；改为每条通知仅挂起一次后，三条真实竞争路径全部通过，无需修改产品权限规则。
 - 管理对话新建时增加名称、管理代数、配置版本；更新管理 Workspace 名称，便于区分更名后的新旧对话。已有 ready 会话不自动改名。此次 `npm run check` 42 项通过，UI 标题复验待进行。
 - SB-10～12 的当前文件任务纵切完成；Shell/共享外部服务、真实模型质量仍明确后置。
+
+
+## 故障窗口与已提交回执（2026-11-07 05:55）
+
+- `test/transactions.test.ts` 在报告、settle、人工验收、Manager 返工的最后 requests 插入处触发 ABORT，核对所有业务表、资源、待办、通知、审计整体回滚；关库重开后仍无半条事务。去除故障后同请求可提交，再重开重试不增加记录。
+- ready 已提交但尚未 settle 时重启恢复，候选保留但不可验收、资源仍占用；entered 写入失败时 enqueued 不提升为已进入上下文，报告拒绝，恢复保留未知占用。sending 的管理通知重开后转 unknown，迟到 entered 不触发重发或重执行。
+- 独立审查找到 adapter 在 Store 回执之前检查 rowVersion/读取成果文件的问题。Manager 现在先核对身份与 Bot 归属，再按原 prepare/dispatch/review 操作查验回执；Worker 保存原请求文件路径并先取已提交报告，不因后续磁盘变化把成功回执误报失败。所有新操作仍执行完整版本、权限、证据检查。
+- 补充审查修复：prepare 意图仅处于 creating/recovery 时仍要求核对，不能返回 prepared；已解除的关联不能借重试重新绑定。大文件 accept 降为 human 时，原判定与未截断说明也参与回执 hash，防止不同请求因展示说明截断而碰撞。
+- `test/adapter/receipts.test.ts` 单独运行，不混入无 DSH 的核心账本测试。8 项覆盖准备/派发/各类验收成功后重试、同调用异参冲突、删除成果后的已提交回执、结束后的报告权限拒绝，以及 Fake 原 Agent 仍 active 时重新安装 adapter 的授权撤销/不重派/不释放。最后一项不代表真实宿主热卸载已验证。
+- `npm run check`：49 项核心测试、8 项适配测试、类型检查和构建通过。修复后真实 `probe:run` 11 项再次通过；真实 Manager 返工与大文件转人工回归通过。
+- 独立 UI 第 22 轮通过：新 Manager 标题含 Bot 名、管理 3/4 和配置 2/3；更名同步管理 Workspace，旧标题保留，两项任务始终暂停，console warn/error 为空。

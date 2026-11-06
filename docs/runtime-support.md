@@ -22,7 +22,7 @@
 | Manager 迟到命令 | 已验证 | 模型读取后暂停，用户改目标或在 Worker 原生输入；迟到 dispatch/review 被拒绝。`smoke-manager-stale.mjs` |
 | 两个 Worker 容量 | 已验证 | 同 Bot 两项实际同时运行；第三项不创建 Run，另一个 Bot 的 Manager 等待名额，释放后才派发。`smoke-capacity.mjs` |
 | 后台作业收敛 | 已验证契约；产品能力有限 | Agent idle 不代表 job 停止，kill accepted 不代表 settled。合成 job 探针及 `smoke-background.mjs` 实际 ready→恢复门槛验证；不开放业务 Shell |
-| 重启与未知投递 | 已验证主要窗口 | 实际 SIGKILL、投递后丢回执、Manager 通知丢回执均不自动重放责任。`smoke-restart.mjs`、`probe:run` |
+| 重启与未知投递 | 已验证支持范围 | 报告/settle/验收事务回滚和提交回执重开、entered 失败、Fake 旧 Agent 存活重装 adapter 均通过。实际 SIGKILL、投递后丢回执、Manager 通知丢回执均不自动重放责任。`smoke-restart.mjs`、`probe:run` |
 | 账本迁移和恢复 | 已验证主要窗口 | schema 2→7、实际 schema 6→7、失败回滚、未提交升级进程中断、一致性快照、新目录恢复。`npm test`、`smoke-restored.mjs` |
 | Dashboard 离线 | 已验证 | 仅保留快照并禁用变更；重连不重放操作，恢复筛选和位置。100 项分页通过 |
 | 运行中热卸载/热替换 | 未验证 | 目前使用停止宿主→卸载/更新→重启的操作方式 |
