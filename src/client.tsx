@@ -19,7 +19,7 @@ export function apply(context: Context): void {
   const api: WorkspaceApi = {
     async call<T>(action: string, payload: Record<string, unknown> = {}, signal?: AbortSignal): Promise<T> {
       const result = await ctx.connection.rpc.call('/api', 'super-bot', { ...payload, action }, signal);
-      if (!result.ok) throw new Error(result.error.message);
+      if (!result.ok) throw Object.assign(new Error(result.error.message),{code:result.error.code});
       return result.value as T;
     },
     openSession: id => ctx.uiWorkspace.openSession(id as SessionId),

@@ -4,7 +4,7 @@
 
 | 能力 | 当前结果 | 产品行为与证据 |
 | --- | --- | --- |
-| 安装、启动、原生会话导航 | 已验证 | 官方插件安装；单独 Web profile；停机卸载/重装保留数据。独立 UI 多轮通过 |
+| 安装、启动、原生会话导航 | 已验证 | 官方插件安装；单独 Web profile；实际 tgz 全新安装、停机卸载/重装保留数据。独立 UI 多轮通过 |
 | 准备新的任务会话 | 已验证 | 预分配 Session ID、持久创建意图；丢回执后只核对同一个会话。`probe:run` |
 | 关联已有普通会话 | 已验证 API 与 UI | 双授权、有效目录检查、关联后暂停；已有归属拒绝。`smoke-attach.mjs` 包含并发竞争和普通 fork |
 | Bot 配置与参考资料 | 已验证 API 与 UI | 配置版本、最多 4 个本地 UTF-8 文本快照；旧任务保持原配置，变更撤销旧 Manager。`smoke-bot-config.mjs` 含并发重复请求、源文件变化和启用前任务积压 |
@@ -23,9 +23,9 @@
 | 两个 Worker 容量 | 已验证 | 同 Bot 两项实际同时运行；第三项不创建 Run，另一个 Bot 的 Manager 等待名额，释放后才派发。`smoke-capacity.mjs` |
 | 后台作业收敛 | 已验证契约；产品能力有限 | Agent idle 不代表 job 停止，kill accepted 不代表 settled。合成 job 探针及 `smoke-background.mjs` 实际 ready→恢复门槛验证；不开放业务 Shell |
 | 重启与未知投递 | 已验证支持范围 | 报告/settle/验收事务回滚和提交回执重开、entered 失败、Fake 旧 Agent 存活重装 adapter 均通过。实际 SIGKILL、投递后丢回执、Manager 通知丢回执均不自动重放责任。`smoke-restart.mjs`、`probe:run` |
-| 账本迁移和恢复 | 已验证主要窗口 | schema 2→7、实际 schema 6→7、失败回滚、未提交升级进程中断、一致性快照、新目录恢复。`npm test`、`smoke-restored.mjs` |
-| 首次模型选择与错误提示 | 已验证 API，UI 复验中 | 使用原生 modelSelection 投影区分已选模型与默认路由；未选 Worker 不创建 Run，Manager 保留通知/0 次唤醒。真实 turn/end 的缺凭证错误显示明确原因，不抄录提供方原始错误正文。`smoke-model-errors.mjs`、实际 tgz `smoke-package.mjs` |
-| Dashboard 离线 | 已验证 | 仅保留快照并禁用变更；重连不重放操作，恢复筛选和位置。100 项分页通过 |
+| 账本迁移和恢复 | 已验证主要窗口 | schema 2→7、实际 schema 6→7、失败回滚、未提交升级进程中断、一致性快照、新目录恢复、schema 6 旧版本实际回退。`npm test`、`smoke-restored.mjs` |
+| 首次模型选择与错误提示 | 已验证 API 与 UI | 使用原生 modelSelection 投影区分已选模型与默认路由；未选 Worker 不创建 Run，Manager 保留通知/0 次唤醒。真实 turn/end 的缺凭证错误显示明确原因，不抄录提供方原始错误正文。`smoke-model-errors.mjs`、实际 tgz `smoke-package.mjs` |
+| Dashboard 离线 | 已验证 | 仅保留快照并禁用变更；重连不重放操作，恢复筛选和位置。100 项分页通过；恢复旧备份时清除失效任务/Bot 选择并钳制页码，同页任务消失路径 UI 通过 |
 | 运行中热卸载/热替换 | 未验证 | 目前使用停止宿主→卸载/更新→重启的操作方式 |
 | Desktop | 未验证 | 本机 `0.2.1-rc.5` 未接入验证；当前安装包目标是 Web rc.1 |
 | 真实模型质量、Token/费用 | 未验证 / 未提供精确归因 | 不把确定性测试当模型能力评估；真实账号与最终个人试用留待用户方便时进行 |

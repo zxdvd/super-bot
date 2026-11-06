@@ -124,17 +124,20 @@ export function Workspace({ api }: { api:WorkspaceApi }) {
       let cadence=5000;
       if(document.visibilityState==='hidden'){timer=setTimeout(pull,5000);return;}
       try {
+        const existing=async<T,>(query:Promise<T>):Promise<T|undefined>=>{try{return await query;}catch(error){if(error instanceof Error&&'code' in error&&error.code==='not-found')return;throw error;}};
         const [s, b, p, d, m]=await Promise.all([
           api.call<WorkspaceStatus>('status',{},controller.signal), api.call<Bot[]>('bot.list',{},controller.signal),
-          botId?api.call<TaskPage>('task.list',{botId,q:query,lifecycle:filter,offset,limit:25},controller.signal):undefined,
-          selected?api.call<Detail>('task.detail',{id:selected},controller.signal):undefined,
-          botId?api.call<typeof managerInfo>('manager.status',{botId},controller.signal):undefined,
+          botId?existing(api.call<TaskPage>('task.list',{botId,q:query,lifecycle:filter,offset,limit:25},controller.signal)):undefined,
+          selected?existing(api.call<Detail>('task.detail',{id:selected},controller.signal)):undefined,
+          botId?existing(api.call<typeof managerInfo>('manager.status',{botId},controller.signal)):undefined,
         ]);
         if(controller.signal.aborted)return;
         setStatus(s);setBots(b);setPage(p);setManagerInfo(m);setConnectionError('');
         if(p&&pendingSelection.current){if(p.items.some(t=>t.id===pendingSelection.current))setSelected(pendingSelection.current);pendingSelection.current='';}
         if(p?.items.some(t=>['queued','running','stopping','approval'].includes(t.status)))cadence=1000;
-        if(selected&&p&&!p.items.some(t=>t.id===selected)){setSelected('');setDetail(undefined);setForm(null);}else setDetail(d);setOnline(true);setLoading(false);setSynced(Date.now());failures=0;
+        if(selected&&(!d||(p&&!p.items.some(t=>t.id===selected)))){setSelected('');setDetail(undefined);setForm(current=>current==='edit'?null:current);}else setDetail(d);setOnline(true);setLoading(false);setSynced(Date.now());failures=0;
+        if(p&&offset>0&&offset>=p.total){setOffset(Math.max(0,Math.floor((p.total-1)/25)*25));setSelected('');setDetail(undefined);setForm(null);}
+        if(botId&&!b.some(bot=>bot.id===botId)){const id=b[0]?.id??'';pendingSelection.current='';savedView.current=undefined;preferredBot.current=id;setBotId(id);rememberBot(id);setPage(undefined);setSelected('');setDetail(undefined);setManagerInfo(undefined);setOffset(0);setFilter('');setQuery('');setForm(null);if(!id)try{sessionStorage.removeItem('super-bot:view');}catch{/* Optional view memory. */}}
         if(!botId&&b.length){const id=b.some(bot=>bot.id===preferredBot.current)?preferredBot.current:b[0].id;setBotId(id);rememberBot(id);if(savedView.current?.botId===id){setQuery(savedView.current.query);setFilter(savedView.current.filter);setOffset(savedView.current.offset);pendingSelection.current=savedView.current.selected;}savedView.current=undefined;}
       } catch(e){if(controller.signal.aborted)return;setOnline(false);setLoading(false);setConnectionError('暂时无法读取宿主状态，将自动重试。');failures++;}
       timer=setTimeout(pull,Math.min(30000,cadence*2**failures));

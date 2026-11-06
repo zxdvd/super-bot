@@ -16,7 +16,8 @@
     "README.md",
     "schema-version.json",
     "scripts/restore-ledger.mjs",
-    "docs/runtime-support.md"
+    "docs/runtime-support.md",
+    "docs/first-trial.md"
   ],
   "engines": {
     "node": ">=24.9.0",

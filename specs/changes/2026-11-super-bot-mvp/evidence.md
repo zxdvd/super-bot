@@ -265,3 +265,14 @@ ELECTRON_RUN_AS_NODE=1 '/Applications/DeepSeek Harness.app/Contents/MacOS/DeepSe
 - Worker 和 Manager 订阅原生 turn/end 结构化错误码，将缺凭证、认证失败、额度不足/无提供方映射成明确步骤；不保存提供方原始错误正文，不自动重试。既有 12 步预算原因不会被泛化错误覆盖。
 - `npm run check` 49 核心 + 8 适配测试通过；`smoke-model-errors.mjs` 使用合成 MISSING_CREDENTIAL、真实原生错误事件验证两类提示与未选模型零调用；Manager 全闭环/更换与 12 步预算回归通过。
 - candidate-2 tgz 停机更新后，`smoke-package.mjs prepare` 验证未选任务无 Run、普通会话/Manager 创建、一致性备份幂等和参考 A 文本快照（磁盘后来变 B）；UI 第 24 轮复验中。
+
+
+## 安装、恢复、卸载和实际回退（2026-11-07 06:17）
+
+- 独立 UI 第 24 轮通过未选模型的拒绝与空原生会话、Manager pending 1 / wakes 0；没有选真实模型或添加凭证。
+- 用 candidate-2 包内恢复脚本恢复到全新数据目录，实际启动后原任务/Session 引用保留、未完成任务 paused/recovery、Manager pending 0；原账本文件与备份哈希均未改变。UI 第 25 轮确认恢复说明、原生会话与管理标题可读，未点击核对或执行。
+- 停机 remove 后再次启动：认证 API 返回 404，独立 UI 确认产品入口消失；原 Workspace、失败任务历史和管理会话仍保留。再安装 candidate-3 tgz、切回原账本，`smoke-package.mjs retained` 确认原任务/绑定/备份不变，没有模型执行。
+- 只读审查发现若恢复前仍选中一个不在备份中的 Task，query not-found 会被当成全宿主 offline。客户端现在保留错误码，仅把选择相关查询的 not-found 视为失效选择；其他错误仍离线，Bot 消失时重选，页码超界时钳回有效页。UI 第 26 轮保持同页、不手动刷新/导航，切回旧备份后任务 2→1，消失任务与详情自动清除，宿主在线；仅停机期间连接重试警告。操作记录/连续 AX 支持同页更新，未取得独立 document timeOrigin 证据，不夸大成浏览器内部导航证明。
+- 实际回退：从 Git `b19cb02` 构建 schema 6 旧插件包，使用该版本恢复脚本与升级前一致性备份。在停止 schema 7 测试宿主后，使用同一独立 DSH home、新 profile/新数据目录启动旧包于 3083；查询得到 45 Bot、198 Task、66 Result，176 项未完成任务全部暂停/待核对，管理 pending 0。旧脚本对 schema 7 备份在创建目标目录前拒绝。回退验证后停止 3083，重新启动原 3081 schema 7 宿主。
+- 滚动小时额度补证：原 20 次唤醒已实际超过一小时，旧计数归 0，7 条通知仍保留；显式为替换会话选择无网络测试模型后，7 条处理完、计数 7，全部暂停任务仍没有 Worker Session。证据 `.runtime/manager-hourly-rollover.json`。
+- 安装清单与用户恢复步骤补齐，提供 `docs/first-trial.md`。SB-14 完成当前支持范围，SB-15/FV 等待真实账号/模型质量与个人最终验收。
