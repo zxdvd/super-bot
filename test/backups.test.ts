@@ -1,12 +1,48 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync,rmSync,statSync } from 'node:fs';
+import { mkdtempSync,rmSync,statSync,readFileSync,writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join,resolve } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { DatabaseSync } from 'node:sqlite';
 import { Store } from '../src/store.ts';
 import { createLedgerBackup } from '../src/backups.ts';
+
+test('backup retry reconstructs a missing manifest without replacing the first snapshot',async()=>{
+  const directory=mkdtempSync(join(tmpdir(),'super-bot-backup-window-'));const store=new Store(join(directory,'ledger.sqlite'));
+  try {
+    store.createBot('first',{name:'First snapshot',instructions:'Synthetic fixture'});
+    const first=await createLedgerBackup(store,directory,'backup'),bytes=readFileSync(first.path);
+    // Simulate interruption after publishing SQLite but before publishing the manifest/receipt.
+    rmSync(first.manifestPath);store.db.prepare("DELETE FROM requests WHERE id LIKE 'backup:%'").run();store.db.prepare("DELETE FROM events WHERE kind='ledger.backup'").run();
+    store.createBot('later',{name:'Later write',instructions:'Must not enter first snapshot'});
+    const retried=await createLedgerBackup(store,directory,'backup');
+    assert.equal(retried.counts.bots,1);assert.deepEqual(readFileSync(first.path),bytes);
+    assert.deepEqual(await createLedgerBackup(store,directory,'backup'),retried);
+  }finally{store.close();rmSync(directory,{recursive:true,force:true});}
+});
+
+test('deleted backup cannot be reported as available or silently recreated by the same request',async()=>{
+  const directory=mkdtempSync(join(tmpdir(),'super-bot-backup-missing-'));const store=new Store(join(directory,'ledger.sqlite'));
+  try {
+    store.createBot('first',{name:'First snapshot',instructions:'Synthetic fixture'});
+    const first=await createLedgerBackup(store,directory,'backup');rmSync(first.path);
+    await assert.rejects(createLedgerBackup(store,directory,'backup'),{code:'backup-unavailable'});
+    rmSync(first.manifestPath);
+    await assert.rejects(createLedgerBackup(store,directory,'backup'),{code:'backup-unavailable'});
+    const replacement=await createLedgerBackup(store,directory,'new-backup');assert.equal(replacement.counts.bots,1);
+  }finally{store.close();rmSync(directory,{recursive:true,force:true});}
+});
+
+test('corrupt published backup is rejected without changing the original or ledger',async()=>{
+  const directory=mkdtempSync(join(tmpdir(),'super-bot-backup-corrupt-'));const store=new Store(join(directory,'ledger.sqlite'));
+  try {
+    store.createBot('first',{name:'First snapshot',instructions:'Synthetic fixture'});
+    const first=await createLedgerBackup(store,directory,'backup');writeFileSync(first.path,'damaged fixture');
+    await assert.rejects(createLedgerBackup(store,directory,'backup'),{code:'backup-invalid'});
+    assert.equal(readFileSync(first.path,'utf8'),'damaged fixture');assert.equal(store.listBots().length,1);
+  }finally{store.close();rmSync(directory,{recursive:true,force:true});}
+});
 
 test('schema 6 backups restore paused and upgrade to task configuration snapshots',()=>{
   const directory=mkdtempSync(join(tmpdir(),'super-bot-old-backup-'));

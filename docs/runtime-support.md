@@ -23,7 +23,7 @@
 | 两个 Worker 容量 | 已验证 | 同 Bot 两项实际同时运行；第三项不创建 Run，另一个 Bot 的 Manager 等待名额，释放后才派发。`smoke-capacity.mjs` |
 | 后台作业收敛 | 已验证契约；产品能力有限 | Agent idle 不代表 job 停止，kill accepted 不代表 settled。合成 job 探针及 `smoke-background.mjs` 实际 ready→恢复门槛验证；不开放业务 Shell |
 | 重启与未知投递 | 已验证支持范围 | 报告/settle/验收事务回滚和提交回执重开、entered 失败、Fake 旧 Agent 存活重装 adapter 均通过。实际 SIGKILL、投递后丢回执、Manager 通知丢回执均不自动重放责任。`smoke-restart.mjs`、`probe:run` |
-| 账本迁移和恢复 | 已验证主要窗口 | schema 2→7、实际 schema 6→7、失败回滚、未提交升级进程中断、一致性快照、新目录恢复、schema 6 旧版本实际回退。`npm test`、`smoke-restored.mjs` |
+| 账本迁移和恢复 | 已验证主要窗口 | schema 2→7、实际 schema 6→7、失败回滚、未提交升级进程中断、一致性快照、新目录恢复、schema 6 旧版本实际回退。快照发布后清单中断的重试保留原快照；缺失/损坏文件拒绝成功。`npm test`、`smoke-restored.mjs`、实际安装包 `smoke-backup-retry.mjs` |
 | 首次模型选择与错误提示 | 已验证 API 与 UI | 使用原生 modelSelection 投影区分已选模型与默认路由；未选 Worker 不创建 Run，Manager 保留通知/0 次唤醒。真实 turn/end 的缺凭证错误显示明确原因，不抄录提供方原始错误正文。`smoke-model-errors.mjs`、实际 tgz `smoke-package.mjs` |
 | Dashboard 离线 | 已验证 | 仅保留快照并禁用变更；重连不重放操作，恢复筛选和位置。100 项分页通过；恢复旧备份时清除失效任务/Bot 选择并钳制页码，同页任务消失路径 UI 通过 |
 | 运行中热卸载/热替换 | 未验证 | 目前使用停止宿主→卸载/更新→重启的操作方式 |

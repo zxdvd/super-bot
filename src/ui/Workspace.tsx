@@ -71,7 +71,7 @@ function TaskForm({ task, submit, cancel, busy }: { task?:Task; submit:(data:Rec
 
 function ReplyForm({label,busy,submit}:{label:string;busy:boolean;submit:(text:string,requestId:string)=>Promise<boolean>}) {
   const [text,setText]=useState('');const request=useRef(crypto.randomUUID());
-  return <form className="form" onSubmit={e=>{e.preventDefault();if(text.trim())void submit(text,request.current);}}><label>{label}<textarea disabled={busy} required maxLength={10000} value={text} onChange={e=>{setText(e.target.value);request.current=crypto.randomUUID();}}/></label><button disabled={busy||!text.trim()}>保存{label}</button><p className="muted" style={{fontSize:12}}>保存后点击“开始执行”投递。暂停期间会保留输入。</p></form>;
+  return <form className="form" onSubmit={e=>{e.preventDefault();if(text.trim())void submit(text,request.current);}}><label>{label}<textarea disabled={busy} required maxLength={10000} value={text} onChange={e=>{setText(e.target.value);request.current=crypto.randomUUID();}}/></label><button disabled={busy||!text.trim()}>保存{label}</button><p className="muted" style={{fontSize:12}}>启用 Manager 后会自动安排；未启用时需点击“开始执行”。暂停或人工接管期间保留输入，需先恢复自动管理。</p></form>;
 }
 function RecoveryPanel({busy,confirm}:{busy:boolean;confirm:()=>void}) {
   const [checked,setChecked]=useState(false);
