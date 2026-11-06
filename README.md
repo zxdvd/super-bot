@@ -61,3 +61,28 @@ Node 用 fnm 管理时，可用 `fnm exec --using=24.21.0 npm run dev`，无需�
 Manager 只拥有管理工具，不能调用 Shell 或任意文件写入。任务按 Bot 隔离；自动返工最多 2 次，要求第三次时暂停并转人判断。自动管理每 Bot 同时一轮、全局最多两轮；每轮最多 12 步/5 分钟，每 Bot 每小时最多 20 次自动唤醒。进度报告不唤醒 Manager。
 
 “管理会话设置”可在空闲时更换对话。原对话与任务保留，新对话从账本恢复；旧对话不能继续修改任务。返回工作台会保留当前 Bot 选择。
+
+## 备份、恢复与卸载
+
+工作台底部“备份账本”使用 SQLite 一致性快照，并返回备份路径和清单。它可以在宿主运行时执行；同一请求重复到达只生成一份备份。文件位于数据目录的 `backups/`，权限为仅当前用户可读写。
+
+**账本备份不包含成果文件、DSH 会话或模型凭证。** 清单列出需要另行保留的会话 ID 和工作目录。不要只复制一个正在使用的 `ledger.sqlite` 而遗漏 WAL；应使用面板的备份操作。
+
+先停止使用该账本的宿主，再恢复到一个尚不存在的新目录：
+
+```sh
+npm run restore:ledger -- /absolute/path/backup.sqlite /absolute/path/new-super-bot-data
+```
+
+恢复脚本检查完整性和 schema，拒绝覆盖现有目录。恢复后的未完成任务全部暂停并产生待核对事项，旧管理通知不自动重放；备份之后真实文件或会话可能已经变化，需要逐项核对。原账本与备份不会被修改。当前脚本要求使用与备份 schema 匹配的插件版本。
+
+启动宿主时设置 `SUPER_BOT_DATA_DIR=/absolute/path/new-super-bot-data`，或在插件配置中设置 `dataDir`（配置优先）。继续使用原 DSH home，或先恢复对应会话与成果目录；仅修改数据目录不会搬迁那些文件。切回原账本时，停止宿主并撤销该设置。不要同时运行两个宿主操作同一组会话/成果。
+
+在隔离 profile 中卸载、重装的命令为：
+
+```sh
+DSH_HOME=/absolute/path/dsh-home dsh plugin --profile profile-name remove @zxdvd/super-bot
+DSH_HOME=/absolute/path/dsh-home dsh plugin --profile profile-name add /absolute/path/super-bot
+```
+
+执行前停止该宿主，之后重新启动。卸载会移除产品入口/API/工具，不删除账本、原生会话或成果。此流程已在测试 profile 验证；运行中热卸载尚未验证。

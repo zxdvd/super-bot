@@ -224,6 +224,35 @@ export function apply(ctx:Context) {
         assert.equal(ledger.db.prepare('SELECT count(*) AS n FROM bindings').get()?.n,1);
         checks.push('lost session-create receipt reconciles the preassigned session after ledger restart');
       }finally{ledger.close();}
+      const faultLedger=new Store(join(home!,'super-bot',`receipt-probe-${randomUUID()}.sqlite`));
+      let calls=0;let execution:DshExecution|undefined;
+      try {
+        const bot=faultLedger.createBot('b',{name:'Receipt loss',instructions:'Synthetic only'});
+        const task=faultLedger.createTask('t',{botId:bot.id,goal:'Receipt loss probe',scope:'Dedicated files only',acceptance:'Do not duplicate delivery',reviewPolicy:'human'});
+        const facade=new Proxy(ctx,{get(target,key){
+          if(key==='sessionController')return new Proxy(target.sessionController,{get(controller,method){
+            if(method==='resolveAgent')return async(id:SessionId)=>{
+              const resolved=await controller.resolveAgent(id);if('error' in resolved)return resolved;
+              return {agent:new Proxy(resolved.agent,{get(agent,field){
+                if(field==='followup')return (message:Parameters<Agent['followup']>[0])=>{calls++;agent.followup(message);throw new Error('Synthetic receipt lost after acceptance');};
+                const value=Reflect.get(agent,field,agent);return typeof value==='function'?value.bind(agent):value;
+              }})};
+            };
+            const value=Reflect.get(controller,method,controller);return typeof value==='function'?value.bind(controller):value;
+          }});
+          return Reflect.get(target,key,target);
+        }});
+        execution=new DshExecution(facade,faultLedger,join(home!,'super-bot','receipt-probes'));
+        const binding=await execution.prepareSession('prepare',task.id,task.rowVersion);
+        const resolved=await ctx.sessionController.resolveAgent(SessionId(binding.sessionId!));assert.ok('agent' in resolved);resolved.agent.model.select({provider,model:'deterministic'});
+        const version=faultLedger.getTask(task.id).rowVersion;
+        await assert.rejects(execution.dispatch('dispatch',task.id,version),/receipt lost/);
+        await bounded(resolved.agent.whenIdle(),'receipt-loss cancellation');
+        const first=faultLedger.latestRun(task.id)!;assert.equal(first.state,'interrupted');assert.equal(faultLedger.heldRuns().length,1);
+        assert.equal((await execution.dispatch('dispatch',task.id,version)).id,first.id);assert.equal(calls,1);
+        assert.equal(resolved.agent.inbox.nextTurn.length,0);
+        checks.push('real inbox acceptance followed by lost receipt cancels owned input and replay never sends twice');
+      }finally{await execution?.dispose();faultLedger.close();}
       const result={ok:true,checks,sessionIds:agents.map(a=>a.id),at:new Date().toISOString()};
       await writeFile(join(home!,'super-bot','contract-probe-result.json'),JSON.stringify(result,null,2));
       return result;
@@ -232,6 +261,12 @@ export function apply(ctx:Context) {
   ctx.effect(()=>ctx.connection.fetch.register({path:'/api/super-bot-probe',methods:['POST'],requestBody:'buffered',
     fetch:async request=>{try{
       const body=await request.json() as {action?:string;sessionId?:string;text?:string};
+      if(body.action==='inspect-session') {
+        assert.ok(body.sessionId);const resolved=await ctx.sessionController.resolveAgent(SessionId(body.sessionId));assert.ok('agent' in resolved);
+        assert.ok(resolved.agent.session.header.cwd?.startsWith(join(home!,'super-bot')+'/'));
+        return Response.json({ok:true,sessionId:resolved.agent.id,status:resolved.agent.status,pending:resolved.agent.inbox.nextTurn.length+resolved.agent.inbox.nextStep.length,
+          productTools:ctx.tools.definitions().map(tool=>tool.name).filter(name=>['super_bot_report','super_bot_manage'].includes(name))});
+      }
       if(body.action==='select-test-model'||body.action==='native-prompt') {
         assert.ok(body.sessionId);const resolved=await ctx.sessionController.resolveAgent(SessionId(body.sessionId));
         assert.ok('agent' in resolved);assert.ok(resolved.agent.session.header.cwd?.startsWith(join(home!,'super-bot')+'/'));

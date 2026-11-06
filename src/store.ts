@@ -2,6 +2,7 @@ import { DatabaseSync } from 'node:sqlite';
 import { mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
+import schemaVersion from '../schema-version.json' with {type:'json'};
 import { AppError, requiredText, optionalText, taskStatus, type Bot, type Task, type NewBot, type NewTask, type TaskPage, type ControlMode, type Attention, type Binding, type Run, type RunInput, type WorkReport, type Result,type ManagerBinding,type ManagerEvent } from './model.ts';
 
 /** One local database. Business transactions will live here, not in the UI/adapter. */
@@ -13,7 +14,7 @@ export class Store {
     try {
       this.db.exec('PRAGMA busy_timeout=100; PRAGMA foreign_keys=ON; PRAGMA locking_mode=EXCLUSIVE;');
       const version = this.db.prepare('PRAGMA user_version').get() as { user_version: number };
-      if (version.user_version > 6) throw new AppError('schema-newer', '数据库来自更新版本，请升级插件。');
+      if (version.user_version > schemaVersion) throw new AppError('schema-newer', '数据库来自更新版本，请升级插件。');
       this.db.exec('PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;');
       this.db.exec(`BEGIN IMMEDIATE;
         CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -63,7 +64,7 @@ export class Store {
       const inputColumns=this.db.prepare('PRAGMA table_info(inputs)').all().map(row=>row.name);
       if(!inputColumns.includes('messageId'))this.db.exec('ALTER TABLE inputs ADD COLUMN messageId TEXT; ALTER TABLE inputs ADD COLUMN messageJson TEXT;');
       if(!inputColumns.includes('attentionId'))this.db.exec('ALTER TABLE inputs ADD COLUMN attentionId TEXT REFERENCES attentions(id);');
-      this.db.exec('PRAGMA user_version=6; COMMIT;');
+      this.db.exec(`PRAGMA user_version=${schemaVersion}; COMMIT;`);
     } catch (error) {
       this.db.close();
       if ((error as { errcode?: number }).errcode === 5) throw new AppError('host-active', '另一宿主正在使用此工作台，请先关闭该宿主。');
@@ -199,7 +200,7 @@ export class Store {
   }
   private decorateTask(task:Task):Task {
     let status=taskStatus(task);const run=this.latestRun(task.id);
-    if(task.lifecycle==='open') {
+    if(task.lifecycle==='open'||task.lifecycle==='review') {
       if(this.db.prepare("SELECT 1 FROM attentions WHERE taskId=? AND kind='recovery' AND state='open'").get(task.id))status='recovery';
       else if(run?.state==='cancelling')status='stopping';
       else if(run?.state==='running')status='running';
@@ -496,13 +497,17 @@ export class Store {
     return this.command(requestId,'run.resolve-recovery',{taskId,expectedRowVersion},()=>{
       const task=this.getTask(taskId),run=this.latestRun(taskId);
       if(task.rowVersion!==expectedRowVersion)throw new AppError('version-conflict','任务已经更新，请刷新后核对。');
-      if(!run||run.finishedAt===null)throw new AppError('run-active','请先停止当前执行。');
-      this.db.prepare('DELETE FROM resources WHERE runId=?').run(run.id);
-      this.db.prepare("UPDATE attentions SET state='resolved' WHERE id=? AND kind='recovery'").run(`run:${run.id}`);
-      this.db.prepare("UPDATE inputs SET state='discarded' WHERE id=? AND state IN ('accepted','unknown','enqueued')").run(run.inputId);
-      const input=this.getRunInput(run.id);if(input.attentionId&&input.state==='discarded')this.db.prepare("UPDATE attentions SET state='open' WHERE id=? AND state='responding'").run(input.attentionId);
+      if(run?.finishedAt===null)throw new AppError('run-active','请先停止当前执行。');
+      if(!run&&!this.db.prepare("SELECT 1 FROM attentions WHERE id=? AND state='open'").get(`restore:${taskId}`))throw new AppError('not-found','没有待核对的执行。');
+      if(run) {
+        this.db.prepare('DELETE FROM resources WHERE runId=?').run(run.id);
+        this.db.prepare("UPDATE attentions SET state='resolved' WHERE id=? AND kind='recovery'").run(`run:${run.id}`);
+        this.db.prepare("UPDATE inputs SET state='discarded' WHERE id=? AND state IN ('accepted','unknown','enqueued')").run(run.inputId);
+        const input=this.getRunInput(run.id);if(input.attentionId&&input.state==='discarded')this.db.prepare("UPDATE attentions SET state='open' WHERE id=? AND state='responding'").run(input.attentionId);
+      }
+      this.db.prepare("UPDATE attentions SET state='resolved' WHERE id=? AND kind='recovery'").run(`restore:${taskId}`);
       this.db.prepare("UPDATE tasks SET controlMode='paused',rowVersion=rowVersion+1,updatedAt=? WHERE id=?").run(Date.now(),taskId);
-      this.event('run.recovery-confirmed',taskId,{runId:run.id,actor:'user'});return this.getTask(taskId);
+      this.event('run.recovery-confirmed',taskId,{runId:run?.id??null,actor:'user'});return this.getTask(taskId);
     });
   }
   managerReview(requestId:string,botId:string,taskId:string,expectedRowVersion:number,resultId:string,verdict:'accept'|'rework'|'human',text:string):Task {
@@ -551,5 +556,10 @@ export class Store {
     const journal = this.db.prepare('PRAGMA journal_mode').get() as { journal_mode: string };
     return { sqliteVersion: sqlite.version, journalMode: journal.journal_mode };
   }
+  backupLedger(path:string):void {
+    // VACUUM INTO is a consistent SQLite snapshot; copying a live WAL file is not.
+    this.db.prepare('VACUUM INTO ?').run(path);
+  }
+  recordBackup(key:string,path:string):void {this.command(`backup:${key}`,'ledger.backup',{path},()=>{this.event('ledger.backup',null,{path});return {};});}
   close(): void { this.db.close(); }
 }

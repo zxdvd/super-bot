@@ -96,7 +96,17 @@ export class DshExecution {
       }).catch(error=>{if(!this.disposed)this.store.runRecovery(run.id,error instanceof AppError?error.message:'执行状态待核对，请打开原生会话检查。');}).finally(()=>{clearTimeout(deadline);release();this.running.delete(run.id);});
       this.running.set(run.id,{agent,release,done});
       return this.store.getRun(run.id);
-    }catch(error){release();this.store.runRecovery(run.id,'输入投递未能确认，没有自动重投。请核对原生会话。');throw error;}
+    }catch(error){
+      // A throw may happen AFTER the inbox accepted the message. Keep the mask until idle.
+      try{this.store.runRecovery(run.id,'输入投递未能确认，没有自动重投。请核对原生会话。');}
+      finally {
+        if(input.messageId)agent.inbox.remove(input.messageId as UserMessage['id']);
+        agent.cancel({kind:'user'},{keepInbox:true});
+        const done=agent.whenIdle().catch(()=>{}).finally(()=>{release();this.running.delete(run.id);});
+        this.running.set(run.id,{agent,release,done});
+      }
+      throw error;
+    }
   }
   async accept(requestId:string,taskId:string,rowVersion:number,resultId:string) {
     const receipt=this.store.commandReceipt<import('./model.ts').Task>(requestId,'result.accept',{taskId,expectedRowVersion:rowVersion,resultId});
@@ -125,10 +135,13 @@ export class DshExecution {
   async recover(requestId:string,taskId:string,rowVersion:number,acknowledged:unknown) {
     if(acknowledged!==true)throw new AppError('confirmation-required','请先检查原生会话、文件和外部效果，再确认核对完成。');
     const receipt=this.store.commandReceipt<import('./model.ts').Task>(requestId,'run.resolve-recovery',{taskId,expectedRowVersion:rowVersion});if(receipt)return receipt;
-    const run=this.store.latestRun(taskId);if(!run)throw new AppError('not-found','没有待核对的执行。');
-    const resolved=await this.ctx.sessionController.resolveAgent(SessionId(run.sessionId));
-    if('error' in resolved)throw new AppError('session-unavailable','无法读取原生会话，暂未释放执行占用。');
-    this.assertQuiet(resolved.agent);return this.store.resolveRunRecovery(requestId,taskId,rowVersion);
+    const sessionId=this.store.activeBinding(taskId)?.sessionId;
+    if(sessionId) {
+      const resolved=await this.ctx.sessionController.resolveAgent(SessionId(sessionId));
+      if('error' in resolved)throw new AppError('session-unavailable','无法读取原生会话，暂未释放执行占用。');
+      this.assertQuiet(resolved.agent);
+    }
+    return this.store.resolveRunRecovery(requestId,taskId,rowVersion);
   }
   async dispose():Promise<void> {
     this.disposed=true;
