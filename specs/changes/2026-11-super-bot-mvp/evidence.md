@@ -166,3 +166,12 @@ ELECTRON_RUN_AS_NODE=1 '/Applications/DeepSeek Harness.app/Contents/MacOS/DeepSe
 - 真实契约探针共 11 项：新增三个真实 Manager Session 的故障对照，一个解析失败、一个 followup 接受后丢回执、一个正常。失败 Bot 不挡住后者；未知通知取消且同一通知不二次 followup，无 Worker 任务被重新执行。
 - `node scripts/smoke-manager-rework.mjs`：一次自动返工产生两轮/新成果（176 字节）；无限返工夹具只产生三轮（最多两次返工）后暂停转人。更换 Manager 后显式恢复，仍不能重置同一目标版本的返工额度。
 - 独立第 15 轮 UI：新 Bot 的两任务分别真实 2 turn/6 steps 与 3 turn/9 steps；原生 Manager 11 turn 中实际 detail 读取文件和 review: rework，工作台关闭期间继续，额度任务 rowVersion 12 保持稳定，无循环。百项夹具统计与分页抽查通过，无 console error。暂停验收任务的标签补为“待验收 · 已暂停”，并解释只暂停自动管理。
+
+
+## 执行边界、证据上限与新版本视图（2026-11-07 04:42）
+
+- `npm run check`：29 项核心测试通过。证据读取改为分块 SHA-256，单文件 10 MB/合计 20 MB，预览仅保留前 12,000 字节；尾部内容变化仍使哈希核对失败。文件缺失返回明确恢复提示。
+- `node scripts/smoke-directory.mjs`：实际改变 DSH 有效目录会中断授权、保留恢复事项；目录不匹配时不能创建新 Run，恢复原目录后显式新 Run 可执行；相对文件路径在写入前拒绝。未修改上游。
+- `node scripts/smoke-scoped-tools.mjs`：实际 agent-scoped 合成工具出现在模型工具列表，Worker/Manager 各尝试调用一次，但执行函数计数均为 0；Worker 仍完成正常文件任务。增加执行 guard 后不依赖全局工具列表的筛选能力。
+- `node scripts/smoke-manager-rework.mjs`：复验一次返工/两次额度/更换 Manager 不重置额度，并新增大文件：即使显式 Bot 验收授权，截断预览也只能转人工，不能自动完成。
+- 独立第 16 轮 UI：缺条件任务不派发，补全后新目标版本自动唤醒 Manager 并执行；解绑/新代数不展示旧成果为当前候选，旧会话和文件保留；暂停验收标签通过。发现旧输入标题易误读，已改为历史输入，待第 17 轮复验。

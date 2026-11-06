@@ -225,8 +225,8 @@ export class Store {
     return {...task,status,managerReviewed};
   }
   taskDetail(id: string): { task: Task; binding: Binding | null; bindingHistory:Binding[]; run:Run|null; input:RunInput|null; result:Result|null; attentions: Attention[]; events: { id: number; kind: string; data: string; createdAt: number }[] } {
-    const run=this.latestRun(id);
-    return { task: this.getTask(id), binding: this.activeBinding(id),bindingHistory:this.db.prepare("SELECT * FROM bindings WHERE taskId=? AND state='released' ORDER BY generation DESC").all(id) as unknown as Binding[],run,input:this.pendingInput(id)??(run?this.getRunInput(run.id):null),result:run?this.runResult(run.id):null,
+    const task=this.getTask(id),binding=this.activeBinding(id),run=this.latestRun(id);
+    return { task,binding,bindingHistory:this.db.prepare("SELECT * FROM bindings WHERE taskId=? AND state='released' ORDER BY generation DESC").all(id) as unknown as Binding[],run,input:this.pendingInput(id)??(run?this.getRunInput(run.id):null),result:run&&run.taskRevision===task.taskRevision&&run.bindingId===binding?.id?this.runResult(run.id):null,
       attentions: this.db.prepare('SELECT * FROM attentions WHERE taskId=? ORDER BY createdAt,id').all(id) as unknown as Attention[],
       events: this.db.prepare('SELECT id,kind,data,createdAt FROM events WHERE taskId=? ORDER BY id DESC LIMIT 50').all(id) as unknown as { id: number; kind: string; data: string; createdAt: number }[],
     };
@@ -244,6 +244,7 @@ export class Store {
       this.db.prepare("UPDATE attentions SET state='stale' WHERE taskId=? AND state='open'").run(id);
       if (!payload.scope || !payload.acceptance) this.db.prepare('INSERT INTO attentions(id,taskId,kind,question,taskRevision,createdAt) VALUES (?,?,?,?,?,?)')
         .run(randomUUID(),id,'input','请补充任务范围和验收条件，然后再安排执行。',task.taskRevision+1,Date.now());
+      this.enqueueManager(task.botId,`revision:${id}:${task.taskRevision+1}`,'用户已更新任务目标、范围或验收条件，请读取新版本后安排。',id,10);
       this.event('task.revised',id,{ taskRevision: task.taskRevision+1 }); return this.getTask(id);
     });
   }

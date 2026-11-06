@@ -5,11 +5,13 @@ import type {} from '@deepseek-ai/dsh-workspace';
 import type {} from '@deepseek-ai/dsh-tools';
 import type {} from '@deepseek-ai/dsh-jobs';
 import type {} from '@deepseek-ai/dsh-user-approval';
+import type {} from '@deepseek-ai/dsh-working-directory';
 import type { Agent } from '@deepseek-ai/dsh-agent';
 import { createUserMessage,freezeMessage,type UserMessage } from '@deepseek-ai/dsh-llm';
 import { SessionId } from '@deepseek-ai/dsh-session/types';
 import { mkdir, realpath } from 'node:fs/promises';
-import { join } from 'node:path';
+import { realpathSync } from 'node:fs';
+import { join,isAbsolute } from 'node:path';
 import { AppError,requiredText,optionalText,type Binding,type Run,type WorkReport } from './model.ts';
 import type { Store } from './store.ts';
 import { collectEvidence,containedPath,verifyEvidence } from './evidence.ts';
@@ -40,6 +42,13 @@ export class DshExecution {
     },{when:({agent})=>this.store.heldRuns().some(r=>r.sessionId===agent.id&&r.finishedAt===null)}));
     this.ctx.on('session/event',(session,event)=>{
       if(this.disposed)return;
+      if(event.type==='working-directory/change') {
+        const run=this.store.heldRuns().find(r=>r.sessionId===session.id&&r.finishedAt===null);
+        if(run&&event.data.cwd!==this.store.getBinding(run.bindingId).cwd) {
+          this.store.runRecovery(run.id,'原生会话工作目录已改变，当前执行授权停止。请核对文件和原生会话。');
+          this.running.get(run.id)?.agent.cancel({kind:'user'},{keepInbox:true});
+        }
+      }
       if(event.type==='approval/asked') {
         const run=this.store.heldRuns().find(r=>r.sessionId===session.id&&r.finishedAt===null);
         if(run)this.store.nativeApprovalAsked(run.id,event.data.id,event.data.toolName,event.data.reason??'');
@@ -63,6 +72,10 @@ export class DshExecution {
     if(this.ctx.jobs.list(agent.id).some(job=>job.owner===agent.id&&['running','stopping'].includes(job.status)))throw new AppError('job-active','后台工作尚未停止，不能开始或确认执行结束。');
     if(this.ctx.agents.list().some(child=>this.ctx.agents.isOwnedBy(child.id,agent)))throw new AppError('child-active','会话仍有子 Agent，需要先核对。');
   }
+  private assertDirectory(agent:Agent,cwd:string):void {
+    let current:string;try{current=realpathSync(this.ctx.workingDirectory.get(agent.session));}catch{throw new AppError('working-directory-unavailable','原生会话目录不可用，请先恢复目录或解除关联后准备新会话。');}
+    if(current!==cwd)throw new AppError('working-directory-changed','原生会话当前目录已改变。请在原生会话恢复任务目录，或解除关联后准备新会话。');
+  }
   async dispatch(requestId:string,taskId:string,rowVersion:number,authorize:()=>void=()=>{}):Promise<Run> {
     if(this.disposed)throw new AppError('unavailable','插件正在退出。');
     const receipt=this.store.commandReceipt<Run>(requestId,'task.dispatch',{taskId,expectedRowVersion:rowVersion});
@@ -70,7 +83,7 @@ export class DshExecution {
     const b=this.store.activeBinding(taskId);if(!b?.sessionId||b.state!=='ready')throw new AppError('not-ready','请先准备执行会话。');
     const resolved=await this.ctx.sessionController.resolveAgent(SessionId(b.sessionId));
     if('error' in resolved)throw new AppError('session-unavailable','执行会话暂不可用，请核对。');
-    const agent=resolved.agent;this.assertQuiet(agent);
+    const agent=resolved.agent;this.assertQuiet(agent);this.assertDirectory(agent,b.cwd);
     if(!agent.model.current())throw new AppError('model-required','请先打开任务会话选择模型，再回来开始执行。');
     authorize();
     const run=this.store.reserveRun(requestId,taskId,rowVersion);
@@ -79,14 +92,16 @@ export class DshExecution {
     let input=this.store.getRunInput(run.id);
     if(!input.messageJson) {
       const supplement=input.kind==='answer'||input.kind==='rework'?`\nAdditional user input (${input.kind}): ${input.content}`:'';
-      const message=createUserMessage({source:{kind:'super-bot',taskId,runId:run.id,inputId:run.inputId,taskRevision:run.taskRevision,generation:run.generation},content:[{type:'text',text:`You are executing one Super Bot task.\nBot responsibility: ${bot.instructions}\nGoal: ${task.goal}\nAuthorized scope: ${task.scope}\nAcceptance criteria: ${task.acceptance}\nWorking directory: ${b.cwd}${supplement}\nUse only read/write/edit in this directory. Shell and subagents are not enabled in this preview.\nReport with super_bot_report. Use waiting to ask a necessary question. For ready provide files and checks explaining every acceptance criterion. Never claim the task is accepted; the user decides.`}]});
+      const message=createUserMessage({source:{kind:'super-bot',taskId,runId:run.id,inputId:run.inputId,taskRevision:run.taskRevision,generation:run.generation},content:[{type:'text',text:`You are executing one Super Bot task.\nBot responsibility: ${bot.instructions}\nGoal: ${task.goal}\nAuthorized scope: ${task.scope}\nAcceptance criteria: ${task.acceptance}\nWorking directory: ${b.cwd}${supplement}\nUse only read/write/edit in this directory, always with absolute file_path values. Do not change working directories. Shell and subagents are not enabled in this preview.\nReport with super_bot_report. Use waiting to ask a necessary question. For ready provide files and checks explaining every acceptance criterion. Never claim the task is accepted; the user decides.`}]});
       input=this.store.saveRunMessage(run.id,message.id,JSON.stringify(message));
     }
     const releaseMask=agent.ctx.tools.restrict({allow:['read','write','edit','super_bot_report']});
     const releaseGuard=agent.ctx.tools.guard(exec=>{
       if(this.store.getRun(run.id).finishedAt!==null||this.store.getTask(taskId).controlMode==='manual')return 'This automatic run no longer has task authority.';
+      if(!['read','write','edit','super_bot_report'].includes(exec.name))return 'Only task file tools and super_bot_report are authorized for this run.';
+      try{this.assertDirectory(agent,b.cwd);}catch(error){return error instanceof Error?error.message:'Working directory changed';}
       if(!['read','write','edit'].includes(exec.name))return;
-      try{const args=exec.arguments as {file_path?:unknown};if(typeof args.file_path!=='string')return 'A file_path is required';containedPath(b.cwd,args.file_path);}catch(error){return error instanceof Error?error.message:'File path refused';}
+      try{const args=exec.arguments as {file_path?:unknown};if(typeof args.file_path!=='string'||!isAbsolute(args.file_path))return 'Use an absolute file_path inside the task working directory.';containedPath(b.cwd,args.file_path);}catch(error){return error instanceof Error?error.message:'File path refused';}
     });
     let released=false;const release=()=>{if(released)return;released=true;releaseGuard();releaseMask();};
     try {

@@ -25,18 +25,26 @@ declare module '@deepseek-ai/dsh-llm' {
   }
 }
 export const name = 'super-bot-probe';
-export const inject = ['llm','tools','sessionController','workspaceRegistry','connection','agents','jobs'];
+export const inject = ['llm','tools','sessionController','workspaceRegistry','connection','agents','jobs','workingDirectory'];
 const provider = 'super-bot-probe';
 const toolName = 'super_bot_probe_report';
+const scopedToolName='super_bot_scoped_probe';
 
 class ProbeAdapter extends LlmAdapter {
   calls: {sessionId?: string;purpose?:string; ids: string[]; tools: string[]}[] = [];
   approvalWrites=new Set<string>();
+  scopedAttempts=new Map<string,number>();
   async listModels() { return [{provider,id:'deterministic',name:'Super Bot 测试模型（无网络）'}]; }
   async resolveModel(p:string,m:string) { return {provider:p,id:m,name:m,context:{contextWindow:200000},defaultMaxTokens:1000}; }
   async *stream(options: GenerateOptions): AsyncIterable<StreamChunk> {
     options.signal?.throwIfAborted();
     this.calls.push({sessionId:options.sessionId,purpose:options.purpose,ids:options.messages.flatMap(m=>m.id?[m.id]:[]),tools:(options.tools??[]).map(t=>t.name)});
+    const scopedInput=options.messages.findLast(message=>message.role==='user'&&(message.source?.kind==='user'||message.source?.kind==='super-bot'));
+    if(scopedInput&&options.tools?.some(tool=>tool.name===scopedToolName)&&scopedInput.content.some(block=>block.type==='text'&&block.text.includes('SCOPED_TOOL_PROBE'))&&!options.messages.slice(options.messages.indexOf(scopedInput)+1).some(message=>message.content.some(block=>block.type==='tool-call'&&block.name===scopedToolName))) {
+      if(options.sessionId)this.scopedAttempts.set(options.sessionId,(this.scopedAttempts.get(options.sessionId)??0)+1);
+      const id=ToolCallId(randomUUID());yield {type:'block-start',index:0,blockType:'tool-call'};yield {type:'tool-call-delta',index:0,id,name:scopedToolName,argumentsDelta:'{}'};
+      yield {type:'block-end',index:0,block:{type:'tool-call',id,name:scopedToolName,arguments:'{}'}};yield {type:'finish',reason:{kind:'tool-calls'}};return;
+    }
     if(options.tools?.some(tool=>tool.name==='super_bot_manage')) {
       const trigger=options.messages.findLast(m=>m.role==='user'&&(m.source?.kind==='user'||m.source?.kind==='super-bot-manager'));
       const text=trigger?.content.filter(b=>b.type==='text').map(b=>b.text).join('')??'';
@@ -88,7 +96,7 @@ class ProbeAdapter extends LlmAdapter {
       const needsAnswer=body.includes('Goal: ASK_PROBE')&&!hasAnswer;
       const planned=approvalProbe&&calls.includes('write')&&!existsSync(file)&&!calls.includes('super_bot_report')?{name:'super_bot_report',args:{kind:'failed',summary:'审批路径结束，写入没有生成文件；请核对原生审批结果。'}}:
         needsAnswer&&!calls.includes('super_bot_report')?{name:'super_bot_report',args:{kind:'waiting',summary:'请说明文档面向谁？'}}:
-        !calls.includes('write')?{name:'write',args:{file_path:file,content:'# 合成成果\n\n事实一：这份文档由隔离测试模型生成。\n事实二：测试没有访问网络或使用模型凭证。\n'+(body.includes('Additional user input (rework):')?'\n修订：已按返工要求补充说明。\n':'')}}:
+        !calls.includes('write')?{name:'write',args:{file_path:body.includes('Goal: RELATIVE_PATH_PROBE')?'result.md':file,content:'# 合成成果\n\n事实一：这份文档由隔离测试模型生成。\n事实二：测试没有访问网络或使用模型凭证。\n'+(body.includes('Additional user input (rework):')?'\n修订：已按返工要求补充说明。\n':'')+(body.includes('Goal: LARGE_RESULT_PROBE')?'\n'+'x'.repeat(16000):'')}}:
         !calls.includes('read')?{name:'read',args:{file_path:file}}:
         !calls.includes('super_bot_report')?{name:'super_bot_report',args:{kind:'ready',summary:'已生成并回读两项事实的说明文件。',checks:'result.md 包含标题和两项事实；已用原生 read 工具回读核对。',files:[file]}}:null;
       if(planned) {
@@ -130,6 +138,7 @@ export function apply(ctx:Context) {
   const home=process.env.DSH_HOME;
   if (!home?.endsWith('/super-bot/.runtime/dsh')) throw new Error('Probe requires the dedicated Super Bot test home');
   const adapter=new ProbeAdapter();
+  const scopedCalls=new Map<string,number>();
   // The dev home is nested in the source repository. Bound native turn diffs to
   // each synthetic workspace, so concurrent product edits are not attributed to it.
   ctx.on('agent/created',async({agent})=>{
@@ -324,10 +333,30 @@ export function apply(ctx:Context) {
   ctx.effect(()=>ctx.connection.fetch.register({path:'/api/super-bot-probe',methods:['POST'],requestBody:'buffered',
     fetch:async request=>{try{
       const body=await request.json() as {action?:string;sessionId?:string;text?:string};
+      if(body.action==='install-scoped-probe') {
+        assert.ok(body.sessionId);const resolved=await ctx.sessionController.resolveAgent(SessionId(body.sessionId));assert.ok('agent' in resolved);const agent=resolved.agent;
+        assert.ok(agent.session.header.cwd?.startsWith(join(home!,'super-bot')+'/'));assert.equal(agent.model.current()?.provider,provider);
+        if(!scopedCalls.has(agent.id)) {
+          scopedCalls.set(agent.id,0);
+          agent.ctx.tools.register({name:scopedToolName,description:'Synthetic scoped capability probe, with no external effects.',parameters:{type:'object',properties:{},additionalProperties:false},output:{schema:{type:'object',properties:{ok:{type:'boolean'}}},render:()=>[{type:'text',text:'Scoped probe executed'}]},execute:async()=>{scopedCalls.set(agent.id,(scopedCalls.get(agent.id)??0)+1);return {ok:true};}});
+        }
+        return Response.json({ok:true});
+      }
+      if(['change-test-directory','restore-test-directory','clear-directory-notices'].includes(body.action??'')) {
+        assert.ok(body.sessionId);const resolved=await ctx.sessionController.resolveAgent(SessionId(body.sessionId));assert.ok('agent' in resolved);const agent=resolved.agent;
+        assert.ok(agent.session.header.cwd?.startsWith(join(home!,'super-bot')+'/'));assert.equal(agent.model.current()?.provider,provider);
+        if(body.action==='clear-directory-notices') {
+          for(const message of [...agent.inbox.nextTurn,...agent.inbox.nextStep])if(message.source.kind==='working-directory')agent.inbox.remove(message.id);
+        }else {
+          const cwd=body.action==='restore-test-directory'?agent.session.header.cwd!:join(home!,'super-bot','directory-probes',agent.id);
+          await mkdir(cwd,{recursive:true});await ctx.workingDirectory.set(agent,cwd);
+        }
+        return Response.json({ok:true,cwd:ctx.workingDirectory.get(agent.session),status:agent.status});
+      }
       if(body.action==='inspect-session') {
         assert.ok(body.sessionId);const resolved=await ctx.sessionController.resolveAgent(SessionId(body.sessionId));assert.ok('agent' in resolved);
         assert.ok(resolved.agent.session.header.cwd?.startsWith(join(home!,'super-bot')+'/'));
-        return Response.json({ok:true,sessionId:resolved.agent.id,status:resolved.agent.status,pending:resolved.agent.inbox.nextTurn.length+resolved.agent.inbox.nextStep.length,
+        return Response.json({ok:true,sessionId:resolved.agent.id,status:resolved.agent.status,pending:resolved.agent.inbox.nextTurn.length+resolved.agent.inbox.nextStep.length,scopedProbeCalls:scopedCalls.get(resolved.agent.id)??0,scopedProbeAttempts:adapter.scopedAttempts.get(resolved.agent.id)??0,
           productTools:ctx.tools.definitions().map(tool=>tool.name).filter(name=>['super_bot_report','super_bot_manage'].includes(name))});
       }
       if(body.action==='select-test-model'||body.action==='native-prompt') {

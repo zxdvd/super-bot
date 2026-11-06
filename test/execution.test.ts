@@ -1,10 +1,10 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync,writeFileSync,symlinkSync,rmSync } from 'node:fs';
+import { mkdtempSync,writeFileSync,symlinkSync,rmSync,truncateSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Store } from '../src/store.ts';
-import { collectEvidence,verifyEvidence,containedPath } from '../src/evidence.ts';
+import { collectEvidence,verifyEvidence,containedPath,previewEvidence } from '../src/evidence.ts';
 
 function prepared(store:Store,key='1',cwd=`/tmp/task-${key}`,reviewPolicy:'human'|'bot'='human') {
   const bot=store.createBot(`b:${key}`,{name:`Bot ${key}`,instructions:'文件工作'});
@@ -18,6 +18,21 @@ function entered(store:Store,key='1') {
   store.inputEnqueued(run.id);store.inputEntered(run.id,`m:${key}`,15);return {task,run};
 }
 const ready={kind:'ready' as const,summary:'说明已生成',checks:'两项事实均在文档中',evidence:[{path:'/tmp/result.md',sha256:'synthetic',bytes:30}]};
+
+test('evidence reads have hard byte limits and previews disclose truncation while verifying full hashes',async()=>{
+  const root=mkdtempSync(join(tmpdir(),'super-bot-bounds-'));
+  try {
+    const path=join(root,'result.txt');writeFileSync(path,'a'.repeat(15000));
+    const evidence=await collectEvidence(root,[path]);const preview=await previewEvidence(root,evidence);
+    assert.equal(preview[0]?.text.length,12000);assert.equal(preview[0]?.bytes,15000);assert.equal(preview[0]?.truncated,true);
+    writeFileSync(path,'a'.repeat(14999)+'b');await assert.rejects(previewEvidence(root,evidence),/已经变化/);
+    truncateSync(path,10*1024*1024+1);await assert.rejects(collectEvidence(root,[path]),/不超过/);
+    rmSync(path);await assert.rejects(verifyEvidence(root,evidence),/无法读取/);
+    const second=join(root,'second.txt'),third=join(root,'third.txt');
+    for(const file of [path,second]){writeFileSync(file,'');truncateSync(file,10*1024*1024);}
+    writeFileSync(third,'x');await assert.rejects(collectEvidence(root,[path,second,third]),/不超过/);
+  }finally{rmSync(root,{recursive:true,force:true});}
+});
 
 test('native approval decisions resolve only their attention and never imply execution completion',()=>{
   const store=new Store(':memory:');try {
@@ -76,6 +91,20 @@ test('detach preserves binding history, pauses work, and allows a new goal and g
     assert.equal(replacement.generation,2);assert.notEqual(replacement.requestedSessionId,old.sessionId);
     assert.equal(store.getBinding(old.id).state,'released');
     assert.equal(store.nativeIntervention(old.sessionId!,'old-message'),false);
+  }finally{store.close();}
+});
+test('a replacement binding never presents an old result as its current candidate',()=>{
+  const store=new Store(':memory:');try {
+    const {task,run}=entered(store);const report=store.workerReport(run.id,'ready',ready);store.settleRun(run.id);
+    const rejected=store.rejectResult('rework',task.id,store.getTask(task.id).rowVersion,report.resultId!,'Change the goal first');
+    const detached=store.detachSession('detach',task.id,rejected.rowVersion);
+    assert.equal(store.taskDetail(task.id).result,null);assert.equal(store.runResult(run.id)?.id,report.resultId);
+    const manager=store.beginManager('manager',task.botId,'/tmp/manager');store.confirmManager(manager.id,manager.requestedSessionId);
+    const revised=store.reviseTask('revise',task.id,detached.rowVersion,{goal:'New goal',scope:'New directory',acceptance:'New result'});
+    assert.ok(store.pendingManagerEvents(task.botId).some(event=>event.id.includes(`revision:${task.id}:2`)));
+    const next=store.beginBinding('prepare-new',task.id,revised.rowVersion,'/tmp/new-task');store.confirmBinding(next.id,next.requestedSessionId);
+    assert.equal(store.taskDetail(task.id).result,null);assert.equal(store.pendingInput(task.id),null);
+    assert.throws(()=>store.workerReport(run.id,'late-old-revision',ready),/执行或目标已改变/);
   }finally{store.close();}
 });
 
@@ -200,17 +229,17 @@ test('manager queue counts all work, prioritizes human responses, and rotates be
   const store=new Store(':memory:');try {
     const bots=['one','two','three'].map(key=>store.createBot(key,{name:key,instructions:'Synthetic'}));
     for(const bot of bots){const m=store.beginManager(`m:${bot.id}`,bot.id,`/tmp/${bot.id}`);store.confirmManager(m.id,m.requestedSessionId);}
-    const first=bots[0]!;
+    const [first,...others]=store.listBots();assert.ok(first);
     for(let n=0;n<25;n++)store.enqueueManager(first.id,`bulk:${n}`,'New task',null);
     store.enqueueManager(first.id,'human-answer','Human answer',null,10);
     assert.equal(store.managerInfo(first.id).pending,27);assert.equal(store.pendingManagerEvents(first.id).length,10);
     assert.equal(store.pendingManagerEvents(first.id)[0]?.id,'manager-event:human-answer');
     store.claimManagerEvent('manager-event:human-answer','msg','{}');
-    assert.deepEqual(store.managerOrder().map(bot=>bot.id),[bots[1]!.id,bots[2]!.id,first.id]);
+    assert.deepEqual(store.managerOrder().map(bot=>bot.id),[...others.map(bot=>bot.id),first.id]);
     store.db.exec("CREATE TEMP TRIGGER cursor_failure BEFORE INSERT ON metadata WHEN NEW.key='managerCursor' BEGIN SELECT RAISE(ABORT,'injected cursor failure'); END");
-    const secondEvent=store.pendingManagerEvents(bots[1]!.id)[0]!;
+    const secondEvent=store.pendingManagerEvents(others[0]!.id)[0]!;
     assert.throws(()=>store.claimManagerEvent(secondEvent.id,'failed-msg','{}'),/cursor failure/);
-    assert.equal(store.pendingManagerEvents(bots[1]!.id)[0]?.state,'pending');assert.equal(store.managerWakeCount(bots[1]!.id,0),0);
+    assert.equal(store.pendingManagerEvents(others[0]!.id)[0]?.state,'pending');assert.equal(store.managerWakeCount(others[0]!.id,0),0);
     store.managerProblem(first.id,'Unavailable');const original=store.managerInfo(first.id).problem;
     store.managerProblem(first.id,'Unavailable');assert.deepEqual(store.managerInfo(first.id).problem,original);
     store.managerProblem(first.id,'');assert.equal(store.managerInfo(first.id).problem,null);
