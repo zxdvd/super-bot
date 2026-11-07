@@ -16,6 +16,6 @@
 
 已有 SB-00～14 保留：Bot/任务账本、Manager 与 Worker、普通会话、文件证据、返工、停止恢复、并发预算、备份和安装生命周期。复用一个 SQLite、现有 Outbox 与 DSH 原生聊天；只补入口、对话行为和必要工具，不重做 Agent Loop 或聊天数据库。旧测试作为底层回归基线，新体验单独验收。
 
-本轮先用本地文档任务证明流程，当前仍只开放文件工具。Shell/子 Agent、Desktop、外部订阅、自动记忆、Bot 协商、独立 App/Web、第二执行引擎和云端部署后置；Bot 收到不支持的请求应说明限制，不伪称已执行。
+当前用真实 Bot 委派完整 DSH Worker 修复本仓库，验证聊天接单、Shell/测试、子 Agent、报告和回到原对话交付。Bot 使用 Sol medium，Worker 使用 Sol xhigh，两者显式 Full Access；旧 files 模式保留兼容。Desktop、外部订阅、自动记忆、Bot 协商、独立 App/Web、第二执行引擎和云端部署后置。
 
 权威方案见 [聊天主流程](specs/changes/2026-11-super-bot-mvp/06-chat-first.md)，实施与证据维护在 [任务清单](specs/changes/2026-11-super-bot-mvp/tasks.md)。

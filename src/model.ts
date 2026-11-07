@@ -104,5 +104,8 @@ export function optionalText(value: unknown, label: string, max = 10000): string
   return requiredText(value, label, max);
 }
 
-/** Actual host user message, supplied by the adapter rather than model arguments. */
-export interface ChatSource { sessionId:string; messageId:string; seq:number; text:string }
+/** Actual host user input supplied by the adapter, never model arguments.
+ * A single message retains its original shape. For a multi-message turn, the top-level
+ * identity is the latest message; text is complete and messages preserves each source.
+ */
+export interface ChatSource { sessionId:string; messageId:string; seq:number; text:string; messages?:{messageId:string;seq:number;text:string}[] }

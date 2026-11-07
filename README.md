@@ -38,11 +38,11 @@ npm run check
 npm pack
 ```
 
-用独立数据目录和 profile 安装生成的 `zxdvd-super-bot-0.1.0.tgz`：
+用独立数据目录和 profile 安装生成的 `zxdvd-super-bot-0.1.2.tgz`：
 
 ```sh
 DSH_HOME=/absolute/path/super-bot-home dsh --profile super-bot --from-default-profile web --dump-config > /dev/null
-DSH_HOME=/absolute/path/super-bot-home dsh plugin --profile super-bot add /absolute/path/zxdvd-super-bot-0.1.0.tgz
+DSH_HOME=/absolute/path/super-bot-home dsh plugin --profile super-bot add /absolute/path/zxdvd-super-bot-0.1.2.tgz
 DSH_HOME=/absolute/path/super-bot-home dsh --profile super-bot --no-open --port 3081
 ```
 
@@ -67,8 +67,31 @@ npm run dev
 - `npm run smoke`：测试宿主运行时检查真实状态、WAL、未认证访问与跨域拒绝。
 - `npm pack --dry-run`：核对分发清单；运行数据和契约测试插件不进入安装包。
 
-Node 用 fnm 管理时，可用 `fnm exec --using=24.21.0 npm run dev`，无需改变机器默认版本。完整执行流程和可靠性门槛见任务清单。未启用 Manager 时，创建任务只保存目标，“开始执行”才调用原生会话中选定的模型。启用 Manager 后，完整且未暂停的任务会自动安排执行；需要先核对时，请在创建表单选择“先暂停”。当前 Worker 只开放任务目录内的 read/write/edit 和结构化报告，不开放 Shell/子 Agent；每次执行最多 40 步或 10 分钟（先到者触发），全局最多 2 个未收敛任务。暂停只阻止后续派发，停止会请求取消并核对收敛。预算耗尽后保留原因并转人工核对，不自动重试。原生当前工作目录改变会停止本轮授权并要求核对；文件工具必须使用任务目录内的绝对路径。执行时另行拒绝会话额外注册的工具，不只依赖工具列表筛选。
+Node 用 fnm 管理时，可用 `fnm exec --using=24.21.0 npm run dev`，无需改变机器默认版本。完整执行流程和可靠性门槛见任务清单。未启用 Manager 时，创建任务只保存目标，“开始执行”才调用原生会话中选定的模型。启用 Manager 后，完整且未暂停的任务会自动安排执行；需要先核对时，请在创建表单选择“先暂停”。Worker 使用普通 DSH Session。显式配置 `fullAccess: true` 后，使用原生 Full Access 预设和宿主可用工具，包括 Shell、Git 与子 Agent；Super Bot 不再附加工具白名单、目录守卫或执行步数/时长上限。`workspace` 指定项目目录，作为任务资源占用根；全局最多两个未收敛任务，同一项目不能并发派发写入任务。暂停阻止后续派发，停止请求取消并核对收敛。旧 files 模式保留用于兼容和隔离验证：只允许任务目录内 read/write/edit 与报告，每次最多 40 步或 10 分钟，目录变化和预算耗尽转核对。
 
+
+## 使用完整原生 Worker
+
+在所用 profile 的 `cordis.patch.yml` 为本插件配置角色模型和项目目录，provider/model 填该 profile 中已有的标识：
+
+```yaml
+- id: super-bot
+  config:
+    fullAccess: true
+    workspace: /absolute/path/project
+    managerModel:
+      provider: your-provider
+      model: gpt-6.1-sol
+      reasoningEffort: medium
+    workerModel:
+      provider: your-provider
+      model: gpt-6.1-sol
+      reasoningEffort: xhigh
+```
+
+推理档位需由该 profile 的模型目录及提供方支持。未配置角色模型时仍使用原生会话选择；Worker 可继承 Bot 的选择。Full Access 是用户对本机执行的明确授权，项目目录不再作为安全沙箱。Super Bot 继续记录任务归属、输入、结果和执行收敛，不把模型报告当作人工验收。
+
+更新本地 tgz 时使用新版本和新文件名；复用同版本文件可能命中包管理器缓存。仅在 Bot、Worker 都空闲时更新/重新加载插件，并通过新会话的模型、权限和实际工作目录验证生效；插件清单显示新版本不能单独证明旧运行实例已替换。
 
 ## 当前可试用流程
 
@@ -80,7 +103,7 @@ Node 用 fnm 管理时，可用 `fnm exec --using=24.21.0 npm run dev`，无需�
 4. 需要修改就继续说；Bot 将实际用户消息交给对应任务返工。完成后点交付中的“查看成果并确认”，直接进入该成果详情，检查后点击“接受成果”。Bot 不能代替人点击接受。
 5. “工作与设置”用于按需查看进度、设置参考材料、停止或处理异常；正常接单不需要任务表单、Session ID 或手动开始。
 
-聊天接单与反馈会记录真实原生用户消息来源；自动通知不能充当用户请求。文件链接只读取已报告的任务成果，下载时重新验证哈希；文件改变后需要重新提交。默认人工最终确认。当前只开放专用目录内的文件工作，不支持 Shell、外部服务或网络研究。
+聊天接单与反馈会记录真实原生用户消息来源；自动通知不能充当用户请求。文件链接只读取已报告的任务成果，下载时重新验证哈希；文件改变后需要重新提交。默认人工最终确认。Full Access 下可用能力跟随宿主及其插件，具体外部服务仍需对应配置与任务授权。
 
 确定性测试只证明流程与约束，不能代替真实模型质量验收。测试模型只存在于单独的契约测试插件中，不随产品包交付。
 
@@ -97,7 +120,7 @@ DSH 的原生变更视图会包含同一轮期间工作树中的其他编辑，�
 
 创建或打开 Bot 时自动准备当前对话；在原生界面选择模型。它可以通过聊天创建任务，也会接收新任务、回答、返工和执行结束的重要事件。仅完整且处于自动管理状态的任务可派发；默认由人最终验收。创建任务时明确授权的低风险任务可由 Bot 验收，记录不会伪装成人工接受。
 
-Manager 只拥有管理工具，不能调用 Shell 或任意文件写入。文件预览每项最多 12,000 字节，验收仍校验完整文件哈希；超过预览范围的成果转人工检查全文，即使任务允许 Bot 验收。任务按 Bot 隔离；自动返工最多 2 次，要求第三次时暂停并转人判断。自动管理每 Bot 同时一轮、全局最多两轮；每轮最多 12 步，自动唤醒的轮次另限 5 分钟，每 Bot 最近一小时最多 20 次自动唤醒。进度报告不唤醒 Manager。
+Full Access 下 Bot 同样保留原生工具，负责协调、检查和交付，并通过账本委派 Worker 实施。旧 files 模式的 Manager 仅开放管理工具。文件预览每项最多 12,000 字节，验收仍校验完整文件哈希；超过预览范围的成果转人工检查全文，即使任务允许 Bot 验收。任务按 Bot 隔离；自动返工最多 2 次，要求第三次时暂停并转人判断。自动管理每 Bot 同时一轮、全局最多两轮；files 模式每轮最多 12 步、Full Access 模式最多 24 步；自动唤醒的轮次另限 5 分钟，每 Bot 最近一小时最多 20 次自动唤醒。进度报告不唤醒 Manager。
 
 Bot 之间轮流获得自动管理机会；同一 Bot 的用户回答、人工返工和恢复通知优先。一个管理会话暂不可用不会挡住其他 Bot，错误会显示在工作台。通知回执不明时取消该轮并保留核对状态，不自动重发未知通知。
 

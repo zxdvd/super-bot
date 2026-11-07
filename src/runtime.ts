@@ -1,6 +1,6 @@
 /** DSH role configuration; explicit full access is a trusted local deployment choice. */
 import type {Agent,ModelSelection} from '@deepseek-ai/dsh-agent';
-import {setSandboxMode} from '@deepseek-ai/dsh-sandbox-policy';
+import type {} from '@deepseek-ai/dsh-permission-presets';
 
 export interface RuntimeOptions {
   fullAccess?:boolean;
@@ -11,5 +11,5 @@ export interface RuntimeOptions {
 export function configureRole(agent:Agent,role:'manager'|'worker',options:RuntimeOptions):void {
   const model=role==='manager'?options.managerModel:options.workerModel;
   if(model)agent.model.select(model);
-  if(options.fullAccess)setSandboxMode(agent.session,'danger-full-access');
+  if(options.fullAccess)agent.ctx.permissionPresets.set(agent.session,'danger-full-access');
 }

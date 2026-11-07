@@ -2,7 +2,9 @@
 import type { Context } from '@deepseek-ai/cordis';
 import type { Agent } from '@deepseek-ai/dsh-agent';
 import type {} from '@deepseek-ai/dsh-system-prompt';
-import { createUserMessage,type UserMessage } from '@deepseek-ai/dsh-llm';
+import { createUserMessage,lastAssistantStreamChunk,type UserMessage } from '@deepseek-ai/dsh-llm';
+import type {Session,SessionEvent,SessionStore} from '@deepseek-ai/dsh-session';
+import type {} from '@deepseek-ai/dsh-session-persistence';
 import { SessionId } from '@deepseek-ai/dsh-session/types';
 import { mkdir,realpath } from 'node:fs/promises';
 import { join } from 'node:path';
@@ -18,11 +20,13 @@ declare module '@deepseek-ai/dsh-llm' {
 }
 
 export class Managers {
-  private userMessages=new Map<string,ChatSource>();
+  private userMessages=new Map<string,ChatSource[]>();
   private scopes=new Map<string,{agent:Agent;release:()=>void}>();
   private creating=new Map<string,Promise<ManagerBinding>>();
   private botWrites=new Map<string,{payload:string;promise:Promise<Bot>}>();
   private waking=new Map<string,Promise<void>>();
+  private finishing=new Map<string,Promise<void>>();
+  private deliveryScopes=new Map<string,{taskId:string;resultId:string}>();
   private timer?:ReturnType<typeof setTimeout>;
   private closed=false;
   constructor(private ctx:Context,private store:Store,private execution:DshExecution,private dataDir:string,private webOrigin:()=>string=()=>'',private options:RuntimeOptions={}){}
@@ -32,6 +36,11 @@ export class Managers {
     if(!manager||manager.state!=='ready'||(id&&manager.id!==id)||this.store.getBot(manager.botId).configRevision!==manager.configRevision)throw new AppError('manager-scope','管理会话或配置已失效。');
     return manager;
   }
+  private deliveryAccess(sessionId:string,data:Record<string,unknown>):void {
+    const delivery=this.deliveryScopes.get(sessionId);if(!delivery)return;
+    if((data.action!=='list'&&data.action!=='detail')||(data.action==='detail'&&data.taskId!==delivery.taskId))throw new AppError('delivery-only','本轮只补交付指定成果，不能派发、返工或修改任务。');
+    if(data.action==='detail'&&this.store.taskDetail(delivery.taskId).result?.id!==delivery.resultId)throw new AppError('result-stale','补交付的成果已经改变，请核对当前任务。');
+  }
   install():void {
     this.store.resetUnconfirmedManagerEvents();
     this.ctx.effect(()=>this.ctx.tools.register({name:'super_bot_manage',description:'Manage only this Bot\'s durable tasks. List work first. Normal conversation does not require creating a task. Dispatch returns immediately; do not poll for completion. Important events wake you later. Inspect result files via detail before review. Human acceptance is the default.',
@@ -40,10 +49,15 @@ export class Managers {
       execute:async(args,exec)=>{
         if(!exec.agent)throw new AppError('manager-scope','缺少管理身份。');
         const manager=this.authority(exec.agent.id),bot=this.store.getBot(manager.botId),data=args as Record<string,unknown>;
-        const authorize=()=>{exec.signal.throwIfAborted();this.authority(exec.agent!.id,manager.id);};
+        this.deliveryAccess(exec.agent.id,data);
+        const authorize=()=>{exec.signal.throwIfAborted();this.authority(exec.agent!.id,manager.id);this.deliveryAccess(exec.agent!.id,data);};
         const requestId=`manager:${manager.id}:${exec.callId}`;
         if(data.action==='list')return this.store.listTasks({botId:bot.id,q:optionalText(data.query,'搜索',200),offset:data.offset as number|undefined,limit:25});
-        const human=()=>{const source=this.userMessages.get(exec.agent!.id);if(!source)throw new AppError('human-message-required','需要当前对话中的真实用户消息；自动通知不能代替用户提出新工作、回答或返工。');return source;};
+        const human=():ChatSource=>{
+          const sources=this.userMessages.get(exec.agent!.id);if(!sources?.length)throw new AppError('human-message-required','需要当前对话中的真实用户消息；自动通知不能代替用户提出新工作、回答或返工。');
+          const ordered=[...sources].sort((a,b)=>a.seq-b.seq),latest=ordered.at(-1)!;
+          return ordered.length===1?latest:{...latest,text:ordered.map(source=>source.text).join('\n\n'),messages:ordered.map(({messageId,seq,text})=>({messageId,seq,text}))};
+        };
         if(data.action==='create')return {task:this.store.createTask(requestId,{botId:bot.id,goal:requiredText(data.goal,'目标'),scope:optionalText(data.scope,'范围'),acceptance:optionalText(data.acceptance,'验收条件'),reviewPolicy:'human'},human())};
         const task=this.store.getTask(requiredText(data.taskId,'任务标识',200));
         if(task.botId!==bot.id)throw new AppError('manager-scope','只能查看或管理自己负责的任务。');
@@ -99,7 +113,7 @@ export class Managers {
           const detail=this.store.taskDetail(task.id);
           if(!detail.result||!detail.binding||detail.result.id!==resultId)throw new AppError('result-stale','成果已经改变。');
           if(verdict==='accept')await this.execution.verifyResult(task.id,resultId);authorize();
-          const result=this.store.managerReview(requestId,bot.id,task.id,task.rowVersion,resultId,decision,explanation,requested);
+          const result=this.store.managerReview(requestId,bot.id,task.id,task.rowVersion,resultId,decision,explanation,requested,{reviewSessionId:exec.agent.id,reviewCallId:exec.rootCallId??exec.callId});
           return {task:result,humanAcceptanceRequired:result.lifecycle==='review'};
         }
         throw new AppError('unknown-action','不支持的管理操作。');
@@ -111,7 +125,9 @@ export class Managers {
       if(this.closed)return;
       if(event.type==='turn/start'||event.type==='turn/end')this.userMessages.delete(_session.id);
       if(event.type==='user/message'&&event.data.source.kind==='user'&&'rpcId' in event.data.source) {
-        this.userMessages.set(_session.id,{sessionId:_session.id,messageId:event.data.id,seq:event.seq,text:event.data.content.filter(block=>block.type==='text').map(block=>block.text).join('\n')});
+        const sources=this.userMessages.get(_session.id)??[];
+        if(!sources.some(source=>source.messageId===event.data.id||source.seq===event.seq))sources.push({sessionId:_session.id,messageId:event.data.id,seq:event.seq,text:event.data.content.filter(block=>block.type==='text').map(block=>block.text).join('\n')});
+        this.userMessages.set(_session.id,sources);
       }
       if(event.type==='turn/end'&&event.data.reason.kind==='error') {
         const manager=this.store.managerForSession(_session.id);
@@ -119,16 +135,98 @@ export class Managers {
       }
       if(event.type==='user/message'&&event.data.source.kind==='super-bot-manager') {
         const source=event.data.source;
-        if(this.store.activeManager(source.botId)?.id===source.managerId)this.store.managerEventEntered(source.eventId,event.data.id);
+        if(this.store.activeManager(source.botId)?.id===source.managerId) {
+          this.restoreDeliveryScope(_session.id,source.eventId,event.data.id);
+          this.store.managerEventEntered(source.eventId,event.data.id);
+        }
+      }
+      if(event.type==='turn/end'&&this.store.managerForSession(_session.id)) {
+        const scope=this.deliveryScopes.get(_session.id),botId=this.store.managerForSession(_session.id)!.botId;
+        const done=this.reconcileDelivery(_session).catch(()=>{
+          if(!this.closed){const manager=this.store.managerForSession(_session.id);if(manager)this.store.managerProblem(manager.botId,'聊天交付尚未得到持久确认；通知已保留，不会重新执行 Worker。');}
+        }).finally(()=>{
+          // A retained native Inbox input has no monitorWake in this instance. Release only its own turn scope.
+          if(!this.waking.has(botId)&&this.deliveryScopes.get(_session.id)===scope)this.deliveryScopes.delete(_session.id);
+        });
+        this.finishing.set(_session.id,done);return done;
       }
     });
     this.timer=setInterval(()=>{void this.pump();},1000);this.timer.unref();
   }
+  /** Flush then read the native durable log. Live session/event and idle are not storage receipts. */
+  private async reconcileDelivery(session:Session):Promise<void> {
+    const manager=this.authority(session.id),notifications=this.store.managerNotifications(manager.botId);
+    if(!notifications.length)return;
+    // The Web client also augments Context.sessions; this adapter uses the Host SessionStore.
+    if(!await (this.ctx.sessions as unknown as SessionStore).flush(session))throw new AppError('delivery-unconfirmed','原生会话没有持久化确认。');
+    const handle=await this.ctx.sessionPersistence.open(SessionId(session.id),'read');
+    let events:readonly SessionEvent[];try{events=(await handle.read()).events;}finally{await handle.close();}
+    if(this.closed)return;this.authority(session.id,manager.id);
+    const inputs=new Map<string,{turn:number;seq:number;messageId:string}>();
+    const finals=new Map<number,SessionEvent<'assistant/message'>>(),ends=new Map<number,SessionEvent<'turn/end'>>();
+    let turn:number|undefined;
+    for(const event of events) {
+      if(event.type==='turn/start')turn=event.data.turn;
+      if(event.type==='user/message'&&event.surfaceOp==='append'&&turn!==undefined&&event.data.source.kind==='super-bot-manager') {
+        const source=event.data.source;
+        if(source.botId===manager.botId&&source.managerId===manager.id)inputs.set(source.eventId,{turn,seq:event.seq,messageId:event.data.id});
+      }
+      if(event.type==='assistant/message') {
+        // Only the last, naturally stopped, visible model reply can be final. Tool chatter is not delivery.
+        const data=event.data;
+        if(event.surfaceOp==='append'&&!data.interrupted&&data.message.source.kind==='model'&&lastAssistantStreamChunk(data.stream,'finish')?.reason.kind==='stop'&&data.message.content.some(block=>block.type==='text'&&block.text.trim())&&!data.message.content.some(block=>block.type==='tool-call'))finals.set(data.turn,event);
+        else finals.delete(data.turn);
+      }
+      if(event.type==='turn/end'){ends.set(event.data.turn,event);turn=undefined;}
+    }
+    for(const notification of notifications) {
+      const payload=JSON.parse(notification.payload);
+      let candidates:SessionEvent<'assistant/message'>[];
+      if(payload.deliveryOnly) {
+        const task=this.store.getTask(notification.taskId!),result=this.store.taskDetail(task.id).result;
+        if(!result||result.id!==payload.resultId||task.taskRevision!==payload.taskRevision||!['review','completed'].includes(task.lifecycle)){this.store.supersedeManagerDelivery(notification.id);continue;}
+        const links=result.evidence.map((_file,index)=>`${this.webOrigin()}/api/super-bot-file?resultId=${encodeURIComponent(result.id)}&index=${index}`);
+        links.push(`${this.webOrigin()}/#super-bot-task=${task.id}`);
+        const review=payload.reviewSessionId===session.id?events.find(event=>event.type==='tool/call'&&event.data.callId===payload.reviewCallId):undefined;
+        const input=inputs.get(notification.id);
+        // Same-turn delivery follows the real Review call; later delivery follows its exact entered notification.
+        const after=review?.seq??(input?.messageId===payload.messageId?input?.seq:undefined);
+        candidates=[...finals.values()].filter(event=>{
+          const text=event.data.message.content.filter(block=>block.type==='text').map(block=>block.text).join('\n');
+          return (after!==undefined?event.seq>after:!payload.reviewCallId&&event.time>=notification.createdAt)&&links.every(link=>text.includes(link));
+        });
+      }else {
+        const input=inputs.get(notification.id),final=input?finals.get(input.turn):undefined;
+        candidates=input&&input.messageId===payload.messageId&&final&&final.seq>input.seq?[final]:[];
+      }
+      const final=candidates.find(event=>{const end=ends.get(event.data.turn);return end?.data.reason.kind==='completed'&&end.seq>event.seq;});
+      if(final) {
+        const end=ends.get(final.data.turn)!;
+        this.store.managerNotificationDelivered(notification.id,session.id,{turn:final.data.turn,messageId:final.data.message.id,seq:final.seq,endSeq:end.seq});
+      }else if(payload.deliveryOnly&&candidates.length) {
+        // A persisted visible reply with a missing/error/repaired closer is ambiguous; do not blindly redeliver it.
+        this.store.managerDeliveryUncertain(notification.id);
+        this.store.managerProblem(manager.botId,'已有成果回复但原生轮次未确认结束，请打开管理对话核对；没有自动重复交付或执行。');
+      }
+    }
+  }
+  private restoreDeliveryScope(sessionId:string,eventId?:string,messageId?:string):void {
+    const manager=this.store.managerForSession(sessionId);if(!manager)return;
+    for(const event of this.store.managerNotifications(manager.botId)) {
+      const payload=JSON.parse(event.payload);if(!payload.deliveryOnly||!payload.messageJson||(eventId&&event.id!==eventId)||(messageId&&payload.messageId!==messageId))continue;
+      const message=JSON.parse(payload.messageJson) as UserMessage;
+      if(message.source.kind==='super-bot-manager'&&message.source.managerId===manager.id)this.deliveryScopes.set(sessionId,{taskId:event.taskId!,resultId:payload.resultId});
+    }
+  }
   private attachScope(agent:Agent):void {
     if(this.scopes.has(agent.id))return;const manager=this.store.managerForSession(agent.id);if(!manager)return;
+    if(agent.status!=='idle'||agent.inbox.nextTurn.length||agent.inbox.nextStep.length) {
+      this.restoreDeliveryScope(agent.id);
+      void agent.whenIdle().then(()=>{this.deliveryScopes.delete(agent.id);},()=>{});
+    }
     configureRole(agent,'manager',this.options);
     const mask=this.options.fullAccess?()=>{}:agent.ctx.tools.restrict({allow:['super_bot_manage']});
-    const guard=agent.ctx.tools.guard(exec=>{try{this.authority(agent.id);}catch{return 'This Bot session no longer has management authority.';}return this.options.fullAccess||exec.name==='super_bot_manage'?undefined:'This manager may only use super_bot_manage.';});
+    const guard=agent.ctx.tools.guard(exec=>{try{this.authority(agent.id);}catch{return 'This Bot session no longer has management authority.';}if(this.deliveryScopes.has(agent.id)&&exec.name!=='super_bot_manage')return 'Delivery-only recovery cannot execute native tools or modify work.';return this.options.fullAccess||exec.name==='super_bot_manage'?undefined:'This manager may only use super_bot_manage.';});
     let turn=-1,steps=0;
     const budget=agent.ctx.on('agent/pre-step',async(payload,next)=>{
       if(payload.turn!==turn){turn=payload.turn;steps=0;}
@@ -240,7 +338,7 @@ export class Managers {
     },5*60*1000);timeout.unref();
     const done=agent.whenIdle().catch(()=>{
       if(!this.closed)this.store.managerProblem(botId,'自动管理未正常结束，请打开管理会话核对。');
-    }).finally(()=>{clearTimeout(timeout);if(!this.closed){this.store.managerEventUnknown(eventId);if(timedOut)this.store.managerProblem(botId,'自动管理达到 5 分钟上限，本轮已结束、管理会话已空闲。可打开管理对话检查账本后继续。');}this.waking.delete(botId);});
+    }).finally(async()=>{await this.finishing.get(agent.id);clearTimeout(timeout);if(!this.closed){this.store.managerEventUnknown(eventId);if(timedOut)this.store.managerProblem(botId,'自动管理达到 5 分钟上限，本轮已结束、管理会话已空闲。可打开管理对话检查账本后继续。');}this.deliveryScopes.delete(agent.id);this.waking.delete(botId);});
     this.waking.set(botId,done);
   }
   private async pump():Promise<void> {
@@ -251,16 +349,24 @@ export class Managers {
         if((this.retryAfter.get(bot.id)??0)>Date.now())continue;
         try {
         const manager=this.store.activeManager(bot.id);if(!manager?.sessionId||manager.state!=='ready'||this.waking.has(bot.id))continue;
-        const event=this.store.pendingManagerEvents(bot.id)[0];if(!event)continue;
-        if(this.store.managerWakeCount(bot.id,Date.now()-60*60*1000)>=20)continue;
+        let event=this.store.pendingManagerEvents(bot.id)[0];if(!event)continue;
         if(event.id.startsWith('manager-event:capacity:')&&this.store.heldRuns().length>=2)continue;
         const resolved=await this.ctx.sessionController.resolveAgent(SessionId(manager.sessionId));
         if(this.closed)break;if('error' in resolved)throw new AppError('manager-unavailable','管理会话暂不可用；请打开管理会话核对。');const agent=resolved.agent;this.attachScope(agent);
         this.authority(agent.id,manager.id);
         if(agent.status!=='idle'||agent.inbox.nextTurn.length||agent.inbox.nextStep.length)continue;
+        if(JSON.parse(event.payload).deliveryOnly) {
+          await this.reconcileDelivery(agent.session);
+          if(this.closed)break;this.authority(agent.id,manager.id);
+          if(agent.status!=='idle'||agent.inbox.nextTurn.length||agent.inbox.nextStep.length)continue;
+          event=this.store.pendingManagerEvents(bot.id)[0];if(!event)continue;
+        }
+        if(this.store.managerWakeCount(bot.id,Date.now()-60*60*1000)>=20)continue;
         if(!selectedModel(this.ctx,agent)){this.store.managerProblem(bot.id,'请打开管理对话，明确选择并配置模型；任务通知已保留，尚未自动调用模型。');continue;}
         const message=createUserMessage({source:{kind:'super-bot-manager',botId:bot.id,managerId:manager.id,eventId:event.id},content:[{type:'text',text:`Important task event: ${JSON.parse(event.payload).reason}\nTask: ${event.taskId??'all current work'}\nRead current ledger state. Do not assume the event is still current. Do not manufacture new tasks. If ready, read detail, review only if needed, and deliver a concise result with file links and pending human confirmation here. If waiting for input, ask the user here. Do not repeat a stale delivery. Finish after useful bounded work; do not poll.`}]});
         if(!this.store.claimManagerEvent(event.id,message.id,JSON.stringify(message)))continue;
+        const payload=JSON.parse(event.payload);
+        if(payload.deliveryOnly)this.deliveryScopes.set(agent.id,{taskId:event.taskId!,resultId:payload.resultId});
         this.store.managerProblem(bot.id,'');this.retryAfter.delete(bot.id);
         try {agent.followup(message);}
         catch {
@@ -279,6 +385,7 @@ export class Managers {
     await Promise.allSettled([...this.botWrites.values()].map(write=>write.promise));
     for(const {agent}of this.scopes.values())if(agent.status==='running')agent.cancel({kind:'user'},{keepInbox:true});
     await Promise.allSettled([...this.scopes.values()].map(({agent})=>agent.whenIdle()));
-    for(const scope of this.scopes.values())scope.release();this.scopes.clear();
+    await Promise.allSettled([...this.finishing.values()]);
+    for(const scope of this.scopes.values())scope.release();this.scopes.clear();this.deliveryScopes.clear();this.finishing.clear();
   }
 }
