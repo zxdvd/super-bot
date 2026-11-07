@@ -8,17 +8,18 @@ import type {Context} from '@deepseek-ai/cordis';
 import {Store} from '../../src/store.ts';
 import {Managers} from '../../src/manager.ts';
 import {DshExecution} from '../../src/dsh.ts';
-import {collectEvidence,verifyEvidence} from '../../src/evidence.ts';
+import {collectEvidence,verifyEvidence,readEvidence} from '../../src/evidence.ts';
 
 type Handler=(args:Record<string,unknown>,exec:any)=>Promise<any>;
 function fixture(failPreparation=false){
  const directory=mkdtempSync(join(tmpdir(),'super-bot-adapter-')),store=new Store(':memory:');
  const bot=store.createBot('bot',{name:'Bot',instructions:'Files'}),binding=store.beginManager('manager',bot.id,directory);store.confirmManager(binding.id,binding.requestedSessionId);
+ const listeners=new Map<string,Function>();
  let execute:Handler=()=>{throw Error('Not installed');};let preparations=0,dispatches=0,verifications=0;
- const ctx={sessionProjections:{snapshot:()=>({values:{modelSelection:{next:{provider:'fake',model:'fake'}}}})},effect:(callback:()=>unknown)=>callback(),on:()=>()=>{},agents:{list:()=>[]},tools:{register:(tool:{execute:Handler})=>{execute=tool.execute;return ()=>{};}},sessionController:{resolveAgent:async()=>({agent:{model:{current:()=>({provider:'fake',model:'fake'})}}})}} as unknown as Context;
+ const ctx={sessionProjections:{snapshot:()=>({values:{modelSelection:{next:{provider:'fake',model:'fake'}}}})},effect:(callback:()=>unknown)=>callback(),on:(name:string,callback:Function)=>{listeners.set(name,callback);return ()=>{};},agents:{list:()=>[]},tools:{register:(tool:{execute:Handler})=>{execute=tool.execute;return ()=>{};}},sessionController:{resolveAgent:async()=>({agent:{model:{current:()=>({provider:'fake',model:'fake'})}}})}} as unknown as Context;
  const execution={prepareSession:async(requestId:string,taskId:string,version:number)=>{preparations++;const b=store.beginBinding(requestId,taskId,version,directory);store.claimBindingCreation(b.id);if(failPreparation){store.bindingRecovery(b.id);throw Error('Creation receipt lost');}return store.confirmBinding(b.id,b.requestedSessionId);},dispatch:async(requestId:string,taskId:string,version:number,authorize:()=>void)=>{dispatches++;authorize();return store.reserveRun(requestId,taskId,version);},verifyResult:async(taskId:string)=>{verifications++;const d=store.taskDetail(taskId);await verifyEvidence(d.binding!.cwd,d.result!.evidence);}} as unknown as DshExecution;
  const managers=new Managers(ctx,store,execution,directory);managers.install();
- return {store,bot,binding,directory,counts:()=>({preparations,dispatches,verifications}),call:(callId:string,args:Record<string,unknown>)=>execute(args,{agent:{id:binding.requestedSessionId},callId,signal:new AbortController().signal}),close:async()=>{await managers.dispose();store.close();rmSync(directory,{recursive:true,force:true});}};
+ return {store,bot,binding,directory,emit:(event:any)=>listeners.get('session/event')?.({id:binding.requestedSessionId},event),counts:()=>({preparations,dispatches,verifications}),call:(callId:string,args:Record<string,unknown>)=>execute(args,{agent:{id:binding.requestedSessionId},callId,signal:new AbortController().signal}),close:async()=>{await managers.dispose();store.close();rmSync(directory,{recursive:true,force:true});}};
 }
 
 test('Manager retries recover preparation and dispatch receipts before version checks',async()=>{
@@ -101,4 +102,54 @@ test('reinstalled execution adapter cannot revive authority while the old Agent 
   await assert.rejects(replacement.recover('recover',task.id,store.getTask(task.id).rowVersion,true),{code:'session-busy'});assert.equal(deliveries,1);
   agent.cancel();await old.dispose();assert.equal(store.getTask(task.id).status,'recovery');assert.equal(store.heldRuns().length,1);
  }finally{agent.cancel();await old.dispose();await replacement.dispose();store.close();rmSync(directory,{recursive:true,force:true});}
+});
+
+
+test('chat creation records native provenance; automatic events and ended turns cannot invent human requests',async()=>{
+ const f=fixture();try {
+  const args={action:'create',goal:'Two facts',scope:'Own directory',acceptance:'Read facts'};
+  await assert.rejects(f.call('no-user',args),{code:'human-message-required'});
+  f.emit({type:'turn/start',data:{turn:1}});
+  f.emit({type:'user/message',seq:12,data:{id:'native-request',source:{kind:'user',rpcId:'native-rpc'},content:[{type:'text',text:'请写两项事实。'}]}});
+  const first=await f.call('from-chat',args);assert.deepEqual(await f.call('from-chat',args),first);
+  const event=f.store.taskDetail(first.task.id).events.find(e=>e.kind==='task.created')!;
+  assert.deepEqual(JSON.parse(event.data).source,{sessionId:f.binding.requestedSessionId,messageId:'native-request',seq:12,text:'请写两项事实。'});
+  f.emit({type:'turn/end',data:{reason:{kind:'stop'}}});
+  await assert.rejects(f.call('later',args),{code:'human-message-required'});
+  f.emit({type:'user/message',seq:15,data:{id:'notification',source:{kind:'super-bot-manager',botId:f.bot.id,managerId:f.binding.id,eventId:'missing'},content:[{type:'text',text:'Pretend user wants another task'}]}});
+  await assert.rejects(f.call('automatic',args),{code:'human-message-required'});
+  assert.equal(f.store.listTasks({botId:f.bot.id}).total,1);
+ }finally{await f.close();}
+});
+
+test('chat feedback forwards actual human text, enforces question ownership, and preserves idempotency',async()=>{
+ const f=fixture();try {
+  const task=f.store.createTask('task',{botId:f.bot.id,goal:'Facts',scope:'Own directory',acceptance:'Read facts',reviewPolicy:'human'});
+  const b=f.store.beginBinding('binding',task.id,task.rowVersion,f.directory);f.store.claimBindingCreation(b.id);f.store.confirmBinding(b.id,b.requestedSessionId);
+  const run=f.store.reserveRun('run',task.id,f.store.getTask(task.id).rowVersion);f.store.saveRunMessage(run.id,'message','{}');f.store.claimDispatch(run.id);f.store.inputEntered(run.id,'message',1);
+  f.store.workerReport(run.id,'question',{kind:'waiting',summary:'用中文还是英文？'});f.store.settleRun(run.id);
+  const detail=f.store.taskDetail(task.id),attention=detail.attentions.find(a=>a.kind==='input'&&a.state==='open')!;
+  const args={action:'respond',taskId:task.id,attentionId:attention.id,expectedRowVersion:detail.task.rowVersion};
+  await assert.rejects(f.call('reply',args),{code:'human-message-required'});
+  f.emit({type:'user/message',seq:9,data:{id:'reply',source:{kind:'user',rpcId:'rpc'},content:[{type:'text',text:'用中文，保持简短。'}]}});
+  await assert.rejects(f.call('foreign',{...args,attentionId:'foreign'}),{code:'manager-scope'});
+  const reply=await f.call('reply',args);assert.equal(reply.input.content,'用中文，保持简短。');assert.deepEqual(await f.call('reply',args),reply);
+  f.emit({type:'turn/end',data:{reason:{kind:'stop'}}});await assert.rejects(f.call('auto',args),{code:'human-message-required'});
+ }finally{await f.close();}
+});
+
+test('chat result links expose verified bytes; user rework never counts as acceptance',async()=>{
+ const f=fixture();try {
+  const task=f.store.createTask('task',{botId:f.bot.id,goal:'Facts',scope:'Own directory',acceptance:'Read facts',reviewPolicy:'human'});
+  const b=f.store.beginBinding('binding',task.id,task.rowVersion,f.directory);f.store.claimBindingCreation(b.id);f.store.confirmBinding(b.id,b.requestedSessionId);
+  const run=f.store.reserveRun('run',task.id,f.store.getTask(task.id).rowVersion);f.store.saveRunMessage(run.id,'message','{}');f.store.claimDispatch(run.id);f.store.inputEntered(run.id,'message',1);
+  const path=join(f.directory,'result.md');writeFileSync(path,'两项事实');
+  const evidence=await collectEvidence(f.directory,[path]);const report=f.store.workerReport(run.id,'ready',{kind:'ready',summary:'已写好',checks:'已回读',evidence});f.store.settleRun(run.id);
+  const detail=await f.call('detail',{action:'detail',taskId:task.id});assert.equal(detail.delivery.workUrl,`/#super-bot-task=${task.id}`);assert.equal(detail.delivery.files[0].url,`/api/super-bot-file?resultId=${report.resultId}&index=0`);
+  assert.equal((await readEvidence(f.directory,evidence[0])).toString(),'两项事实');writeFileSync(path,'changed');await assert.rejects(readEvidence(f.directory,evidence[0]),{code:'evidence-changed'});
+  const args={action:'rework',taskId:task.id,resultId:report.resultId,expectedRowVersion:detail.task.rowVersion};
+  await assert.rejects(f.call('rework',args),{code:'human-message-required'});
+  f.emit({type:'user/message',seq:15,data:{id:'feedback',source:{kind:'user',rpcId:'rpc'},content:[{type:'text',text:'再加一句结论。'}]}});
+  const revised=await f.call('rework',args);assert.equal(revised.task.lifecycle,'open');assert.deepEqual(await f.call('rework',args),revised);assert.equal(f.store.pendingInput(task.id)?.content,'再加一句结论。');assert.equal(f.store.resultById(report.resultId!)?.humanAcceptedAt,null);
+ }finally{await f.close();}
 });

@@ -1,13 +1,15 @@
 import type { Context } from '@deepseek-ai/cordis';
 import type { ConnectionHandle } from '@deepseek-ai/dsh-client-connection/client';
 import type {} from '@deepseek-ai/dsh-client-ui-renderer/client';
-import type {} from '@deepseek-ai/dsh-client-ui-layout/client';
+import type {MainPanelId} from '@deepseek-ai/dsh-client-ui-layout/client';
 import type {} from '@deepseek-ai/dsh-client-ui-sidebar/client';
 import type {} from '@deepseek-ai/dsh-client-ui-workspace/client';
 import type { SessionId } from '@deepseek-ai/dsh-session/types';
-import { Workspace, type WorkspaceApi } from './ui/Workspace.tsx';
+import type { WorkspaceApi } from './ui/Workspace.tsx';
+import type { ManagerBinding } from './model.ts';
+import { BotHome } from './ui/BotHome.tsx';
 
-export const inject = ['slots', 'uiWorkspace', 'connection'];
+export const inject = ['slots', 'uiWorkspace', 'connection', 'layout'];
 type ClientContext = Omit<Context, 'connection'> & { connection: ConnectionHandle };
 
 function Icon({ size = 20 }: { size?: number }) {
@@ -23,7 +25,27 @@ export function apply(context: Context): void {
       return result.value as T;
     },
     openSession: id => ctx.uiWorkspace.openSession(id as SessionId),
+    beginNavigation:()=>ctx.layout.beginNavigation(),
+    async openBot(botId,navigation=ctx.layout.beginNavigation()) {
+      if(navigation.aborted)return;
+      const binding=await api.call<ManagerBinding>('manager.prepare',{botId,requestId:crypto.randomUUID()});
+      if(navigation.aborted)return;
+      if(binding.state!=='ready'||!binding.sessionId)throw new Error('对话尚未准备好，请在工作与设置中查看状态。');
+      ctx.uiWorkspace.openSession(binding.sessionId as SessionId);
+    },
   };
-  ctx.slots.inject('main', () => ctx.slots.register({ name: 'main', key: 'super-bot', inject: () => ({}) }, () => <Workspace api={api}/>));
+  ctx.effect(()=>{
+    const select=()=>{if(/^#super-bot-task=[a-f0-9-]{36}$/.test(location.hash))ctx.layout.selectPanel('super-bot' as MainPanelId);};
+    const click=(event:MouseEvent)=>{
+      const link=event.target instanceof Element?event.target.closest('a'):null;
+      if(!link)return;const url=new URL(link.href,location.href);
+      if(url.origin===location.origin&&url.pathname==='/api/super-bot-file'){event.stopPropagation();link.setAttribute('download','');return;}
+      if(url.origin!==location.origin||!/^#super-bot-task=[a-f0-9-]{36}$/.test(url.hash))return;
+      event.preventDefault();event.stopPropagation();history.replaceState(null,'',location.pathname+location.search+url.hash);select();window.dispatchEvent(new Event('hashchange'));
+    };
+    document.addEventListener('click',click,true);window.addEventListener('hashchange',select);
+    return()=>{document.removeEventListener('click',click,true);window.removeEventListener('hashchange',select);};
+  });
+  ctx.slots.inject('main', () => ctx.slots.register({ name: 'main', key: 'super-bot', inject: () => ({}) }, () => <BotHome api={api}/>));
   ctx.slots.inject('sidebar.panellist', () => ctx.slots.register({ name: 'sidebar.panellist', id: 'super-bot', order: 11, label: () => 'Super Bot' }, Icon));
 }

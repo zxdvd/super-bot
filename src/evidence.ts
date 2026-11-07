@@ -13,7 +13,7 @@ export function containedPath(cwd:string,path:string):string {
   if(!rel||rel==='..'||rel.startsWith(`..${sep}`)||isAbsolute(rel))throw new AppError('path-outside','文件必须位于当前任务的专用工作目录。');
   return canonical;
 }
-type InspectedEvidence=Evidence&{text:string;truncated:boolean};
+type InspectedEvidence=Evidence&{text:string;data:Buffer;truncated:boolean};
 export function evidencePaths(paths:unknown):string[] {
   if(!Array.isArray(paths)||paths.length<1||paths.length>10||paths.some(p=>typeof p!=='string'))throw new AppError('invalid-evidence','请提供 1～10 个任务目录内的文件路径。');
   return [...new Set(paths as string[])];
@@ -36,7 +36,7 @@ async function inspectFiles(cwd:string,paths:unknown,previewBytes=0):Promise<Ins
           hash.update(buffer.subarray(0,read.bytesRead));
           const take=Math.min(read.bytesRead,previewBytes-captured);if(take>0){preview.push(Buffer.from(buffer.subarray(0,take)));captured+=take;}
         }
-        total+=bytes;evidence.push({path:canonical,sha256:hash.digest('hex'),bytes,text:Buffer.concat(preview).toString('utf8'),truncated:bytes>captured});
+        total+=bytes;evidence.push({path:canonical,sha256:hash.digest('hex'),bytes,text:Buffer.concat(preview).toString('utf8'),data:Buffer.concat(preview),truncated:bytes>captured});
       }finally{await file.close();}
     }catch(error){if(error instanceof AppError)throw error;throw new AppError('evidence-unavailable',`成果文件无法读取，请恢复文件或重新提交：${canonical}`);}
   }
@@ -55,4 +55,10 @@ export async function verifyEvidence(cwd:string,evidence:Evidence[]):Promise<voi
 export async function previewEvidence(cwd:string,evidence:Evidence[]):Promise<{path:string;text:string;bytes:number;truncated:boolean}[]> {
   const current=await inspectFiles(cwd,evidence.map(file=>file.path),12000);assertSameEvidence(current,evidence);
   return current.map(({path,text,bytes,truncated})=>({path,text,bytes,truncated}));
+}
+
+/** Return only bytes whose hash still matches the delivered result. */
+export async function readEvidence(cwd:string,evidence:Evidence):Promise<Buffer> {
+  const current=await inspectFiles(cwd,[evidence.path],10*1024*1024);assertSameEvidence(current,[evidence]);
+  return current[0].data;
 }

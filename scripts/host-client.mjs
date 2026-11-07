@@ -16,5 +16,5 @@ export async function hostClient(logPath='.runtime/host.log') {
     const location=response.headers.get('location');if(!location)break;url=new URL(location,url).href;
     assert.equal(new URL(url).origin,base,'authentication stays on dedicated host');
   }
-  return {base,post:async(path,body={})=>fetch(base+path,{method:'POST',headers:{cookie:[...cookies].map(([k,v])=>`${k}=${v}`).join('; '),origin:base,'content-type':'application/json'},body:JSON.stringify(body)})};
+  return {base,get:async(path)=>fetch(base+path,{redirect:'manual',headers:{cookie:[...cookies].map(([k,v])=>`${k}=${v}`).join('; ')}}),post:async(path,body={})=>fetch(base+path,{method:'POST',headers:{cookie:[...cookies].map(([k,v])=>`${k}=${v}`).join('; '),origin:base,'content-type':'application/json'},body:JSON.stringify(body)})};
 }

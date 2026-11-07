@@ -74,16 +74,21 @@ class ProbeAdapter extends LlmAdapter {
       else if(!prior) {
         const foreign=text.match(/CROSS_BOT:([^\s]+)/)?.[1];
         if(foreign)plan={action:'detail',taskId:foreign};
-        else if(trigger?.source?.kind==='user'&&text.includes('MANAGER_PROBE'))plan={action:'create',goal:'Manager 生成合成说明',scope:'专用任务目录，不访问网络',acceptance:'result.md 包含两项事实并已回读'};
+        else if(trigger?.source?.kind==='user'&&(text.includes('MANAGER_PROBE')||text==='请写一份简短的说明，包含两项事实，完成后给我文件。'||text==='请写一份说明，先确认读者。'))plan={action:'create',goal:text.includes('先确认读者')?'ASK_PROBE':'Manager 生成合成说明',scope:'专用任务目录，不访问网络',acceptance:'result.md 包含两项事实并已回读'};
+        else if(trigger?.source?.kind==='user'&&(text==='读者是新同事，保持简短。'||text==='再加一句结论。'))plan={action:'list'};
         else if(trigger?.source?.kind==='super-bot-manager'){const target=text.match(/\nTask: ([a-f0-9-]{36})\n/)?.[1];plan=target?{action:'detail',taskId:target}:{action:'list'};}
       }else if(prior.action==='list'&&value?.items) {
         const tasks=value.items as {id:string;rowVersion:number;status:string;controlMode:string;managerReviewed?:boolean}[];
+        const feedback=trigger?.source?.kind==='user'&&(text==='读者是新同事，保持简短。'||text==='再加一句结论。');
+        const target=feedback?tasks.find(t=>t.status===(text==='再加一句结论。'?'review':'needs-input')):undefined;
         const review=tasks.find(t=>t.status==='review'&&t.controlMode==='auto'&&!t.managerReviewed);
         const queued=tasks.find(t=>t.status==='unscheduled'&&t.controlMode==='auto');
-        if(review)plan={action:'detail',taskId:review.id};else if(queued)plan={action:'dispatch',taskId:queued.id,expectedRowVersion:queued.rowVersion};
-      }else if((prior.action==='create'||value?.prepared)&&value?.task)plan={action:'dispatch',taskId:value.task.id,expectedRowVersion:value.task.rowVersion};
+        if(target)plan={action:'detail',taskId:target.id};else if(review)plan={action:'detail',taskId:review.id};else if(queued)plan={action:'dispatch',taskId:queued.id,expectedRowVersion:queued.rowVersion};
+      }else if((['create','respond','rework'].includes(String(prior.action))||value?.prepared)&&value?.task)plan={action:'dispatch',taskId:value.task.id,expectedRowVersion:value.task.rowVersion};
       else if(prior.action==='detail'&&value?.task?.controlMode==='auto') {
-        if(value.result&&value.task.lifecycle==='review') {
+        if(trigger?.source?.kind==='user'&&text==='再加一句结论。'&&value.result)plan={action:'rework',taskId:value.task.id,expectedRowVersion:value.task.rowVersion,resultId:value.result.id};
+        else if(trigger?.source?.kind==='user'&&text==='读者是新同事，保持简短。'&&value.attentions?.some((a:any)=>a.kind==='input'&&a.state==='open'))plan={action:'respond',taskId:value.task.id,expectedRowVersion:value.task.rowVersion,attentionId:value.attentions.find((a:any)=>a.kind==='input'&&a.state==='open').id};
+        else if(value.result&&value.task.lifecycle==='review'&&!value.task.managerReviewed) {
           const rework=String(value.task.goal).includes('MANAGER_REWORK_LOOP')||(String(value.task.goal).includes('MANAGER_REWORK_PROBE')&&!JSON.stringify(value.files).includes('修订'));
           plan={action:'review',taskId:value.task.id,expectedRowVersion:value.task.rowVersion,resultId:value.result.id,verdict:rework?'rework':'accept',note:rework?'请补充修订说明后重新提交。':'已通过 detail 读取文件内容：含标题、两项事实，并有回读记录。默认提交用户最终验收。'};
         }else if(value.task.status==='unscheduled')plan={action:'dispatch',taskId:value.task.id,expectedRowVersion:value.task.rowVersion};
@@ -94,8 +99,11 @@ class ProbeAdapter extends LlmAdapter {
         yield {type:'block-start',index:0,blockType:'tool-call'};yield {type:'tool-call-delta',index:0,id,name:'super_bot_manage',argumentsDelta:args};
         yield {type:'block-end',index:0,block:{type:'tool-call',id,name:'super_bot_manage',arguments:args}};yield {type:'finish',reason:{kind:'tool-calls'}};return;
       }
-      yield {type:'block-start',index:0,blockType:'text'};yield {type:'text-delta',index:0,text:'确定性管理轮次已结束，请查看工作台。'};
-      yield {type:'block-end',index:0,block:{type:'text',text:'确定性管理轮次已结束，请查看工作台。'}};yield {type:'finish',reason:{kind:'stop'}};return;
+      const detail=later.filter(m=>m.role==='tool').flatMap(m=>m.content.filter(b=>b.type==='text').map(b=>{try{return JSON.parse(b.text);}catch{return null;}})).findLast(v=>v?.delivery);
+      const question=value?.attentions?.find((a:any)=>a.kind==='input'&&a.state==='open');
+      const reply=prior?.action==='review'&&detail?.delivery?`已完成：${detail.delivery.summary}\n${detail.delivery.files.map((f:any)=>`[${f.name}](${f.url})`).join('\n')}\n检查：${detail.delivery.checks}\n等待你确认。[查看成果并确认](${detail.delivery.workUrl})`:question?question.question:prior?.action==='dispatch'?'已经开始处理，完成后我会回到这里交付。':trigger?.source?.kind==='user'?'你好，我可以帮你安排文档工作。':'已核对当前状态。';
+      yield {type:'block-start',index:0,blockType:'text'};yield {type:'text-delta',index:0,text:reply};
+      yield {type:'block-end',index:0,block:{type:'text',text:reply}};yield {type:'finish',reason:{kind:'stop'}};return;
     }
     const latestInput=options.messages.findLast(m=>m.role==='user'&&(m.source?.kind==='super-bot'||m.source?.kind==='user'));
     const workInput=latestInput?.source?.kind==='super-bot'?latestInput:undefined;
@@ -346,7 +354,7 @@ export function apply(ctx:Context) {
         const bots=[];
         for(let n=0;n<3;n++) {
           const bot=managerLedger.createBot(`bot-${n}`,{name:`Manager fault ${n}`,instructions:'Synthetic notification receipt only'});bots.push(bot);
-          const binding=await managers.prepare(`prepare-${n}`,bot.id);const resolved=await ctx.sessionController.resolveAgent(SessionId(binding.sessionId!));assert.ok('agent' in resolved);
+          const binding=await managers.prepare(`prepare-${n}`,bot.id);managerLedger.enqueueManager(bot.id,`synthetic-${n}`,'Synthetic notification failure probe',null);const resolved=await ctx.sessionController.resolveAgent(SessionId(binding.sessionId!));assert.ok('agent' in resolved);
           resolved.agent.model.select({provider,model:'deterministic'});managerAgents.push(resolved.agent);
         }
         failedSession=managerAgents[0]!.id;lostSession=managerAgents[1]!.id;
@@ -427,7 +435,7 @@ export function apply(ctx:Context) {
       if(body.action==='inspect-session') {
         assert.ok(body.sessionId);const resolved=await ctx.sessionController.resolveAgent(SessionId(body.sessionId));assert.ok('agent' in resolved);
         assert.ok(resolved.agent.session.header.cwd?.startsWith(join(home!,'super-bot')+'/'));
-        return Response.json({ok:true,sessionId:resolved.agent.id,status:resolved.agent.status,pending:resolved.agent.inbox.nextTurn.length+resolved.agent.inbox.nextStep.length,stalled:adapter.stalled.has(resolved.agent.id),stalledAborted:adapter.stalled.get(resolved.agent.id)?.signal?.aborted??false,managerAttempts:adapter.managerAttempts.get(resolved.agent.id)??[],materialMarkers:adapter.calls.filter(call=>call.sessionId===body.sessionId&&(!call.purpose||call.purpose==='conversation')).at(-1)?.markers??[],historyMessageIds:resolved.agent.session.snapshotEvents().filter(event=>event.type==='user/message').map(event=>event.data.id),modelSteps:adapter.calls.filter(call=>call.sessionId===body.sessionId&&(!call.purpose||call.purpose==='conversation')).length,scopedProbeCalls:scopedCalls.get(resolved.agent.id)??0,scopedProbeAttempts:adapter.scopedAttempts.get(resolved.agent.id)??0,
+        return Response.json({ok:true,sessionId:resolved.agent.id,status:resolved.agent.status,pending:resolved.agent.inbox.nextTurn.length+resolved.agent.inbox.nextStep.length,stalled:adapter.stalled.has(resolved.agent.id),stalledAborted:adapter.stalled.get(resolved.agent.id)?.signal?.aborted??false,managerAttempts:adapter.managerAttempts.get(resolved.agent.id)??[],materialMarkers:adapter.calls.filter(call=>call.sessionId===body.sessionId&&(!call.purpose||call.purpose==='conversation')).at(-1)?.markers??[],assistantTexts:resolved.agent.session.snapshotEvents().filter(event=>event.type==='assistant/message').map(event=>event.data.message.content.filter(block=>block.type==='text').map(block=>block.text).join('')),historyMessageIds:resolved.agent.session.snapshotEvents().filter(event=>event.type==='user/message').map(event=>event.data.id),modelSteps:adapter.calls.filter(call=>call.sessionId===body.sessionId&&(!call.purpose||call.purpose==='conversation')).length,scopedProbeCalls:scopedCalls.get(resolved.agent.id)??0,scopedProbeAttempts:adapter.scopedAttempts.get(resolved.agent.id)??0,
           productTools:ctx.tools.definitions().map(tool=>tool.name).filter(name=>['super_bot_report','super_bot_manage'].includes(name))});
       }
       if(body.action==='select-test-model'||body.action==='native-prompt') {

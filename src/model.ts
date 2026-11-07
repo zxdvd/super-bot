@@ -103,3 +103,6 @@ export function optionalText(value: unknown, label: string, max = 10000): string
   if (value === '' || value === undefined) return '';
   return requiredText(value, label, max);
 }
+
+/** Actual host user message, supplied by the adapter rather than model arguments. */
+export interface ChatSource { sessionId:string; messageId:string; seq:number; text:string }

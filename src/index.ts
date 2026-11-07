@@ -3,9 +3,11 @@ import Schema from '@deepseek-ai/schemastery';
 import type {} from '@deepseek-ai/dsh-client-connection';
 import type {} from '@deepseek-ai/dsh-api-session-controller';
 import type {} from '@deepseek-ai/dsh-workspace';
+import type {} from '@deepseek-ai/dsh-host-webserver';
 import { createRequire } from 'node:module';
 import { homedir } from 'node:os';
-import { join,resolve } from 'node:path';
+import { basename,join,resolve } from 'node:path';
+import { readEvidence } from './evidence.ts';
 import { Store } from './store.ts';
 import { DshExecution } from './dsh.ts';
 import { Managers } from './manager.ts';
@@ -13,14 +15,14 @@ import { createLedgerBackup } from './backups.ts';
 import { AppError, requiredText, optionalText,type WorkspaceStatus, type NewBot, type NewTask, type ControlMode } from './model.ts';
 
 export const name = 'super-bot';
-export const inject = ['connection', 'sessionController', 'workspaceRegistry','agents','tools','jobs','systemPrompt','workingDirectory','sessionProjections'];
+export const inject = ['connection', 'sessionController', 'workspaceRegistry','agents','tools','jobs','systemPrompt','workingDirectory','sessionProjections','webServer'];
 export const Config = Schema.object({ dataDir: Schema.string().description('Super Bot 本地数据目录') });
 
 export function apply(ctx: Context, config: { dataDir?: string } = {}): void {
   const dataDir = resolve(config.dataDir ?? process.env.SUPER_BOT_DATA_DIR ?? join(process.env.DSH_HOME ?? join(homedir(), '.dsh'), 'super-bot'));
   const store = new Store(join(dataDir, 'ledger.sqlite'));
   const execution=new DshExecution(ctx,store,dataDir);
-  const managers=new Managers(ctx,store,execution,dataDir);
+  const managers=new Managers(ctx,store,execution,dataDir,()=>ctx.webServer.getOrigin());
   ctx.effect(() => async () => {await managers.dispose();await execution.dispose();store.close();});
   execution.install();
   managers.install();
@@ -67,6 +69,17 @@ export function apply(ctx: Context, config: { dataDir?: string } = {}): void {
         message: error instanceof AppError ? error.message : '操作未完成，请检查宿主日志并核对状态。', details: {} } };
     }
   }
+  // Read-only artifact links work in native chat. Never accept a caller-supplied path.
+  ctx.effect(()=>ctx.connection.fetch.register({path:'/api/super-bot-file',methods:['GET'],requestBody:'buffered',fetch:async request=>{
+    try {
+      const params=new URL(request.url).searchParams,resultId=params.get('resultId')??'',index=Number(params.get('index'));
+      const result=store.resultById(resultId);
+      if(!result||!params.has('index')||!Number.isSafeInteger(index)||index<0||!result.evidence[index])return new Response('找不到成果文件。',{status:404});
+      const run=store.getRun(result.runId),binding=store.getBinding(run.bindingId),evidence=result.evidence[index];
+      const bytes=await readEvidence(binding.cwd,evidence);
+      return new Response(new Uint8Array(bytes),{headers:{'Content-Type':'application/octet-stream','Content-Disposition':`attachment; filename*=UTF-8''${encodeURIComponent(basename(evidence.path))}`,'Cache-Control':'no-store','X-Content-Type-Options':'nosniff'}});
+    }catch(error){return new Response(error instanceof AppError?error.message:'无法读取成果文件。',{status:409,headers:{'Cache-Control':'no-store'}});}
+  }}));
   // Exact routes are authenticated and owner-only by DSH Connection on every carrier.
   // Do not take its sole shared-RPC interceptor (that belongs to the API Gateway).
   ctx.effect(() => ctx.connection.fetch.register({

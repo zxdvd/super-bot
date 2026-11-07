@@ -3,7 +3,7 @@ import { mkdirSync } from 'node:fs';
 import { dirname,relative,isAbsolute,sep } from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
 import schemaVersion from '../schema-version.json' with {type:'json'};
-import { AppError, requiredText, optionalText, taskStatus, type Bot, type Task, type NewBot, type NewTask, type TaskPage, type ControlMode, type Attention, type Binding, type Run, type RunInput, type WorkReport, type Result,type ManagerBinding,type ManagerEvent,type ExistingSessionGrant,type ReferenceMaterial,type TaskBotContext,botDraft } from './model.ts';
+import { AppError, requiredText, optionalText, taskStatus, type ChatSource, type Bot, type Task, type NewBot, type NewTask, type TaskPage, type ControlMode, type Attention, type Binding, type Run, type RunInput, type WorkReport, type Result,type ManagerBinding,type ManagerEvent,type ExistingSessionGrant,type ReferenceMaterial,type TaskBotContext,botDraft } from './model.ts';
 
 /** One local database. Business transactions will live here, not in the UI/adapter. */
 export class Store {
@@ -186,14 +186,11 @@ export class Store {
       this.db.prepare("UPDATE managers SET state='ready',sessionId=? WHERE id=?").run(sessionId,id);
       this.db.prepare('UPDATE bots SET managerSessionId=? WHERE id=?').run(sessionId,manager.botId);
       this.db.prepare("UPDATE outbox SET state='done' WHERE id=?").run(`manager-create:${id}`);
-      let actionable=0;
       for(const row of this.db.prepare("SELECT id FROM tasks WHERE botId=? AND controlMode='auto' AND lifecycle IN ('open','review') ORDER BY createdAt,id").all(manager.botId)) {
         const task=this.getTask(String(row.id));
         if(task.status!=='unscheduled'&&!(task.status==='review'&&!task.managerReviewed))continue;
-        actionable++;
         if(!this.db.prepare("SELECT 1 FROM outbox WHERE kind='manager.notify' AND state='pending' AND taskId=? AND json_extract(payload,'$.botId')=?").get(task.id,manager.botId))this.enqueueManager(manager.botId,`backlog:${id}:${task.id}`,'管理会话已准备好，请从账本恢复这项现有工作。',task.id);
       }
-      if(!actionable)this.enqueueManager(manager.botId,`init:${id}`,'管理会话已准备好，请从账本恢复当前工作。',null);
       this.event('manager.ready',null,{botId:manager.botId,sessionId});return this.activeManager(manager.botId)!;
     });
   }
@@ -237,19 +234,19 @@ export class Store {
       this.event('manager.replaced',null,{botId,oldSessionId:manager.sessionId});return manager;
     });
   }
-  createTask(requestId: string, input: NewTask): Task {
+  createTask(requestId: string, input: NewTask, source?:ChatSource): Task {
     if(input.startPaused!==undefined&&typeof input.startPaused!=='boolean')throw new AppError('invalid-input','初始暂停状态必须是布尔值。');
     const payload: NewTask = { botId: requiredText(input.botId, 'Bot 标识', 200), goal: requiredText(input.goal, '任务目标'),
       scope: optionalText(input.scope, '任务范围'), acceptance: optionalText(input.acceptance, '验收条件'), reviewPolicy: input.reviewPolicy,...(input.startPaused?{startPaused:true}:{}) };
     if (!['human', 'bot'].includes(payload.reviewPolicy)) throw new AppError('invalid-input', '请选择有效的验收方式。');
-    return this.command(requestId, 'task.create', payload, () => {
+    return this.command(requestId, 'task.create', {...payload,...(source?{source}:{})}, () => {
       const bot=this.getBot(payload.botId),context=this.currentBotContext(payload.botId);
       const id = randomUUID(), now = Date.now();
       this.db.prepare('INSERT INTO tasks(id,botId,goal,scope,acceptance,reviewPolicy,controlMode,createdAt,updatedAt,botConfigRevision,botContext) VALUES (?,?,?,?,?,?,?,?,?,?,?)')
         .run(id, payload.botId, payload.goal, payload.scope, payload.acceptance, payload.reviewPolicy,payload.startPaused?'paused':'auto',now,now,bot.configRevision,JSON.stringify(context));
       this.db.prepare('INSERT INTO inputs(id,taskId,kind,content,createdAt) VALUES (?,?,?,?,?)')
         .run(randomUUID(), id, 'goal', payload.goal, now);
-      this.event('task.created', id, { taskRevision: 1 });
+      this.event('task.created', id, { taskRevision: 1,...(source?{source}:{}) });
       this.enqueueManager(payload.botId,`created:${id}`,'有新任务，请检查授权范围与验收条件后安排。',id);
       if (!payload.scope || !payload.acceptance) this.db.prepare('INSERT INTO attentions(id,taskId,kind,question,taskRevision,createdAt) VALUES (?,?,?,?,?,?)')
         .run(randomUUID(),id,'input','请补充任务范围和验收条件，然后再安排执行。',1,now);
@@ -609,9 +606,9 @@ export class Store {
       this.event('run.cancelled',run.taskId,{runId:id});return {};
     });
   }
-  respondAttention(requestId:string,attentionId:string,expectedRowVersion:number,text:string):RunInput {
+  respondAttention(requestId:string,attentionId:string,expectedRowVersion:number,text:string,source?:ChatSource):RunInput {
     const content=requiredText(text,'回答');
-    return this.command(requestId,'attention.respond',{attentionId,expectedRowVersion,content},()=>{
+    return this.command(requestId,'attention.respond',{attentionId,expectedRowVersion,content,...(source?{source}:{})},()=>{
       const attention=this.db.prepare('SELECT * FROM attentions WHERE id=?').get(attentionId) as unknown as Attention|undefined;
       if(!attention)throw new AppError('not-found','待办不存在。');const task=this.getTask(attention.taskId);
       if(task.rowVersion!==expectedRowVersion)throw new AppError('version-conflict','任务已经更新，请刷新后回答。');
@@ -623,12 +620,12 @@ export class Store {
       this.db.prepare("UPDATE attentions SET state='responding' WHERE id=?").run(attentionId);
       this.db.prepare('UPDATE tasks SET rowVersion=rowVersion+1,updatedAt=? WHERE id=?').run(Date.now(),task.id);
       this.enqueueManager(task.botId,`answer:${id}`,'用户回答已保存，请核对管理方式后继续。',task.id,10);
-      this.event('attention.answered',task.id,{attentionId,inputId:id});return this.pendingInput(task.id)!;
+      this.event('attention.answered',task.id,{attentionId,inputId:id,...(source?{source}:{})});return this.pendingInput(task.id)!;
     });
   }
-  rejectResult(requestId:string,taskId:string,expectedRowVersion:number,resultId:string,text:string):Task {
+  rejectResult(requestId:string,taskId:string,expectedRowVersion:number,resultId:string,text:string,source?:ChatSource):Task {
     const content=requiredText(text,'返工要求');
-    return this.command(requestId,'result.reject',{taskId,expectedRowVersion,resultId,content},()=>{
+    return this.command(requestId,'result.reject',{taskId,expectedRowVersion,resultId,content,...(source?{source}:{})},()=>{
       const task=this.getTask(taskId),run=this.latestRun(taskId),result=run?this.runResult(run.id):null;
       if(task.rowVersion!==expectedRowVersion)throw new AppError('version-conflict','任务已经更新，请刷新后再返工。');
       if(task.lifecycle!=='review'||!result||result.id!==resultId||result.taskRevision!==task.taskRevision)throw new AppError('result-stale','这份成果已失效。');
@@ -639,7 +636,7 @@ export class Store {
       this.db.prepare("UPDATE attentions SET state='resolved' WHERE taskId=? AND kind='review' AND state='open'").run(taskId);
       this.db.prepare("UPDATE tasks SET lifecycle='open',rowVersion=rowVersion+1,updatedAt=? WHERE id=?").run(Date.now(),taskId);
       this.enqueueManager(task.botId,`user-rework:${inputId}`,'用户返工要求已保存，请核对管理方式后继续。',taskId,10);
-      this.event('result.rejected',taskId,{resultId,inputId});return this.getTask(taskId);
+      this.event('result.rejected',taskId,{resultId,inputId,...(source?{source}:{})});return this.getTask(taskId);
     });
   }
   resolveRunRecovery(requestId:string,taskId:string,expectedRowVersion:number):Task {

@@ -1,13 +1,13 @@
 # Super Bot 首版：与 Bot 聊天，由它安排执行并交付
 
-- Status: ready
+- Status: implementing
 - Scope: repo（`repos/super-bot`）；workspace 项目索引仅作导航同步
 - Complexity: standard（单仓库；复用既有执行，调整对话入口与交付）
 - Context: super-bot
 - Created: 2026-11-07
 - Revised: 2026-11-07（用户确认聊天为主入口）
 
-本次修订已具备实施条件，没有阻塞产品问题；ready 指聊天主流程修订待实现。既有 SB-00～14 的底层实现与证据保留，但不表示聊天产品已验收。当前安装包仍是工作台优先的工程预览。主要验证目标仍为 DSH Web `0.2.2-rc.1`，Desktop 后置。
+本次修订已具备实施条件，没有阻塞产品问题；implementing 指聊天主流程正在实现。既有 SB-00～14 的底层实现与证据保留，但不表示聊天产品已验收。聊天入口与交付流程已有实现并通过确定性宿主测试；真实模型质量仍待验证。主要验证目标仍为 DSH Web `0.2.2-rc.1`，Desktop 后置。
 
 ## Why
 

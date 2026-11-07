@@ -2,7 +2,7 @@
   "name": "@zxdvd/super-bot",
   "version": "0.1.0",
   "private": true,
-  "description": "Persistent bots, accountable tasks, and a supervision workspace",
+  "description": "Chat with persistent bots that arrange work and deliver results",
   "type": "module",
   "main": "lib/index.js",
   "exports": {
@@ -52,6 +52,7 @@
     "smoke:execution": "node scripts/smoke-execution.mjs",
     "smoke:workflow": "node scripts/smoke-workflow.mjs",
     "smoke:manager": "node scripts/smoke-manager.mjs",
+    "smoke:chat": "node scripts/smoke-chat.mjs",
     "seed:ui": "node scripts/seed-ui.mjs",
     "restore:ledger": "node scripts/restore-ledger.mjs",
     "test:adapter": "node --import tsx --test test/adapter/*.test.ts"
@@ -81,7 +82,8 @@
     "react": "18.3.1",
     "tsx": "4.21.0",
     "typescript": "6.0.3",
-    "@deepseek-ai/dsh-session-projection": "0.2.2-rc.1"
+    "@deepseek-ai/dsh-session-projection": "0.2.2-rc.1",
+    "@deepseek-ai/dsh-host-webserver": "0.2.2-rc.1"
   },
   "peerDependencies": {
     "@deepseek-ai/cordis": "4.1.0",
@@ -101,6 +103,7 @@
     "@deepseek-ai/dsh-working-directory": "0.2.2-rc.1",
     "@deepseek-ai/dsh-workspace": "0.2.2-rc.1",
     "@deepseek-ai/schemastery": "3.19.0",
-    "@deepseek-ai/dsh-session-projection": "0.2.2-rc.1"
+    "@deepseek-ai/dsh-session-projection": "0.2.2-rc.1",
+    "@deepseek-ai/dsh-host-webserver": "0.2.2-rc.1"
   }
 }

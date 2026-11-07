@@ -6,6 +6,8 @@ import type { BackupInfo } from '../backups.ts';
 export interface WorkspaceApi {
   call<T>(action: string, payload?: Record<string, unknown>, signal?: AbortSignal): Promise<T>;
   openSession(id: string): void;
+  beginNavigation(): AbortSignal;
+  openBot(id: string,navigation?:AbortSignal): Promise<void>;
 }
 type Detail = { task: Task; binding: Binding | null;bindingHistory:Binding[];run:Run|null;input:RunInput|null;result:Result|null; attentions: Attention[]; events: { id: number; kind: string; data:string; createdAt: number }[] };
 const labels: Record<Task['status'],string> = { unscheduled:'待安排', 'needs-input':'等你补充', approval:'原生审批待处理', paused:'已暂停', manual:'人工接管', completed:'已完成', cancelled:'已取消', review:'待验收',queued:'待投递',running:'执行中',stopping:'正在停止',recovery:'待核对' };
@@ -107,14 +109,14 @@ function ExistingSessionForm({api,busy,task,submit}:{api:WorkspaceApi;busy:boole
   </div></details>;
 }
 
-export function Workspace({ api }: { api:WorkspaceApi }) {
-  const preferredBot=useRef(rememberedBot());
+export function Workspace({ api,initialBotId,initialTaskId }: { api:WorkspaceApi;initialBotId?:string;initialTaskId?:string }) {
+  const preferredBot=useRef(initialBotId??rememberedBot());
   const savedView=useRef(rememberedView());const pendingSelection=useRef('');
   const [managerInfo,setManagerInfo]=useState<{binding:ManagerBinding|null;pending:number;uncertain:number;hourlyWakes:number;problem:{message:string;at:number}|null}>();
   const [backupInfo,setBackupInfo]=useState<BackupInfo>();
   const backupNotice=useRef<HTMLDivElement>(null);
   const [status,setStatus]=useState<WorkspaceStatus>(); const [bots,setBots]=useState<Bot[]>([]);
-  const [botId,setBotId]=useState(''); const [page,setPage]=useState<TaskPage>(); const [selected,setSelected]=useState('');
+  const [botId,setBotId]=useState(''); const [page,setPage]=useState<TaskPage>(); const [selected,setSelected]=useState(initialTaskId??'');
   const [detail,setDetail]=useState<Detail>(); const [query,setQuery]=useState(''); const [filter,setFilter]=useState(''); const [offset,setOffset]=useState(0);
   const [online,setOnline]=useState(false);const [loading,setLoading]=useState(true);const [error,setError]=useState('');const [connectionError,setConnectionError]=useState('');const [busy,setBusy]=useState(false);
   const [form,setForm]=useState<'bot'|'bot-edit'|'task'|'edit'|null>(null); const [refresh,setRefresh]=useState(0); const [synced,setSynced]=useState(0);
@@ -137,10 +139,10 @@ export function Workspace({ api }: { api:WorkspaceApi }) {
         setStatus(s);setBots(b);setPage(p);setManagerInfo(m);setConnectionError('');
         if(p&&pendingSelection.current){if(p.items.some(t=>t.id===pendingSelection.current))setSelected(pendingSelection.current);pendingSelection.current='';}
         if(p?.items.some(t=>['queued','running','stopping','approval'].includes(t.status)))cadence=1000;
-        if(selected&&(!d||(p&&!p.items.some(t=>t.id===selected)))){setSelected('');setDetail(undefined);setForm(current=>current==='edit'?null:current);}else setDetail(d);setOnline(true);setLoading(false);setSynced(Date.now());failures=0;
+        if(selected&&(!d||(p&&selected!==initialTaskId&&!p.items.some(t=>t.id===selected)))){setSelected('');setDetail(undefined);setForm(current=>current==='edit'?null:current);}else setDetail(d);setOnline(true);setLoading(false);setSynced(Date.now());failures=0;
         if(p&&offset>0&&offset>=p.total){setOffset(Math.max(0,Math.floor((p.total-1)/25)*25));setSelected('');setDetail(undefined);setForm(current=>current==='edit'?null:current);}
         if(botId&&!b.some(bot=>bot.id===botId)){const id=b[0]?.id??'';pendingSelection.current='';savedView.current=undefined;preferredBot.current=id;setBotId(id);rememberBot(id);setPage(undefined);setSelected('');setDetail(undefined);setManagerInfo(undefined);setOffset(0);setFilter('');setQuery('');setForm(null);if(!id)try{sessionStorage.removeItem('super-bot:view');}catch{/* Optional view memory. */}}
-        if(!botId&&b.length){const id=b.some(bot=>bot.id===preferredBot.current)?preferredBot.current:b[0].id;setBotId(id);rememberBot(id);if(savedView.current?.botId===id){setQuery(savedView.current.query);setFilter(savedView.current.filter);setOffset(savedView.current.offset);pendingSelection.current=savedView.current.selected;}savedView.current=undefined;}
+        if(!botId&&b.length){const id=b.some(bot=>bot.id===preferredBot.current)?preferredBot.current:b[0].id;setBotId(id);rememberBot(id);if(!initialTaskId&&savedView.current?.botId===id){setQuery(savedView.current.query);setFilter(savedView.current.filter);setOffset(savedView.current.offset);pendingSelection.current=savedView.current.selected;}savedView.current=undefined;}
       } catch(e){if(controller.signal.aborted)return;setOnline(false);setLoading(false);setConnectionError('暂时无法读取宿主状态，将自动重试。');failures++;}
       timer=setTimeout(pull,Math.min(30000,cadence*2**failures));
     }

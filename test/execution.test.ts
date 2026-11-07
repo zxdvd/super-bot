@@ -238,6 +238,7 @@ test('manager binding is durable, its wake is claimed once, and another bot cann
     assert.deepEqual(store.beginManager('manager',task.botId,'/tmp/manager'),manager);
     assert.equal(store.claimManagerCreation(manager.id),true);assert.equal(store.claimManagerCreation(manager.id),false);
     store.confirmManager(manager.id,manager.requestedSessionId);
+    store.enqueueManager(task.botId,'synthetic-notify','Synthetic event',task.id);
     const event=store.pendingManagerEvents(task.botId)[0];assert.ok(event);
     assert.equal(store.claimManagerEvent(event.id,'wake','{}'),true);assert.equal(store.claimManagerEvent(event.id,'wake','{}'),false);
     assert.equal(store.managerWakeCount(task.botId,Date.now()-10000),1);
@@ -252,7 +253,7 @@ test('manager binding is durable, its wake is claimed once, and another bot cann
 test('manager queue counts all work, prioritizes human responses, and rotates between bots',()=>{
   const store=new Store(':memory:');try {
     const bots=['one','two','three'].map(key=>store.createBot(key,{name:key,instructions:'Synthetic'}));
-    for(const bot of bots){const m=store.beginManager(`m:${bot.id}`,bot.id,`/tmp/${bot.id}`);store.confirmManager(m.id,m.requestedSessionId);}
+    for(const bot of bots){const m=store.beginManager(`m:${bot.id}`,bot.id,`/tmp/${bot.id}`);store.confirmManager(m.id,m.requestedSessionId);assert.equal(store.managerInfo(bot.id).pending,0);store.enqueueManager(bot.id,`synthetic:${bot.id}`,'Synthetic event',null);}
     const [first,...others]=store.listBots();assert.ok(first);
     for(let n=0;n<25;n++)store.enqueueManager(first.id,`bulk:${n}`,'New task',null);
     store.enqueueManager(first.id,'human-answer','Human answer',null,10);
