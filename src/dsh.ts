@@ -132,7 +132,7 @@ export class DshExecution {
     const b=this.store.activeBinding(taskId);if(!b?.sessionId||b.state!=='ready')throw new AppError('not-ready','请先准备执行会话。');
     const resolved=await this.ctx.sessionController.resolveAgent(SessionId(b.sessionId));
     if('error' in resolved)throw new AppError('session-unavailable','执行会话暂不可用，请核对。');
-    const agent=resolved.agent;this.assertQuiet(agent);this.assertDirectory(agent,b.cwd);configureRole(agent,'worker',this.options);
+    const agent=resolved.agent;this.assertQuiet(agent);this.assertDirectory(agent,b.cwd);configureRole(this.ctx,agent,'worker',this.options);
     if(!selectedModel(this.ctx,agent))throw new AppError('model-required','请先打开任务会话，明确选择并配置模型，再回来开始执行。宿主默认路由不算已选择。');
     authorize();
     const run=this.store.reserveRun(requestId,taskId,rowVersion);

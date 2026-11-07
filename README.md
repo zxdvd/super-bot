@@ -38,11 +38,11 @@ npm run check
 npm pack
 ```
 
-用独立数据目录和 profile 安装生成的 `zxdvd-super-bot-0.1.2.tgz`：
+用独立数据目录和 profile 安装生成的 `zxdvd-super-bot-0.1.3.tgz`：
 
 ```sh
 DSH_HOME=/absolute/path/super-bot-home dsh --profile super-bot --from-default-profile web --dump-config > /dev/null
-DSH_HOME=/absolute/path/super-bot-home dsh plugin --profile super-bot add /absolute/path/zxdvd-super-bot-0.1.2.tgz
+DSH_HOME=/absolute/path/super-bot-home dsh plugin --profile super-bot add /absolute/path/zxdvd-super-bot-0.1.3.tgz
 DSH_HOME=/absolute/path/super-bot-home dsh --profile super-bot --no-open --port 3081
 ```
 

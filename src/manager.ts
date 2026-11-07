@@ -224,7 +224,7 @@ export class Managers {
       this.restoreDeliveryScope(agent.id);
       void agent.whenIdle().then(()=>{this.deliveryScopes.delete(agent.id);},()=>{});
     }
-    configureRole(agent,'manager',this.options);
+    configureRole(this.ctx,agent,'manager',this.options);
     const mask=this.options.fullAccess?()=>{}:agent.ctx.tools.restrict({allow:['super_bot_manage']});
     const guard=agent.ctx.tools.guard(exec=>{try{this.authority(agent.id);}catch{return 'This Bot session no longer has management authority.';}if(this.deliveryScopes.has(agent.id)&&exec.name!=='super_bot_manage')return 'Delivery-only recovery cannot execute native tools or modify work.';return this.options.fullAccess||exec.name==='super_bot_manage'?undefined:'This manager may only use super_bot_manage.';});
     let turn=-1,steps=0;
@@ -252,7 +252,7 @@ export class Managers {
     const canonical=receipt?.cwd??await realpath(cwd);
     if(this.closed)throw new AppError('manager-unavailable','管理器正在退出。');
     const manager=receipt??this.store.beginManager(requestId,botId,canonical);
-    const current=this.store.getManager(manager.id);if(current.state==='ready'||current.state==='released'){if(current.state==='ready'&&current.sessionId&&(this.options.managerModel||this.options.fullAccess)){const resolved=await this.ctx.sessionController.resolveAgent(SessionId(current.sessionId));if('agent' in resolved&&resolved.agent.status==='idle')configureRole(resolved.agent,'manager',this.options);}return current;}
+    const current=this.store.getManager(manager.id);if(current.state==='ready'||current.state==='released'){if(current.state==='ready'&&current.sessionId&&(this.options.managerModel||this.options.fullAccess)){const resolved=await this.ctx.sessionController.resolveAgent(SessionId(current.sessionId));if('agent' in resolved&&resolved.agent.status==='idle')configureRole(this.ctx,resolved.agent,'manager',this.options);}return current;}
     const active=this.creating.get(manager.id);if(active)return active;
     const promise=(async()=>{
       try {
