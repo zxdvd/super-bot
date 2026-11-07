@@ -386,3 +386,25 @@ ELECTRON_RUN_AS_NODE=1 '/Applications/DeepSeek Harness.app/Contents/MacOS/DeepSe
 - 空闲宿主启用 `0.1.2` 时真实报错：不能在未注入的 `agent.ctx` 上读取 `permissionPresets`。原角色测试伪造了 Agent Context 上的服务，未覆盖 Cordis 的真实注入边界，不能拿单测通过替代宿主启动。
 - 外层改为向角色配置传入插件 Context，使用已显式注入的原生权限服务；测试中的 Agent Context 现在主动拒绝属性读取，防止退回原错误路径。交付测试夹具同步到正确服务归属。
 - `0.1.3` 再次完整 check 通过（63 核心 + 43 适配、typecheck/build），使用新版本 tgz 安装并核对构建字节一致；没有修改 DSH 上游或安装源码。此启动修正由外层完成，非 Worker 的 P1 业务修复。
+
+### 第二轮 P2：Worker 最小修复与本地回归（待人工验收）
+
+- 开始实际核对 Shell、Node、fnm、Git：仓库为 `/Users/zxd/coding-spaces/repos/super-bot`，HEAD `e04304fe5912b814b1fb0728a25e4a8730c66f51`，初始 `git status --short` 为空。默认 Node 22.22.3，所有本轮测试显式通过 fnm 使用 24.21.0；Git 2.50.1、fnm 1.39.0。先读取项目指引、README、ROADMAP、活动 change README/tasks/evidence 及相关契约，未发现 GLOSSARY 或独立 ADR。
+- Worker 的业务改动仅 [manager.ts](../../../src/manager.ts)、[store.ts](../../../src/store.ts)，新增 [p2.test.ts](../../../test/adapter/p2.test.ts)；本节是额外的脱敏验证记录。没有改架构、UI、schema、执行适配或权限配置，不安装本轮构建，不更改第一轮任务的人工待验收状态。
+
+最小诊断与红绿闭环（测试仅使用 `.runtime/p2-adapter-*` 内合成账本/文件及合成原生宿主边界；测试中实际注册的管理工具、应用事务、派发、报告、验收和证据读取代码实际运行）：
+
+1. 无 binding 的缺项任务：`fnm exec --using=24.21.0 node --import tsx --test --test-name-pattern='P2 incomplete unbound' test/adapter/p2.test.ts` 连续两次退出 1，均为原路径 `not-execution-question`。排序假设为管理入口误走执行问答、问题版本/归属失效、补充字段未入账；实际错误栈与字段状态定位到第一项。修复后同命令退出 0：`respond` 只从当前真实用户消息填尚缺 scope/acceptance，事务内检查任务/问题版本与归属、保留完整来源、推进 taskRevision/rowVersion，随后实际 prepare/dispatch，Worker 输入包含新字段。不改变目标、已有非空字段、reviewPolicy 或暂停/manual 控制。
+2. 文件修改/删除导致详情不可读：`fnm exec --using=24.21.0 node --import tsx --test --test-name-pattern='P2 (modified|deleted) evidence' test/adapter/p2.test.ts` 退出 1，两个用例分别抛 `evidence-changed` / `evidence-unavailable`。排序假设为预览异常冒泡、账本投影损坏、接受/下载校验问题；错误栈与独立元数据对比定位第一项。仅在 detail 隔离已知证据预览错误，返回 `evidenceValidation`，失败时不返回任何部分预览，保留 task/result/run/attentions/events/交付入口；同命令修复后 2/2、退出 0。真实 `DshExecution.accept`、Manager accept 和下载使用的 `readEvidence` 对修改/删除文件仍拒绝；真实用户消息可按原范围请求返工，自动通知不能冒充用户。
+3. 同真实消息同意图跨 callId 重建：`fnm exec --using=24.21.0 node --import tsx --test --test-name-pattern='P2 same native message' test/adapter/p2.test.ts` 退出 1，规范化字段完全相同而 taskId 不同。排序假设为只有 callId 回执、字段未一致规范化、内存去重重启丢失；实际创建字段相同且重启前就重复，定位第一项。复用 SQLite requests，在同一创建事务中保存真实会话/有序完整消息身份 + 规范化任务意图的回执，保留原 callId 冲突检查；修复后同命令退出 0。重开实际 SQLite 后仍去重，同消息不同 goal/scope/acceptance、不同消息相同目标及相同文本均允许；外层回执失败会回滚任务与意图回执，不依赖 Prompt。
+
+已执行的最终检查：
+
+- `fnm exec --using=24.21.0 node --import tsx --test test/adapter/p2.test.ts`：最终 11/11，退出 0。额外覆盖部分缺项分次回答、自动通知拒绝、完整多消息来源、版本冲突/问题失效、禁止覆盖已有授权、暂停保持、调用重试/账本重开、空字段规范化及故障事务回滚；损坏预览 await 期间取消、Manager 替换仍拒绝失效权限，不因证据错误回退吞掉授权错误。
+- 独立子 Agent 只读审查发现“已提交 Worker 回答→解绑→同 callId 重试”会被新增分支误当补全、报 `idempotency-conflict`；新增真实管理/解绑入口测试，`--test-name-pattern='P2 committed Worker answer'` 实际退出 1。排序排查为可变 binding 导致命令种类切换、来源改变、版本问题；保持同来源/参数的栈定位到第一项。最小改为按请求是否携带 scope/acceptance 字段稳定路由，不按当前 binding；同一回归随后退出 0。审查者复看后无剩余阻塞发现，未改任何文件。
+- `fnm exec --using=24.21.0 node --import tsx --test test/adapter/p2.test.ts test/adapter/multi-message.test.ts test/adapter/receipts.test.ts`：当时已有的 3 个 P2 补全用例及原回归共 17/17，退出 0；之后新增的其余 P2 已纳入完整检查。
+- `fnm exec --using=24.21.0 npm run check`：本轮两次实际完整执行都退出 0。初次 63 核心 + 51 适配 = 114；审查修复与新增保护用例后最终 63 核心 + 55 适配 = 118 测试、typecheck 与 Host/Client build 通过（最终打印 `FINAL_CHECK_EXIT=0`）。其中新增 11 项 P2 来自本 Worker，另 1 项 fresh-profile 配置回归为外层并发新增，不冒认。包括第一轮 P1 通知/多消息/交付与既有 files、原生 Full Access/Context 注入回归；不是沿用外层的 106 项结果。
+- 最终组合定向测试（P2、multi-message、receipts、runtime、delivery）50/50，退出 0；`git diff --check` 退出 0。`git diff --exit-code e04304f -- src/dsh.ts src/runtime.ts test/notifications.test.ts test/adapter/multi-message.test.ts test/adapter/delivery.test.ts test/manager-delivery.test.ts` 退出 0，关键旧执行/权限/P1实现及回归未被修改。HEAD 仍为 e04304f。
+- 开始写测试时有一处末尾笔误使首次调用语法失败（退出 1），已修正，未当成业务红测。没有加入调试日志；合成目录由测试核对路径后清理。原生 create_goal 因 Worker 非顶层人类调用被拒绝一次，随后用任务清单推进，没有绕过拒绝。
+
+并发与限制：验证中发现外层另外修改 [package.json](../../../package.json)、[build.mjs](../../../scripts/build.mjs)、[dev.mjs](../../../scripts/dev.mjs)、[tasks.md](tasks.md)，新增 [dev-reload.mjs](../../../scripts/dev-reload.mjs)；后续还修改 [README](../../../README.md)、[runtime-support](../../../docs/runtime-support.md)、[index.ts](../../../src/index.ts)、[runtime.test.ts](../../../test/adapter/runtime.test.ts)（可选角色配置及 1 项回归）。这些非本 Worker 所改或所交付，未覆盖。检查时确认 check 仍只执行 typecheck/test/test:adapter/build，普通 build 不安装或重载宿主；完整结果针对当时工作树，非隔离分支。未运行开发热加载脚本、真实宿主探针、安装、重启、真实宿主破坏性操作、Git 提交或推送；未修改凭证/其他项目。未验证部署后的真实模型聊天质量、实际浏览器下载/接受点击和异常表达；这里的文件下载拒绝覆盖其实际 `readEvidence` 校验入口，未冒充真实 HTTP/UI 验收。第一轮与本轮的最终人工确认均仍待用户决定。

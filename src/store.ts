@@ -272,7 +272,13 @@ export class Store {
     const payload: NewTask = { botId: requiredText(input.botId, 'Bot 标识', 200), goal: requiredText(input.goal, '任务目标'),
       scope: optionalText(input.scope, '任务范围'), acceptance: optionalText(input.acceptance, '验收条件'), reviewPolicy: input.reviewPolicy,...(input.startPaused?{startPaused:true}:{}) };
     if (!['human', 'bot'].includes(payload.reviewPolicy)) throw new AppError('invalid-input', '请选择有效的验收方式。');
+    // Native provenance, not a model-provided call ID, identifies one human request.
+    // Keep the normal call receipt too: reusing a call ID with changed content must still fail.
+    const intentHash=source?createHash('sha256').update(JSON.stringify({action:'task.create-intent',payload,source:{sessionId:source.sessionId,messages:(source.messages??[source]).map(({messageId,seq})=>({messageId,seq})).sort((a,b)=>a.seq-b.seq)}})).digest('hex'):undefined;
+    const intentId=intentHash?`task-intent:${intentHash}`:undefined;
     return this.command(requestId, 'task.create', {...payload,...(source?{source}:{})}, () => {
+      const prior=intentId?this.db.prepare('SELECT result FROM requests WHERE id=?').get(intentId):undefined;
+      if(prior)return JSON.parse(String(prior.result)) as Task;
       const bot=this.getBot(payload.botId),context=this.currentBotContext(payload.botId);
       const id = randomUUID(), now = Date.now();
       this.db.prepare('INSERT INTO tasks(id,botId,goal,scope,acceptance,reviewPolicy,controlMode,createdAt,updatedAt,botConfigRevision,botContext) VALUES (?,?,?,?,?,?,?,?,?,?,?)')
@@ -283,7 +289,10 @@ export class Store {
       this.enqueueManager(payload.botId,`created:${id}`,'有新任务，请检查授权范围与验收条件后安排。',id);
       if (!payload.scope || !payload.acceptance) this.db.prepare('INSERT INTO attentions(id,taskId,kind,question,taskRevision,createdAt) VALUES (?,?,?,?,?,?)')
         .run(randomUUID(),id,'input','请补充任务范围和验收条件，然后再安排执行。',1,now);
-      return this.getTask(id);
+      const task=this.getTask(id);
+      // Same transaction as Task/Input/Event/Outbox: a crash cannot leave an unclaimed intent.
+      if(intentId)this.db.prepare('INSERT INTO requests VALUES (?,?,?)').run(intentId,intentHash!,JSON.stringify(task));
+      return task;
     });
   }
   getTask(id: string): Task {
@@ -641,6 +650,26 @@ export class Store {
       this.db.prepare('UPDATE tasks SET rowVersion=rowVersion+1,updatedAt=? WHERE id=?').run(Date.now(),run.taskId);
       if(budget)this.enqueueManager(this.getTask(run.taskId).botId,`budget-stopped:${id}`,`${run.note} 已确认停止；不会自动重试。请在任务详情检查进展并明确核对后再安排。`,run.taskId,10);
       this.event('run.cancelled',run.taskId,{runId:id});return {};
+    });
+  }
+  /** Chat can fill missing task essentials, never replace existing authorization or a goal. */
+  completeTaskInput(requestId:string,taskId:string,attentionId:string,expectedRowVersion:number,input:{scope?:string;acceptance?:string},source:ChatSource):Task {
+    const fields={...(input.scope!==undefined?{scope:requiredText(input.scope,'任务范围')}:{}),...(input.acceptance!==undefined?{acceptance:requiredText(input.acceptance,'验收条件')}:{})};
+    return this.command(requestId,'task.complete-input',{taskId,attentionId,expectedRowVersion,...fields,source},()=>{
+      const task=this.getTask(taskId),attention=this.db.prepare('SELECT * FROM attentions WHERE id=?').get(attentionId) as unknown as Attention|undefined;
+      if(task.rowVersion!==expectedRowVersion)throw new AppError('version-conflict','任务已经更新，请刷新后补充。');
+      if(!attention||attention.taskId!==taskId||attention.kind!=='input'||attention.state!=='open'||attention.taskRevision!==task.taskRevision)throw new AppError('attention-stale','问题已失效或已有回答。');
+      if(this.activeBinding(taskId))throw new AppError('execution-attached','执行会话已关联，不能通过补充缺项修改任务范围。');
+      if(task.lifecycle!=='open'||(task.scope&&task.acceptance))throw new AppError('not-incomplete','当前任务没有可补充的缺项。');
+      if((task.scope&&fields.scope!==undefined&&fields.scope!==task.scope)||(task.acceptance&&fields.acceptance!==undefined&&fields.acceptance!==task.acceptance))throw new AppError('scope-change','补充缺项不能覆盖已有范围或验收条件。');
+      const scope=fields.scope??task.scope,acceptance=fields.acceptance??task.acceptance;
+      if(scope===task.scope&&acceptance===task.acceptance)throw new AppError('invalid-input','请根据真实用户补充填写尚缺的范围或验收条件。');
+      const now=Date.now();
+      this.db.prepare('UPDATE tasks SET scope=?,acceptance=?,taskRevision=taskRevision+1,rowVersion=rowVersion+1,updatedAt=? WHERE id=?').run(scope,acceptance,now,taskId);
+      this.db.prepare("UPDATE attentions SET state='resolved' WHERE id=?").run(attentionId);
+      if(!scope||!acceptance)this.db.prepare('INSERT INTO attentions(id,taskId,kind,question,taskRevision,createdAt) VALUES (?,?,?,?,?,?)').run(randomUUID(),taskId,'input','请补充任务范围和验收条件，然后再安排执行。',task.taskRevision+1,now);
+      this.enqueueManager(task.botId,`revision:${taskId}:${task.taskRevision+1}`,'用户已补充任务缺项，请读取新版本和控制状态后安排。',taskId,10);
+      this.event('task.revised',taskId,{taskRevision:task.taskRevision+1,attentionId,source});return this.getTask(taskId);
     });
   }
   respondAttention(requestId:string,attentionId:string,expectedRowVersion:number,text:string,source?:ChatSource):RunInput {
