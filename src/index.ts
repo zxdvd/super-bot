@@ -10,19 +10,21 @@ import { basename,join,resolve } from 'node:path';
 import { readEvidence } from './evidence.ts';
 import { Store } from './store.ts';
 import { DshExecution } from './dsh.ts';
+import type {RuntimeOptions} from './runtime.ts';
 import { Managers } from './manager.ts';
 import { createLedgerBackup } from './backups.ts';
 import { AppError, requiredText, optionalText,type WorkspaceStatus, type NewBot, type NewTask, type ControlMode } from './model.ts';
 
 export const name = 'super-bot';
 export const inject = ['connection', 'sessionController', 'workspaceRegistry','agents','tools','jobs','systemPrompt','workingDirectory','sessionProjections','webServer'];
-export const Config = Schema.object({ dataDir: Schema.string().description('Super Bot 本地数据目录') });
+const roleModel=Schema.object({provider:Schema.string().required(),model:Schema.string().required(),reasoningEffort:Schema.string()});
+export const Config = Schema.object({ dataDir: Schema.string().description('Super Bot 本地数据目录'), fullAccess:Schema.boolean().default(false),workspace:Schema.string(),managerModel:roleModel,workerModel:roleModel });
 
-export function apply(ctx: Context, config: { dataDir?: string } = {}): void {
+export function apply(ctx: Context, config: RuntimeOptions & { dataDir?: string } = {}): void {
   const dataDir = resolve(config.dataDir ?? process.env.SUPER_BOT_DATA_DIR ?? join(process.env.DSH_HOME ?? join(homedir(), '.dsh'), 'super-bot'));
   const store = new Store(join(dataDir, 'ledger.sqlite'));
-  const execution=new DshExecution(ctx,store,dataDir);
-  const managers=new Managers(ctx,store,execution,dataDir,()=>ctx.webServer.getOrigin());
+  const execution=new DshExecution(ctx,store,dataDir,config);
+  const managers=new Managers(ctx,store,execution,dataDir,()=>ctx.webServer.getOrigin(),config);
   ctx.effect(() => async () => {await managers.dispose();await execution.dispose();store.close();});
   execution.install();
   managers.install();

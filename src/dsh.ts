@@ -16,6 +16,7 @@ import { join,isAbsolute } from 'node:path';
 import { AppError,requiredText,optionalText,type Binding,type Run,type WorkReport,type ExistingSessionGrant,type ExistingSessionPreview } from './model.ts';
 import type { Store } from './store.ts';
 import { collectEvidence,containedPath,verifyEvidence,evidencePaths } from './evidence.ts';
+import {configureRole,type RuntimeOptions} from './runtime.ts';
 import { materialPrompt } from './materials.ts';
 
 declare module '@deepseek-ai/dsh-llm' {
@@ -38,7 +39,7 @@ export class DshExecution {
   private creating=new Map<string,Promise<Binding>>();
   private running=new Map<string,{agent:Agent;release:()=>void;done:Promise<void>}>();
   private disposed=false;
-  constructor(private ctx:Context,private store:Store,private dataDir:string) {}
+  constructor(private ctx:Context,private store:Store,private dataDir:string,private options:RuntimeOptions={}) {}
   install():void {
     this.ctx.effect(()=>this.ctx.tools.register({name:'super_bot_report',description:'Report progress, a question, a blockage, failure, or ready results to the task ledger. Ready requires files and acceptance checks. A ready report requests human review, it does not complete the task.',
       parameters:{type:'object',properties:{kind:{type:'string',enum:['progress','waiting','ready','blocked','failed']},summary:{type:'string'},checks:{type:'string'},files:{type:'array',items:{type:'string'},maxItems:10}},required:['kind','summary'],additionalProperties:false},
@@ -131,7 +132,7 @@ export class DshExecution {
     const b=this.store.activeBinding(taskId);if(!b?.sessionId||b.state!=='ready')throw new AppError('not-ready','请先准备执行会话。');
     const resolved=await this.ctx.sessionController.resolveAgent(SessionId(b.sessionId));
     if('error' in resolved)throw new AppError('session-unavailable','执行会话暂不可用，请核对。');
-    const agent=resolved.agent;this.assertQuiet(agent);this.assertDirectory(agent,b.cwd);
+    const agent=resolved.agent;this.assertQuiet(agent);this.assertDirectory(agent,b.cwd);configureRole(agent,'worker',this.options);
     if(!selectedModel(this.ctx,agent))throw new AppError('model-required','请先打开任务会话，明确选择并配置模型，再回来开始执行。宿主默认路由不算已选择。');
     authorize();
     const run=this.store.reserveRun(requestId,taskId,rowVersion);
@@ -140,20 +141,20 @@ export class DshExecution {
     let input=this.store.getRunInput(run.id);
     if(!input.messageJson) {
       const supplement=input.kind==='answer'||input.kind==='rework'?`\nAdditional user input (${input.kind}): ${input.content}`:'';
-      const message=createUserMessage({source:{kind:'super-bot',taskId,runId:run.id,inputId:run.inputId,taskRevision:run.taskRevision,generation:run.generation},content:[{type:'text',text:`You are executing one Super Bot task.\nBot configuration revision: ${task.botConfigRevision}\nBot responsibility: ${botContext.instructions}${materialPrompt(botContext.materials)}\nGoal: ${task.goal}\nAuthorized scope: ${task.scope}\nAcceptance criteria: ${task.acceptance}\nWorking directory: ${b.cwd}${supplement}\nUse only read/write/edit in this directory, always with absolute file_path values. Do not change working directories. Shell and subagents are not enabled in this preview.\nReport with super_bot_report. Use waiting to ask a necessary question. For ready provide files and checks explaining every acceptance criterion. Never claim the task is accepted; the user decides.`}]});
+      const message=createUserMessage({source:{kind:'super-bot',taskId,runId:run.id,inputId:run.inputId,taskRevision:run.taskRevision,generation:run.generation},content:[{type:'text',text:`You are executing one Super Bot task.\nBot configuration revision: ${task.botConfigRevision}\nBot responsibility: ${botContext.instructions}${materialPrompt(botContext.materials)}\nGoal: ${task.goal}\nAuthorized scope: ${task.scope}\nAcceptance criteria: ${task.acceptance}\nWorking directory: ${b.cwd}${supplement}\n${this.options.fullAccess?'Full Access is explicitly authorized. Use native tools including shell to implement and test the requested work. Keep work scoped to this task; do not modify unrelated projects, credentials, or the running host configuration. Keep the native session working directory unchanged. Report actual changed source files and test results.':'Use only read/write/edit in this directory, always with absolute file_path values. Do not change working directories. Shell and subagents are not enabled in this preview.'}\nReport with super_bot_report. Use waiting to ask a necessary question. For ready provide files and checks explaining every acceptance criterion. Never claim the task is accepted; the user decides.`}]});
       input=this.store.saveRunMessage(run.id,message.id,JSON.stringify(message));
     }
-    const releaseMask=agent.ctx.tools.restrict({allow:['read','write','edit','super_bot_report']});
+    const releaseMask=this.options.fullAccess?()=>{}:agent.ctx.tools.restrict({allow:['read','write','edit','super_bot_report']});
     const releaseGuard=agent.ctx.tools.guard(exec=>{
       if(this.store.getRun(run.id).finishedAt!==null||this.store.getTask(taskId).controlMode==='manual')return 'This automatic run no longer has task authority.';
-      if(!['read','write','edit','super_bot_report'].includes(exec.name))return 'Only task file tools and super_bot_report are authorized for this run.';
+      if(!this.options.fullAccess&&!['read','write','edit','super_bot_report'].includes(exec.name))return 'Only task file tools and super_bot_report are authorized for this run.';
       try{this.assertDirectory(agent,b.cwd);}catch(error){return error instanceof Error?error.message:'Working directory changed';}
-      if(!['read','write','edit'].includes(exec.name))return;
+      if(this.options.fullAccess||!['read','write','edit'].includes(exec.name))return;
       try{const args=exec.arguments as {file_path?:unknown};if(typeof args.file_path!=='string'||!isAbsolute(args.file_path))return 'Use an absolute file_path inside the task working directory.';containedPath(b.cwd,args.file_path);}catch(error){return error instanceof Error?error.message:'File path refused';}
     });
     let steps=0;let deadline:ReturnType<typeof setTimeout>|undefined;
     const releaseBudget=agent.ctx.on('agent/pre-step',async(_payload,next)=>{
-      if(++steps>40){await this.stopForBudget(run.id,'steps');throw new AppError('run-budget','执行达到 40 步上限。');}
+      if(++steps>(this.options.fullAccess?120:40)){await this.stopForBudget(run.id,'steps');throw new AppError('run-budget','执行达到步数上限。');}
       return next();
     });
     let released=false;const release=()=>{if(released)return;released=true;clearTimeout(deadline);releaseStatus();releaseBudget();releaseGuard();releaseMask();};
@@ -167,7 +168,7 @@ export class DshExecution {
       if(!this.store.claimDispatch(run.id)){release();this.store.runRecovery(run.id,'投递记录已经发出，但回执不完整。没有重复投递，请核对原生会话。');return this.store.getRun(run.id);}
       agent.followup(freezeMessage(JSON.parse(input.messageJson!) as UserMessage));
       this.store.inputEnqueued(run.id);
-      deadline=setTimeout(()=>{void this.stopForBudget(run.id,'time');},10*60*1000);
+      deadline=setTimeout(()=>{void this.stopForBudget(run.id,'time');},(this.options.fullAccess?30:10)*60*1000);
       deadline.unref();
       const done=agent.whenIdle().then(()=>{
         if(this.disposed)return;
@@ -253,7 +254,7 @@ export class DshExecution {
     // Validate the ID through the ledger before using it as a directory segment.
     const task=this.store.getTask(taskId);
     const generation=this.store.nextBindingGeneration(taskId);
-    const cwd=this.store.activeBinding(taskId)?.cwd??join(this.dataDir,'workspaces',generation===1?task.id:`${task.id}-g${generation}`);await mkdir(cwd,{recursive:true});
+    const cwd=this.store.activeBinding(taskId)?.cwd??(this.options.fullAccess&&this.options.workspace?realpathSync(this.options.workspace):undefined)??join(this.dataDir,'workspaces',generation===1?task.id:`${task.id}-g${generation}`);await mkdir(cwd,{recursive:true});
     const b=this.store.beginBinding(requestId,taskId,rowVersion,await realpath(cwd));
     const current=this.store.getBinding(b.id);if(current.state==='ready')return current;
     const active=this.creating.get(b.id);if(active)return active;
