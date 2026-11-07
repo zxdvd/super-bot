@@ -65,7 +65,7 @@ export class DshExecution {
         const run=this.store.heldRuns().find(r=>r.sessionId===session.id&&r.finishedAt===null);
         if(run)this.store.runRecovery(run.id,modelFailureNote(event.data.reason.error.code));
       }
-      if(event.type==='working-directory/change') {
+      if(!this.options.fullAccess&&event.type==='working-directory/change') {
         const run=this.store.heldRuns().find(r=>r.sessionId===session.id&&r.finishedAt===null);
         if(run&&event.data.cwd!==this.store.getBinding(run.bindingId).cwd) {
           this.store.runRecovery(run.id,'原生会话工作目录已改变，当前执行授权停止。请核对文件和原生会话。');
@@ -141,20 +141,21 @@ export class DshExecution {
     let input=this.store.getRunInput(run.id);
     if(!input.messageJson) {
       const supplement=input.kind==='answer'||input.kind==='rework'?`\nAdditional user input (${input.kind}): ${input.content}`:'';
-      const message=createUserMessage({source:{kind:'super-bot',taskId,runId:run.id,inputId:run.inputId,taskRevision:run.taskRevision,generation:run.generation},content:[{type:'text',text:`You are executing one Super Bot task.\nBot configuration revision: ${task.botConfigRevision}\nBot responsibility: ${botContext.instructions}${materialPrompt(botContext.materials)}\nGoal: ${task.goal}\nAuthorized scope: ${task.scope}\nAcceptance criteria: ${task.acceptance}\nWorking directory: ${b.cwd}${supplement}\n${this.options.fullAccess?'Full Access is explicitly authorized. Use native tools including shell to implement and test the requested work. Keep work scoped to this task; do not modify unrelated projects, credentials, or the running host configuration. Keep the native session working directory unchanged. Report actual changed source files and test results.':'Use only read/write/edit in this directory, always with absolute file_path values. Do not change working directories. Shell and subagents are not enabled in this preview.'}\nReport with super_bot_report. Use waiting to ask a necessary question. For ready provide files and checks explaining every acceptance criterion. Never claim the task is accepted; the user decides.`}]});
+      const message=createUserMessage({source:{kind:'super-bot',taskId,runId:run.id,inputId:run.inputId,taskRevision:run.taskRevision,generation:run.generation},content:[{type:'text',text:`You are executing one Super Bot task.\nBot configuration revision: ${task.botConfigRevision}\nBot responsibility: ${botContext.instructions}${materialPrompt(botContext.materials)}\nGoal: ${task.goal}\nAuthorized scope: ${task.scope}\nAcceptance criteria: ${task.acceptance}\nWorking directory: ${b.cwd}${supplement}\n${this.options.fullAccess?'Full Access is explicitly authorized. Use native tools including shell to implement and test the requested work. Keep work scoped to this task; do not modify unrelated projects, credentials, or the running host configuration. Report actual changed source files and test results.':'Use only read/write/edit in this directory, always with absolute file_path values. Do not change working directories. Shell and subagents are not enabled in this preview.'}\nReport with super_bot_report. Use waiting to ask a necessary question. For ready provide files and checks explaining every acceptance criterion. Never claim the task is accepted; the user decides.`}]});
       input=this.store.saveRunMessage(run.id,message.id,JSON.stringify(message));
     }
     const releaseMask=this.options.fullAccess?()=>{}:agent.ctx.tools.restrict({allow:['read','write','edit','super_bot_report']});
     const releaseGuard=agent.ctx.tools.guard(exec=>{
       if(this.store.getRun(run.id).finishedAt!==null||this.store.getTask(taskId).controlMode==='manual')return 'This automatic run no longer has task authority.';
       if(!this.options.fullAccess&&!['read','write','edit','super_bot_report'].includes(exec.name))return 'Only task file tools and super_bot_report are authorized for this run.';
+      if(this.options.fullAccess)return;
       try{this.assertDirectory(agent,b.cwd);}catch(error){return error instanceof Error?error.message:'Working directory changed';}
       if(this.options.fullAccess||!['read','write','edit'].includes(exec.name))return;
       try{const args=exec.arguments as {file_path?:unknown};if(typeof args.file_path!=='string'||!isAbsolute(args.file_path))return 'Use an absolute file_path inside the task working directory.';containedPath(b.cwd,args.file_path);}catch(error){return error instanceof Error?error.message:'File path refused';}
     });
     let steps=0;let deadline:ReturnType<typeof setTimeout>|undefined;
-    const releaseBudget=agent.ctx.on('agent/pre-step',async(_payload,next)=>{
-      if(++steps>(this.options.fullAccess?120:40)){await this.stopForBudget(run.id,'steps');throw new AppError('run-budget','执行达到步数上限。');}
+    const releaseBudget=this.options.fullAccess?()=>{}:agent.ctx.on('agent/pre-step',async(_payload,next)=>{
+      if(++steps>40){await this.stopForBudget(run.id,'steps');throw new AppError('run-budget','执行达到步数上限。');}
       return next();
     });
     let released=false;const release=()=>{if(released)return;released=true;clearTimeout(deadline);releaseStatus();releaseBudget();releaseGuard();releaseMask();};
@@ -168,8 +169,7 @@ export class DshExecution {
       if(!this.store.claimDispatch(run.id)){release();this.store.runRecovery(run.id,'投递记录已经发出，但回执不完整。没有重复投递，请核对原生会话。');return this.store.getRun(run.id);}
       agent.followup(freezeMessage(JSON.parse(input.messageJson!) as UserMessage));
       this.store.inputEnqueued(run.id);
-      deadline=setTimeout(()=>{void this.stopForBudget(run.id,'time');},(this.options.fullAccess?30:10)*60*1000);
-      deadline.unref();
+      if(!this.options.fullAccess){deadline=setTimeout(()=>{void this.stopForBudget(run.id,'time');},10*60*1000);deadline.unref();}
       const done=agent.whenIdle().then(()=>{
         if(this.disposed)return;
         this.assertQuiet(agent);

@@ -31,7 +31,7 @@ export function apply(ctx: Context, config: RuntimeOptions & { dataDir?: string 
   const require = createRequire(import.meta.url);
   const runtime = require('@deepseek-ai/dsh-agent/package.json').version as string;
   const startedAt = Date.now();
-  const status = (): WorkspaceStatus => ({ product: 'Super Bot', version: '0.1.0', runtime,
+  const status = (): WorkspaceStatus => ({ product: 'Super Bot', version: require('../package.json').version as string, runtime,
     ...store.sqliteInfo(), startedAt });
 
   async function invoke(endpoint: string, payload: Record<string, unknown>) {
