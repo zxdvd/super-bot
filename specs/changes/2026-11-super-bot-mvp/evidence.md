@@ -408,3 +408,13 @@ ELECTRON_RUN_AS_NODE=1 '/Applications/DeepSeek Harness.app/Contents/MacOS/DeepSe
 - 开始写测试时有一处末尾笔误使首次调用语法失败（退出 1），已修正，未当成业务红测。没有加入调试日志；合成目录由测试核对路径后清理。原生 create_goal 因 Worker 非顶层人类调用被拒绝一次，随后用任务清单推进，没有绕过拒绝。
 
 并发与限制：验证中发现外层另外修改 [package.json](../../../package.json)、[build.mjs](../../../scripts/build.mjs)、[dev.mjs](../../../scripts/dev.mjs)、[tasks.md](tasks.md)，新增 [dev-reload.mjs](../../../scripts/dev-reload.mjs)；后续还修改 [README](../../../README.md)、[runtime-support](../../../docs/runtime-support.md)、[index.ts](../../../src/index.ts)、[runtime.test.ts](../../../test/adapter/runtime.test.ts)（可选角色配置及 1 项回归）。这些非本 Worker 所改或所交付，未覆盖。检查时确认 check 仍只执行 typecheck/test/test:adapter/build，普通 build 不安装或重载宿主；完整结果针对当时工作树，非隔离分支。未运行开发热加载脚本、真实宿主探针、安装、重启、真实宿主破坏性操作、Git 提交或推送；未修改凭证/其他项目。未验证部署后的真实模型聊天质量、实际浏览器下载/接受点击和异常表达；这里的文件下载拒绝覆盖其实际 `readEvidence` 校验入口，未冒充真实 HTTP/UI 验收。第一轮与本轮的最终人工确认均仍待用户决定。
+
+### 外层收尾：第二轮真实交付与日常开发热加载
+
+- 第二轮 Worker 实际运行 19 分 18 秒、55 步，完整原生 Shell 与只读子 Agent 可用；外层直接展开原生最终 Job 输出，看到 63 核心 + 55 适配测试通过、typecheck/build 成功及 `FINAL_CHECK_EXIT=0`，不是仅转述报告。外层审查实际源码 diff 与关键事务/权限路径，没有发现新的阻塞问题。
+- Worker 报告并收敛后，Sol medium Bot 自动唤醒，48 秒内在原对话检查、说明三项修复并交付三个源码/测试链接；真实工作台出现 `manager.delivered` 持久回执。第一轮新增的原生 Session flush/readback 交付确认已在实际宿主成功运行；没有重新执行 Worker。两项任务均为待人工验收，已完成数为 0。
+- 业务修复由产品内 Worker 完成，外层将其独立记录为提交 `8c1db9b`。外层另外实现开发 HMR 脚本、修复全新 profile 可选模型配置，并更正工作面板两处仍暗示只支持文件/必须手动选模型开始的旧文案；这些不冒认为 Worker 成果。
+- 开发热加载的官方机制、失败实验和隔离真实验证见 [development-hmr.md](../../../docs/development-hmr.md)。随后在 Bot 和 Worker 都空闲时，外层实际执行 `fnm exec --using=24.21.0 npm run dev:reload` 更新日常 web profile，退出 0。没有升版本、打新 tgz 或重启 DSH。
+- 日常 profile 的 manifest 和真实链接路径指向本仓库；DSH PID 保持不变。Plugins 刷新后显示 `link:` 源码来源、版本 `0.1.3`、`1 total · 1 running`。前端自动重挂载，重新打开工作台看到新文案及原来的两项待验收任务；原生 Bot 会话与模型仍保留。Plugins 旧详情在刷新前缓存旧 tgz 来源，不应据此误判加载失败。
+- 隔离 HMR 宿主和构建监听已退出；`npm pack --dry-run` 包含新增开发说明，不包含 `.runtime` 或实际聊天/日志。最终只有文案/文档/分发清单在 Worker 的完整 check 后继续变化；文案已重新构建并在日常浏览器实际显示，没有为纯文案重复整套测试。
+- 尚未把新版三个 P2 的每个分支都做真实模型/HTTP/UI 端到端复验；这些有实际应用/适配层回归，不能冒充用户已验收。旧第一轮源码证据在后续迭代后可能 hash 失效，原结果没有被伪造为仍可接受；第二轮的三个报告文件保持原 hash。

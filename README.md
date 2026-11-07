@@ -52,6 +52,18 @@ DSH_HOME=/absolute/path/super-bot-home dsh --profile super-bot --no-open --port 
 
 ## 本地开发预览
 
+开发迭代不需要修改版本号或打 tgz。DSH Web 自带 Host HMR 和 Client HMR，源码以本地 `link:` 安装即可使用；[机制与实际验证](docs/development-hmr.md)。
+
+日常使用已有 `~/.dsh/profiles/web`（保留该 profile 的模型和会话），在 Bot、Worker 都空闲后运行：
+
+```sh
+fnm exec --using=24.21.0 npm run dev:reload
+```
+
+该命令构建代码，首次将本插件切换为仓库本地链接，然后更新 profile patch 中的一行开发标记，触发 DSH 原生配置重载。仅 `touch` 文件会被 DSH 的内容去重忽略。默认使用运行中的 web profile；可用 `DSH_HOME` 和 `SUPER_BOT_PROFILE` 指定其他现有 profile。宿主需启用原生 HMR（Web 默认配置已启用），执行后检查 Plugins 是否正常激活。它不会替你启动 DSH，也不把“已请求重载”当作激活成功。当前开发模式下不要移动仓库或删除 `lib`。
+
+日常自修改 dogfooding 使用手动重载：Worker 改源码时不自动卸载正在执行的后端。前端构建产物由 DSH Client HMR 自动刷新，页面局部状态可能重置。需要自动监听源码时，使用下面的独立开发宿主：
+
 需要 Node `>=24.9`，当前验证 Node `24.21.0`。在仓库中运行：
 
 ```sh
@@ -60,7 +72,7 @@ npm run check
 npm run dev
 ```
 
-`dev` 使用仓库 `.runtime/dsh` 下的独立 home/profile，监听 `127.0.0.1:3081`。从终端启动链接进入后点击左侧 Super Bot。它不复用日常 DSH 的会话或模型凭证。退出用 Ctrl-C；再次运行保留任务数据。数据库默认在 `$DSH_HOME/super-bot/ledger.sqlite`，不要同时用多个宿主打开同一数据库。
+`dev` 使用仓库 `.runtime/dsh-dev` 下的独立 home 和 `super-bot-dev` profile，监听 `127.0.0.1:3081`（可设 `SUPER_BOT_PORT`）。自动构建监听 `src`，Host HMR 监听 `lib/index.js`，Client HMR 刷新 `lib/client.js`；不需要重复打包、安装或重启宿主。从终端启动链接进入后点击左侧 Super Bot。该隔离环境不复用日常会话或模型凭证；有模型的日常入口仍是 web profile。退出用 Ctrl-C；再次运行保留任务数据。数据库默认在 `$DSH_HOME/super-bot/ledger.sqlite`，不要同时用多个宿主打开同一数据库。
 
 - `npm run check`：类型检查、核心账本测试、DSH 适配层测试、Host/Client 构建。`npm test` 单独运行不依赖 DSH 的账本测试。
 - `npm run smoke:chat`：在专用探针宿主上验证聊天接单、同对话交付、文件下载、提问回答及返工；仅确定性模型。
@@ -91,7 +103,7 @@ Node 用 fnm 管理时，可用 `fnm exec --using=24.21.0 npm run dev`，无需�
 
 推理档位需由该 profile 的模型目录及提供方支持。未配置角色模型时仍使用原生会话选择；Worker 可继承 Bot 的选择。Full Access 是用户对本机执行的明确授权，项目目录不再作为安全沙箱。Super Bot 继续记录任务归属、输入、结果和执行收敛，不把模型报告当作人工验收。
 
-更新本地 tgz 时使用新版本和新文件名；复用同版本文件可能命中包管理器缓存。仅在 Bot、Worker 都空闲时更新/重新加载插件，并通过新会话的模型、权限和实际工作目录验证生效；插件清单显示新版本不能单独证明旧运行实例已替换。
+正式分发 tgz 时使用新版本和新文件名；复用同版本文件可能命中包管理器缓存。本地开发用上面的 `dev:reload` 或 `dev`，无需升版本。仅在 Bot、Worker 都空闲时更新/重新加载日常插件，并核实激活结果；插件清单显示新版本不能单独证明旧运行实例已替换。插件配置/业务模块可热替换，涉及 DSH 框架、共享宿主依赖的更改仍可能要求重启，以原生 HMR 诊断为准。
 
 ## 当前可试用流程
 

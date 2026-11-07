@@ -17,7 +17,7 @@ import { AppError, requiredText, optionalText,type WorkspaceStatus, type NewBot,
 
 export const name = 'super-bot';
 export const inject = ['connection', 'sessionController', 'workspaceRegistry','agents','tools','jobs','systemPrompt','workingDirectory','sessionProjections','webServer','permissionPresets','sessions','sessionPersistence'];
-const roleModel=Schema.object({provider:Schema.string().required(),model:Schema.string().required(),reasoningEffort:Schema.string()});
+const roleModel=Schema.union([Schema.const(undefined),Schema.object({provider:Schema.string().required(),model:Schema.string().required(),reasoningEffort:Schema.string()})]);
 export const Config = Schema.object({ dataDir: Schema.string().description('Super Bot 本地数据目录'), fullAccess:Schema.boolean().default(false),workspace:Schema.string(),managerModel:roleModel,workerModel:roleModel });
 
 export function apply(ctx: Context, config: RuntimeOptions & { dataDir?: string } = {}): void {

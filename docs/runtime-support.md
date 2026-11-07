@@ -29,9 +29,9 @@
 | 账本迁移和恢复 | 已验证主要窗口 | schema 2→7、实际 schema 6→7、失败回滚、未提交升级进程中断、一致性快照、新目录恢复、schema 6 旧版本实际回退。快照发布后清单中断的重试保留原快照；缺失/损坏文件拒绝成功。`npm test`、`smoke-restored.mjs`、实际安装包 `smoke-backup-retry.mjs` |
 | 首次模型选择与错误提示 | 已验证 API 与 UI | 使用原生 modelSelection 投影区分已选模型与默认路由；未选 Worker 不创建 Run，Manager 保留通知/0 次唤醒。真实 turn/end 的缺凭证错误显示明确原因，不抄录提供方原始错误正文。`smoke-model-errors.mjs`、实际 tgz `smoke-package.mjs` |
 | Dashboard 离线 | 已验证 | 仅保留快照并禁用变更；重连不重放操作，恢复筛选和位置。100 项分页通过；恢复旧备份时清除失效任务/Bot 选择并钳制页码，同页任务消失路径 UI 通过 |
-| 运行中热卸载/热替换 | 仅空闲插件重载实测 | 日常 web profile 空闲时启停本插件，保留账本和原生会话；安装新 tgz 后曾仍运行旧实现，需重载并核实新 Worker 配置。活动执行期间不热替换 |
+| 运行中热卸载/热替换 | 空闲插件原生 HMR 已实测 | 独立宿主验证 link 源码监听及 tgz→link 配置重组：同 PID、同版本换成新模块。真实 Super Bot 后端重挂载、前端 rebuilt SSE 通过。`dev:reload` 用于日常空闲重载，`dev` 用于隔离自动监听；活动执行期间不热替换 |
 | Desktop | 未验证 | 本机 `0.2.1-rc.5` 未接入验证；当前安装包目标是 Web rc.1 |
-| 真实模型质量、Token/费用 | 未验证 / 未提供精确归因 | 不把确定性测试当模型能力评估；真实账号与最终个人试用留待用户方便时进行 |
+| 真实模型质量、Token/费用 | 两轮代码 dogfooding 已通过；无精确费用归因 | Sol medium Bot 委派 Sol xhigh Full Access Worker，实际 Shell/子 Agent/测试及原对话交付通过；完整澄清、返工、用户接受体验和费用评估仍待验证 |
 
 files 模式目录限制是应用层约束，不是操作系统沙箱。Full Access 不附加该目录限制，也不把不同 Bot 作为安全租户。既有原生会话的历史、插件和用户手动操作仍属于当前单用户宿主。
 

@@ -4,6 +4,16 @@ import type {Context} from '@deepseek-ai/cordis';
 import type {Agent} from '@deepseek-ai/dsh-agent';
 import {ReasoningEffortId} from '@deepseek-ai/dsh-llm';
 import {configureRole} from '../../src/runtime.ts';
+import {Config} from '../../src/index.ts';
+
+test('fresh profiles can omit role overrides but incomplete model selections fail',()=>{
+  const config=Config({});
+  assert.equal(config.managerModel,undefined);
+  assert.equal(config.workerModel,undefined);
+  assert.throws(()=>Config({managerModel:{model:'sol'}}));
+  assert.throws(()=>Config({workerModel:{provider:'test'}}));
+  assert.deepEqual(Config({workerModel:{provider:'test',model:'sol'}}).workerModel,{provider:'test',model:'sol'});
+});
 
 test('full roles select independent models and the complete native permission preset',()=>{
   const selected:unknown[]=[],presets:unknown[]=[];
