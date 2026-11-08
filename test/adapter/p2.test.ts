@@ -4,7 +4,11 @@ import {test,type TestContext} from 'node:test';
 import assert from 'node:assert/strict';
 import {mkdirSync,mkdtempSync,realpathSync,rmSync,writeFileSync,unlinkSync} from 'node:fs';
 import {join} from 'node:path';
-import type {Context} from '@deepseek-ai/cordis';
+import {Context} from '@deepseek-ai/cordis';
+import {ToolsService} from '@deepseek-ai/dsh-tools';
+import {NativeToolExecutor} from '@deepseek-ai/dsh-tool-executor-native';
+import type {Agent} from '@deepseek-ai/dsh-agent';
+import {ToolCallId} from '@deepseek-ai/dsh-llm';
 import {Managers} from '../../src/manager.ts';
 import {DshExecution} from '../../src/dsh.ts';
 import {Store} from '../../src/store.ts';
@@ -18,11 +22,21 @@ function fixture(t:TestContext) {
   const bot=store.createBot('bot',{name:'P2 Bot',instructions:'Synthetic regression only'});
   const manager=store.beginManager('manager',bot.id,directory);store.confirmManager(manager.id,manager.requestedSessionId);
   const listeners=new Map<string,Function[]>(),tools=new Map<string,any>(),agents=new Map<string,any>();
+  // Use the installed DSH registry and native JSON transport, not a hand-written normalizer.
+  const toolContext=new Context();toolContext.provide('systemPrompt',{tools:()=>()=>{}});
+  const registry=new ToolsService(toolContext),executor=new NativeToolExecutor(toolContext),registrations:(()=>void)[]=[];
+  const nativeAgent={id:manager.requestedSessionId} as Agent;
+  const nativeResult=async(callId:string,args:Record<string,unknown>)=>{
+    const signal=new AbortController().signal;
+    const toolSet=await registry.resolve({agent:nativeAgent,modelSelection:{provider:'synthetic',model:'synthetic'},signal});
+    try{return (await executor.execute({calls:[{type:'tool-call',id:ToolCallId(callId),name:'super_bot_manage',arguments:JSON.stringify(args)}],agent:nativeAgent,toolSet,signal})).results[0]!.result;}
+    finally{toolSet.dispose();}
+  };
   let delivered:any;
   const ctx={
     effect:(callback:()=>unknown)=>callback(),
     on:(name:string,callback:Function)=>{const list=listeners.get(name)??[];list.push(callback);listeners.set(name,list);return ()=>{list.splice(list.indexOf(callback),1);};},
-    tools:{register:(tool:any)=>{tools.set(tool.name,tool);return ()=>{};}},
+    tools:{register:(tool:any,options:any)=>{tools.set(tool.name,tool);const off=registry.register(tool,options);registrations.push(off);return off;}},
     agents:{list:()=>[],isOwnedBy:()=>false},jobs:{list:()=>[]},
     workingDirectory:{get:(session:any)=>session.header.cwd},
     sessionProjections:{snapshot:()=>({values:{modelSelection:{next:{provider:'synthetic',model:'synthetic'}}}})},
@@ -44,7 +58,9 @@ function fixture(t:TestContext) {
   const install=()=>{execution.install();managers.install();};install();
   const emit=async(event:any,sessionId=manager.requestedSessionId)=>{for(const listener of listeners.get('session/event')??[])await listener({id:sessionId},event);};
   const native=async(id:string,seq:number,text:string)=>emit({type:'user/message',seq,data:{id,source:{kind:'user',rpcId:`rpc:${id}`},content:[{type:'text',text}]}});
-  return {get store(){return store;},get execution(){return execution;},bot,manager,directory,tools,emit,native,
+  return {get store(){return store;},get execution(){return execution;},bot,manager,directory,tools,emit,native,nativeResult,
+    schemas:()=>registry.schemas(),
+    nativeCall:async(callId:string,args:Record<string,unknown>)=>{const result=await nativeResult(callId,args);assert.ok(!result.isError,JSON.stringify(result.error));return result.value as any;},
     delivered:()=>delivered,
     finish:async(taskId:string,files:string[],kind:'ready'|'waiting'='ready')=>{
       const run=store.latestRun(taskId)!;await emit({type:'user/message',seq:1,data:delivered},run.sessionId);
@@ -52,15 +68,102 @@ function fixture(t:TestContext) {
       agents.get(run.sessionId).finish();await new Promise<void>(resolve=>setImmediate(resolve));return report;
     },
     call:(callId:string,args:Record<string,unknown>,signal=new AbortController().signal)=>tools.get('super_bot_manage').execute(args,{agent:{id:manager.requestedSessionId},callId,signal}),
-    reload:async()=>{await managers.dispose();await execution.dispose();listeners.clear();store.close();store=new Store(database);execution=new DshExecution(ctx,store,directory);managers=new Managers(ctx,store,execution,directory,()=> 'https://example.test');install();},
-    close:async()=>{await managers.dispose();await execution.dispose();store.close();assert.equal(realpathSync(directory),directory);assert.ok(directory.startsWith(join(root,'.runtime','p2-adapter-')));rmSync(directory,{recursive:true,force:true});t.mock.timers.reset();},
+    reload:async()=>{await managers.dispose();await execution.dispose();registrations.splice(0).forEach(off=>off());listeners.clear();store.close();store=new Store(database);execution=new DshExecution(ctx,store,directory);managers=new Managers(ctx,store,execution,directory,()=> 'https://example.test');install();},
+    close:async()=>{await managers.dispose();await execution.dispose();registrations.splice(0).forEach(off=>off());store.close();assert.equal(realpathSync(directory),directory);assert.ok(directory.startsWith(join(root,'.runtime','p2-adapter-')));rmSync(directory,{recursive:true,force:true});t.mock.timers.reset();},
   };
 }
+
+for(const [label,fields] of Object.entries({omitted:{},'empty scope':{scope:''},'empty acceptance':{acceptance:''},'both empty':{scope:'',acceptance:''}}))test(`respond native tool accepts ${label} optional fields for a bound Worker question`,async t=>{
+  const f=fixture(t);try {
+    const schema=f.schemas().find(tool=>tool.name==='super_bot_manage')!.parameters as any;
+    assert.deepEqual(schema.required,['action']);assert.deepEqual(schema.properties.scope,{type:'string'});assert.deepEqual(schema.properties.acceptance,{type:'string'});
+    await f.native('request',1,'按原范围写介绍。');
+    const created=await f.nativeCall('create',{action:'create',goal:'介绍',scope:'原范围',acceptance:'回读'});
+    const prepared=await f.nativeCall('prepare',{action:'dispatch',taskId:created.task.id,expectedRowVersion:created.task.rowVersion});
+    await f.nativeCall('dispatch',{action:'dispatch',taskId:created.task.id,expectedRowVersion:prepared.task.rowVersion});await f.finish(created.task.id,[],'waiting');
+    const before=await f.nativeCall('detail',{action:'detail',taskId:created.task.id}),attention=before.attentions.find((a:any)=>a.kind==='input'&&a.state==='open');
+    assert.ok(before.binding);assert.equal(before.task.scope,'原范围');assert.equal(before.task.acceptance,'回读');
+    await f.emit({type:'turn/start',data:{turn:2}});await f.native('answer',4,'使用中文。');
+    const args={action:'respond',taskId:created.task.id,attentionId:attention.id,expectedRowVersion:before.task.rowVersion};
+    const first=await f.nativeCall('answer',{...args,...fields});assert.equal(first.input.content,'使用中文。');
+    for(const retryFields of [{},{scope:''},{acceptance:''},{scope:'',acceptance:''}]){
+      const retry=await f.nativeCall('answer',{...args,...retryFields});assert.deepEqual(retry,first);
+    }
+    const after=await f.nativeCall('after',{action:'detail',taskId:created.task.id});
+    assert.equal(after.task.taskRevision,before.task.taskRevision);assert.equal(after.task.scope,'原范围');assert.equal(after.task.acceptance,'回读');
+    assert.equal(after.events.filter((e:any)=>e.kind==='attention.answered').length,1);
+    const detached=await f.execution.endTaskLink('session.detach','detach',created.task.id,after.task.rowVersion);
+    for(const retryFields of [{},{scope:''},{acceptance:''},{scope:'',acceptance:''}]){
+      const retry=await f.nativeCall('answer',{...args,...retryFields});assert.deepEqual(retry.input,first.input);assert.equal(retry.task.rowVersion,detached.rowVersion);
+    }
+    await f.reload();await f.native('answer',4,'使用中文。');
+    assert.deepEqual((await f.nativeCall('answer',{...args,scope:'',acceptance:''})).input,first.input);
+    const resumed=f.store.controlTask('resume',created.task.id,detached.rowVersion,'auto');
+    const rebound=await f.nativeCall('rebind',{action:'dispatch',taskId:created.task.id,expectedRowVersion:resumed.rowVersion});assert.equal(rebound.prepared,true);
+    assert.deepEqual((await f.nativeCall('answer',args)).input,first.input);
+    assert.equal(f.store.taskDetail(created.task.id).events.filter(e=>e.kind==='attention.answered').length,1);
+  }finally{await f.close();}
+});
+
+test('respond native tool delivers an empty-field answer to the bound Worker without revising authorization',async t=>{
+  const f=fixture(t);try {
+    await f.native('request',1,'按原范围写介绍。');
+    const created=await f.nativeCall('create',{action:'create',goal:'介绍',scope:'原范围',acceptance:'回读'});
+    const prepared=await f.nativeCall('prepare',{action:'dispatch',taskId:created.task.id,expectedRowVersion:created.task.rowVersion});
+    await f.nativeCall('dispatch',{action:'dispatch',taskId:created.task.id,expectedRowVersion:prepared.task.rowVersion});await f.finish(created.task.id,[],'waiting');
+    const before=f.store.taskDetail(created.task.id),attention=before.attentions.find(a=>a.kind==='input'&&a.state==='open')!;
+    await f.emit({type:'turn/start',data:{turn:2}});await f.native('answer',4,'使用中文。');
+    const answered=await f.nativeCall('answer',{action:'respond',taskId:created.task.id,attentionId:attention.id,expectedRowVersion:before.task.rowVersion,scope:'',acceptance:''});
+    const continued=await f.nativeCall('continue',{action:'dispatch',taskId:created.task.id,expectedRowVersion:answered.task.rowVersion});
+    assert.equal(continued.run.inputId,answered.input.id);assert.equal(continued.run.sessionId,before.binding!.sessionId);assert.equal(continued.run.taskRevision,before.task.taskRevision);
+    assert.ok(f.delivered().content[0].text.includes('使用中文。'));
+    await f.finish(created.task.id,[],'waiting');
+    const after=await f.nativeCall('after',{action:'detail',taskId:created.task.id});
+    assert.equal(after.input.id,answered.input.id);assert.equal(after.input.state,'entered');assert.equal(after.attentions.find((a:any)=>a.id===attention.id).state,'resolved');
+    assert.equal(after.task.scope,'原范围');assert.equal(after.task.acceptance,'回读');assert.equal(after.task.taskRevision,before.task.taskRevision);
+  }finally{await f.close();}
+});
+
+test('respond native tool keeps source, version, valued-input and invalid-type rejection boundaries',async t=>{
+  const f=fixture(t);try {
+    await f.native('request',1,'按原范围写介绍。');
+    const created=await f.nativeCall('create',{action:'create',goal:'介绍',scope:'原范围',acceptance:'回读'});
+    const prepared=await f.nativeCall('prepare',{action:'dispatch',taskId:created.task.id,expectedRowVersion:created.task.rowVersion});
+    await f.nativeCall('dispatch',{action:'dispatch',taskId:created.task.id,expectedRowVersion:prepared.task.rowVersion});await f.finish(created.task.id,[],'waiting');
+    const before=await f.nativeCall('detail',{action:'detail',taskId:created.task.id}),attention=before.attentions.find((a:any)=>a.kind==='input'&&a.state==='open');
+    const args={action:'respond',taskId:created.task.id,attentionId:attention.id,expectedRowVersion:before.task.rowVersion,scope:'',acceptance:''};
+    const rejected=async(callId:string,data:Record<string,unknown>,message:string)=>{const result=await f.nativeResult(callId,data);assert.equal(result.isError,true);assert.equal(result.error?.message,message);};
+    await f.emit({type:'turn/start',data:{turn:2}});
+    for(const source of [{kind:'super-bot-manager',botId:f.bot.id,managerId:f.manager.id,eventId:'missing'},{kind:'synthetic-automatic',rpcId:'not-native'},{kind:'user'}]){
+      await f.emit({type:'user/message',seq:2,data:{id:'automatic',source,content:[{type:'text',text:'自动通知不能授权回答'}]}});
+      await rejected('automatic',args,'需要当前对话中的真实用户消息；自动通知不能代替用户提出新工作、回答或返工。');
+    }
+    await f.emit({type:'user/message',seq:3,data:{id:'foreign',source:{kind:'user',rpcId:'foreign'},content:[{type:'text',text:'其他对话'}]}},'other-session');
+    await rejected('foreign-source',args,'需要当前对话中的真实用户消息；自动通知不能代替用户提出新工作、回答或返工。');
+    await f.native('answer-last',6,'保留背景。');await f.native('answer-first',4,'使用中文。');await f.native('answer-first',8,'重复投递不能覆盖原文。');
+    for(const [field,label] of [['scope','任务范围'],['acceptance','验收条件']]){
+      for(const [index,value] of [null,false,0,[],{},' \t\n'].entries())await rejected(`invalid:${field}:${index}`,{...args,scope:undefined,acceptance:undefined,[field]:value},`请填写${label}。`);
+      await rejected(`oversize:${field}`,{...args,scope:undefined,acceptance:undefined,[field]:'x'.repeat(10001)},`${label}不能超过 10000 字符。`);
+      await rejected(`valued:${field}`,{...args,scope:undefined,acceptance:undefined,[field]:'扩大授权'},'执行会话已关联，不能通过补充缺项修改任务范围。');
+    }
+    await rejected('stale',{...args,expectedRowVersion:before.task.rowVersion-1},'任务已经更新，请刷新后回答。');
+    assert.equal(f.store.getTask(created.task.id).rowVersion,before.task.rowVersion);assert.equal(f.store.pendingInput(created.task.id),null);
+    const first=await f.nativeCall('answer',args);assert.equal(first.input.content,'使用中文。\n\n保留背景。');
+    const after=await f.nativeCall('after',{action:'detail',taskId:created.task.id});
+    assert.deepEqual(JSON.parse(after.events.find((e:any)=>e.kind==='attention.answered').data).source,{sessionId:f.manager.requestedSessionId,messageId:'answer-last',seq:6,text:'使用中文。\n\n保留背景。',messages:[{messageId:'answer-first',seq:4,text:'使用中文。'},{messageId:'answer-last',seq:6,text:'保留背景。'}]});
+    await rejected('answered',{...args,expectedRowVersion:after.task.rowVersion},'问题已失效或已有回答。');
+    await rejected('answer',{...args,scope:'改变已提交请求',acceptance:undefined},'同一请求标识不能用于不同的内容。');
+    await f.native('new-source',9,'新来源不能借用旧回执。');await rejected('answer',args,'同一请求标识不能用于不同的内容。');
+    await f.emit({type:'turn/end',data:{reason:{kind:'stop'}}});
+    await rejected('answer',args,'需要当前对话中的真实用户消息；自动通知不能代替用户提出新工作、回答或返工。');
+    assert.equal(f.store.taskDetail(created.task.id).events.filter(e=>e.kind==='attention.answered').length,1);
+  }finally{await f.close();}
+});
 
 test('P2 incomplete unbound task can be completed by a real chat answer and dispatched',async t=>{
   const f=fixture(t);try {
     await f.native('request',1,'请安排一份介绍，范围和检查稍后补充。');
-    const created=await f.call('create',{action:'create',goal:'项目介绍'});
+    const created=await f.nativeCall('create',{action:'create',goal:'项目介绍'});
     const before=await f.call('before',{action:'detail',taskId:created.task.id});
     assert.equal(before.binding,null);assert.equal(before.task.status,'needs-input');
     const attention=before.attentions.find((a:any)=>a.kind==='input'&&a.state==='open');assert.ok(attention);
@@ -68,7 +171,7 @@ test('P2 incomplete unbound task can be completed by a real chat answer and disp
     await f.emit({type:'turn/start',data:{turn:2}});
     await f.native('scope-answer',5,'仅在任务目录写介绍；包含背景和结论，并回读检查。');
     const args={action:'respond',taskId:created.task.id,attentionId:attention.id,expectedRowVersion:before.task.rowVersion,scope:'仅在任务目录写介绍',acceptance:'包含背景和结论，并回读检查'};
-    const completed=await f.call('complete',args);
+    const completed=await f.nativeCall('complete',args);
     assert.equal(completed.task.scope,args.scope);assert.equal(completed.task.acceptance,args.acceptance);
     assert.equal(completed.task.taskRevision,2);assert.equal(completed.task.rowVersion,before.task.rowVersion+1);
     assert.equal(completed.task.status,'unscheduled');assert.equal(completed.task.reviewPolicy,'human');
@@ -118,15 +221,23 @@ test('P2 completion keeps real multi-message sources, versions, existing scope a
 test('P2 partial completion leaves a current question and cannot erase existing acceptance',async t=>{
   const f=fixture(t);try {
     await f.native('request',1,'范围和验收分两次补充。');
-    const created=await f.call('create',{action:'create',goal:'分次补充'}),before=f.store.taskDetail(created.task.id);
+    const created=await f.nativeCall('create',{action:'create',goal:'分次补充'}),before=f.store.taskDetail(created.task.id);
     await f.emit({type:'turn/start',data:{turn:2}});await f.native('acceptance',2,'先补验收：回读内容。');
-    const first=await f.call('acceptance',{action:'respond',taskId:created.task.id,attentionId:before.attentions[0]!.id,expectedRowVersion:before.task.rowVersion,acceptance:'回读内容'});
+    const firstArgs={action:'respond',taskId:created.task.id,attentionId:before.attentions[0]!.id,expectedRowVersion:before.task.rowVersion,acceptance:'回读内容'};
+    const first=await f.nativeCall('acceptance',firstArgs);
     assert.equal(first.task.status,'needs-input');assert.equal(first.task.scope,'');assert.equal(first.task.taskRevision,2);
     const partial=f.store.taskDetail(created.task.id),next=partial.attentions.find(a=>a.state==='open')!;assert.equal(next.taskRevision,2);
     await f.emit({type:'turn/start',data:{turn:3}});await f.native('scope',3,'仅写任务目录。');
     const args={action:'respond',taskId:created.task.id,attentionId:next.id,expectedRowVersion:first.task.rowVersion,scope:'仅写任务目录'};
     await assert.rejects(f.call('erase',{...args,acceptance:''}),{code:'invalid-input'});
-    const complete=await f.call('scope',args);assert.equal(complete.task.status,'unscheduled');assert.equal(complete.task.acceptance,'回读内容');assert.equal(complete.task.taskRevision,3);
+    const overwrite=await f.nativeResult('overwrite',{...args,acceptance:'替换已有验收'});assert.equal(overwrite.isError,true);assert.equal(overwrite.error?.message,'补充缺项不能覆盖已有范围或验收条件。');
+    const complete=await f.nativeCall('scope',args);assert.equal(complete.task.status,'unscheduled');assert.equal(complete.task.acceptance,'回读内容');assert.equal(complete.task.taskRevision,3);
+    assert.deepEqual(await f.nativeCall('scope',args),complete);
+    await f.emit({type:'turn/start',data:{turn:4}});await f.native('acceptance',2,'先补验收：回读内容。');assert.deepEqual(await f.nativeCall('acceptance',firstArgs),first);
+    await f.emit({type:'turn/start',data:{turn:5}});await f.native('scope',3,'仅写任务目录。');
+    const prepared=await f.nativeCall('prepare',{action:'dispatch',taskId:created.task.id,expectedRowVersion:complete.task.rowVersion});assert.equal(prepared.prepared,true);
+    assert.deepEqual(await f.nativeCall('scope',args),complete,'completion receipt survives a new execution binding');
+    assert.equal(f.store.pendingInput(created.task.id),null);assert.equal(f.store.taskDetail(created.task.id).events.filter(e=>e.kind==='task.revised').length,2);
     const other=f.store.createBot('other-bot',{name:'Other',instructions:'Synthetic'}),foreign=f.store.createTask('other-task',{botId:other.id,goal:'其他 Bot',scope:'',acceptance:'',reviewPolicy:'human'});
     await assert.rejects(f.call('foreign-task',{...args,taskId:foreign.id}),{code:'manager-scope'});
     await assert.rejects(f.call('foreign-attention',{...args,attentionId:f.store.taskDetail(foreign.id).attentions[0]!.id}),{code:'manager-scope'});

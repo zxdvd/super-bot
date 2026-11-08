@@ -66,8 +66,9 @@ export class Managers {
           if(data.action==='respond') {
             const attentionId=requiredText(data.attentionId,'问题标识',200);
             if(!this.store.taskDetail(task.id).attentions.some(item=>item.id===attentionId))throw new AppError('manager-scope','问题不属于当前任务。');
-            // Route by immutable command fields, not a binding that may change before a retry.
-            if(data.scope!==undefined||data.acceptance!==undefined)return {task:this.store.completeTaskInput(requestId,task.id,attentionId,data.expectedRowVersion as number,{scope:data.scope as string|undefined,acceptance:data.acceptance as string|undefined},source)};
+            // Route by immutable command values, not a binding that may change before a retry.
+            // Only omitted/exact-empty optional strings are neutral; other values retain completion validation.
+            if([data.scope,data.acceptance].some(value=>value!==undefined&&value!==''))return {task:this.store.completeTaskInput(requestId,task.id,attentionId,data.expectedRowVersion as number,{scope:data.scope as string|undefined,acceptance:data.acceptance as string|undefined},source)};
             return {input:this.store.respondAttention(requestId,attentionId,data.expectedRowVersion as number,source.text,source),task:this.store.getTask(task.id)};
           }
           return {task:this.store.rejectResult(requestId,task.id,data.expectedRowVersion as number,requiredText(data.resultId,'成果标识',200),source.text,source)};

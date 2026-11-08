@@ -418,3 +418,18 @@ ELECTRON_RUN_AS_NODE=1 '/Applications/DeepSeek Harness.app/Contents/MacOS/DeepSe
 - 日常 profile 的 manifest 和真实链接路径指向本仓库；DSH PID 保持不变。Plugins 刷新后显示 `link:` 源码来源、版本 `0.1.3`、`1 total · 1 running`。前端自动重挂载，重新打开工作台看到新文案及原来的两项待验收任务；原生 Bot 会话与模型仍保留。Plugins 旧详情在刷新前缓存旧 tgz 来源，不应据此误判加载失败。
 - 隔离 HMR 宿主和构建监听已退出；`npm pack --dry-run` 包含新增开发说明，不包含 `.runtime` 或实际聊天/日志。最终只有文案/文档/分发清单在 Worker 的完整 check 后继续变化；文案已重新构建并在日常浏览器实际显示，没有为纯文案重复整套测试。
 - 尚未把新版三个 P2 的每个分支都做真实模型/HTTP/UI 端到端复验；这些有实际应用/适配层回归，不能冒充用户已验收。旧第一轮源码证据在后续迭代后可能 hash 失效，原结果没有被伪造为仍可接受；第二轮的三个报告文件保持原 hash。
+
+## 2026-11-08：respond 空可选字段小修复（本轮待人工验收）
+
+- 本轮 run `f081d7ec-0c01-4a61-a29e-309f69eb06cf`，初始工作树干净，HEAD 为 `62fbb6a973477ce37f1c9249a3409d280fbfb6b1`；已读取仓库指引、README、ROADMAP、活动提案/任务/证据及聊天契约。Node 显式选用 `24.21.0`，未改变机器默认版本。没有覆盖或冒认基线的外层目录预留上下文修正。
+- 实际注册 schema 中 scope/acceptance 为可选 string，无默认值/minLength。核读仓库已安装 DSH `0.2.2-rc.1` 的 ToolsService、NativeToolExecutor 与共享 pipeline：原生 JSON.parse/参数快照保留省略与精确空字符串，未观察到该入口自行补空。因此不把上游归一化位置当成已证实事实；测试直接重放两种合法工具载荷，不自行伪造“归一化器”。
+- 在原 P2 夹具接入真正的 Cordis ToolsService 注册/激活、NativeToolExecutor JSON 参数解析与结果封装；Manager、执行适配和 SQLite 账本均运行产品代码，只有会话/模型/文件目录为合成边界，不访问日常宿主或真实用户聊天。根因：respond 仅按字段存在性判断，`scope: ''` / `acceptance: ''` 误入 completeTaskInput，随后 requiredText 返回“请填写任务范围/验收条件”。
+- 红测命令 `fnm exec --using=24.21.0 node --import tsx --test --test-name-pattern='respond native tool accepts' test/adapter/p2.test.ts` 在修复前实际执行两次，均退出 1：首版在省略成功后的空字段重试报“请填写任务范围”；展开成四种首次输入后，首次单空/双空分别报上述准确错误，省略用例在交叉空形式重试时报同错。不是强制改源码制造红测。
+- 排查顺序为字段存在性误路由、绑定/版本变化、原生参数转换；不改变绑定和版本的新问题首次空字段也失败，原生解析保留载荷，且错误落在原补全校验，定位第一项。最小修复只改 [manager.ts](../../../src/manager.ts) 一处分流：undefined/精确 `''` 均为中性；任何其他值仍原样进入补全校验。分流不依赖可变绑定；不整体 trim、不吞 null/false/0/数组/对象/空白/超长/有值请求，不改变补全路径中另一空字段的既有拒绝行为。
+- 同一红测命令修复后 4/4、退出 0。后续扩大验证命令 `fnm exec --using=24.21.0 node --import tsx --test --test-name-pattern='respond native tool' test/adapter/p2.test.ts` 最终 6/6、退出 0：四种首次输入及同 callId 跨四种空形式重试；解绑、账本重开、重新绑定后仍回原 Input；空字段回答实际派发至同一 Worker，Input entered/原问题 resolved，授权与 taskRevision 不变；完整有序去重多消息来源；自动通知/伪 rpc/no-rpc/外会话拒绝；旧 rowVersion/问题拒绝；同 callId 改字段或来源拒绝；turn/end 撤权。两字段的空白、非空、超长与非法类型均返回原准确错误且不创建回答。
+- 原缺项完整补全与分次补全成功调用已接到同一原生工具边界；两次补充仍推进版本、保留已有 scope/acceptance、禁止覆盖已有授权，历史补全回执在后续版本和新绑定后仍幂等。原暂停保持、完整来源、跨 Bot/问题归属以及事务/证据回归保留。
+- 最终组合定向命令 `fnm exec --using=24.21.0 node --import tsx --test test/adapter/p2.test.ts test/adapter/multi-message.test.ts test/adapter/receipts.test.ts test/adapter/runtime.test.ts test/adapter/delivery.test.ts`：56/56，退出 0（`TARGETED_FINAL_EXIT=0`）。
+- `fnm exec --using=24.21.0 npm run check` 本轮实际两次退出 0；最终包含新增消费链路用例，63 核心 + 61 适配 = 124 项通过，typecheck、Host/Client build 均通过，打印 `FINAL_CHECK_EXIT=0`。消费链路用例首次误用了不存在的 detail.inputs 数组而退出 1，按公开 detail.input 修正后通过；这次夹具断言笔误不当作业务红测。早期隔离注册探针曾因 Cordis provide/清理 API 使用错误退出 1，修正为实际注册/注销接口后原生回归已执行通过。
+- 独立只读审查未发现 must-fix；另用内存账本实际运行安装库原生链路探针，退出 0，核对四空形式首次/解绑重试与非法有值/来源/版本拒绝。此结果不冒认为父 Worker 的组合测试或全量 check。
+- `git diff --check` 退出 0；对照 `62fbb6a` 核对执行/权限/入口/Store/model、schema-version、package/lock 无差异，退出 0。实际改动只有本轮 [manager.ts](../../../src/manager.ts)、[p2.test.ts](../../../test/adapter/p2.test.ts) 与本节脱敏证据；未修改数据库/schema/权限机制、profile/凭证、DSH 安装源码、其他仓库，未提交/推送、升版本、dev:reload 或重启/部署。测试合成目录均在仓库 .runtime 下，清理前核对真实路径。
+- 未验证：加载后真实 Provider 的参数适配、真实模型对话/UI 端到端、人工验收；本轮安装库接线测试不代替这些事实。外层待交付空闲后 HMR，再按账本继续原工作视图 `cd3174c7-6c2b-4426-bb70-aa8436c0c892` → 说明 `e9c2efdf-1511-4517-84ad-4b8dfdb2a4e2`，无需再次确认目录释放。本 Worker 未取消/修改或绕过账本实现这两项任务，最终接受仍由用户决定。
