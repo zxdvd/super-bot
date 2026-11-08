@@ -6,10 +6,14 @@ import type {} from '@deepseek-ai/dsh-client-ui-sidebar/client';
 import type {} from '@deepseek-ai/dsh-client-ui-workspace/client';
 import type { SessionId } from '@deepseek-ai/dsh-session/types';
 import type { WorkspaceApi } from './ui/Workspace.tsx';
-import type { ManagerBinding } from './model.ts';
+import type {} from '@deepseek-ai/dsh-client-ui-conversation/client';
+import type {} from '@deepseek-ai/dsh-client-ui-session/client';
+import type { UseSidebarRightTabInfo } from '@deepseek-ai/dsh-client-ui-sidebar-right/client';
+import { WorkButton, SessionWork } from './ui/SessionWork.tsx';
+import { WORK_TAB, openBotConversation } from './ui/work-navigation.ts';
 import { BotHome } from './ui/BotHome.tsx';
 
-export const inject = ['slots', 'uiWorkspace', 'connection', 'layout'];
+export const inject = ['slots', 'uiWorkspace', 'connection', 'layout', 'sidebarRight', 'sidebarRightTabs'];
 type ClientContext = Omit<Context, 'connection'> & { connection: ConnectionHandle };
 
 function Icon({ size = 20 }: { size?: number }) {
@@ -26,13 +30,8 @@ export function apply(context: Context): void {
     },
     openSession: id => ctx.uiWorkspace.openSession(id as SessionId),
     beginNavigation:()=>ctx.layout.beginNavigation(),
-    async openBot(botId,navigation=ctx.layout.beginNavigation()) {
-      if(navigation.aborted)return;
-      const binding=await api.call<ManagerBinding>('manager.prepare',{botId,requestId:crypto.randomUUID()});
-      if(navigation.aborted)return;
-      if(binding.state!=='ready'||!binding.sessionId)throw new Error('对话尚未准备好，请在工作与设置中查看状态。');
-      ctx.uiWorkspace.openSession(binding.sessionId as SessionId);
-    },
+    currentSession:()=>ctx.sidebarRight.mounted.getSnapshot(),
+    openBot:(botId,navigation=ctx.layout.beginNavigation())=>openBotConversation(api,botId,navigation),
   };
   ctx.effect(()=>{
     const select=()=>{if(/^#super-bot-task=[a-f0-9-]{36}$/.test(location.hash))ctx.layout.selectPanel('super-bot' as MainPanelId);};
@@ -46,6 +45,14 @@ export function apply(context: Context): void {
     document.addEventListener('click',click,true);window.addEventListener('hashchange',select);
     return()=>{document.removeEventListener('click',click,true);window.removeEventListener('hashchange',select);};
   });
+  ctx.effect(()=>ctx.sidebarRightTabs.register({id:WORK_TAB,kind:WORK_TAB,title:()=> '工作',guide:[{id:'work',order:20,title:()=> '当前 Bot 的工作',description:()=> '进展、需要你处理的事与成果',icon:Icon}]}));
+  for(const name of ['conversation.session.header.actions','conversation.hero.options'] as const) {
+    ctx.slots.inject(name,()=>ctx.slots.register({name,id:WORK_TAB,order:20},(props:{sessionId:SessionId})=><WorkButton api={api} sessionId={props.sessionId} sidebar={ctx.sidebarRight}/>));
+  }
+  ctx.slots.inject('sidebar.right.pane.tab',()=>ctx.slots.register({name:'sidebar.right.pane.tab',key:WORK_TAB},(props:{sessionId:SessionId;useTabInfo:UseSidebarRightTabInfo})=>{
+    const {tab}=props.useTabInfo();
+    return tab.visible?<SessionWork api={api} sessionId={props.sessionId} sidebar={ctx.sidebarRight} tabId={tab.id}/>:null;
+  }));
   ctx.slots.inject('main', () => ctx.slots.register({ name: 'main', key: 'super-bot', inject: () => ({}) }, () => <BotHome api={api}/>));
   ctx.slots.inject('sidebar.panellist', () => ctx.slots.register({ name: 'sidebar.panellist', id: 'super-bot', order: 11, label: () => 'Super Bot' }, Icon));
 }

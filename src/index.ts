@@ -39,6 +39,7 @@ export function apply(ctx: Context, config: RuntimeOptions & { dataDir?: string 
       if (endpoint === 'status') return { ok: true, value: status() };
       if (endpoint === 'backup.create') return {ok:true,value:await createLedgerBackup(store,dataDir,requiredText(payload.requestId,'请求标识',200))};
       if (endpoint === 'bot.list') return { ok: true, value: store.listBots() };
+      if (endpoint === 'bot.for-session') return { ok: true, value: store.botForSession(requiredText(payload.sessionId,'会话标识',200)) };
       if (endpoint === 'manager.prepare') return {ok:true,value:await managers.prepare(requiredText(payload.requestId,'请求标识',200),requiredText(payload.botId,'Bot 标识',200))};
       if (endpoint === 'manager.replace') return {ok:true,value:await managers.replace(requiredText(payload.requestId,'请求标识',200),requiredText(payload.botId,'Bot 标识',200),payload.expectedGeneration as number)};
       if (endpoint === 'manager.status') return {ok:true,value:store.managerInfo(requiredText(payload.botId,'Bot 标识',200))};

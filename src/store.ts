@@ -168,6 +168,13 @@ export class Store {
   managerForSession(sessionId:string):ManagerBinding|null {
     const row=this.db.prepare("SELECT * FROM managers WHERE requestedSessionId=? AND state!='released'").get(sessionId) as unknown as ManagerBinding|undefined;return row?{...row}:null;
   }
+  /** Only the current, ready native Bot conversation owns a chat-adjacent work view. */
+  botForSession(sessionId:string):Bot|null {
+    const manager=this.managerForSession(sessionId);
+    if(!manager||manager.state!=='ready'||manager.sessionId!==sessionId)return null;
+    const bot=this.getBot(manager.botId);
+    return bot.managerSessionId===sessionId&&bot.configRevision===manager.configRevision&&this.activeManager(bot.id)?.id===manager.id?bot:null;
+  }
   beginManager(requestId:string,botId:string,cwd:string):ManagerBinding {
     return this.command(requestId,'manager.prepare',{botId,cwd},()=>{
       const bot=this.getBot(botId),existing=this.activeManager(botId);if(existing)return existing;

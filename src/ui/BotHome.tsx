@@ -1,7 +1,8 @@
 import { useEffect, useRef, useState, type FormEvent } from 'react';
-import type { Bot,Task } from '../model.ts';
+import type { Bot } from '../model.ts';
 import { Workspace, type WorkspaceApi } from './Workspace.tsx';
 import { styles } from './styles.ts';
+import { readTaskLink } from './work-navigation.ts';
 
 /** Native DSH owns the conversation, composer, model choice and history. */
 export function BotHome({api}:{api:WorkspaceApi}) {
@@ -18,7 +19,8 @@ export function BotHome({api}:{api:WorkspaceApi}) {
     const navigate=()=>{
       controller?.abort();controller=new AbortController();const signal=controller.signal;
       const taskId=location.hash.match(/^#super-bot-task=([a-f0-9-]{36})$/)?.[1];if(!taskId)return;
-      api.call<{task:Task}>('task.detail',{id:taskId},signal).then(({task})=>{if(!signal.aborted)setWork({botId:task.botId,taskId:task.id});}).catch(e=>{if(!signal.aborted)setError(e.message);});
+      const navigation=api.beginNavigation();
+      readTaskLink(api,taskId,signal,navigation).then(task=>{if(task)setWork({botId:task.botId,taskId:task.id});}).catch(e=>{if(!signal.aborted&&!navigation.aborted)setError(e.message);});
     };
     navigate();window.addEventListener('hashchange',navigate);return()=>{controller?.abort();window.removeEventListener('hashchange',navigate);};
   },[api]);
@@ -38,14 +40,14 @@ export function BotHome({api}:{api:WorkspaceApi}) {
     }catch(e){if(alive.current)setError(e instanceof Error?e.message:'暂时无法创建，请重试。');}
     finally{locked.current=false;if(alive.current)setBusy(false);}
   }
-  if(work!==null)return <div style={{height:'100%',display:'flex',flexDirection:'column'}}><div className="sb" style={{height:'auto',flexShrink:0,padding:12}}><style>{styles}</style><button onClick={()=>{history.replaceState(null,'',location.pathname+location.search);window.dispatchEvent(new Event('hashchange'));setWork(null);}}>← 我的 Bot</button></div><div style={{flex:1,minHeight:0}}><Workspace api={api} key={work.taskId??work.botId} initialBotId={work.botId} initialTaskId={work.taskId}/></div></div>;
+  if(work!==null)return <div style={{height:'100%',display:'flex',flexDirection:'column'}}><div className="sb" style={{height:'auto',flexShrink:0,padding:12}}><style>{styles}</style><button onClick={()=>{api.beginNavigation();history.replaceState(null,'',location.pathname+location.search);window.dispatchEvent(new Event('hashchange'));setWork(null);}}>← 我的 Bot</button> <button onClick={()=>void api.openBot(work.botId).catch(e=>setError(e.message))}>返回这个 Bot 聊天 →</button>{error&&<p role="alert">{error}</p>}</div><div style={{flex:1,minHeight:0}}><Workspace api={api} key={work.taskId??work.botId} initialBotId={work.botId} initialTaskId={work.taskId}/></div></div>;
   return <div className="sb"><style>{styles}</style><main className="sb-wrap" style={{maxWidth:820}}>
     <header className="sb-header"><div><div className="eyebrow">Super Bot</div><h1>你想一起做点什么？</h1><p className="muted">和 Bot 聊聊，把事情交给它，完成后它会回来告诉你。</p></div>{bots.length>0&&<button disabled={busy} onClick={()=>setCreating(true)}>新建 Bot</button>}</header>
     {error&&<p role="alert" className="notice error">{error}</p>}
     {loading?<p className="muted">正在读取你的 Bot…</p>:<>
       {bots.map(bot=><article key={bot.id} style={{display:'flex',gap:12,alignItems:'center',borderBottom:'1px solid var(--sb-line)',padding:'18px 0'}}>
         <button disabled={busy} style={{flex:1,textAlign:'left',padding:18}} onClick={()=>void chat(bot)}><strong style={{fontSize:18}}>{bot.name}</strong><div className="muted" style={{marginTop:8}}>继续聊天 →</div></button>
-        <button disabled={busy} onClick={()=>setWork({botId:bot.id})}>工作与设置</button>
+        <button disabled={busy} onClick={()=>{api.beginNavigation();setWork({botId:bot.id});}}>工作与设置</button>
       </article>)}
       {(creating||bots.length===0)&&<form className="form" onSubmit={create} style={{marginTop:28}}><h2>{bots.length?'新建 Bot':'创建你的第一个 Bot'}</h2>
         <label htmlFor="sb-home-name">给它起个名字</label><input id="sb-home-name" autoFocus required maxLength={80} disabled={busy} value={name} placeholder="例如：小帮手" onChange={e=>{setName(e.target.value);request.current=crypto.randomUUID();}}/>
