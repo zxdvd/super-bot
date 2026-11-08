@@ -448,3 +448,39 @@ ELECTRON_RUN_AS_NODE=1 '/Applications/DeepSeek Harness.app/Contents/MacOS/DeepSe
 - `fnm exec --using=24.21.0 npm run check`：最终退出 0，63 核心 + 72 适配 = 135 项，typecheck 和 Host/Client build 全通过；Node 实际打印 `v24.21.0`。源码最后一处“完整说明”展开文案后又完整执行一次并打印 `FINAL_CHECK_EXIT=0`，原始合成测试日志仅在忽略的 [.runtime 检查日志](../../../.runtime/df06-final-check-XXXXXX.log)，不随产品提交。检查脚本未加入安装或重载行为。
 - `git diff --check` 退出 0；`git diff --exit-code ad73346 -- src/dsh.ts src/manager.ts src/runtime.ts test/adapter/p2.test.ts docs/development-hmr.md schema-version.json` 退出 0，外层提示、respond 修复、角色权限和 schema 未覆盖。产品版本仍 `0.1.3`。[package](../../../package.json) 和 [lock](../../../package-lock.json) 仅把已存在的 sidebar-right/conversation/session 三个 rc.1 包补为直接 dev/peer 与 client inject 声明，无安装、无新包解析。开始及收尾状态均未观察到额外并发源码变更，本轮全部源码差异为本 Worker，外层基线提交不计入成果。
 - 限制与交接：本轮未执行实际浏览器宽/窄屏、空白/已有聊天入口点击、真实 UI 回答/停止/恢复/返工/接受、刷新/工作页选择记忆复验，也未验证真实模型体验或 HTTP 下载。未执行 `dev:reload`、安装、宿主重载/重启、Git 提交/推送或升版本；未修改 DSH 安装源码、凭证或其他项目。只做源码构建，不能承诺当前 GUI 已更新；待 Bot/Worker 空闲后由外层原生 HMR 并做上述浏览器验证。DF-06、SB-15/FV 不因本次源码交付勾选，前两轮及本轮成果都待人工验收；未填补或修改说明任务 `e9c2efdf-1511-4517-84ad-4b8dfdb2a4e2` 的缺项或状态，交回 Bot 按既定队列继续。
+
+## 2026-11-09：DF-08 原生侧栏命名与安全整理（run083，待人工验收）
+
+### 本轮事实与范围
+
+- 当前 run 为 `08311e89-da61-485d-a144-74895513c17c`。重新核对 cwd 为本仓库、HEAD 为 `589c245e386e360a13d76e0d91f2a6892cf15a5b`；本轮开始已有前一尝试 `e9619ce2-be6e-4162-90e0-bdc2a020650b` 遗留的 10 个 tracked 修改与 2 个 untracked 文件，均为此项 DF-08 工作，未冒称本轮从干净工作树开始。前一尝试的检查不作为本 run 的完成依据，本轮重新读指引/DF-08/原生契约、审查实现、补修复并完整重跑。没有回滚或覆盖其他任务成果，也未询问目录释放。
+- 初次实施已读 [AGENTS](../../../AGENTS.md)、[README](../../../README.md)、[ROADMAP](../../../ROADMAP.md)、活动 change README/tasks/evidence、Bot Workspace 与执行契约；本轮再次读取相应当前内容。只读研究仓库安装的 DSH `0.2.2-rc.1` SDK 类型与发行 JS，不改 SDK 或宿主。静态发现：Worker 的 `super-bot` 消息不属于原生标题生成接受的 `user` 来源；Workspace create 按 canonical path 复用且不更新旧 title；Workspace 没有命名来源/owner/CAS，不能以旧名文本或目录推断独占归属。
+
+### 最小机制与验收边界
+
+1. **新命名**：[Worker 适配](../../../src/dsh.ts) 在确认 Binding 前写原生短标题（首段最多 24 个 Unicode code point + 短 task ID），新项目 Workspace 使用目录 basename。复用原生 Session、Workspace、标题事件与 Host SessionStore.flush，不增加侧栏、表、schema、聊天数据库或通用框架。Manager 使用 Bot 名，但不再无条件覆盖已有 Workspace/会话标题。
+2. **可靠归属及用户名称**：[Store 查询](../../../src/store.ts) 要求当前 Bot、匹配 Binding/task 及 `session.preparing` 创建事件，排除外部授权 attachment 和过期目标代数。[整理适配](../../../src/sidebar.ts) 再核对原生 Session ID、root/nonseeded、cwd 和当前 Manager 身份；只从 Host live SessionStore 取已加载对象，不 resolve/resume 冷历史。原生 `sessionTitle.get` 的 undefined/fallback/provider 才可整理；任何 user 来源都保留，包括文本恰好为 Untitled/旧自动名的情况。同步检查来源→原生 rename，无 await 间隙；realpath 后重查归档、live 对象、taskRevision，flush 后重查 Manager，防迟到变更越界。
+3. **幂等及失败恢复**：原生 rename 产生 user 来源后，重复整理不再追加或覆盖，仅重试持久化检查；flush=false/throw 均不谎报成功。新会话创建仍先落意图/claim，未知回执只找同 requested ID，不二次 create。明确返回不同 ID 的事实保存在现有 metadata 中并保持硬性待核对，后续不自动收养原 ID；当前无自动解除标记/重建 UI。Manager partial attach failure 会恢复同 ID 的 Workspace membership，且先核对 root/nonseeded/目录，避免拒绝前改动其他资源。同任务返工保留 Binding/Session/短名或用户名，不新建或接受成果。
+4. **置顶与归档**：[工作视图](../../../src/ui/Workspace.tsx) 增加显式“置顶主聊天”“整理自动会话名”，经原有认证 API 调用原生能力。只有用户点击置顶才调用 pinSession；prepare/open/tidy 永不 pin/unpin，因而不重置取消置顶偏好。整理不 archive/unarchive、不派发、不取消或改人工验收。任何已存在 Workspace 均不自动 setTitle；即使像插件旧长名，也保留原生手动改名。冷历史、不确定历史和归档留原生手动处理，不为了隐藏待验收/待返工 Worker 改生命周期。
+
+### 本 run 的实际验证
+
+- 新增“Manager seeded/subagent 恢复必须在 membership mutation 前拒绝”两项回归：`fnm exec --using=24.21.0 node --import tsx --test --test-name-pattern='recovery before mutating' test/adapter/sidebar.test.ts` 在本轮修复前实际退出 **1**，2/2 因 attach 计数 1 而非 0 失败。将已有完整身份检查前移至 Workspace create/attach 之前，并在 await 后复核 released；下述本轮回归全部通过，未强改实现制造红测。
+- `fnm exec --using=24.21.0 node --version`：实际 `v24.21.0`、退出 **0**。
+- `fnm exec --using=24.21.0 node --import tsx --test test/adapter/sidebar.test.ts test/adapter/manager-lifecycle.test.ts test/adapter/p2.test.ts test/adapter/work-view.test.ts`：**61/61，退出 0**，打印 `RUN083_TARGETED_EXIT=0`。其中 DF-08 新增文件本身 28 项，包含真实安装库 SessionTitleService 的规范化/source/log-append 语义；其他宿主能力、durability checkpoint 和侧栏对象为合成边界，产品 Store/适配代码实际执行。
+- `fnm exec --using=24.21.0 npm run check`：本 run 实际重跑 **退出 0**，**63 核心 + 100 适配 = 163 项通过**，typecheck、Host/Client build 通过，打印 `RUN083_FULL_CHECK_EXIT=0`。原始合成输出仅在忽略的 [本轮检查日志](../../../.runtime/df08-run083-check.PL9Vid)，不随产品打包。
+- 回归覆盖当前 Bot/其他 Bot/普通及 attachment、重复整理、用户取名 Untitled/后续改名、用户取消置顶、未加载/归档/fork/子 Agent/目录不符、create accepted-then-throw、并发重试、rename/flush 失败、false flush、Manager partial attachment、native 不同 ID 两次调用拒绝，以及 realpath 期间改名/归档/更换 Manager/移除 live Session/改变目标版本；同任务 review→返工仍保留 Session 与用户名称、humanAcceptedAt=null，零自动归档。
+- 本轮最终 `git diff --check` **退出 0**（`RUN083_DIFF_CHECK_EXIT=0`）；对照 `589c245` 的权限/模型配置、领域模型、schema、原聊天旁入口/导航、build/dev/reload 脚本无差异，**退出 0**（`RUN083_PROTECTED_BASELINE_EXIT=0`），HEAD 未改变。检查期间未观察到额外并发源码变更。
+- 独立子 Agent 只读审查了原生契约及实现，发现的 partial attachment、mismatch 重试、异步核验窗口均已有保护与回归。本轮进一步实测并修正了 header 验证顺序；审查者复看新 delta 后无新增 must-fix。静态审查不是实际宿主验收。
+
+### 全部改动文件（13 个，正式报告选 10 个关键文件）
+
+- 源码 6 个：[sidebar](../../../src/sidebar.ts)、[dsh](../../../src/dsh.ts)、[manager](../../../src/manager.ts)、[store](../../../src/store.ts)、[index](../../../src/index.ts)、[Workspace](../../../src/ui/Workspace.tsx)。
+- 测试 3 个：[sidebar.test](../../../test/adapter/sidebar.test.ts)、[manager-lifecycle.test](../../../test/adapter/manager-lifecycle.test.ts)、[p2.test](../../../test/adapter/p2.test.ts)。后两者仅调整新增原生能力的合成宿主接线；Manager late-inheritance 用例仍在已 ready 后的解析窗口检查撤权，没有删除或放宽既有业务断言。
+- 文档/声明 4 个：[本证据](evidence.md)、[README](../../../README.md)、[package](../../../package.json)、[lock](../../../package-lock.json)。后两者只把已经安装/锁定的 session-title rc.1 补为根 dev/peer 声明，无安装、新解析或版本升级；正式报告证据链接的额外三文件为 README/package/lock，不能因只提交 10 个关键路径而遗漏披露。
+
+### 未验证与交接
+
+- 本轮未在日常 profile 执行探针、整理或真实聊天操作；未安装、HMR、dev:reload、重载/重启正在执行的插件或宿主；未修改 DSH 安装源码、其他仓库、真实 profile/凭证；未升产品版本（仍 0.1.3）、提交或推送 Git。权限/模型配置、schema 和开发重载脚本不在本轮改动范围。
+- 待外层在 Bot/Worker 空闲后加载，通过产品能力验证真实侧栏的新 Worker 名/项目名、已有真实历史的可整理覆盖、置顶→手动取消→再次打开/整理、用户改名、同任务返工，以及按钮反馈/宽窄屏。已有 Workspace 名或冷历史不是自动迁移承诺；不可安全推断的保留原生手动操作。构建通过不表示当前 GUI 已加载，也不等于真实浏览器或真实模型验收。
+- DF-08、SB-15/FV 不因源码交付勾选；所有既有和本次成果保持待人工验收，由 Bot 在原对话交付，用户决定是否接受。

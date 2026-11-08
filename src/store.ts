@@ -367,6 +367,17 @@ export class Store {
     const binding=this.db.prepare("SELECT * FROM bindings WHERE taskId=? AND state!='released'").get(taskId) as unknown as Binding | undefined;
     return binding?{...binding}:null;
   }
+  /** Only sessions actually created by this plugin, not user-authorized attachments.
+   * Stale goal generations lack their original title input: leave those native/manual.
+   */
+  sidebarWorkers(botId:string):{binding:Binding;task:Task}[] {
+    this.getBot(botId);
+    const rows=this.db.prepare(`SELECT b.* FROM bindings b JOIN tasks t ON t.id=b.taskId
+      WHERE t.botId=? AND b.sessionId=b.requestedSessionId AND b.taskRevision=t.taskRevision
+      AND EXISTS (SELECT 1 FROM events e WHERE e.kind='session.preparing' AND e.taskId=t.id AND json_extract(e.data,'$.bindingId')=b.id)
+      ORDER BY b.createdAt,b.id`).all(botId) as unknown as Binding[];
+    return rows.map(binding=>({binding,task:this.getTask(binding.taskId)}));
+  }
   getBinding(id: string): Binding {
     const binding=this.db.prepare('SELECT * FROM bindings WHERE id=?').get(id) as unknown as Binding | undefined;
     if(!binding)throw new AppError('not-found','会话关联不存在。');return {...binding};

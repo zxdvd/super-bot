@@ -12,7 +12,8 @@ import { createUserMessage,freezeMessage,type UserMessage } from '@deepseek-ai/d
 import { SessionId } from '@deepseek-ai/dsh-session/types';
 import { mkdir, realpath } from 'node:fs/promises';
 import { realpathSync } from 'node:fs';
-import { join,isAbsolute } from 'node:path';
+import { join,isAbsolute,basename } from 'node:path';
+import {nameAutomaticSession,workerTitle} from './sidebar.ts';
 import { AppError,requiredText,optionalText,type Binding,type Run,type WorkReport,type ExistingSessionGrant,type ExistingSessionPreview } from './model.ts';
 import type { Store } from './store.ts';
 import { collectEvidence,containedPath,verifyEvidence,evidencePaths } from './evidence.ts';
@@ -261,21 +262,26 @@ export class DshExecution {
     if(!this.store.claimBindingCreation(b.id))return this.reconcileBinding(b.id);
     const promise=(async()=>{
       try {
-        const workspace=await this.ctx.workspaceRegistry.create(b.cwd,`Super Bot · ${task.goal.slice(0,40)}`);
+        const workspace=await this.ctx.workspaceRegistry.create(b.cwd,basename(b.cwd));
         const result=await this.ctx.sessionController.create({workspaceId:workspace.id,sessionId:SessionId(b.requestedSessionId)});
-        return this.store.confirmBinding(b.id,result.sessionId);
+        if(result.sessionId!==b.requestedSessionId){this.store.set(`native-create-mismatch:${b.id}`,result.sessionId);throw new AppError('session-mismatch','宿主返回了不同会话，尚未命名或关联。');}
+        return await this.reconcileBinding(b.id);
       }catch(error){this.store.bindingRecovery(b.id);throw error instanceof AppError?error:new AppError('session-recovery','会话创建结果暂未确认，请在任务详情核对。');}
       finally{this.creating.delete(b.id);}
     })();this.creating.set(b.id,promise);return promise;
   }
   async reconcileBinding(id:string):Promise<Binding> {
     const b=this.store.getBinding(id);
-    if(b.state==='ready')return b;
+    if(b.state==='ready'||b.state==='released')return b;
+    if(this.store.get(`native-create-mismatch:${id}`))throw new AppError('session-mismatch','宿主已返回不同会话，保留待人工核对，不能自动关联原请求 ID。');
     const resolved=await this.ctx.sessionController.resolveAgent(SessionId(b.requestedSessionId));
     if('error' in resolved){this.store.bindingRecovery(id);throw new AppError('session-recovery','尚未找到已申请的会话；保持待核对，没有重复创建。');}
     const header=resolved.agent.session.header;
-    if(header.origin==='subagent'||!header.cwd||await realpath(header.cwd)!==b.cwd){this.store.bindingRecovery(id);throw new AppError('session-mismatch','会话目录或归属不一致，尚未关联。');}
-    const workspace=await this.ctx.workspaceRegistry.create(b.cwd);await workspace.attachSession(SessionId(b.requestedSessionId));
+    if(resolved.agent.session.id!==b.requestedSessionId||header.origin==='subagent'||header.isSeeded||!header.cwd||await realpath(header.cwd)!==b.cwd){this.store.bindingRecovery(id);throw new AppError('session-mismatch','会话目录或归属不一致，尚未关联。');}
+    const workspace=await this.ctx.workspaceRegistry.create(b.cwd,basename(b.cwd));await workspace.attachSession(SessionId(b.requestedSessionId));
+    if(this.store.getBinding(id).state==='released')return this.store.getBinding(id);
+    if(this.store.getTask(b.taskId).taskRevision!==b.taskRevision)throw new AppError('binding-stale','任务版本已改变，尚未命名旧会话。');
+    await nameAutomaticSession(this.ctx,resolved.agent.session,workerTitle(this.store.getTask(b.taskId)));
     return this.store.confirmBinding(id,b.requestedSessionId);
   }
 }

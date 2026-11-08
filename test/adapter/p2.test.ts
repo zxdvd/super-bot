@@ -33,14 +33,17 @@ function fixture(t:TestContext) {
     finally{toolSet.dispose();}
   };
   let delivered:any;
+  const titles=new Map<any,any>();
   const ctx={
+    sessionTitle:{get:(session:any)=>titles.get(session),rename:(session:any,title:string)=>{const value={title,source:{kind:'user'}};titles.set(session,value);return value;}},
+    sessions:{get:(id:string)=>agents.get(id)?.session,flush:async()=>true},
     effect:(callback:()=>unknown)=>callback(),
     on:(name:string,callback:Function)=>{const list=listeners.get(name)??[];list.push(callback);listeners.set(name,list);return ()=>{list.splice(list.indexOf(callback),1);};},
     tools:{register:(tool:any,options:any)=>{tools.set(tool.name,tool);const off=registry.register(tool,options);registrations.push(off);return off;}},
     agents:{list:()=>[],isOwnedBy:()=>false},jobs:{list:()=>[]},
     workingDirectory:{get:(session:any)=>session.header.cwd},
     sessionProjections:{snapshot:()=>({values:{modelSelection:{next:{provider:'synthetic',model:'synthetic'}}}})},
-    workspaceRegistry:{create:async(cwd:string)=>({id:cwd})},
+    workspaceRegistry:{create:async(cwd:string)=>({id:cwd,attachSession:async()=>{}})},
     sessionController:{
       create:async({workspaceId,sessionId}:{workspaceId:string;sessionId:string})=>{
         let resolveIdle:()=>void=()=>{},idle=Promise.resolve();

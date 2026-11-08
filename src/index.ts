@@ -12,11 +12,12 @@ import { Store } from './store.ts';
 import { DshExecution } from './dsh.ts';
 import type {RuntimeOptions} from './runtime.ts';
 import { Managers } from './manager.ts';
+import { NativeSidebar } from './sidebar.ts';
 import { createLedgerBackup } from './backups.ts';
 import { AppError, requiredText, optionalText,type WorkspaceStatus, type NewBot, type NewTask, type ControlMode } from './model.ts';
 
 export const name = 'super-bot';
-export const inject = ['connection', 'sessionController', 'workspaceRegistry','agents','tools','jobs','systemPrompt','workingDirectory','sessionProjections','webServer','permissionPresets','sessions','sessionPersistence'];
+export const inject = ['connection', 'sessionController', 'workspaceRegistry','agents','tools','jobs','systemPrompt','workingDirectory','sessionProjections','webServer','permissionPresets','sessions','sessionPersistence','sessionTitle'];
 const roleModel=Schema.union([Schema.const(undefined),Schema.object({provider:Schema.string().required(),model:Schema.string().required(),reasoningEffort:Schema.string()})]);
 export const Config = Schema.object({ dataDir: Schema.string().description('Super Bot 本地数据目录'), fullAccess:Schema.boolean().default(false),workspace:Schema.string(),managerModel:roleModel,workerModel:roleModel });
 
@@ -25,6 +26,7 @@ export function apply(ctx: Context, config: RuntimeOptions & { dataDir?: string 
   const store = new Store(join(dataDir, 'ledger.sqlite'));
   const execution=new DshExecution(ctx,store,dataDir,config);
   const managers=new Managers(ctx,store,execution,dataDir,()=>ctx.webServer.getOrigin(),config);
+  const sidebar=new NativeSidebar(ctx,store);
   ctx.effect(() => async () => {await managers.dispose();await execution.dispose();store.close();});
   execution.install();
   managers.install();
@@ -40,6 +42,10 @@ export function apply(ctx: Context, config: RuntimeOptions & { dataDir?: string 
       if (endpoint === 'backup.create') return {ok:true,value:await createLedgerBackup(store,dataDir,requiredText(payload.requestId,'请求标识',200))};
       if (endpoint === 'bot.list') return { ok: true, value: store.listBots() };
       if (endpoint === 'bot.for-session') return { ok: true, value: store.botForSession(requiredText(payload.sessionId,'会话标识',200)) };
+      if (endpoint === 'sidebar.tidy' || endpoint === 'sidebar.pin') {
+        const botId=requiredText(payload.botId,'Bot 标识',200),sessionId=requiredText(payload.sessionId,'主聊天标识',200);
+        return {ok:true,value:endpoint==='sidebar.tidy'?await sidebar.tidy(botId,sessionId):await sidebar.pin(botId,sessionId)};
+      }
       if (endpoint === 'manager.prepare') return {ok:true,value:await managers.prepare(requiredText(payload.requestId,'请求标识',200),requiredText(payload.botId,'Bot 标识',200))};
       if (endpoint === 'manager.replace') return {ok:true,value:await managers.replace(requiredText(payload.requestId,'请求标识',200),requiredText(payload.botId,'Bot 标识',200),payload.expectedGeneration as number)};
       if (endpoint === 'manager.status') return {ok:true,value:store.managerInfo(requiredText(payload.botId,'Bot 标识',200))};

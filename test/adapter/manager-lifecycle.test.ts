@@ -13,11 +13,14 @@ function fixture(){
   const bot=store.createBot('bot',{name:'Bot',instructions:'Original config'});
   const agents=new Map<string,any>();let creates=0,resolves=0;
   let beforeResolve:((id:string)=>Promise<void>)|undefined;
+  const titles=new Map<any,any>();
   const ctx={
+    sessionTitle:{get:(session:any)=>titles.get(session),rename:(session:any,title:string)=>{const value={title,source:{kind:'user'}};titles.set(session,value);return value;}},
+    sessions:{flush:async()=>true},
     sessionProjections:{snapshot:(session:any)=>({values:{modelSelection:{next:agents.get(session.id).selection}}})},
-    workspaceRegistry:{create:async(cwd:string)=>({id:cwd,setTitle:async()=>{}})},
+    workspaceRegistry:{create:async(cwd:string)=>({id:cwd,attachSession:async()=>{}})},
     sessionController:{
-      create:async({sessionId,workspaceId}:any)=>{creates++;const agent:any={id:sessionId,session:{id:sessionId,header:{cwd:workspaceId}},status:'idle',inbox:{nextTurn:[],nextStep:[]},selection:null};agent.model={select:(model:any)=>{agent.selection=model;}};agents.set(sessionId,agent);return {sessionId};},
+      create:async({sessionId,workspaceId}:any)=>{creates++;const agent:any={id:sessionId,session:{id:sessionId,header:{id:sessionId,cwd:workspaceId,isSeeded:false}},status:'idle',inbox:{nextTurn:[],nextStep:[]},selection:null};agent.model={select:(model:any)=>{agent.selection=model;}};agents.set(sessionId,agent);return {sessionId};},
       rename:async()=>{},resolveAgent:async(id:string)=>{resolves++;await beforeResolve?.(id);return agents.has(id)?{agent:agents.get(id)}:{error:'missing'};},
     },
   } as unknown as Context;
@@ -61,7 +64,7 @@ test('interrupted replacement only resumes preparation while its original config
 test('late model inheritance rechecks the prepared generation after resolving its native Agent',async()=>{
   const f=fixture();try{
     const first=await f.managers.prepare('prepare',f.bot.id);f.agents.get(first.sessionId!).selection=model;
-    f.beforeResolve(async id=>{if(id!==first.sessionId)f.store.updateBot('update',f.bot.id,1,{name:'Changed',instructions:'New config'},[]);});
+    f.beforeResolve(async id=>{if(id!==first.sessionId&&f.store.activeManager(f.bot.id)?.state==='ready')f.store.updateBot('update',f.bot.id,1,{name:'Changed',instructions:'New config'},[]);});
     const result=await f.managers.replace('replace',f.bot.id,1);
     assert.equal(result.state,'released');assert.equal(f.agents.get(result.sessionId!).selection,null);assert.equal(f.store.activeManager(f.bot.id),null);
   }finally{await f.close();}

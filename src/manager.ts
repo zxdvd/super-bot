@@ -14,6 +14,7 @@ import { selectedModel,modelFailureNote,type DshExecution } from './dsh.ts';
 import { previewEvidence } from './evidence.ts';
 import {configureRole,type RuntimeOptions} from './runtime.ts';
 import { readMaterials,materialPrompt } from './materials.ts';
+import {nameAutomaticSession} from './sidebar.ts';
 
 declare module '@deepseek-ai/dsh-llm' {
   interface MessageSourceMap {'super-bot-manager':{kind:'super-bot-manager';botId:string;managerId:string;eventId:string}}
@@ -268,6 +269,7 @@ export class Managers {
     const promise=(async()=>{
       try {
         let sessionId:string;
+        if(this.store.get(`native-create-mismatch:${manager.id}`))throw new AppError('manager-recovery','宿主已返回不同会话，保留待人工核对，不能自动关联原请求 ID。');
         if(!this.store.claimManagerCreation(manager.id)) {
           const resolved=await this.ctx.sessionController.resolveAgent(SessionId(manager.requestedSessionId));
           if('error' in resolved||resolved.agent.session.header.cwd!==manager.cwd)throw new AppError('manager-recovery','管理会话创建结果待核对，没有重复创建。');
@@ -277,9 +279,16 @@ export class Managers {
           const created=await this.ctx.sessionController.create({workspaceId:workspace.id,sessionId:SessionId(manager.requestedSessionId)});
           sessionId=created.sessionId;
         }
+        if(sessionId!==manager.requestedSessionId){this.store.set(`native-create-mismatch:${manager.id}`,sessionId);throw new AppError('manager-recovery','宿主返回了不同会话，尚未命名或关联。');}
+        const resolved=await this.ctx.sessionController.resolveAgent(SessionId(sessionId));
+        if('error' in resolved||resolved.agent.session.id!==sessionId||resolved.agent.session.header.origin==='subagent'||resolved.agent.session.header.isSeeded||resolved.agent.session.header.cwd!==manager.cwd)throw new AppError('manager-recovery','管理会话归属待核对，尚未命名或关联 Workspace。');
+        if(this.store.getManager(manager.id).state==='released')return this.store.getManager(manager.id);
         const workspace=await this.ctx.workspaceRegistry.create(manager.cwd,bot.name);
-        await workspace.setTitle(bot.name);
-        await this.ctx.sessionController.rename({sessionId:SessionId(sessionId),title:bot.name});
+        if(this.store.getManager(manager.id).state==='released')return this.store.getManager(manager.id);
+        await workspace.attachSession(SessionId(sessionId));
+        if(this.store.getManager(manager.id).state==='released')return this.store.getManager(manager.id);
+        await nameAutomaticSession(this.ctx,resolved.agent.session,bot.name);
+        if(this.store.getManager(manager.id).state==='released')return this.store.getManager(manager.id);
         return this.store.confirmManager(manager.id,sessionId);
       }finally{this.creating.delete(manager.id);}
     })();this.creating.set(manager.id,promise);return promise;
