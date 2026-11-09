@@ -17,7 +17,9 @@ export const inject = ['slots', 'uiWorkspace', 'connection', 'layout', 'sidebarR
 type ClientContext = Omit<Context, 'connection'> & { connection: ConnectionHandle };
 
 function Icon({ size = 20 }: { size?: number }) {
-  return <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.6"><rect x="4" y="7" width="16" height="13" rx="4"/><path d="M12 3v4M8 12v2m8-2v2m-7 3h6"/></svg>;
+  return <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.6">
+    <rect x="4" y="7" width="16" height="13" rx="4"/><path d="M12 3v4M8 12v2m8-2v2m-7 3h6"/>
+  </svg>;
 }
 
 export function apply(context: Context): void {
@@ -38,21 +40,28 @@ export function apply(context: Context): void {
     const click=(event:MouseEvent)=>{
       const link=event.target instanceof Element?event.target.closest('a'):null;
       if(!link)return;const url=new URL(link.href,location.href);
-      if(url.origin===location.origin&&url.pathname==='/api/super-bot-file'){event.stopPropagation();link.setAttribute('download','');return;}
+      if(url.origin===location.origin&&url.pathname==='/api/super-bot-file'){
+        event.stopPropagation();link.setAttribute('download','');return;
+      }
       if(url.origin!==location.origin||!/^#super-bot-task=[a-f0-9-]{36}$/.test(url.hash))return;
-      event.preventDefault();event.stopPropagation();history.replaceState(null,'',location.pathname+location.search+url.hash);select();window.dispatchEvent(new Event('hashchange'));
+      event.preventDefault();event.stopPropagation();
+      history.replaceState(null,'',location.pathname+location.search+url.hash);select();window.dispatchEvent(new Event('hashchange'));
     };
     document.addEventListener('click',click,true);window.addEventListener('hashchange',select);
     return()=>{document.removeEventListener('click',click,true);window.removeEventListener('hashchange',select);};
   });
-  ctx.effect(()=>ctx.sidebarRightTabs.register({id:WORK_TAB,kind:WORK_TAB,title:()=> '工作',guide:[{id:'work',order:20,title:()=> '当前 Bot 的工作',description:()=> '进展、需要你处理的事与成果',icon:Icon}]}));
+  const guide={id:'work',order:20,title:()=> '当前 Bot 的工作',description:()=> '进展、需要你处理的事与成果',icon:Icon};
+  ctx.effect(()=>ctx.sidebarRightTabs.register({id:WORK_TAB,kind:WORK_TAB,title:()=> '工作',guide:[guide]}));
   for(const name of ['conversation.session.header.actions','conversation.hero.options'] as const) {
-    ctx.slots.inject(name,()=>ctx.slots.register({name,id:WORK_TAB,order:20},(props:{sessionId:SessionId})=><WorkButton api={api} sessionId={props.sessionId} sidebar={ctx.sidebarRight}/>));
+    ctx.slots.inject(name,()=>ctx.slots.register({name,id:WORK_TAB,order:20},
+      (props:{sessionId:SessionId})=><WorkButton api={api} sessionId={props.sessionId} sidebar={ctx.sidebarRight}/>));
   }
-  ctx.slots.inject('sidebar.right.pane.tab',()=>ctx.slots.register({name:'sidebar.right.pane.tab',key:WORK_TAB},(props:{sessionId:SessionId;useTabInfo:UseSidebarRightTabInfo})=>{
+  type TabProps={sessionId:SessionId;useTabInfo:UseSidebarRightTabInfo};
+  ctx.slots.inject('sidebar.right.pane.tab',()=>ctx.slots.register({name:'sidebar.right.pane.tab',key:WORK_TAB},(props:TabProps)=>{
     const {tab}=props.useTabInfo();
     return tab.visible?<SessionWork api={api} sessionId={props.sessionId} sidebar={ctx.sidebarRight} tabId={tab.id}/>:null;
   }));
   ctx.slots.inject('main', () => ctx.slots.register({ name: 'main', key: 'super-bot', inject: () => ({}) }, () => <BotHome api={api}/>));
-  ctx.slots.inject('sidebar.panellist', () => ctx.slots.register({ name: 'sidebar.panellist', id: 'super-bot', order: 11, label: () => 'Super Bot' }, Icon));
+  ctx.slots.inject('sidebar.panellist', () => ctx.slots.register(
+    { name: 'sidebar.panellist', id: 'super-bot', order: 11, label: () => 'Super Bot' }, Icon));
 }

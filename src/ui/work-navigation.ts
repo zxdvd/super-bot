@@ -5,7 +5,9 @@ import type { WorkspaceApi } from './Workspace.tsx';
 export const WORK_TAB = 'super-bot-work';
 
 /** No remembered Bot participates in this lookup. Undefined means a superseded read. */
-export async function readSessionBot(api: WorkspaceApi, sessionId: string, signal: AbortSignal, currentSession: () => string | undefined): Promise<Bot | null | undefined> {
+export async function readSessionBot(
+  api: WorkspaceApi, sessionId: string, signal: AbortSignal, currentSession: () => string | undefined,
+): Promise<Bot | null | undefined> {
   try {
     const bot = await api.call<Bot | null>('bot.for-session', { sessionId }, signal);
     if (signal.aborted || currentSession() !== sessionId) return undefined;
@@ -23,7 +25,9 @@ export interface SessionSource {
 export type SessionBotState = { bot: Bot | null; error?: string };
 
 /** UI-only refresh; native selection changes invalidate reads synchronously, including A → B → A. */
-export function watchSessionBot(api: WorkspaceApi, sessionId: string, source: SessionSource, receive: (state: SessionBotState | undefined) => void): () => void {
+export function watchSessionBot(
+  api: WorkspaceApi, sessionId: string, source: SessionSource, receive: (state: SessionBotState | undefined) => void,
+): () => void {
   let controller = new AbortController();
   let timer: ReturnType<typeof setTimeout>;
   async function pull(signal: AbortSignal) {
@@ -56,7 +60,9 @@ export async function openBotConversation(api: WorkspaceApi, botId: string, navi
 }
 
 /** A delivery link resolves its real task owner, but cannot outlive navigation away. */
-export async function readTaskLink(api: WorkspaceApi, taskId: string, signal: AbortSignal, navigation: AbortSignal): Promise<Task | undefined> {
+export async function readTaskLink(
+  api: WorkspaceApi, taskId: string, signal: AbortSignal, navigation: AbortSignal,
+): Promise<Task | undefined> {
   try {
     const { task } = await api.call<{ task: Task }>('task.detail', { id: taskId }, signal);
     if (signal.aborted || navigation.aborted || task.id !== taskId) return undefined;
