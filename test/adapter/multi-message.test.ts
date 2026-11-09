@@ -48,7 +48,7 @@ test('native multi-message turns preserve ordered, deduplicated full sources for
     f.emit({type:'user/message',seq:15,data:{id:'no-rpc',source:{kind:'user'},content:[{type:'text',text:'缺少原生 rpcId。'}]}});
     f.emit({type:'turn/start',data:{turn:1}},'other-session');
     f.emit({type:'user/message',seq:17,data:{id:'foreign',source:{kind:'user',rpcId:'foreign'},content:[{type:'text',text:'另一个会话。'}]}},'other-session');
-    const createArgs={action:'create',goal:'项目介绍',scope:'本地合成文档',acceptance:'包含背景和结论'};
+    const createArgs={action:'create',dispatch:false,goal:'项目介绍',scope:'本地合成文档',acceptance:'包含背景和结论'};
     const created=await f.call('create',createArgs);
     assert.deepEqual(f.source(created.task.id,'task.created'),{
       sessionId,messageId:'request-last',seq:13,
@@ -83,7 +83,7 @@ test('native multi-message turns preserve ordered, deduplicated full sources for
 
 test('turn boundaries clear human authority while automatic and other-session messages never grant it',async()=>{
   const f=fixture();try{
-    const args={action:'create',goal:'合成任务',scope:'当前仓库',acceptance:'检查来源'};
+    const args={action:'create',dispatch:false,goal:'合成任务',scope:'当前仓库',acceptance:'检查来源'};
     f.native('previous',1,'上一轮用户请求');f.emit({type:'turn/start',data:{turn:1}});
     await assert.rejects(f.call('after-start',args),{code:'human-message-required'});
     f.emit({type:'user/message',seq:3,data:{id:'other',source:{kind:'user',rpcId:'other-rpc'},content:[{type:'text',text:'另一个会话的请求'}]}},'other-session');
@@ -108,7 +108,7 @@ test('long multi-message sources are never truncated and oversized feedback fail
   const f=fixture();try{
     const first='前'.repeat(6000)+'FIRST-TAIL',last='后'.repeat(5000)+'LAST-TAIL',full=`${first}\n\n${last}`;
     f.emit({type:'turn/start',data:{turn:1}});f.native('long-first',11,first);f.native('long-last',12,last);
-    const args={action:'create',goal:'超限回答边界',scope:'当前仓库',acceptance:'完整来源，不得静默截断'};
+    const args={action:'create',dispatch:false,goal:'超限回答边界',scope:'当前仓库',acceptance:'完整来源，不得静默截断'};
     const created=await f.call('long-create',args);
     assert.deepEqual(f.source(created.task.id,'task.created'),{
       sessionId:f.manager.requestedSessionId,messageId:'long-last',seq:12,text:full,

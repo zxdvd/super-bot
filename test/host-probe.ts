@@ -101,7 +101,7 @@ class ProbeAdapter extends LlmAdapter {
         const review=tasks.find(t=>t.status==='review'&&t.controlMode==='auto'&&!t.managerReviewed);
         const queued=tasks.find(t=>t.status==='unscheduled'&&t.controlMode==='auto');
         if(target)plan={action:'detail',taskId:target.id};else if(review)plan={action:'detail',taskId:review.id};else if(queued)plan={action:'dispatch',taskId:queued.id,expectedRowVersion:queued.rowVersion};
-      }else if((['create','respond','rework'].includes(String(prior.action))||value?.prepared)&&value?.task)plan={action:'dispatch',taskId:value.task.id,expectedRowVersion:value.task.rowVersion};
+      }else if((['create','respond','rework'].includes(String(prior.action))||value?.prepared)&&value?.task&&!value?.run&&!value?.deferred)plan={action:'dispatch',taskId:value.task.id,expectedRowVersion:value.task.rowVersion};
       else if(prior.action==='detail'&&value?.task?.controlMode==='auto') {
         if(trigger?.source?.kind==='user'&&text==='再加一句结论。'&&value.result)plan={action:'rework',taskId:value.task.id,expectedRowVersion:value.task.rowVersion,resultId:value.result.id};
         else if(trigger?.source?.kind==='user'&&text==='读者是新同事，保持简短。'&&value.attentions?.some((a:any)=>a.kind==='input'&&a.state==='open'))plan={action:'respond',taskId:value.task.id,expectedRowVersion:value.task.rowVersion,attentionId:value.attentions.find((a:any)=>a.kind==='input'&&a.state==='open').id};
@@ -118,7 +118,7 @@ class ProbeAdapter extends LlmAdapter {
       }
       const detail=later.filter(m=>m.role==='tool').flatMap(m=>m.content.filter(b=>b.type==='text').map(b=>{try{return JSON.parse(b.text);}catch{return null;}})).findLast(v=>v?.delivery);
       const question=value?.attentions?.find((a:any)=>a.kind==='input'&&a.state==='open');
-      const reply=prior?.action==='review'&&detail?.delivery?`已完成：${detail.delivery.summary}\n${detail.delivery.files.map((f:any)=>`[${f.name}](${f.url})`).join('\n')}\n检查：${detail.delivery.checks}\n等待你确认。[查看成果并确认](${detail.delivery.workUrl})`:question?question.question:prior?.action==='dispatch'?'已经开始处理，完成后我会回到这里交付。':trigger?.source?.kind==='user'?'你好，我可以帮你安排文档工作。':'已核对当前状态。';
+      const reply=prior?.action==='review'&&detail?.delivery?`已完成：${detail.delivery.summary}\n${detail.delivery.files.map((f:any)=>`[${f.name}](${f.url})`).join('\n')}\n检查：${detail.delivery.checks}\n等待你确认。[查看成果并确认](${detail.delivery.workUrl})`:question?question.question:(prior?.action==='dispatch'||(prior?.action==='create'&&(value?.run||value?.deferred)))?'已经开始处理，完成后我会回到这里交付。':trigger?.source?.kind==='user'?'你好，我可以帮你安排文档工作。':'已核对当前状态。';
       yield {type:'block-start',index:0,blockType:'text'};yield {type:'text-delta',index:0,text:reply};
       yield {type:'block-end',index:0,block:{type:'text',text:reply}};yield {type:'finish',reason:{kind:'stop'}};return;
     }

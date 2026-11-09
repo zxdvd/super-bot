@@ -8,7 +8,7 @@ import type {} from '@deepseek-ai/dsh-session-persistence';
 import { SessionId } from '@deepseek-ai/dsh-session/types';
 import { mkdir,realpath } from 'node:fs/promises';
 import { join } from 'node:path';
-import { AppError,requiredText,optionalText,type ChatSource,type ManagerBinding,type NewBot,type Bot,botDraft } from './model.ts';
+import { AppError,requiredText,optionalText,type ChatSource,type ManagerBinding,type NewBot,type Bot,type Task,type Run,botDraft } from './model.ts';
 import type { Store } from './store.ts';
 import { selectedModel,modelFailureNote,type DshExecution } from './dsh.ts';
 import { previewEvidence } from './evidence.ts';
@@ -43,6 +43,9 @@ function deliveryMarkdown(text:string,links:ReturnType<typeof deliveryLinks>,hum
   return [text.trim(),...links.files.map(file=>`- [${file.name}](${file.url})`),`[${humanAcceptanceRequired?'查看成果并确认':'查看任务'}](${links.workUrl})`].join('\n');
 }
 
+const DEFAULT_SCOPE='按用户请求完成目标所需的最小改动，只在任务工作目录内进行；不访问无关账号或数据。';
+const DEFAULT_ACCEPTANCE='Worker 报告完成内容、实际执行的检查及未验证项，并提交可回读的成果文件；用户最终确认。';
+
 export class Managers {
   private userMessages=new Map<string,ChatSource[]>();
   private scopes=new Map<string,{agent:Agent;release:()=>void}>();
@@ -67,8 +70,8 @@ export class Managers {
   }
   install():void {
     this.store.resetUnconfirmedManagerEvents();
-    this.ctx.effect(()=>this.ctx.tools.register({name:'super_bot_manage',description:'Manage only this Bot\'s durable tasks. List work first. Normal conversation does not require creating a task. Short read-only/status queries (including lark-cli and shell-based skills) may run directly in the Bot when fullAccess is enabled, without a Task. Code/file changes, multi-step work and long-running tasks require a Task and Worker. In explicit files mode, explain config.fullAccess: true for Shell requests. Dispatch returns immediately; do not poll for completion. Important events wake you later. Inspect result files via detail before review. After a non-rework review, call deliver with taskId, resultId and a short text; the plugin records delivery and renders the file/task links, so reply with the returned markdown verbatim and do not write links yourself. Human acceptance is the default.',
-      parameters:{type:'object',properties:{action:{type:'string',enum:['list','detail','create','dispatch','review','respond','rework','deliver']},text:{type:'string'},taskId:{type:'string'},attentionId:{type:'string'},goal:{type:'string'},scope:{type:'string'},acceptance:{type:'string'},expectedRowVersion:{type:'integer'},resultId:{type:'string'},verdict:{type:'string',enum:['accept','rework','human']},note:{type:'string'},offset:{type:'integer'},query:{type:'string'}},required:['action'],additionalProperties:false},
+    this.ctx.effect(()=>this.ctx.tools.register({name:'super_bot_manage',description:'Manage only this Bot\'s durable tasks. List work first. Normal conversation does not require creating a task. Short read-only/status queries (including lark-cli and shell-based skills) may run directly in the Bot when fullAccess is enabled, without a Task. Code/file changes, multi-step work and long-running tasks require a Task and Worker. In explicit files mode, explain config.fullAccess: true for Shell requests. create also prepares and dispatches the Worker in the same call (pass dispatch:false only to keep a task for clarification); infer scope/acceptance from the request. Dispatch returns immediately; do not poll for completion. Important events wake you later. Inspect result files via detail before review. After a non-rework review, call deliver with taskId, resultId and a short text; the plugin records delivery and renders the file/task links, so reply with the returned markdown verbatim and do not write links yourself. Human acceptance is the default.',
+      parameters:{type:'object',properties:{action:{type:'string',enum:['list','detail','create','dispatch','review','respond','rework','deliver']},text:{type:'string'},dispatch:{type:'boolean'},taskId:{type:'string'},attentionId:{type:'string'},goal:{type:'string'},scope:{type:'string'},acceptance:{type:'string'},expectedRowVersion:{type:'integer'},resultId:{type:'string'},verdict:{type:'string',enum:['accept','rework','human']},note:{type:'string'},offset:{type:'integer'},query:{type:'string'}},required:['action'],additionalProperties:false},
       output:{schema:{type:'object',additionalProperties:true},render:(_args,value)=>[{type:'text',text:typeof (value as {delivery?:{markdown?:unknown}})?.delivery?.markdown==='string'?String((value as {delivery:{markdown:string}}).delivery.markdown):JSON.stringify(value)}]},
       execute:async(args,exec)=>{
         if(!exec.agent)throw new AppError('manager-scope','缺少管理身份。');
@@ -82,7 +85,16 @@ export class Managers {
           const ordered=[...sources].sort((a,b)=>a.seq-b.seq),latest=ordered.at(-1)!;
           return ordered.length===1?latest:{...latest,text:ordered.map(source=>source.text).join('\n\n'),messages:ordered.map(({messageId,seq,text})=>({messageId,seq,text}))};
         };
-        if(data.action==='create')return {task:this.store.createTask(requestId,{botId:bot.id,goal:requiredText(data.goal,'目标'),scope:optionalText(data.scope,'范围'),acceptance:optionalText(data.acceptance,'验收条件'),reviewPolicy:'human'},human())};
+        if(data.action==='create') {
+          // Default one step: Bot-inferred scope/acceptance (or conservative defaults) satisfy the ledger, then dispatch.
+          // dispatch:false keeps the clarification flow: missing essentials become an input question.
+          const oneStep=data.dispatch!==false;
+          const scope=optionalText(data.scope,'范围')||(oneStep?DEFAULT_SCOPE:''),acceptance=optionalText(data.acceptance,'验收条件')||(oneStep?DEFAULT_ACCEPTANCE:'');
+          const created=this.store.createTask(requestId,{botId:bot.id,goal:requiredText(data.goal,'目标'),scope,acceptance,reviewPolicy:'human'},human());
+          if(!oneStep)return {task:created};
+          authorize();const started=await this.startCreated(requestId,bot.id,created.id,exec.agent,authorize);
+          return {task:this.store.getTask(created.id),...started};
+        }
         const task=this.store.getTask(requiredText(data.taskId,'任务标识',200));
         if(task.botId!==bot.id)throw new AppError('manager-scope','只能查看或管理自己负责的任务。');
         if(data.action==='respond'||data.action==='rework') {
@@ -126,14 +138,7 @@ export class Managers {
             await this.execution.prepareSession(requestId,task.id,task.rowVersion);authorize();
             return {prepared:true,task:this.store.getTask(task.id),message:'会话已准备；使用返回的版本再次 dispatch。'};
           }
-          if(!binding.sessionId)throw new AppError('session-recovery','执行会话需要核对，不能自动重建。');
-          const resolved=await this.ctx.sessionController.resolveAgent(SessionId(binding.sessionId));authorize();
-          if('error' in resolved)throw new AppError('session-unavailable','执行会话不可用。');
-          if(!this.options.workerModel&&!selectedModel(this.ctx,resolved.agent)) {
-            const model=exec.agent.model.current();if(!model)throw new AppError('model-required','管理会话没有模型。');resolved.agent.model.select(model);
-          }
-          try{return {run:await this.execution.dispatch(requestId,task.id,task.rowVersion,authorize)};}
-          catch(error){if(error instanceof AppError&&['capacity','resource-conflict'].includes(error.code)){this.store.enqueueManager(bot.id,`capacity:${task.id}:${task.rowVersion}`,'资源等待：名额和目录可用后再次核对任务并派发。',task.id);return {deferred:true,message:'执行名额或目录已占用，已排队等待资源通知。不要轮询。'};}throw error;}
+          return this.runPrepared(requestId,bot.id,task,exec.agent,authorize);
         }
         if(data.action==='deliver') {
           const resultId=requiredText(data.resultId,'成果标识',200),text=requiredText(data.text,'交付说明',4000);
@@ -198,6 +203,31 @@ export class Managers {
     this.timer=setInterval(()=>{void this.pump();},1000);this.timer.unref();
   }
   /** Flush then read the native durable log. Live session/event and idle are not storage receipts. */
+  /** Reserve a run on an already prepared binding; capacity and directory conflicts queue a resource notification. */
+  private async runPrepared(requestId:string,botId:string,task:Task,manager:Agent,authorize:()=>void):Promise<{run:Run}|{deferred:true;message:string}> {
+    const binding=this.store.activeBinding(task.id);
+    if(!binding?.sessionId)throw new AppError('session-recovery','执行会话需要核对，不能自动重建。');
+    const resolved=await this.ctx.sessionController.resolveAgent(SessionId(binding.sessionId));authorize();
+    if('error' in resolved)throw new AppError('session-unavailable','执行会话不可用。');
+    if(!this.options.workerModel&&!selectedModel(this.ctx,resolved.agent)) {
+      const model=manager.model.current();if(!model)throw new AppError('model-required','管理会话没有模型。');resolved.agent.model.select(model);
+    }
+    try{return {run:await this.execution.dispatch(requestId,task.id,task.rowVersion,authorize)};}
+    catch(error){if(error instanceof AppError&&['capacity','resource-conflict'].includes(error.code)){this.store.enqueueManager(botId,`capacity:${task.id}:${task.rowVersion}`,'资源等待：名额和目录可用后再次核对任务并派发。',task.id);return {deferred:true,message:'执行名额或目录已占用，已排队等待资源通知。不要轮询。'};}throw error;}
+  }
+  /** One-step create: prepare the Worker session and reserve its run inside the create call; retries reuse receipts. */
+  private async startCreated(requestId:string,botId:string,taskId:string,manager:Agent,authorize:()=>void):Promise<Record<string,unknown>> {
+    const prior=this.store.runForRequest(`${requestId}:dispatch`);if(prior)return {run:prior};
+    let task=this.store.getTask(taskId);
+    if(task.controlMode!=='auto'||task.lifecycle!=='open'||!task.scope||!task.acceptance)return {message:'任务已保存，未自动派发；请核对任务状态。'};
+    try {
+      if(!this.store.activeBinding(task.id)){await this.execution.prepareSession(`${requestId}:prepare`,task.id,task.rowVersion);authorize();task=this.store.getTask(task.id);}
+      const result=await this.runPrepared(`${requestId}:dispatch`,botId,task,manager,authorize);
+      // The task is already scheduled (or queued for resources); the generic "new task" wake would be redundant.
+      this.store.settleManagerEvent(`manager-event:created:${task.id}`);
+      return result;
+    }catch(error){if(error instanceof AppError&&!['manager-scope','manager-unavailable'].includes(error.code))return {dispatchError:{code:error.code,message:error.message}};throw error;}
+  }
   private async reconcileDelivery(session:Session):Promise<void> {
     const manager=this.authority(session.id),notifications=this.store.managerNotifications(manager.botId);
     if(!notifications.length)return;

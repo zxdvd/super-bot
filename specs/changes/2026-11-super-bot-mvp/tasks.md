@@ -204,3 +204,4 @@ DF-08 验证见 [侧栏整理 Dogfooding](../../../docs/dogfooding-sidebar-2026-
 
 - [x] P0-2：任务独立目录 / Git worktree；resource-conflict 入队等待；P1-8 敏感成果拒绝名单与错误不泄露绝对路径。
 - [x] P0-3：显式 `deliver` 事务内落账并由插件渲染相对链接；文本匹配仅兜底。
+- [x] P1-5：create 默认一步派发；推断/默认范围与验收满足账本；dispatch:false 保留澄清流程。

@@ -454,6 +454,15 @@ export class Store {
     const receipt=this.commandReceipt<Binding>(requestId,'session.prepare',{taskId,expectedRowVersion,cwd:previous.cwd});
     return receipt?this.getBinding(receipt.id):undefined;
   }
+  /** Raw run receipt for an internal dispatch request ID; undefined when that dispatch never committed. */
+  runForRequest(requestId:string):Run|undefined {
+    const row=this.db.prepare('SELECT result FROM requests WHERE id=?').get(requestId) as {result:string}|undefined;if(!row)return;
+    const saved=JSON.parse(row.result) as {id?:unknown;inputId?:unknown};
+    return typeof saved.inputId==='string'&&typeof saved.id==='string'?this.getRun(saved.id):undefined;
+  }
+  settleManagerEvent(id:string):void {
+    this.db.prepare("UPDATE outbox SET state='done' WHERE id=? AND kind='manager.notify' AND state='pending'").run(id);
+  }
   managerDispatchReceipt(requestId:string,taskId:string,expectedRowVersion:number):{run:Run}|{prepared:Binding}|undefined {
     const row=this.db.prepare('SELECT result FROM requests WHERE id=?').get(requestId) as {result:string}|undefined;if(!row)return;
     const saved=JSON.parse(row.result) as Record<string,unknown>;

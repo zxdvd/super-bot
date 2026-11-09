@@ -107,7 +107,7 @@ test('reinstalled execution adapter cannot revive authority while the old Agent 
 
 test('chat creation records native provenance; automatic events and ended turns cannot invent human requests',async()=>{
  const f=fixture();try {
-  const args={action:'create',goal:'Two facts',scope:'Own directory',acceptance:'Read facts'};
+  const args={action:'create',dispatch:false,goal:'Two facts',scope:'Own directory',acceptance:'Read facts'};
   await assert.rejects(f.call('no-user',args),{code:'human-message-required'});
   f.emit({type:'turn/start',data:{turn:1}});
   f.emit({type:'user/message',seq:12,data:{id:'native-request',source:{kind:'user',rpcId:'native-rpc'},content:[{type:'text',text:'请写两项事实。'}]}});

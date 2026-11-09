@@ -82,7 +82,7 @@ for(const [label,fields] of Object.entries({omitted:{},'empty scope':{scope:''},
     const schema=f.schemas().find(tool=>tool.name==='super_bot_manage')!.parameters as any;
     assert.deepEqual(schema.required,['action']);assert.deepEqual(schema.properties.scope,{type:'string'});assert.deepEqual(schema.properties.acceptance,{type:'string'});
     await f.native('request',1,'按原范围写介绍。');
-    const created=await f.nativeCall('create',{action:'create',goal:'介绍',scope:'原范围',acceptance:'回读'});
+    const created=await f.nativeCall('create',{action:'create',dispatch:false,goal:'介绍',scope:'原范围',acceptance:'回读'});
     const prepared=await f.nativeCall('prepare',{action:'dispatch',taskId:created.task.id,expectedRowVersion:created.task.rowVersion});
     await f.nativeCall('dispatch',{action:'dispatch',taskId:created.task.id,expectedRowVersion:prepared.task.rowVersion});await f.finish(created.task.id,[],'waiting');
     const before=await f.nativeCall('detail',{action:'detail',taskId:created.task.id}),attention=before.attentions.find((a:any)=>a.kind==='input'&&a.state==='open');
@@ -112,7 +112,7 @@ for(const [label,fields] of Object.entries({omitted:{},'empty scope':{scope:''},
 test('respond native tool delivers an empty-field answer to the bound Worker without revising authorization',async t=>{
   const f=fixture(t);try {
     await f.native('request',1,'按原范围写介绍。');
-    const created=await f.nativeCall('create',{action:'create',goal:'介绍',scope:'原范围',acceptance:'回读'});
+    const created=await f.nativeCall('create',{action:'create',dispatch:false,goal:'介绍',scope:'原范围',acceptance:'回读'});
     const prepared=await f.nativeCall('prepare',{action:'dispatch',taskId:created.task.id,expectedRowVersion:created.task.rowVersion});
     await f.nativeCall('dispatch',{action:'dispatch',taskId:created.task.id,expectedRowVersion:prepared.task.rowVersion});await f.finish(created.task.id,[],'waiting');
     const before=f.store.taskDetail(created.task.id),attention=before.attentions.find(a=>a.kind==='input'&&a.state==='open')!;
@@ -131,7 +131,7 @@ test('respond native tool delivers an empty-field answer to the bound Worker wit
 test('respond native tool keeps source, version, valued-input and invalid-type rejection boundaries',async t=>{
   const f=fixture(t);try {
     await f.native('request',1,'按原范围写介绍。');
-    const created=await f.nativeCall('create',{action:'create',goal:'介绍',scope:'原范围',acceptance:'回读'});
+    const created=await f.nativeCall('create',{action:'create',dispatch:false,goal:'介绍',scope:'原范围',acceptance:'回读'});
     const prepared=await f.nativeCall('prepare',{action:'dispatch',taskId:created.task.id,expectedRowVersion:created.task.rowVersion});
     await f.nativeCall('dispatch',{action:'dispatch',taskId:created.task.id,expectedRowVersion:prepared.task.rowVersion});await f.finish(created.task.id,[],'waiting');
     const before=await f.nativeCall('detail',{action:'detail',taskId:created.task.id}),attention=before.attentions.find((a:any)=>a.kind==='input'&&a.state==='open');
@@ -167,7 +167,7 @@ test('respond native tool keeps source, version, valued-input and invalid-type r
 test('P2 incomplete unbound task can be completed by a real chat answer and dispatched',async t=>{
   const f=fixture(t);try {
     await f.native('request',1,'请安排一份介绍，范围和检查稍后补充。');
-    const created=await f.nativeCall('create',{action:'create',goal:'项目介绍'});
+    const created=await f.nativeCall('create',{action:'create',dispatch:false,goal:'项目介绍'});
     const before=await f.call('before',{action:'detail',taskId:created.task.id});
     assert.equal(before.binding,null);assert.equal(before.task.status,'needs-input');
     const attention=before.attentions.find((a:any)=>a.kind==='input'&&a.state==='open');assert.ok(attention);
@@ -195,7 +195,7 @@ test('P2 incomplete unbound task can be completed by a real chat answer and disp
 test('P2 completion keeps real multi-message sources, versions, existing scope and paused control across reopen',async t=>{
   const f=fixture(t);try {
     await f.native('request',1,'请写介绍，仅在已有范围内；验收要求稍后补充。');
-    const created=await f.call('create',{action:'create',goal:'固定目标',scope:'已有范围'});
+    const created=await f.call('create',{action:'create',dispatch:false,goal:'固定目标',scope:'已有范围'});
     const before=f.store.taskDetail(created.task.id),attention=before.attentions[0]!;
     const args={action:'respond',taskId:created.task.id,attentionId:attention.id,expectedRowVersion:before.task.rowVersion,acceptance:'回读并含结论'};
     await f.emit({type:'turn/start',data:{turn:2}});
@@ -225,7 +225,7 @@ test('P2 completion keeps real multi-message sources, versions, existing scope a
 test('P2 partial completion leaves a current question and cannot erase existing acceptance',async t=>{
   const f=fixture(t);try {
     await f.native('request',1,'范围和验收分两次补充。');
-    const created=await f.nativeCall('create',{action:'create',goal:'分次补充'}),before=f.store.taskDetail(created.task.id);
+    const created=await f.nativeCall('create',{action:'create',dispatch:false,goal:'分次补充'}),before=f.store.taskDetail(created.task.id);
     await f.emit({type:'turn/start',data:{turn:2}});await f.native('acceptance',2,'先补验收：回读内容。');
     const firstArgs={action:'respond',taskId:created.task.id,attentionId:before.attentions[0]!.id,expectedRowVersion:before.task.rowVersion,acceptance:'回读内容'};
     const first=await f.nativeCall('acceptance',firstArgs);
@@ -251,7 +251,7 @@ test('P2 partial completion leaves a current question and cannot erase existing 
 for(const damage of ['modified','deleted'] as const)test(`P2 ${damage} evidence keeps manager detail readable but cannot be accepted or downloaded`,async t=>{
   const f=fixture(t);try {
     await f.native('request',1,'写两份合成文档并回读，等我确认。');
-    const created=await f.call('create',{action:'create',goal:'两份文档',scope:'任务目录',acceptance:'回读两份文档'});
+    const created=await f.call('create',{action:'create',dispatch:false,goal:'两份文档',scope:'任务目录',acceptance:'回读两份文档'});
     const prepared=await f.call('prepare',{action:'dispatch',taskId:created.task.id,expectedRowVersion:created.task.rowVersion});
     await f.call('dispatch',{action:'dispatch',taskId:created.task.id,expectedRowVersion:prepared.task.rowVersion});
     const binding=f.store.activeBinding(created.task.id)!,first=join(binding.cwd,'first.md'),second=join(binding.cwd,'second.md');
@@ -281,7 +281,7 @@ for(const damage of ['modified','deleted'] as const)test(`P2 ${damage} evidence 
 test('P2 same native message and normalized task intent is durable across different management call IDs',async t=>{
   const f=fixture(t);try {
     await f.native('human-request',7,'写一份介绍；另一个不同范围的任务也可以单独安排。');
-    const args={action:'create',goal:'项目介绍',scope:'任务目录',acceptance:'包含背景与结论'};
+    const args={action:'create',dispatch:false,goal:'项目介绍',scope:'任务目录',acceptance:'包含背景与结论'};
     const first=await f.call('create-first',args);
     const duplicate=await f.call('create-another-call',{...args,goal:'  项目介绍\n',scope:' 任务目录 ',acceptance:'包含背景与结论\n'});
     assert.deepEqual(duplicate,first);assert.equal((await f.call('list',{action:'list'})).total,1);
@@ -305,7 +305,7 @@ test('P2 same native message and normalized task intent is durable across differ
 test('P2 creation intent uses the full ordered native message identity and canonical empty fields',async t=>{
   const f=fixture(t);try {
     await f.native('last',3,'稍后补充范围和验收。');await f.native('first',1,'请写介绍。');
-    const args={action:'create',goal:'介绍'},first=await f.call('first',args);
+    const args={action:'create',dispatch:false,goal:'介绍'},first=await f.call('first',args);
     assert.deepEqual(await f.call('canonical-empty',{...args,goal:' 介绍 ',scope:'',acceptance:''}),first);
     await f.reload();await f.native('first',1,'请写介绍。');await f.native('last',3,'稍后补充范围和验收。');
     assert.deepEqual(await f.call('reordered-native-replay',args),first);
@@ -321,7 +321,7 @@ test('P2 creation intent uses the full ordered native message identity and canon
 
 test('P2 task intent receipt rolls back with a failed outer command receipt',async t=>{
   const f=fixture(t);try {
-    await f.native('request',1,'请写介绍，范围稍后补充。');const args={action:'create',goal:'介绍'};
+    await f.native('request',1,'请写介绍，范围稍后补充。');const args={action:'create',dispatch:false,goal:'介绍'};
     f.store.db.exec("CREATE TRIGGER p2_fail_receipt BEFORE INSERT ON requests WHEN NEW.id LIKE 'manager:%:fault' BEGIN SELECT RAISE(ABORT,'synthetic command receipt failure'); END");
     await assert.rejects(f.call('fault',args),/synthetic command receipt failure/);
     assert.equal((await f.call('list-after-fault',{action:'list'})).total,0);assert.equal(f.store.pendingManagerEvents(f.bot.id).length,0);
@@ -336,7 +336,7 @@ test('P2 task intent receipt rolls back with a failed outer command receipt',asy
 test('P2 committed Worker answer retry keeps its original command kind after the binding is detached',async t=>{
   const f=fixture(t);try {
     await f.native('request',1,'按原范围写介绍。');
-    const created=await f.call('create',{action:'create',goal:'介绍',scope:'原范围',acceptance:'回读'});
+    const created=await f.call('create',{action:'create',dispatch:false,goal:'介绍',scope:'原范围',acceptance:'回读'});
     const prepared=await f.call('prepare',{action:'dispatch',taskId:created.task.id,expectedRowVersion:created.task.rowVersion});
     await f.call('dispatch',{action:'dispatch',taskId:created.task.id,expectedRowVersion:prepared.task.rowVersion});await f.finish(created.task.id,[],'waiting');
     const before=f.store.taskDetail(created.task.id),attention=before.attentions.find(a=>a.kind==='input'&&a.state==='open')!;
@@ -352,7 +352,7 @@ test('P2 committed Worker answer retry keeps its original command kind after the
 for(const change of ['aborted','replaced'] as const)test(`P2 evidence failure fallback still rejects ${change} authority after asynchronous preview`,async t=>{
   const f=fixture(t);try {
     await f.native('request',1,'写一份合成文档。');
-    const created=await f.call('create',{action:'create',goal:'介绍',scope:'任务目录',acceptance:'回读'});
+    const created=await f.call('create',{action:'create',dispatch:false,goal:'介绍',scope:'任务目录',acceptance:'回读'});
     const prepared=await f.call('prepare',{action:'dispatch',taskId:created.task.id,expectedRowVersion:created.task.rowVersion});
     await f.call('dispatch',{action:'dispatch',taskId:created.task.id,expectedRowVersion:prepared.task.rowVersion});
     const file=join(f.store.activeBinding(created.task.id)!.cwd,'result.md');writeFileSync(file,'原始文档');await f.finish(created.task.id,[file]);
@@ -402,5 +402,29 @@ test('overlapping legacy bindings defer and pump waits for both capacity and dir
     assert.equal(f.store.dispatchBlocker(tasks[1].id),null);
     await (f.managers as any).pump();assert.equal(f.agents.get(f.manager.requestedSessionId).status,'running');
     f.agents.get(f.manager.requestedSessionId).finish();
+  }finally{await f.close();}
+});
+
+test('create dispatches in one step with inferred fields and retries reuse the same run',async t=>{
+  const f=fixture(t);try {
+    await f.native('request',1,'写一份简短介绍。');
+    const created=await f.call('create-one-step',{action:'create',goal:'简短介绍'});
+    assert.ok(created.run,JSON.stringify(created));assert.equal(created.run.taskId,created.task.id);
+    assert.ok(created.task.scope&&created.task.acceptance);
+    assert.equal(f.store.taskDetail(created.task.id).attentions.filter((a:any)=>a.state==='open').length,0);
+    assert.equal(f.store.db.prepare('SELECT state FROM outbox WHERE id=?').get(`manager-event:created:${created.task.id}`)?.state,'done');
+    const retry=await f.call('create-one-step',{action:'create',goal:'简短介绍'});
+    assert.equal(retry.run.id,created.run.id);assert.equal(f.store.db.prepare('SELECT count(*) AS n FROM runs').get()?.n,1);
+    assert.equal(f.store.db.prepare('SELECT count(*) AS n FROM tasks').get()?.n,1);
+  }finally{await f.close();}
+});
+
+test('one-step create keeps explicit Bot fields and queues instead of failing when capacity is full',async t=>{
+  const f=fixture(t,true);try {
+    await f.native('request',1,'并行写三份介绍。');
+    const results:any[]=[];
+    for(const n of [1,2,3])results.push(await f.call(`create-${n}`,{action:'create',goal:`介绍 ${n}`,scope:`只写 doc-${n}.md`,acceptance:'回读'}));
+    assert.ok(results[0].run&&results[1].run);assert.equal(results[2].deferred,true);assert.equal(results[2].task.scope,'只写 doc-3.md');
+    assert.ok(f.store.pendingManagerEvents(f.bot.id).some((e:any)=>e.id.startsWith(`manager-event:capacity:${results[2].task.id}`)));
   }finally{await f.close();}
 });

@@ -537,3 +537,9 @@ ELECTRON_RUN_AS_NODE=1 '/Applications/DeepSeek Harness.app/Contents/MacOS/DeepSe
 - 链接由插件渲染为相对路径（文件 `/api/super-bot-file?resultId=…&index=N`、任务 `/#super-bot-task=…`），返回 `markdown` 供 Bot 原样回复；`detail.delivery` 同样改为相对链接，不再依赖 webOrigin。补交付作用域允许对本成果调用 deliver。
 - 回复文本链接识别保留为兜底（旧会话/旧模型），不再是主路径；c80f28d 的 3 次上限与退避不变。
 - 回归：deliver 后无链接的模型回复也不会再唤醒（5 分钟推进后 followups 仍为 1）、重放/重开返回同一回执、无绝对 origin；补交付轮次只能交付自己的成果。`npm run check` 通过。
+
+## 2026-11-09：Review 第一批 · P1-5 create 一步派发
+
+- `create` 默认（`dispatch` 省略或 true）在同一调用内 prepare（`<requestId>:prepare`）并 reserve（`<requestId>:dispatch`），返回 `{task,run}`、`{task,deferred}` 或 `{task,dispatchError}`；同一调用重试复用 run 回执，不重复建任务或运行。成功或排队后把冗余的 `created` 通知置 done。
+- Bot 未给出范围/验收时使用保守默认值满足账本，不再阻塞；`dispatch:false` 保留"缺项→提问→respond"流程，原有两步 dispatch action 不变。
+- 回归：一步创建得到 run、无待办、重试同一 run；配置 workspace 时第三个任务排队而非失败。现有澄清/两步测试显式使用 `dispatch:false`。确定性 host-probe 认可 create 直接返回的 run。`npm run check` 通过。

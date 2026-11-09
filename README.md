@@ -81,7 +81,7 @@ npm run dev
 - `npm run smoke`：测试宿主运行时检查真实状态、WAL、未认证访问与跨域拒绝。
 - `npm pack --dry-run`：核对分发清单；运行数据和契约测试插件不进入安装包。
 
-Node 用 fnm 管理时，可用 `fnm exec --using=24.21.0 npm run dev`，无需改变机器默认版本。完整执行流程和可靠性门槛见任务清单。未启用 Manager 时，创建任务只保存目标，“开始执行”才调用原生会话中选定的模型。启用 Manager 后，完整且未暂停的任务会自动安排执行；需要先核对时，请在创建表单选择“先暂停”。Worker 使用普通 DSH Session。默认（省略 `fullAccess` 或设为 `true`）使用原生 Full Access 预设和宿主可用工具，包括 Shell、Git 与子 Agent；Super Bot 不再附加工具白名单、目录守卫或执行步数/时长上限。`workspace` 指定项目根；新任务使用其下 `.super-bot-workspaces/<taskId>` 独立目录，Git 项目创建基于已提交 `HEAD` 的 detached worktree（不复制未提交改动、忽略文件或依赖）。全局默认最多两个未收敛任务；不同任务目录可并发，旧绑定/人工关联的重叠目录排队等待。worktree 保留供检查和返工，不自动合并或删除；Git 项目会自动把 `/.super-bot-workspaces/` 写入本地 `.git/info/exclude`，不污染主 checkout 的 `git status`。暂停阻止后续派发，停止请求取消并核对收敛。只有显式 `fullAccess: false` 才启用 files 模式，用于兼容和隔离验证：只允许任务目录内 read/write/edit 与报告，每次最多 40 步或 10 分钟，目录变化和预算耗尽转核对。
+Node 用 fnm 管理时，可用 `fnm exec --using=24.21.0 npm run dev`，无需改变机器默认版本。完整执行流程和可靠性门槛见任务清单。未启用 Manager 时，创建任务只保存目标，“开始执行”才调用原生会话中选定的模型。启用 Manager 后，完整且未暂停的任务会自动安排执行；Bot 的 `create` 默认在同一次调用内准备 Worker 会话并派发（名额或目录占用时排队等待），缺省的范围/验收由 Bot 推断或使用保守默认值；`dispatch: false` 保留先澄清缺项的流程。需要先核对时，请在创建表单选择“先暂停”。Worker 使用普通 DSH Session。默认（省略 `fullAccess` 或设为 `true`）使用原生 Full Access 预设和宿主可用工具，包括 Shell、Git 与子 Agent；Super Bot 不再附加工具白名单、目录守卫或执行步数/时长上限。`workspace` 指定项目根；新任务使用其下 `.super-bot-workspaces/<taskId>` 独立目录，Git 项目创建基于已提交 `HEAD` 的 detached worktree（不复制未提交改动、忽略文件或依赖）。全局默认最多两个未收敛任务；不同任务目录可并发，旧绑定/人工关联的重叠目录排队等待。worktree 保留供检查和返工，不自动合并或删除；Git 项目会自动把 `/.super-bot-workspaces/` 写入本地 `.git/info/exclude`，不污染主 checkout 的 `git status`。暂停阻止后续派发，停止请求取消并核对收敛。只有显式 `fullAccess: false` 才启用 files 模式，用于兼容和隔离验证：只允许任务目录内 read/write/edit 与报告，每次最多 40 步或 10 分钟，目录变化和预算耗尽转核对。
 
 
 ## 使用完整原生 Worker
