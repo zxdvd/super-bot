@@ -83,3 +83,7 @@
 ## 默认权限与 CLI 委派修复（2026-11-09）
 
 用户报告未配 fullAccess 时 Bot 因自身没有 Shell 而要求开启工具通道。改为 Worker 默认使用原生 Full Access；仅显式 `fullAccess: false` 保留旧 files 隔离/兼容行为，覆盖 DF-01 旧默认。Bot 不再直接使用原生执行工具，所有本机命令、外部 CLI/工具请求均通过账本建 Task 并派 Worker；成果预览继续走 detail。程序用工具列表和执行守卫强制角色边界，提示词负责识别工作意图与说明实际模式。files 模式明确说明 Worker 完整权限未开启和当前 profile 的 `config.fullAccess: true` 开启方法。Desktop 真实体验及真实飞书账号查询仍未复验。
+
+## 仅补交付通知循环修复（2026-11-09）
+
+针对仅交付通知 entered 无条件翻回 pending 导致重复唤醒，复用现有 outbox 的 attempts 与 payload，持久化最多 3 次补交付及 30/60 秒退避。只在真实输入所在轮次持久化结束后重排；到限 unknown 并只记录一次问题，不重跑 Worker。历史 pending 通知先核对，不因升级增加一轮尝试。交付检测按路径与成果/任务 ID 核对有效链接，不依赖完整 origin；保留最终回复、成功 turn/end、持久化及版本约束。Desktop 动态端口已经静态确认，另一台机器的真实账本未读取；证据与未验证范围见 evidence。

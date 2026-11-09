@@ -30,12 +30,14 @@
 | 首次模型选择与错误提示 | 已验证 API 与 UI | 使用原生 modelSelection 投影区分已选模型与默认路由；未选 Worker 不创建 Run，Manager 保留通知/0 次唤醒。真实 turn/end 的缺凭证错误显示明确原因，不抄录提供方原始错误正文。`smoke-model-errors.mjs`、实际 tgz `smoke-package.mjs` |
 | Dashboard 离线 | 已验证 | 仅保留快照并禁用变更；重连不重放操作，恢复筛选和位置。100 项分页通过；恢复旧备份时清除失效任务/Bot 选择并钳制页码，同页任务消失路径 UI 通过 |
 | 运行中热卸载/热替换 | 空闲插件原生 HMR 已实测 | 独立宿主验证 link 源码监听及 tgz→link 配置重组：同 PID、同版本换成新模块。真实 Super Bot 后端重挂载、前端 rebuilt SSE 通过。`dev:reload` 用于日常空闲重载，`dev` 用于隔离自动监听；活动执行期间不热替换 |
-| Desktop | 未验证 | 本机 `0.2.1-rc.5` 未接入验证；当前安装包目标是 Web rc.1 |
+| Desktop | 仅静态核对，体验未验证 | 本轮只读安装包为 `0.2.2-rc.1`，确认使用本地动态端口；未实际验证 Desktop 聊天/UI 兼容，产品验证目标仍为 Web rc.1 |
 | 真实模型质量、Token/费用 | 四轮 dogfooding 已完成；无精确费用归因 | Sol medium Bot 委派 Sol xhigh Full Access Worker，实际 Shell/子 Agent/测试、补充需求、原对话交付及同任务返工通过；多任务歧义、用户最终接受和费用评估仍待验证。自动审查超时等异常见接手说明 |
 
 Bot 在所有模式下只开放管理工具，并用执行守卫阻止直接使用原生/外部工具；Shell、git、lark-cli 等执行请求委派 Worker。显式 `fullAccess: false` 时，Bot 说明“Worker 完整权限未开启”，提示将当前 profile 的 Super Bot `config.fullAccess` 设为 `true`，空闲后重载。默认/true 的 Worker 不受 Manager 工具白名单影响。
 
 复跑旧目录、scoped-tools、预算等 files 隔离 smoke 时，须在专用测试 profile 显式设置 `fullAccess: false`；`smoke:chat` 的新增 Shell 场景使用默认 Full Access。
+
+仅补交付通知每成果最多 3 次自动唤醒，后两次退避 30/60 秒；次数、结束输入与期限落在原 outbox payload，重启不重置。到限 unknown 并停止唤醒；未知发送、缺失结束记录及补交付轮次用户中断不自动重放。链接按路径与 resultId/index/taskId 识别，允许相对地址、参数换序与不同端口；仍以原生持久化最终回复和成功 turn/end 为准。识别历史交付不承诺旧端口的下载地址在重启后仍可打开，可从当前工作面板查看成果。
 
 files 模式目录限制是应用层约束，不是操作系统沙箱。Full Access 不附加该目录限制，也不把不同 Bot 作为安全租户。既有原生会话的历史、插件和用户手动操作仍属于当前单用户宿主。
 

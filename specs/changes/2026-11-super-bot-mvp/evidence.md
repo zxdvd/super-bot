@@ -497,3 +497,17 @@ ELECTRON_RUN_AS_NODE=1 '/Applications/DeepSeek Harness.app/Contents/MacOS/DeepSe
 - chat smoke 从原生用户消息开始，不预建 Task：普通聊天零 Task；文件接单、原对话交付/下载、问答、同任务返工与显式接受通过；新增 Shell 请求创建第三项 Task，Worker 实际执行原生 Bash `printf` 写入合成文件，再 read/report，Bot 回原对话交付。核对 Worker 有 bash、工具结果无错误、下载内容为 `LOCAL_CLI_OK`；Bot 模型可见工具只有 super_bot_manage，实际调用也只有该工具，CLI 成果仍未人工接受。结果仅留 `.runtime/chat-smoke.json` 与 `.runtime/permissions-chat.log`。
 - 测试环境排障：首次 plugin add 因 PATH 无 pnpm 失败，改为专用 overlay 加载具体模块文件；初次 Shell smoke 夹具漏传原生 bash 必填 description，导致 ready 无有效文件而进入 recovery，没有假成功。补齐参数后完整 smoke 通过；最终源码检查后重启专用宿主再跑也通过。没有把这些夹具/接线错误归因为产品权限故障。
 - 边界：确定性模型证明接线与强制角色边界，不证明真实模型的自然语言判断。Desktop 原场景、真实 lark-cli 登录/读群消息、日常宿主加载与用户体验仍需复验；CF/SB-15/FV 不因本次测试勾选。外部 CLI 缺失或账号错误应由 Worker 报告实际错误，不能以“没有工具通道”替代调查。
+
+## 2026-11-09：仅补交付通知无限循环修复
+
+- 基线 `e8e967b`（上一个默认权限修复），开始于干净 `dev`。另一台机器的账本未访问；用本地合成账本/原生事件边界重现用户提供的 pending、attempts 持续增加现象。
+- 红测：`node --import tsx --test --test-name-pattern='unbounded wakes|relative links' test/adapter/delivery.test.ts` 两项均失败：8 次结束/重开循环累计 9 次 wake（预期原检查 1 次 + 补交付最多 3 次）；包含正确成果/任务 ID 的相对链接、换序查询和不同端口仍是 pending。原始合成输出 `.runtime/delivery-loop-red.log`。
+- 根因确认：`managerEventUnknown` 与 `resetUnconfirmedManagerEvents` 将 entered deliveryOnly 无条件翻回 pending；只有每 Bot 每小时 20 次的总预算，没有每事件上限和退避，也未用持久化结束事实约束重排。`reconcileDelivery` 对当前 webOrigin 生成的所有完整 URL 做字符串包含比较，导致等价链接被漏认。无法断言远端用户的某条回复究竟是哪一种链接差异。
+- 修复 [Store](../../../src/store.ts)：复用 outbox.attempts 和 JSON payload，最多 3 次补交付（不含原检查轮次），后两次分别在上一轮确认结束后等 30 秒、60 秒。原子 claim 再检查上限及期限；第三次未确认转 unknown，以持久标记只写一次 managerProblem。结束证明绑定 session/turn/endSeq/messageId，重复结束回调、重启及晚到旧输入不能重置期限或产生第二次唤醒。不改表/schema、不增加通用调度层。
+- 修复 [Manager](../../../src/manager.ts)：已进入但未结束的通知不再因 idle 或重载重排；先 flush/read 原生日志，确认对应输入和结束，再安排有界补交付。未知发送、缺失结束证明、补交付轮次中断保留 unknown；交付阶段仍不能执行 Worker/修改任务。旧 pending/attempts=14 先核对历史，正确交付则 done，否则到限停止；不会因升级多补一次。
+- 链接按 `/api/super-bot-file` 的 resultId/index 和根页面 hash 的 taskId 匹配，支持相对链接、参数换序、HTML &amp;、不同 origin/端口；每份文件仍需对应链接。错误路径/任务/成果、缺序号、仅提到裸 ID 不算交付。保留原 Review/input 之后的顺序、最终模型回复、成功 turn/end、原生日志持久化及当前成果版本约束；没有新增“模型声称已交付”的完成捷径。
+- Desktop 只读研究：本机 `/Applications/DeepSeek Harness.app/Contents/Resources/app.asar` 当前 package 为 **0.2.2-rc.1**。`dsh-desktop-host/lib/index.js` 启动参数为 `--host 127.0.0.1 --port 0`，并向 Electron 返回该监听端口的 authenticatedUrl；打包的 `dsh-host-webserver/lib/index.js#getOrigin()` 与仓库安装库一样使用协议、绑定主机及实际监听端口。因此 Desktop 使用 HTTP 回环动态端口，不是固定 Electron 自定义 origin；重启可能使历史链接端口与当前 origin 不同。本次没有启动/修改 Desktop 安装包，也不把静态研究称作用户桌面端验收。
+- 定向回归 `node --import tsx --test test/manager-delivery.test.ts test/adapter/delivery.test.ts`：**40/40** 通过。覆盖缺失/缩短链接跨轮次及重开后的硬上限、30/60 秒精确边界、重复 turn/end、发送未知/结束未知、旧 attempts=14 的已交付和未交付分支、到限后晚到正确回复、问题记录稳定，以及既有持久化失败、交付恢复、返工/撤权保护。
+- 最终 `npm run check` 退出 **0**：Node **24.21.0**，**65 核心 + 116 适配 = 181 项**，typecheck、Host/Client build 通过。首次完整检查的 TypeScript 可空 input 收窄错误已修正，以上为修正后实际全量结果；日志 `.runtime/delivery-loop-check.log`。`git diff --check` 通过。
+- `npm run probe:build` 与 `npm run smoke:chat -- .runtime/delivery-loop-host.log` 均退出 **0**。新建独立 `.runtime/delivery-smoke-*/super-bot/.runtime/dsh`，profile `super-bot-delivery`，DSH Web rc.1、端口 3097、关闭测试宿主 HMR、仅确定性模型。原生聊天接单、Shell Worker、文件下载、同对话交付、问答、同任务返工及显式人工接受链路通过。该 smoke 验证正常聊天无回归；故障/退避由上面的确定性事件回归验证，不混称为真实模型质量测试。输出 `.runtime/delivery-loop-chat.log`，测试会话/账本不入仓库。
+- 未验证：远端实际账本、远端 Desktop 运行、真实模型改写链接的所有形式；未替日常 profile 安装或重载。旧端口链接的历史交付识别不保证旧下载地址仍可打开，当前工作面板仍是查看成果入口。首版最终用户体验验收保持未勾选。

@@ -10,7 +10,7 @@ import type {DshExecution} from '../../src/dsh.ts';
 import {collectEvidence} from '../../src/evidence.ts';
 
 async function fixture(t:TestContext,fullAccess?:boolean) {
-  t.mock.timers.enable({apis:['setInterval']});
+  t.mock.timers.enable({apis:['Date','setInterval']});
   const root=realpathSync(process.cwd());mkdirSync(join(root,'.runtime'),{recursive:true});
   const directory=mkdtempSync(join(root,'.runtime','delivery-adapter-'));let store=new Store(join(directory,'ledger.sqlite'));
   const bot=store.createBot('bot',{name:'Delivery Bot',instructions:'Synthetic work'});
@@ -33,7 +33,7 @@ async function fixture(t:TestContext,fullAccess?:boolean) {
   const retired:Managers[]=[];
   let managers=new Managers(ctx,store,execution,directory,()=> 'https://example.test',{fullAccess});managers.install();
   const emit=async(type:string,data:any,surfaceOp?:string)=>{const event={type,data,seq:events.length,time:Date.now(),...(surfaceOp?{surfaceOp}:{})};events.push(event);await listeners.get('session/event')?.(session,event);return event;};
-  const pulse=async()=>{t.mock.timers.tick(1000);await new Promise<void>(resolve=>setImmediate(resolve));};
+  const pulse=async(ms=1000)=>{t.mock.timers.tick(ms);await new Promise<void>(resolve=>setImmediate(resolve));};
   const call=(callId:string,args:Record<string,unknown>)=>handler(args,{agent,callId,signal:new AbortController().signal});
   const enter=async(turn:number)=>{await emit('turn/start',{turn});const msg=agent.lastMessage;await emit('user/message',msg,'append');};
   const review=async(turn=1)=>{await emit('tool/call',{turn,step:0,callId:'review',name:'super_bot_manage',arguments:JSON.stringify({action:'review',taskId:task.id})});return call('review',{action:'review',taskId:task.id,expectedRowVersion:store.getTask(task.id).rowVersion,resultId:report.resultId,verdict:'human',note:'Read both facts'});};
@@ -193,5 +193,76 @@ for(const mode of [undefined,true,false])test(`Bot execution routing and capabil
     assert.match(f.prompt(),/lark-cli/);assert.match(f.prompt(),/Never ask the user to enable a tool channel/);
     if(mode===false){assert.match(f.prompt(),/Worker 完整权限未开启/);assert.match(f.prompt(),/fullAccess: true.*cordis.patch.yml/);assert.match(f.prompt(),/BEFORE creating or dispatching/);}
     else {assert.match(f.prompt(),/ALWAYS create and dispatch a Task/);assert.match(f.prompt(),/read-only CLI queries/);assert.doesNotMatch(f.prompt(),/Worker 完整权限未开启/);}
+  }finally{await f.close();}
+});
+
+
+for(const variant of ['missing','shortened'])test(`${variant} delivery links cannot cause unbounded wakes across turns and ledger reopen`,async t=>{
+  const f=await fixture(t);try {
+    await f.pulse();await f.enter(1);await f.review();await f.end(1);
+    let turn=1;
+    for(let n=0;n<8;n++) {
+      await f.pulse(120000);
+      if(f.agent.status==='running') {
+        await f.enter(++turn);await f.assistant(turn,[{type:'text',text:variant==='missing'?'成果已完成，稍后请查看工作面板。':`已完成 [文件](/api/super-bot-file?resultId=${f.report.resultId}) [成果](#super-bot-task=${f.task.id})`}]);await f.end(turn);
+      }
+      await f.reload(true);
+    }
+    assert.equal(f.counts().followups,4,'one original review wake plus at most three delivery-only wakes');
+    assert.equal(f.state()?.state,'unknown');
+    assert.match(f.store.managerInfo(f.bot.id).problem?.message??'',/交付.*3|3.*交付/);
+    const problem=f.store.managerInfo(f.bot.id).problem;await f.pulse(3600000);await f.reload(true);await f.pulse();
+    assert.deepEqual(f.store.managerInfo(f.bot.id).problem,problem);assert.equal(f.counts().followups,4);
+    // A later actual reply can satisfy the obligation; exhaustion does not fabricate delivery or block proof.
+    await f.emit('turn/start',{turn:++turn});await f.assistant(turn);await f.end(turn);
+    assert.equal(f.state()?.state,'done');assert.equal(f.counts().followups,4);
+  }finally{await f.close();}
+});
+
+test('delivery recognizes relative links and reordered queries without a matching host origin',async t=>{
+  const f=await fixture(t);try {
+    await f.pulse();await f.enter(1);await f.review();
+    await f.assistant(1,[{type:'text',text:`已写好并检查，待你确认。 [文件](/api/super-bot-file?index=0&amp;resultId=${f.report.resultId}) [查看成果](http://127.0.0.1:49999/#super-bot-task=${f.task.id})`}]);
+    await f.end(1);
+    assert.equal(f.state()?.state,'done');await f.pulse();assert.equal(f.counts().followups,1);
+  }finally{await f.close();}
+});
+
+
+test('duplicate turn/end callbacks and reload preserve backoff and never wake twice for the same ended input',async t=>{
+  const f=await fixture(t);try {
+    await f.pulse();await f.enter(1);await f.review();await f.end(1);await f.pulse();await f.enter(2);
+    await f.assistant(2,[{type:'text',text:'已完成，未附链接。'}]);await f.end(2);
+    const deadline=JSON.parse(String(f.state()?.payload)).nextAttemptAt;
+    await f.emit('turn/end',{turn:2,reason:{kind:'completed'}});await f.reload(true);
+    assert.equal(JSON.parse(String(f.state()?.payload)).nextAttemptAt,deadline);
+    await f.pulse(29000);assert.equal(f.counts().followups,2);
+    await f.pulse(1000);assert.equal(f.counts().followups,3);
+    await f.emit('turn/end',{turn:2,reason:{kind:'completed'}});await f.pulse(60000);
+    assert.equal(f.counts().followups,3);assert.equal(f.state()?.state,'sending');
+    await f.enter(3);await f.assistant(3);await f.end(3);assert.equal(f.state()?.state,'done');
+  }finally{await f.close();}
+});
+
+for(const delivered of [false,true])test(`legacy pending attempt 14 is reconciled without a fresh wake (delivered=${delivered})`,async t=>{
+  const f=await fixture(t);try {
+    await f.pulse();await f.enter(1);await f.review();await f.end(1);await f.pulse();await f.enter(2);
+    if(delivered)await f.assistant(2,[{type:'text',text:f.text().replaceAll('https://example.test','http://127.0.0.1:45555')}]);
+    // Durable native end, but simulate a crash before its adapter callback / old version requeue.
+    f.events.push({type:'turn/end',data:{turn:2,reason:{kind:'completed'}},seq:f.events.length,time:Date.now()});await f.checkpoint();
+    f.store.db.prepare("UPDATE outbox SET state='pending',attempts=14 WHERE id=?").run(`manager-event:delivery:${f.report.resultId}`);
+    await f.reload(true);await f.pulse();
+    assert.equal(f.state()?.state,delivered?'done':'unknown');assert.equal(f.counts().followups,2);
+    const problem=f.store.managerInfo(f.bot.id).problem;
+    for(let n=0;n<3;n++){await f.pulse(3600000);await f.reload(true);}
+    assert.equal(f.counts().followups,2);assert.deepEqual(f.store.managerInfo(f.bot.id).problem,problem);
+  }finally{await f.close();}
+});
+
+for(const variant of ['wrong-task','missing-index','wrong-path','bare-identifiers'])test(`${variant} cannot masquerade as a linked delivery`,async t=>{
+  const f=await fixture(t);try {
+    await f.pulse();await f.enter(1);await f.review();
+    const text=variant==='wrong-task'?f.text().replaceAll(f.task.id,'another-task'):variant==='missing-index'?f.text().replace('&index=0',''):variant==='wrong-path'?f.text().replace('/api/super-bot-file','/wrong-file'): `已完成 resultId=${f.report.resultId} taskId=${f.task.id}`;
+    await f.assistant(1,[{type:'text',text}]);await f.end(1);assert.equal(f.state()?.state,'pending');
   }finally{await f.close();}
 });

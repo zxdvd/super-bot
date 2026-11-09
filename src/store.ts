@@ -5,6 +5,9 @@ import { createHash, randomUUID } from 'node:crypto';
 import schemaVersion from '../schema-version.json' with {type:'json'};
 import { AppError, requiredText, optionalText, taskStatus, type ChatSource, type Bot, type Task, type NewBot, type NewTask, type TaskPage, type ControlMode, type Attention, type Binding, type Run, type RunInput, type WorkReport, type Result,type ManagerBinding,type ManagerEvent,type ExistingSessionGrant,type ReferenceMaterial,type TaskBotContext,botDraft } from './model.ts';
 
+const DELIVERY_ATTEMPT_LIMIT=3;
+const DELIVERY_RETRY_DELAY_MS=30000;
+
 /** One local database. Business transactions will live here, not in the UI/adapter. */
 export class Store {
   readonly db: DatabaseSync;
@@ -206,11 +209,18 @@ export class Store {
     this.db.prepare('INSERT OR IGNORE INTO outbox(id,kind,taskId,payload,createdAt) VALUES (?,?,?,?,?)').run(`manager-event:${key}`,'manager.notify',taskId,JSON.stringify({botId,reason,taskId,priority,...(delivery?{deliveryOnly:true,...delivery}:{})}),Date.now());
   }
   pendingManagerEvents(botId:string):ManagerEvent[] {
-    return this.db.prepare("SELECT id,taskId,payload,state,createdAt FROM outbox WHERE kind='manager.notify' AND state='pending' AND json_extract(payload,'$.botId')=? ORDER BY coalesce(json_extract(payload,'$.priority'),0) DESC,createdAt,id LIMIT 10").all(botId) as unknown as ManagerEvent[];
+    return this.db.prepare("SELECT id,taskId,payload,state,createdAt FROM outbox WHERE kind='manager.notify' AND state='pending' AND json_extract(payload,'$.botId')=? AND coalesce(json_extract(payload,'$.nextAttemptAt'),0)<=? ORDER BY coalesce(json_extract(payload,'$.priority'),0) DESC,createdAt,id LIMIT 10").all(botId,Date.now()) as unknown as ManagerEvent[];
   }
   claimManagerEvent(id:string,messageId:string,messageJson:string):boolean {
     this.db.exec('BEGIN IMMEDIATE');
     try {
+      const row=this.db.prepare("SELECT payload,attempts FROM outbox WHERE id=? AND kind='manager.notify' AND state='pending'").get(id);
+      if(!row){this.db.exec('COMMIT');return false;}
+      const payload=JSON.parse(String(row.payload));
+      if(payload.deliveryOnly&&Number(row.attempts)>=DELIVERY_ATTEMPT_LIMIT) {
+        this.stopManagerDeliveryRetries(id,payload.botId);this.db.exec('COMMIT');return false;
+      }
+      if((payload.nextAttemptAt??0)>Date.now()){this.db.exec('COMMIT');return false;}
       const claimed=this.db.prepare("UPDATE outbox SET state='sending',attempts=attempts+1,payload=json_set(payload,'$.messageId',?,'$.messageJson',?,'$.deliveredAt',?) WHERE id=? AND state='pending'").run(messageId,messageJson,Date.now(),id).changes===1;
       if(claimed) {
         const row=this.db.prepare('SELECT taskId,payload FROM outbox WHERE id=?').get(id)!;const botId=JSON.parse(String(row.payload)).botId as string;
@@ -224,8 +234,27 @@ export class Store {
     this.db.prepare("UPDATE outbox SET state='entered' WHERE id=? AND state='sending' AND json_extract(payload,'$.messageId')=?").run(id,messageId);
   }
   managerEventUnknown(id:string):void {
-    // Only a known-entered, read-only delivery attempt may be supplemented. Unknown sends never replay.
-    this.db.prepare("UPDATE outbox SET state=CASE WHEN state='entered' AND json_extract(payload,'$.deliveryOnly')=1 THEN 'pending' ELSE 'unknown' END WHERE id=? AND state IN ('sending','entered')").run(id);
+    // Idle/entry alone is not permission to repeat a notification.
+    this.db.prepare("UPDATE outbox SET state='unknown' WHERE id=? AND state IN ('sending','entered')").run(id);
+  }
+  private stopManagerDeliveryRetries(id:string,botId:string):void {
+    const changed=this.db.prepare("UPDATE outbox SET state='unknown',payload=json_set(payload,'$.deliveryRetryExhausted',json('true')) WHERE id=? AND coalesce(json_extract(payload,'$.deliveryRetryExhausted'),0)=0").run(id).changes;
+    if(changed)this.managerProblem(botId,'成果补交付已达到 3 次上限，已停止自动唤醒。请在 Bot 对话或工作面板核对成果；未重新执行 Worker。');
+  }
+  managerDeliveryAttemptEnded(id:string,messageId:string,proof:{sessionId:string;turn:number;endSeq:number}):void {
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      const row=this.db.prepare("SELECT payload,attempts FROM outbox WHERE id=? AND kind='manager.notify' AND state='entered' AND json_extract(payload,'$.deliveryOnly')=1 AND json_extract(payload,'$.messageId')=?").get(id,messageId);
+      if(row) {
+        const payload=JSON.parse(String(row.payload));
+        if(this.activeManager(payload.botId)?.sessionId!==proof.sessionId)throw new AppError('manager-stale','补交付会话已经改变。');
+        // Persist the exact ended input and deadline. Duplicate end callbacks/reloads cannot extend or reset them.
+        this.db.prepare("UPDATE outbox SET payload=json_set(payload,'$.deliveryAttemptEnd',json(?)) WHERE id=?").run(JSON.stringify({messageId,...proof}),id);
+        if(Number(row.attempts)>=DELIVERY_ATTEMPT_LIMIT)this.stopManagerDeliveryRetries(id,payload.botId);
+        else this.db.prepare("UPDATE outbox SET state='pending',payload=json_set(payload,'$.nextAttemptAt',?) WHERE id=?").run(Date.now()+DELIVERY_RETRY_DELAY_MS*2**Math.max(0,Number(row.attempts)-1),id);
+      }
+      this.db.exec('COMMIT');
+    }catch(error){this.db.exec('ROLLBACK');throw error;}
   }
   managerWakeCount(botId:string,since:number):number {
     const current=Number(this.db.prepare("SELECT count(*) AS n FROM events WHERE kind='manager.wake' AND createdAt>=? AND json_extract(data,'$.botId')=?").get(since,botId)?.n);
@@ -233,7 +262,10 @@ export class Store {
     return current+legacy;
   }
   resetUnconfirmedManagerEvents():void {
-    this.db.prepare("UPDATE outbox SET state=CASE WHEN state='entered' AND json_extract(payload,'$.deliveryOnly')=1 THEN 'pending' ELSE 'unknown' END WHERE kind='manager.notify' AND state IN ('sending','entered')").run();
+    // Older versions requeued entered attempts without an end proof. Reconcile those before any fresh wake.
+    this.db.prepare("UPDATE outbox SET state='entered' WHERE kind='manager.notify' AND state='pending' AND attempts>0 AND json_extract(payload,'$.deliveryOnly')=1 AND json_extract(payload,'$.deliveryAttemptEnd') IS NULL AND json_extract(payload,'$.messageId') IS NOT NULL").run();
+    // Keep entered delivery attempts until the adapter verifies their durable turn/end; never requeue on restart alone.
+    this.db.prepare("UPDATE outbox SET state='unknown' WHERE kind='manager.notify' AND (state='sending' OR (state='entered' AND coalesce(json_extract(payload,'$.deliveryOnly'),0)!=1))").run();
   }
   managerNotifications(botId:string):ManagerEvent[] {
     return this.db.prepare("SELECT id,taskId,payload,state,createdAt FROM outbox WHERE kind='manager.notify' AND state NOT IN ('done','superseded') AND json_extract(payload,'$.botId')=?").all(botId) as unknown as ManagerEvent[];
@@ -241,8 +273,8 @@ export class Store {
   supersedeManagerDelivery(id:string):void {
     this.db.prepare("UPDATE outbox SET state='superseded' WHERE id=? AND kind='manager.notify' AND json_extract(payload,'$.deliveryOnly')=1 AND state!='done'").run(id);
   }
-  managerDeliveryUncertain(id:string):void {
-    this.db.prepare("UPDATE outbox SET state='unknown' WHERE id=? AND kind='manager.notify' AND json_extract(payload,'$.deliveryOnly')=1 AND state IN ('pending','sending','entered')").run(id);
+  managerDeliveryUncertain(id:string):boolean {
+    return this.db.prepare("UPDATE outbox SET state='unknown' WHERE id=? AND kind='manager.notify' AND json_extract(payload,'$.deliveryOnly')=1 AND state IN ('pending','sending','entered')").run(id).changes===1;
   }
   managerNotificationDelivered(id:string,sessionId:string,proof:{turn:number;messageId:string;seq:number;endSeq:number}):void {
     this.command(`manager-delivered:${id}`,'manager.delivered',{id,sessionId,...proof},()=>{

@@ -55,20 +55,57 @@ test('Review and its delivery obligation commit or roll back together and retry 
   }finally{store.close();}
 });
 
-test('supplementary attempts count individually against the existing hourly wake budget; unknown sends never replay',()=>{
+test('delivery attempts enforce persistent 30/60 second backoff and a three-wake cap at claim time',t=>{
+  t.mock.timers.enable({apis:['Date'],now:100000});
   const store=new Store(':memory:');try {
     const f=fixture(store);store.managerReview('review',f.bot.id,f.task.id,store.getTask(f.task.id).rowVersion,f.result.resultId!,'human','Read evidence');
     const id=`manager-event:delivery:${f.result.resultId}`;
-    for(let n=0;n<20;n++) {
+    for(let n=0;n<3;n++) {
       assert.equal(store.claimManagerEvent(id,`delivery-${n}`,'{}'),true);
-      store.managerEventEntered(id,`delivery-${n}`);store.managerEventUnknown(id);
+      store.managerEventEntered(id,`delivery-${n}`);
+      const proof={sessionId:f.manager.requestedSessionId,turn:n+1,endSeq:10+n};
+      store.managerDeliveryAttemptEnded(id,`delivery-${n}`,proof);
+      const before=store.db.prepare('SELECT state,payload FROM outbox WHERE id=?').get(id);
+      store.managerDeliveryAttemptEnded(id,`delivery-${n}`,proof);store.managerEventUnknown(id);store.resetUnconfirmedManagerEvents();
+      assert.deepEqual(store.db.prepare('SELECT state,payload FROM outbox WHERE id=?').get(id),before,'duplicate end/reset cannot reset the retry deadline');
+      assert.equal(store.claimManagerEvent(id,'too-soon','{}'),false);
+      if(n<2) {
+        assert.ok(!store.pendingManagerEvents(f.bot.id).some(item=>item.id===id));
+        t.mock.timers.tick(30000*2**n-1);assert.equal(store.claimManagerEvent(id,'still-too-soon','{}'),false);
+        t.mock.timers.tick(1);assert.ok(store.pendingManagerEvents(f.bot.id).some(item=>item.id===id));
+      }
     }
-    assert.equal(store.managerWakeCount(f.bot.id,0),20);assert.equal(store.managerInfo(f.bot.id).hourlyWakes,20);
-    assert.equal(store.db.prepare('SELECT attempts FROM outbox WHERE id=?').get(id)?.attempts,20);
-    assert.equal(store.claimManagerEvent(id,'unconfirmed','{}'),true);store.resetUnconfirmedManagerEvents();
+    assert.equal(store.managerWakeCount(f.bot.id,0),3);
+    assert.equal(store.db.prepare('SELECT attempts FROM outbox WHERE id=?').get(id)?.attempts,3);
     assert.equal(store.db.prepare('SELECT state FROM outbox WHERE id=?').get(id)?.state,'unknown');
-    assert.equal(store.claimManagerEvent(id,'never-replay','{}'),false);
-    store.managerEventEntered(id,'unconfirmed');assert.equal(store.db.prepare('SELECT state FROM outbox WHERE id=?').get(id)?.state,'unknown');
+    const problem=store.managerInfo(f.bot.id).problem;assert.match(problem?.message??'',/3 次/);
+    t.mock.timers.tick(3600000);store.resetUnconfirmedManagerEvents();assert.equal(store.claimManagerEvent(id,'never-replay','{}'),false);
+    assert.deepEqual(store.managerInfo(f.bot.id).problem,problem);
     assert.equal(store.db.prepare('SELECT count(*) AS n FROM runs').get()?.n,1);
+  }finally{store.close();t.mock.timers.reset();}
+});
+
+test('unknown sends and entered attempts without durable end proof never become pending on restart',()=>{
+  for(const entered of [false,true]) {
+    const store=new Store(':memory:');try {
+      const f=fixture(store);store.managerReview('review',f.bot.id,f.task.id,store.getTask(f.task.id).rowVersion,f.result.resultId!,'human','Read evidence');
+      const id=`manager-event:delivery:${f.result.resultId}`;assert.equal(store.claimManagerEvent(id,'unconfirmed','{}'),true);
+      if(entered)store.managerEventEntered(id,'unconfirmed');
+      store.resetUnconfirmedManagerEvents();
+      assert.equal(store.db.prepare('SELECT state FROM outbox WHERE id=?').get(id)?.state,entered?'entered':'unknown');
+      assert.equal(store.claimManagerEvent(id,'never-replay','{}'),false);
+      store.managerEventUnknown(id);store.resetUnconfirmedManagerEvents();
+      assert.equal(store.db.prepare('SELECT state FROM outbox WHERE id=?').get(id)?.state,'unknown');
+    }finally{store.close();}
+  }
+});
+
+test('claim rejects an already exhausted legacy pending delivery and records its problem only once',()=>{
+  const store=new Store(':memory:');try {
+    const f=fixture(store);store.managerReview('review',f.bot.id,f.task.id,store.getTask(f.task.id).rowVersion,f.result.resultId!,'human','Read evidence');
+    const id=`manager-event:delivery:${f.result.resultId}`;store.db.prepare('UPDATE outbox SET attempts=14 WHERE id=?').run(id);
+    assert.equal(store.claimManagerEvent(id,'never','{}'),false);const problem=store.managerInfo(f.bot.id).problem;
+    assert.match(problem?.message??'',/3 次/);assert.equal(store.claimManagerEvent(id,'never-again','{}'),false);
+    assert.deepEqual(store.managerInfo(f.bot.id).problem,problem);assert.equal(store.managerWakeCount(f.bot.id,0),0);
   }finally{store.close();}
 });
