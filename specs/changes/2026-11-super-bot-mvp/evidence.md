@@ -543,3 +543,9 @@ ELECTRON_RUN_AS_NODE=1 '/Applications/DeepSeek Harness.app/Contents/MacOS/DeepSe
 - `create` 默认（`dispatch` 省略或 true）在同一调用内 prepare（`<requestId>:prepare`）并 reserve（`<requestId>:dispatch`），返回 `{task,run}`、`{task,deferred}` 或 `{task,dispatchError}`；同一调用重试复用 run 回执，不重复建任务或运行。成功或排队后把冗余的 `created` 通知置 done。
 - Bot 未给出范围/验收时使用保守默认值满足账本，不再阻塞；`dispatch:false` 保留"缺项→提问→respond"流程，原有两步 dispatch action 不变。
 - 回归：一步创建得到 run、无待办、重试同一 run；配置 workspace 时第三个任务排队而非失败。现有澄清/两步测试显式使用 `dispatch:false`。确定性 host-probe 认可 create 直接返回的 run。`npm run check` 通过。
+
+## 2026-11-09：Review 第一批 · P1-6 唤醒上限提示与可配置限额（含部分 P1-9）
+
+- 达到每小时唤醒上限时写入 `managerProblem`（按消息去重，只记录一次；通知保留；下一次成功唤醒清除），不再静默 continue。
+- 新增配置（schema 默认值同旧常量）：`maxRunningTasks`=2、`managerWakesPerHour`=20、`managerConcurrentWakes`=2、`managerTurnMinutes`=5。补交付 3 次、files 模式 40 步/10 分钟、Bot 24/12 步保持固定（推迟）。
+- 回归：`managerWakesPerHour:1` 时第二个事件不唤醒、问题只记录一次且不刷新；`maxRunningTasks` 1/2 切换改变 capacity 判断。`npm run check` 通过。

@@ -11,6 +11,8 @@ const DELIVERY_RETRY_DELAY_MS=30000;
 /** One local database. Business transactions will live here, not in the UI/adapter. */
 export class Store {
   readonly db: DatabaseSync;
+  /** Global execution slots; set from config by the plugin entry. */
+  maxRunningTasks=2;
   constructor(path: string) {
     if (path !== ':memory:') mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
     this.db = new DatabaseSync(path);
@@ -550,7 +552,7 @@ export class Store {
   }
   dispatchBlocker(taskId:string):'capacity'|'resource-conflict'|null {
     const held=this.db.prepare('SELECT cwd FROM resources').all();
-    if(held.length>=2)return 'capacity';
+    if(held.length>=this.maxRunningTasks)return 'capacity';
     const binding=this.activeBinding(taskId);if(!binding)return null;
     const contains=(parent:string,child:string)=>{const path=relative(parent,child);return path===''||(!isAbsolute(path)&&path!=='..'&&!path.startsWith(`..${sep}`));};
     return held.some(r=>contains(String(r.cwd),binding.cwd)||contains(binding.cwd,String(r.cwd)))?'resource-conflict':null;

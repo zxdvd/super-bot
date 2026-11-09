@@ -368,3 +368,14 @@ test('directory overlap includes the filesystem root in either acquisition order
     }finally{store.close();}
   }
 });
+
+test('maxRunningTasks bounds global execution slots',()=>{
+  const directory=mkdtempSync(join(tmpdir(),'super-bot-slots-'));const store=new Store(join(directory,'ledger.sqlite'));
+  try {
+    store.maxRunningTasks=1;
+    const one=prepared(store,'slot-1','/tmp/slot-1'),two=prepared(store,'slot-2','/tmp/slot-2');
+    store.reserveRun('slot-run-1',one.id,one.rowVersion);
+    assert.equal(store.dispatchBlocker(two.id),'capacity');assert.throws(()=>store.reserveRun('slot-run-2',two.id,two.rowVersion),{code:'capacity'});
+    store.maxRunningTasks=2;assert.equal(store.dispatchBlocker(two.id),null);
+  }finally{store.close();rmSync(directory,{recursive:true,force:true});}
+});

@@ -12,7 +12,7 @@ import { AppError,requiredText,optionalText,type ChatSource,type ManagerBinding,
 import type { Store } from './store.ts';
 import { selectedModel,modelFailureNote,type DshExecution } from './dsh.ts';
 import { previewEvidence } from './evidence.ts';
-import {configureRole,fullAccessEnabled,type RuntimeOptions} from './runtime.ts';
+import {configureRole,fullAccessEnabled,runtimeLimits,type RuntimeOptions} from './runtime.ts';
 import { readMaterials,materialPrompt } from './materials.ts';
 import {nameAutomaticSession} from './sidebar.ts';
 import {MANAGER_NATIVE_TOOLS,managerNoWait} from './manager-tools.ts';
@@ -427,18 +427,18 @@ export class Managers {
     const timeout=setTimeout(()=>{
       timedOut=true;
       agent.inbox.remove(message.id);agent.cancel({kind:'user'},{keepInbox:true});
-      if(!this.closed)this.store.managerProblem(botId,'自动管理达到 5 分钟上限，已请求停止；请检查最新账本。');
-    },5*60*1000);timeout.unref();
+      if(!this.closed)this.store.managerProblem(botId,`自动管理达到 ${runtimeLimits(this.options).managerTurnMinutes} 分钟上限，已请求停止；请检查最新账本。`);
+    },runtimeLimits(this.options).managerTurnMinutes*60*1000);timeout.unref();
     const done=agent.whenIdle().catch(()=>{
       if(!this.closed)this.store.managerProblem(botId,'自动管理未正常结束，请打开管理会话核对。');
-    }).finally(async()=>{await this.finishing.get(agent.id);clearTimeout(timeout);if(!this.closed){this.store.managerEventUnknown(eventId);if(timedOut)this.store.managerProblem(botId,'自动管理达到 5 分钟上限，本轮已结束、管理会话已空闲。可打开管理对话检查账本后继续。');}this.deliveryScopes.delete(agent.id);this.waking.delete(botId);});
+    }).finally(async()=>{await this.finishing.get(agent.id);clearTimeout(timeout);if(!this.closed){this.store.managerEventUnknown(eventId);if(timedOut)this.store.managerProblem(botId,`自动管理达到 ${runtimeLimits(this.options).managerTurnMinutes} 分钟上限，本轮已结束、管理会话已空闲。可打开管理对话检查账本后继续。`);}this.deliveryScopes.delete(agent.id);this.waking.delete(botId);});
     this.waking.set(botId,done);
   }
   private async pump():Promise<void> {
     if(this.closed||this.pumping)return;this.pumping=true;
     try {
       for(const bot of this.store.managerOrder()) {
-        if(this.closed)break;if(this.waking.size>=2)break;
+        if(this.closed)break;if(this.waking.size>=runtimeLimits(this.options).managerConcurrentWakes)break;
         if((this.retryAfter.get(bot.id)??0)>Date.now())continue;
         try {
         const manager=this.store.activeManager(bot.id);if(!manager?.sessionId||manager.state!=='ready'||this.waking.has(bot.id))continue;
@@ -457,7 +457,11 @@ export class Managers {
           event=this.store.pendingManagerEvents(bot.id)[0];if(!event)continue;
         }
         if(!event)continue;
-        if(this.store.managerWakeCount(bot.id,Date.now()-60*60*1000)>=20)continue;
+        const wakeLimit=runtimeLimits(this.options).managerWakesPerHour;
+        if(this.store.managerWakeCount(bot.id,Date.now()-60*60*1000)>=wakeLimit){
+          // Deduplicated by message: recorded once until a later successful wake clears it.
+          this.store.managerProblem(bot.id,`最近一小时自动唤醒已达 ${wakeLimit} 次上限，通知已保留、暂停自动唤醒；可打开 Bot 对话处理，或调整 managerWakesPerHour。`);continue;
+        }
         if(!selectedModel(this.ctx,agent)){this.store.managerProblem(bot.id,'请打开管理对话，明确选择并配置模型；任务通知已保留，尚未自动调用模型。');continue;}
         const message=createUserMessage({source:{kind:'super-bot-manager',botId:bot.id,managerId:manager.id,eventId:event.id},content:[{type:'text',text:`Important task event: ${JSON.parse(event.payload).reason}\nTask: ${event.taskId??'all current work'}\nRead current ledger state. Do not assume the event is still current. Do not manufacture new tasks. If ready, read detail, review only if needed, and deliver a concise result with file links and pending human confirmation here. If waiting for input, ask the user here. Do not repeat a stale delivery. Finish after useful bounded work; do not poll.`}]});
         if(!this.store.claimManagerEvent(event.id,message.id,JSON.stringify(message)))continue;

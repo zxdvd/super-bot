@@ -9,7 +9,7 @@ import {Managers} from '../../src/manager.ts';
 import type {DshExecution} from '../../src/dsh.ts';
 import {collectEvidence} from '../../src/evidence.ts';
 
-async function fixture(t:TestContext,fullAccess?:boolean) {
+async function fixture(t:TestContext,fullAccess?:boolean,extra:Record<string,unknown>={}) {
   t.mock.timers.enable({apis:['Date','setInterval']});
   const root=realpathSync(process.cwd());mkdirSync(join(root,'.runtime'),{recursive:true});
   const directory=mkdtempSync(join(root,'.runtime','delivery-adapter-'));let store=new Store(join(directory,'ledger.sqlite'));
@@ -31,7 +31,7 @@ async function fixture(t:TestContext,fullAccess?:boolean) {
   const ctx={permissionPresets:{set:()=>{}},effect:(callback:()=>unknown)=>callback(),on:(name:string,callback:Function)=>{listeners.set(name,callback);return ()=>{};},agents:{list:()=>[agent]},tools:{register:(tool:any)=>{handler=tool.execute;return ()=>{};}},sessionController:{resolveAgent:async()=>({agent})},sessionProjections:{snapshot:()=>({values:{modelSelection:{next:{provider:'fake',model:'fake'}}}})},sessions:{flush:async()=>{if(flushMode==='blocked')await new Promise<void>(resolve=>{allowFlush=resolve;});if(flushMode==='throw')throw Error('Synthetic durability failure');if(flushMode==='false')return false;durable.splice(0,durable.length,...structuredClone(events));return true;}},sessionPersistence:{open:async()=>({read:async()=>({events:structuredClone(durable)}),close:async()=>{}})}} as unknown as Context;
   const execution={dispatch:async()=>{dispatches++;throw Error('Worker must not run on delivery recovery');},verifyResult:async()=>{}} as unknown as DshExecution;
   const retired:Managers[]=[];
-  let managers=new Managers(ctx,store,execution,directory,()=> 'https://example.test',{fullAccess});managers.install();
+  let managers=new Managers(ctx,store,execution,directory,()=> 'https://example.test',{fullAccess,...extra});managers.install();
   const emit=async(type:string,data:any,surfaceOp?:string)=>{const event={type,data,seq:events.length,time:Date.now(),...(surfaceOp?{surfaceOp}:{})};events.push(event);await listeners.get('session/event')?.(session,event);return event;};
   const pulse=async(ms=1000)=>{t.mock.timers.tick(ms);await new Promise<void>(resolve=>setImmediate(resolve));};
   const call=(callId:string,args:Record<string,unknown>)=>handler(args,{agent,callId,signal:new AbortController().signal});
@@ -41,7 +41,7 @@ async function fixture(t:TestContext,fullAccess?:boolean) {
   const assistant=async(turn:number,content:any[]=[{type:'text',text:text()}],finish='stop',interrupted=false)=>emit('assistant/message',{turn,step:1,message:{id:`assistant-${events.length}`,role:'assistant',source:{kind:'model',provider:'fake',model:'fake'},content},stream:[{type:'chunk',time:Date.now(),chunk:{type:'finish',reason:{kind:finish}}}],...(interrupted?{interrupted:true}:{})},'append');
   const end=async(turn:number,success=true)=>{await emit('turn/end',{turn,reason:success?{kind:'completed'}:{kind:'error',error:{code:'SYNTHETIC_MODEL_FAILURE'}}});agent.status='idle';resolveIdle();await new Promise<void>(resolve=>setImmediate(resolve));};
   const state=()=>store.db.prepare('SELECT state,payload FROM outbox WHERE id=?').get(`manager-event:delivery:${report.resultId}`);
-  return {allowed:()=>allowed,prompt:()=>prompt(),get store(){return store;},bot,manager,task,run,report,ready,agent,events,durable,pulse,enter,call,review,text,assistant,end,state,emit,beginNative:()=>{agent.status='running';idle=new Promise<void>(resolve=>{resolveIdle=resolve;});},checkpoint:()=> (ctx.sessions as any).flush(session),reinstallWhileActive:()=>{retired.push(managers);managers=new Managers(ctx,store,execution,directory,()=> 'https://example.test',{fullAccess});managers.install();},guard:(name:string,args:Record<string,unknown>={})=>guard({name,arguments:args}),counts:()=>({followups,dispatches,cancels}),setFlush:(mode:typeof flushMode)=>{flushMode=mode;},unblockFlush:()=>allowFlush(),reload:async(reopen=false)=>{await managers.dispose();if(reopen){store.close();store=new Store(join(directory,'ledger.sqlite'));}managers=new Managers(ctx,store,execution,directory,()=> 'https://example.test',{fullAccess});managers.install();},close:async()=>{agent.status='idle';resolveIdle();await managers.dispose();for(const old of retired)await old.dispose();store.close();assert.ok(directory.startsWith(join(root,'.runtime','delivery-adapter-')));rmSync(directory,{recursive:true,force:true});t.mock.timers.reset();}};
+  return {allowed:()=>allowed,prompt:()=>prompt(),get store(){return store;},bot,manager,task,run,report,ready,agent,events,durable,pulse,enter,call,review,text,assistant,end,state,emit,beginNative:()=>{agent.status='running';idle=new Promise<void>(resolve=>{resolveIdle=resolve;});},checkpoint:()=> (ctx.sessions as any).flush(session),reinstallWhileActive:()=>{retired.push(managers);managers=new Managers(ctx,store,execution,directory,()=> 'https://example.test',{fullAccess,...extra});managers.install();},guard:(name:string,args:Record<string,unknown>={})=>guard({name,arguments:args}),counts:()=>({followups,dispatches,cancels}),setFlush:(mode:typeof flushMode)=>{flushMode=mode;},unblockFlush:()=>allowFlush(),reload:async(reopen=false)=>{await managers.dispose();if(reopen){store.close();store=new Store(join(directory,'ledger.sqlite'));}managers=new Managers(ctx,store,execution,directory,()=> 'https://example.test',{fullAccess,...extra});managers.install();},close:async()=>{agent.status='idle';resolveIdle();await managers.dispose();for(const old of retired)await old.dispose();store.close();assert.ok(directory.startsWith(join(root,'.runtime','delivery-adapter-')));rmSync(directory,{recursive:true,force:true});t.mock.timers.reset();}};
 }
 
 test('model failure after committed review supplements final delivery without executing Worker or review again',async t=>{
@@ -337,5 +337,16 @@ test('delivery-only recovery may call deliver for its own result only',async t=>
     assert.equal(value.delivery.resultId,f.report.resultId);assert.equal(f.state()?.state,'done');
     await f.assistant(2,[{type:'text',text:'已交付。'}]);await f.end(2);await f.pulse(120000);
     assert.equal(f.counts().followups,2);assert.equal(f.counts().dispatches,0);
+  }finally{await f.close();}
+});
+
+test('hitting the configurable hourly wake limit records one problem and stops waking',async t=>{
+  const f=await fixture(t,undefined,{managerWakesPerHour:1});try {
+    await f.pulse();assert.equal(f.counts().followups,1);await f.enter(1);await f.assistant(1,[{type:'text',text:'已查看。'}]);await f.end(1);
+    f.store.enqueueManager(f.bot.id,'extra:1','合成后续通知',f.task.id);
+    await f.pulse();assert.equal(f.counts().followups,1);
+    const problem=f.store.managerInfo(f.bot.id).problem;assert.match(String(problem?.message),/1 次上限/);
+    await f.pulse(5000);assert.deepEqual(f.store.managerInfo(f.bot.id).problem,problem);assert.equal(f.counts().followups,1);
+    assert.equal(f.store.pendingManagerEvents(f.bot.id).some((e:any)=>e.id==='manager-event:extra:1'),true);
   }finally{await f.close();}
 });

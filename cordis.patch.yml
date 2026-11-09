@@ -5,3 +5,5 @@
       config:
         fullAccess: true
         # workspace: /absolute/path/project  # New tasks use isolated subdirectories / Git worktrees.
+        # maxRunningTasks: 2        # Global Worker slots.
+        # managerWakesPerHour: 20   # Per-Bot automatic wakes; hitting it records a visible problem.

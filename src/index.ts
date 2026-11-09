@@ -10,7 +10,7 @@ import { basename,join,resolve } from 'node:path';
 import { readEvidence } from './evidence.ts';
 import { Store } from './store.ts';
 import { DshExecution } from './dsh.ts';
-import type {RuntimeOptions} from './runtime.ts';
+import {runtimeLimits,type RuntimeOptions} from './runtime.ts';
 import { Managers } from './manager.ts';
 import { NativeSidebar } from './sidebar.ts';
 import { createLedgerBackup } from './backups.ts';
@@ -19,11 +19,11 @@ import { AppError, requiredText, optionalText,type WorkspaceStatus, type NewBot,
 export const name = 'super-bot';
 export const inject = ['connection', 'sessionController', 'workspaceRegistry','agents','tools','jobs','systemPrompt','workingDirectory','sessionProjections','webServer','permissionPresets','sessions','sessionPersistence','sessionTitle'];
 const roleModel=Schema.union([Schema.const(undefined),Schema.object({provider:Schema.string().required(),model:Schema.string().required(),reasoningEffort:Schema.string()})]);
-export const Config = Schema.object({ dataDir: Schema.string().description('Super Bot 本地数据目录'), fullAccess:Schema.boolean().default(true).description('默认开启 Bot 查询工具（含 Shell）及 Worker 原生 Full Access；false 关闭 Bot 原生工具并将 Worker 限为任务目录文件工具'),workspace:Schema.string().description('项目根目录；新任务在其下使用独立子目录或 Git worktree'),managerModel:roleModel,workerModel:roleModel });
+export const Config = Schema.object({ dataDir: Schema.string().description('Super Bot 本地数据目录'), fullAccess:Schema.boolean().default(true).description('默认开启 Bot 查询工具（含 Shell）及 Worker 原生 Full Access；false 关闭 Bot 原生工具并将 Worker 限为任务目录文件工具'),workspace:Schema.string().description('项目根目录；新任务在其下使用独立子目录或 Git worktree'),maxRunningTasks:Schema.natural().min(1).default(2).description('全局同时执行的 Worker 任务数'),managerWakesPerHour:Schema.natural().min(1).default(20).description('每个 Bot 每小时自动唤醒上限；达到后记录问题并暂停自动唤醒'),managerConcurrentWakes:Schema.natural().min(1).default(2).description('同时自动唤醒的 Bot 数'),managerTurnMinutes:Schema.natural().min(1).default(5).description('单次自动 Bot 轮次上限（分钟）'),managerModel:roleModel,workerModel:roleModel });
 
 export function apply(ctx: Context, config: RuntimeOptions & { dataDir?: string } = {}): void {
   const dataDir = resolve(config.dataDir ?? process.env.SUPER_BOT_DATA_DIR ?? join(process.env.DSH_HOME ?? join(homedir(), '.dsh'), 'super-bot'));
-  const store = new Store(join(dataDir, 'ledger.sqlite'));
+  const store = new Store(join(dataDir, 'ledger.sqlite'));store.maxRunningTasks=runtimeLimits(config).maxRunningTasks;
   const execution=new DshExecution(ctx,store,dataDir,config);
   const managers=new Managers(ctx,store,execution,dataDir,()=>ctx.webServer.getOrigin(),config);
   const sidebar=new NativeSidebar(ctx,store);
