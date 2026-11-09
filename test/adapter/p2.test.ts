@@ -2,7 +2,7 @@
  * Only the native host boundary is synthetic; no running host or user data is touched. */
 import {test,type TestContext} from 'node:test';
 import assert from 'node:assert/strict';
-import {mkdirSync,mkdtempSync,realpathSync,rmSync,writeFileSync,unlinkSync} from 'node:fs';
+import {existsSync,mkdirSync,mkdtempSync,realpathSync,rmSync,writeFileSync,unlinkSync} from 'node:fs';
 import {join} from 'node:path';
 import {Context} from '@deepseek-ai/cordis';
 import {ToolsService} from '@deepseek-ai/dsh-tools';
@@ -14,7 +14,7 @@ import {DshExecution} from '../../src/dsh.ts';
 import {Store} from '../../src/store.ts';
 import {readEvidence} from '../../src/evidence.ts';
 
-function fixture(t:TestContext,workspace=false) {
+function fixture(t:TestContext,workspace=false,extra:(directory:string)=>Record<string,unknown>=()=>({})) {
   t.mock.timers.enable({apis:['setInterval']});
   const root=realpathSync(process.cwd());mkdirSync(join(root,'.runtime'),{recursive:true});
   const directory=mkdtempSync(join(root,'.runtime','p2-adapter-')),database=join(directory,'ledger.sqlite');
@@ -58,7 +58,8 @@ function fixture(t:TestContext,workspace=false) {
       resolveAgent:async(sessionId:string)=>agents.has(sessionId)?{agent:agents.get(sessionId)}:{error:'synthetic missing session'},
     },
   } as unknown as Context;
-  let execution=new DshExecution(ctx,store,directory,{fullAccess:workspace,...(workspace?{workspace:directory}:{})}),managers=new Managers(ctx,store,execution,directory,()=> 'https://example.test');
+  const options=()=>({fullAccess:workspace,...(workspace?{workspace:directory}:{}),...extra(directory)});
+  let execution=new DshExecution(ctx,store,directory,options()),managers=new Managers(ctx,store,execution,directory,()=> 'https://example.test',options());
   const install=()=>{execution.install();managers.install();};install();
   const emit=async(event:any,sessionId=manager.requestedSessionId)=>{for(const listener of listeners.get('session/event')??[])await listener({id:sessionId},event);};
   const native=async(id:string,seq:number,text:string)=>emit({type:'user/message',seq,data:{id,source:{kind:'user',rpcId:`rpc:${id}`},content:[{type:'text',text}]}});
@@ -72,7 +73,7 @@ function fixture(t:TestContext,workspace=false) {
       agents.get(run.sessionId).finish();await new Promise<void>(resolve=>setImmediate(resolve));return report;
     },
     call:(callId:string,args:Record<string,unknown>,signal=new AbortController().signal)=>tools.get('super_bot_manage').execute(args,{agent:{id:manager.requestedSessionId},callId,signal}),
-    reload:async()=>{await managers.dispose();await execution.dispose();registrations.splice(0).forEach(off=>off());listeners.clear();store.close();store=new Store(database);execution=new DshExecution(ctx,store,directory,{fullAccess:workspace,...(workspace?{workspace:directory}:{})});managers=new Managers(ctx,store,execution,directory,()=> 'https://example.test');install();},
+    reload:async()=>{await managers.dispose();await execution.dispose();registrations.splice(0).forEach(off=>off());listeners.clear();store.close();store=new Store(database);execution=new DshExecution(ctx,store,directory,options());managers=new Managers(ctx,store,execution,directory,()=> 'https://example.test',options());install();},
     close:async()=>{await managers.dispose();await execution.dispose();registrations.splice(0).forEach(off=>off());store.close();assert.equal(realpathSync(directory),directory);assert.ok(directory.startsWith(join(root,'.runtime','p2-adapter-')));rmSync(directory,{recursive:true,force:true});t.mock.timers.reset();},
   };
 }
@@ -426,5 +427,60 @@ test('one-step create keeps explicit Bot fields and queues instead of failing wh
     for(const n of [1,2,3])results.push(await f.call(`create-${n}`,{action:'create',goal:`介绍 ${n}`,scope:`只写 doc-${n}.md`,acceptance:'回读'}));
     assert.ok(results[0].run&&results[1].run);assert.equal(results[2].deferred,true);assert.equal(results[2].task.scope,'只写 doc-3.md');
     assert.ok(f.store.pendingManagerEvents(f.bot.id).some((e:any)=>e.id.startsWith(`manager-event:capacity:${results[2].task.id}`)));
+  }finally{await f.close();}
+});
+
+const work=(directory:string)=>{const path=join(directory,'work');mkdirSync(path,{recursive:true});return path;};
+test('Bot-chosen existing directories are exclusive: the second task waits in FIFO with its holder named',async t=>{
+  const f=fixture(t,false,directory=>({allowedRoots:[work(directory)]}));try {
+    const app=join(f.directory,'work','app');mkdirSync(app);
+    await f.native('request',1,'在 app 里改两处。');
+    const first=await f.call('wd-1',{action:'create',goal:'改登录',workdir:{mode:'existing',path:app}});
+    assert.ok(first.run,JSON.stringify(first));assert.match(first.workdir,/existing/);
+    assert.ok(f.delivered().content[0].text.includes(`Working directory: ${app} (existing directory`));
+    assert.equal(f.store.activeBinding(first.task.id)?.cwd,app);
+    const second=await f.call('wd-2',{action:'create',goal:'改注册',workdir:{mode:'existing',path:app}});
+    assert.equal(second.deferred,true);assert.equal(second.reason,'resource-conflict');assert.equal(second.holderTaskId,first.task.id);
+    assert.match(second.message,/改登录/);
+    assert.equal(f.store.taskDetail(second.task.id).wait?.holderTaskId,first.task.id);
+    const isolated=await f.call('wd-3',{action:'create',goal:'独立调研',workdir:{mode:'isolated',name:'research'}});
+    assert.ok(isolated.run,'an isolated task runs beside the existing-directory holder');
+    assert.equal(f.store.activeBinding(isolated.task.id)?.cwd,join(f.directory,'work','.super-bot-workspaces',`research-${isolated.task.id.slice(0,8)}`));
+    assert.throws(()=>f.store.reserveRun('late',second.task.id,f.store.getTask(second.task.id).rowVersion),{code:'resource-conflict'});
+  }finally{await f.close();}
+});
+
+test('workdir requests outside allowedRoots are rejected with a stable code and no session',async t=>{
+  const f=fixture(t,false,directory=>({allowedRoots:[join(directory,'allowed')]}));try {
+    mkdirSync(join(f.directory,'allowed'));mkdirSync(join(f.directory,'other'));
+    await f.native('request',1,'改 other。');
+    const result=await f.call('wd-out',{action:'create',goal:'越界',workdir:{mode:'existing',path:join(f.directory,'other')}});
+    assert.equal(result.run,undefined);assert.equal(result.dispatchError?.code??result.error?.code??result.code,'workdir-rejected',JSON.stringify(result));
+    assert.equal(f.store.activeBinding(result.task.id),null);
+    assert.ok(f.store.db.prepare("SELECT count(*) AS n FROM events WHERE kind='workdir.failed'").get()?.n);
+    const bad=await f.nativeResult('wd-shape',{action:'create',goal:'坏参数',workdir:{mode:'hook',args:{x:'$(id)'}}});
+    assert.ok(bad.isError||JSON.stringify(bad).includes('workdir-rejected'),JSON.stringify(bad));
+  }finally{await f.close();}
+});
+
+test('hook provisioning runs once per dispatch request and records a cleanable workdir',async t=>{
+  const f=fixture(t,false,directory=>({allowedRoots:[work(directory)],workdirHook:{create:'echo run >> "$SB_TASK_ID.count"; mkdir -p "ws/$SB_NAME"; echo "SB_WORKDIR=$PWD/ws/$SB_NAME"',remove:'rm -r "$SB_WORKDIR"',argNames:['repos']}}));try {
+    await f.native('request',1,'在多仓工作区里改。');
+    const created=await f.call('wd-hook',{action:'create',goal:'多仓修改',workdir:{mode:'hook',name:'multi',args:{repos:'a b'}}});
+    assert.ok(created.run,JSON.stringify(created));
+    const cwd=f.store.activeBinding(created.task.id)!.cwd;assert.equal(cwd,join(f.directory,'work','ws',`multi-${created.task.id.slice(0,8)}`));
+    const retry=await f.call('wd-hook',{action:'create',goal:'多仓修改',workdir:{mode:'hook',name:'multi',args:{repos:'a b'}}});
+    assert.equal(retry.run.id,created.run.id);
+    const {readFileSync}=await import('node:fs');
+    assert.equal(readFileSync(join(f.directory,'work',`${created.task.id}.count`),'utf8'),'run\n','hook is not rerun by an idempotent retry');
+    await assert.rejects(f.execution.cleanupWorkdir(created.task.id),{code:'task-active'});
+    await f.emit({type:'user/message',seq:1,data:f.delivered()},created.run.sessionId);
+    f.store.workerReport(created.run.id,'failed',{kind:'failed',summary:'Synthetic stop'});
+    f.agents.get(created.run.sessionId).finish();await new Promise<void>(resolve=>setImmediate(resolve));
+    f.store.db.prepare("UPDATE attentions SET state='stale' WHERE taskId=?").run(created.task.id);
+    f.store.cancelTask('cancel',created.task.id,f.store.getTask(created.task.id).rowVersion);
+    const cleaned=await f.execution.cleanupWorkdir(created.task.id);
+    assert.equal(cleaned.workdir?.state,'removed');assert.equal(existsSync(cwd),false);
+    assert.equal(f.store.latestBinding(created.task.id)?.workdir?.state,'removed');
   }finally{await f.close();}
 });

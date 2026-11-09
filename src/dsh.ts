@@ -10,10 +10,10 @@ import type {} from '@deepseek-ai/dsh-session-projection';
 import type { Agent } from '@deepseek-ai/dsh-agent';
 import { createUserMessage,freezeMessage,type UserMessage } from '@deepseek-ai/dsh-llm';
 import { SessionId } from '@deepseek-ai/dsh-session/types';
-import { mkdir, realpath } from 'node:fs/promises';
+import { realpath } from 'node:fs/promises';
 import { realpathSync } from 'node:fs';
 import { join,isAbsolute,basename } from 'node:path';
-import {taskWorkspace} from './task-workspace.ts';
+import {cleanupWorkdir,provisionWorkdir,workdirPolicy,workdirSummary,type WorkdirPolicy,type WorkdirRequest} from './workdir.ts';
 import {nameAutomaticSession,workerTitle} from './sidebar.ts';
 import { AppError,requiredText,optionalText,type Binding,type Run,type WorkReport,type ExistingSessionGrant,type ExistingSessionPreview } from './model.ts';
 import type { Store } from './store.ts';
@@ -41,7 +41,8 @@ export class DshExecution {
   private creating=new Map<string,Promise<Binding>>();
   private running=new Map<string,{agent:Agent;release:()=>void;done:Promise<void>}>();
   private disposed=false;
-  constructor(private ctx:Context,private store:Store,private dataDir:string,private options:RuntimeOptions={}) {}
+  readonly policy:WorkdirPolicy;
+  constructor(private ctx:Context,private store:Store,private dataDir:string,private options:RuntimeOptions={}) {this.policy=workdirPolicy(options,dataDir);}
   install():void {
     this.ctx.effect(()=>this.ctx.tools.register({name:'super_bot_report',description:'Report progress, a question, a blockage, failure, or ready results to the task ledger. Ready requires files and acceptance checks. A ready report requests human review, it does not complete the task.',
       parameters:{type:'object',properties:{kind:{type:'string',enum:['progress','waiting','ready','blocked','failed']},summary:{type:'string'},checks:{type:'string'},files:{type:'array',items:{type:'string'},maxItems:10}},required:['kind','summary'],additionalProperties:false},
@@ -143,7 +144,7 @@ export class DshExecution {
     let input=this.store.getRunInput(run.id);
     if(!input.messageJson) {
       const supplement=`\nScheduling fact: Super Bot has reserved this working directory for the current run. Its ledger rejects concurrent runs in overlapping directories and keeps unresolved runs reserved. You do not need another confirmation that an earlier Super Bot run released this directory. This does not cover unrelated external processes.\n${input.kind==='answer'||input.kind==='rework'?`Additional user input (${input.kind}): ${input.content}`:''}`;
-      const message=createUserMessage({source:{kind:'super-bot',taskId,runId:run.id,inputId:run.inputId,taskRevision:run.taskRevision,generation:run.generation},content:[{type:'text',text:`You are executing a NEW attempt of one Super Bot task.\nCurrent run: ${run.id}. Reports from previous attempts do not complete this run. Re-check current facts and perform the authorized work; do not merely repeat an earlier conclusion. Submit a fresh super_bot_report for this run.\nBot configuration revision: ${task.botConfigRevision}\nBot responsibility: ${botContext.instructions}${materialPrompt(botContext.materials)}\nGoal: ${task.goal}\nAuthorized scope: ${task.scope}\nAcceptance criteria: ${task.acceptance}\nWorking directory: ${b.cwd}${supplement}\n${fullAccessEnabled(this.options)?'This Worker uses the native Full Access preset. Use native tools including shell to implement and test the requested work. Keep work scoped to this task. Do not modify unrelated projects or credentials. Change host configuration only when this task explicitly authorizes that change. Report actual changed source files and test results.':'Use only read/write/edit in this directory, always with absolute file_path values. Do not change working directories. Worker 完整权限未开启：当前 fullAccess: false。Shell and external CLI tools are unavailable in files mode; report this limitation, never ask for a tool channel. To enable them, set fullAccess: true in the Super Bot config of the active profile cordis.patch.yml and reload when idle.'}\nReport with super_bot_report. Use waiting to ask a necessary question. For ready provide files and checks explaining every acceptance criterion. Never claim the task is accepted; the user decides.`}]});
+      const message=createUserMessage({source:{kind:'super-bot',taskId,runId:run.id,inputId:run.inputId,taskRevision:run.taskRevision,generation:run.generation},content:[{type:'text',text:`You are executing a NEW attempt of one Super Bot task.\nCurrent run: ${run.id}. Reports from previous attempts do not complete this run. Re-check current facts and perform the authorized work; do not merely repeat an earlier conclusion. Submit a fresh super_bot_report for this run.\nBot configuration revision: ${task.botConfigRevision}\nBot responsibility: ${botContext.instructions}${materialPrompt(botContext.materials)}\nGoal: ${task.goal}\nAuthorized scope: ${task.scope}\nAcceptance criteria: ${task.acceptance}\nWorking directory: ${workdirSummary(b.cwd,b.workdir)}. Work only inside it; do not change other checkouts or directories.${supplement}\n${fullAccessEnabled(this.options)?'This Worker uses the native Full Access preset. Use native tools including shell to implement and test the requested work. Keep work scoped to this task. Do not modify unrelated projects or credentials. Change host configuration only when this task explicitly authorizes that change. Report actual changed source files and test results.':'Use only read/write/edit in this directory, always with absolute file_path values. Do not change working directories. Worker 完整权限未开启：当前 fullAccess: false。Shell and external CLI tools are unavailable in files mode; report this limitation, never ask for a tool channel. To enable them, set fullAccess: true in the Super Bot config of the active profile cordis.patch.yml and reload when idle.'}\nReport with super_bot_report. Use waiting to ask a necessary question. For ready provide files and checks explaining every acceptance criterion. Never claim the task is accepted; the user decides.`}]});
       input=this.store.saveRunMessage(run.id,message.id,JSON.stringify(message));
     }
     const releaseMask=fullAccessEnabled(this.options)?()=>{}:agent.ctx.tools.restrict({allow:['read','write','edit','super_bot_report']});
@@ -202,7 +203,24 @@ export class DshExecution {
     const receipt=this.store.commandReceipt<import('./model.ts').Task>(requestId,'result.accept',{taskId,expectedRowVersion:rowVersion,resultId});
     if(receipt)return receipt;
     await this.verifyResult(taskId,resultId);
-    return this.store.acceptResult(requestId,taskId,rowVersion,resultId);
+    const task=this.store.acceptResult(requestId,taskId,rowVersion,resultId);
+    await this.autoCleanup(taskId);return task;
+  }
+  /** Removes a finished task's provisioned directory. Existing directories and running tasks are refused. */
+  async cleanupWorkdir(taskId:string):Promise<Binding> {
+    const task=this.store.getTask(taskId),binding=this.store.latestBinding(taskId);
+    if(!binding)throw new AppError('not-found','任务还没有工作目录。');
+    if(!['completed','cancelled'].includes(task.lifecycle)&&binding.state!=='released')throw new AppError('task-active','任务结束（完成或取消）或解除会话关联后才能清理工作目录。');
+    if(this.store.heldRuns().some(run=>run.taskId===taskId))throw new AppError('run-active','执行尚未收敛，不能清理。');
+    const info=binding.workdir??{mode:'existing' as const,state:'provisioned' as const};
+    return this.store.setBindingWorkdir(binding.id,await cleanupWorkdir(binding.cwd,info,taskId,this.policy));
+  }
+  private async autoCleanup(taskId:string):Promise<void> {
+    if(this.policy.cleanup!=='on-complete')return;
+    const mode=this.store.latestBinding(taskId)?.workdir?.mode;
+    if(!mode||mode==='existing'||mode==='default'||(mode==='hook'&&!this.policy.hook?.remove))return;
+    try{await this.cleanupWorkdir(taskId);}
+    catch(error){this.store.note('workdir.cleanup-failed',taskId,{message:error instanceof Error?error.message.slice(0,500):'unknown'});}
   }
   async verifyResult(taskId:string,resultId:string) {
     const detail=this.store.taskDetail(taskId);
@@ -243,21 +261,33 @@ export class DshExecution {
       if('error' in resolved)throw new AppError('session-unavailable','无法核对原生会话，请恢复会话后再操作。');
       this.assertQuiet(resolved.agent);
     }
-    return action==='task.cancel'?this.store.cancelTask(requestId,taskId,rowVersion):this.store.detachSession(requestId,taskId,rowVersion);
+    if(action==='session.detach')return this.store.detachSession(requestId,taskId,rowVersion);
+    const cancelled=this.store.cancelTask(requestId,taskId,rowVersion);await this.autoCleanup(taskId);return cancelled;
   }
   async dispose():Promise<void> {
     this.disposed=true;
     for(const [id,{agent}]of this.running){this.store.runRecovery(id,'插件退出时执行尚未核对，重新启用后请核对原生会话。');const input=this.store.getRunInput(id);if(input.messageId)agent.inbox.remove(input.messageId as UserMessage['id']);agent.cancel({kind:'user'},{keepInbox:true});}
     await Promise.allSettled([...this.running.values()].map(r=>r.done));
   }
-  async prepareSession(requestId:string,taskId:string,rowVersion:number):Promise<Binding> {
+  async prepareSession(requestId:string,taskId:string,rowVersion:number,workdir?:WorkdirRequest):Promise<Binding> {
     const receipt=this.store.bindingReceipt(requestId,taskId,rowVersion);
     if(receipt?.state==='ready'||receipt?.state==='released')return receipt;
     // Validate the ID through the ledger before using it as a directory segment.
     const task=this.store.getTask(taskId);
-    const generation=this.store.nextBindingGeneration(taskId);
-    const cwd=this.store.activeBinding(taskId)?.cwd??(this.options.workspace?await taskWorkspace(this.options.workspace,task.id,generation):undefined)??join(this.dataDir,'workspaces',generation===1?task.id:`${task.id}-g${generation}`);await mkdir(cwd,{recursive:true});
-    const b=this.store.beginBinding(requestId,taskId,rowVersion,await realpath(cwd));
+    const bound=this.store.activeBinding(taskId);
+    let cwd:string,info=bound?.workdir??undefined;
+    if(bound)cwd=bound.cwd;
+    else {
+      // Provisioning has external effects (git, hook): one request provisions at most once.
+      const key=`workdir-provision:${requestId}`,saved=this.store.get(key);
+      if(saved)({cwd,info}=JSON.parse(saved) as {cwd:string;info:typeof info});
+      else {
+        try{({cwd,info}=await provisionWorkdir({request:workdir??task.workdirRequest??undefined,taskId:task.id,generation:this.store.nextBindingGeneration(taskId),policy:this.policy}));}
+        catch(error){if(error instanceof AppError)this.store.note('workdir.failed',taskId,{code:error.code,message:error.message.slice(0,2000)});throw error;}
+        this.store.set(key,JSON.stringify({cwd,info}));
+      }
+    }
+    const b=this.store.beginBinding(requestId,taskId,rowVersion,await realpath(cwd),info);
     const current=this.store.getBinding(b.id);if(current.state==='ready')return current;
     const active=this.creating.get(b.id);if(active)return active;
     if(!this.store.claimBindingCreation(b.id))return this.reconcileBinding(b.id);

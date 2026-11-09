@@ -1,4 +1,6 @@
 /** Values crossing the product/host boundary; no DSH or UI types. */
+import type {WorkdirRequest,WorkdirInfo} from './workdir.ts';
+export type {WorkdirRequest,WorkdirInfo};
 export interface WorkspaceStatus {
   product: 'Super Bot';
   version: string;
@@ -6,6 +8,7 @@ export interface WorkspaceStatus {
   sqliteVersion: string;
   journalMode: string;
   startedAt: number;
+  configWarnings?: string[];
 }
 
 export class AppError extends Error {
@@ -43,6 +46,8 @@ export interface Task {
   status: 'unscheduled' | 'needs-input' | 'approval' | 'paused' | 'manual' | 'completed' | 'cancelled' | 'review' | 'queued' | 'running' | 'stopping' | 'recovery';
   managerReviewed?:boolean;
   botConfigRevision:number;
+  /** What the Bot asked for when creating the task; null means the configured default. */
+  workdirRequest?:WorkdirRequest|null;
 }
 export interface TaskPage {
   items: Task[];
@@ -59,11 +64,12 @@ export function botDraft(input:NewBot):NewBot {
   const referencePaths=[...new Set(paths.map(path=>requiredText(path,'参考文本路径',2000)))];
   return {name:requiredText(input.name,'Bot 名称',80),instructions:requiredText(input.instructions,'Bot 职责'),...(referencePaths.length?{referencePaths}:{})};
 }
-export interface NewTask { botId: string; goal: string; scope: string; acceptance: string; reviewPolicy: 'human' | 'bot'; startPaused?:boolean }
+export interface NewTask { botId: string; goal: string; scope: string; acceptance: string; reviewPolicy: 'human' | 'bot'; startPaused?:boolean; workdir?:WorkdirRequest }
 export interface Binding {
   id: string; taskId: string; generation: number; taskRevision: number;
   requestedSessionId: string; sessionId: string | null; cwd: string;
   state: 'creating' | 'ready' | 'recovery' | 'released'; createdAt: number;
+  workdir?: WorkdirInfo | null;
 }
 export interface ExistingSessionGrant {
   taskId:string;expectedRowVersion:number;sessionId:string;cwd:string;
@@ -109,3 +115,6 @@ export function optionalText(value: unknown, label: string, max = 10000): string
  * identity is the latest message; text is complete and messages preserves each source.
  */
 export interface ChatSource { sessionId:string; messageId:string; seq:number; text:string; messages?:{messageId:string;seq:number;text:string}[] }
+
+/** Why a prepared task is not running yet; holder is the task that has (or is ahead in line for) the slot or directory. */
+export interface DispatchWait {code:'capacity'|'resource-conflict';holderTaskId:string|null;holderGoal:string|null}

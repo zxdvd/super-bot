@@ -3,7 +3,8 @@ import { mkdirSync } from 'node:fs';
 import { dirname,relative,isAbsolute,sep } from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
 import schemaVersion from '../schema-version.json' with {type:'json'};
-import { AppError, requiredText, optionalText, taskStatus, type ChatSource, type Bot, type Task, type NewBot, type NewTask, type TaskPage, type ControlMode, type Attention, type Binding, type Run, type RunInput, type WorkReport, type Result,type ManagerBinding,type ManagerEvent,type ExistingSessionGrant,type ReferenceMaterial,type TaskBotContext,botDraft } from './model.ts';
+import { AppError, requiredText, optionalText, taskStatus, type ChatSource, type Bot, type Task, type NewBot, type NewTask, type TaskPage, type ControlMode, type Attention, type Binding, type Run, type RunInput, type WorkReport, type Result,type ManagerBinding,type ManagerEvent,type ExistingSessionGrant,type ReferenceMaterial,type TaskBotContext,type DispatchWait,type WorkdirInfo,botDraft } from './model.ts';
+import {parseWorkdirRequest} from './workdir.ts';
 
 const DELIVERY_ATTEMPT_LIMIT=3;
 const DELIVERY_RETRY_DELAY_MS=30000;
@@ -66,6 +67,7 @@ export class Store {
         CREATE TABLE IF NOT EXISTS reviews (id TEXT PRIMARY KEY,resultId TEXT NOT NULL REFERENCES results(id),actor TEXT NOT NULL,verdict TEXT NOT NULL,note TEXT NOT NULL,createdAt INTEGER NOT NULL);
         CREATE TABLE IF NOT EXISTS managers (id TEXT PRIMARY KEY,botId TEXT NOT NULL REFERENCES bots(id),generation INTEGER NOT NULL,configRevision INTEGER NOT NULL,requestedSessionId TEXT NOT NULL UNIQUE,sessionId TEXT UNIQUE,cwd TEXT NOT NULL,state TEXT NOT NULL,createdAt INTEGER NOT NULL,UNIQUE(botId,generation));
         CREATE UNIQUE INDEX IF NOT EXISTS managers_active ON managers(botId) WHERE state!='released';
+        CREATE TABLE IF NOT EXISTS waits (taskId TEXT PRIMARY KEY REFERENCES tasks(id),createdAt INTEGER NOT NULL,seq INTEGER NOT NULL);
         `);
       const inputColumns=this.db.prepare('PRAGMA table_info(inputs)').all().map(row=>row.name);
       if(!inputColumns.includes('messageId'))this.db.exec('ALTER TABLE inputs ADD COLUMN messageId TEXT; ALTER TABLE inputs ADD COLUMN messageJson TEXT;');
@@ -75,6 +77,9 @@ export class Store {
       const taskColumns=this.db.prepare('PRAGMA table_info(tasks)').all().map(row=>row.name);
       if(!taskColumns.includes('botConfigRevision'))this.db.exec('ALTER TABLE tasks ADD COLUMN botConfigRevision INTEGER NOT NULL DEFAULT 1; UPDATE tasks SET botConfigRevision=(SELECT configRevision FROM bots WHERE bots.id=tasks.botId);');
       if(!taskColumns.includes('botContext'))this.db.exec("ALTER TABLE tasks ADD COLUMN botContext TEXT NOT NULL DEFAULT '{}'; UPDATE tasks SET botContext=json_object('instructions',(SELECT instructions FROM bots WHERE bots.id=tasks.botId),'materials',json((SELECT materials FROM bots WHERE bots.id=tasks.botId)));");
+      if(!taskColumns.includes('workdirRequest'))this.db.exec('ALTER TABLE tasks ADD COLUMN workdirRequest TEXT;');
+      const bindingColumns=this.db.prepare('PRAGMA table_info(bindings)').all().map(row=>row.name);
+      if(!bindingColumns.includes('workdir'))this.db.exec('ALTER TABLE bindings ADD COLUMN workdir TEXT;');
       this.db.exec(`PRAGMA user_version=${schemaVersion}; COMMIT;`);
     } catch (error) {
       this.db.close();
@@ -113,6 +118,8 @@ export class Store {
       this.db.exec('COMMIT'); return result;
     } catch (error) { this.db.exec('ROLLBACK'); throw error; }
   }
+  /** Audit-only fact recorded by an adapter (no state change). */
+  note(kind:string,taskId:string|null,data:unknown):void {this.event(kind,taskId,data);}
   private event(kind: string, taskId: string | null, data: unknown): void {
     this.db.prepare('INSERT INTO events(taskId,kind,data,createdAt) VALUES (?,?,?,?)').run(taskId, kind, JSON.stringify(data), Date.now());
   }
@@ -327,6 +334,7 @@ export class Store {
     if(input.startPaused!==undefined&&typeof input.startPaused!=='boolean')throw new AppError('invalid-input','初始暂停状态必须是布尔值。');
     const payload: NewTask = { botId: requiredText(input.botId, 'Bot 标识', 200), goal: requiredText(input.goal, '任务目标'),
       scope: optionalText(input.scope, '任务范围'), acceptance: optionalText(input.acceptance, '验收条件'), reviewPolicy: input.reviewPolicy,...(input.startPaused?{startPaused:true}:{}) };
+    const workdir=parseWorkdirRequest(input.workdir);if(workdir)payload.workdir=workdir;
     if (!['human', 'bot'].includes(payload.reviewPolicy)) throw new AppError('invalid-input', '请选择有效的验收方式。');
     // Native provenance, not a model-provided call ID, identifies one human request.
     // Keep the normal call receipt too: reusing a call ID with changed content must still fail.
@@ -337,8 +345,8 @@ export class Store {
       if(prior)return JSON.parse(String(prior.result)) as Task;
       const bot=this.getBot(payload.botId),context=this.currentBotContext(payload.botId);
       const id = randomUUID(), now = Date.now();
-      this.db.prepare('INSERT INTO tasks(id,botId,goal,scope,acceptance,reviewPolicy,controlMode,createdAt,updatedAt,botConfigRevision,botContext) VALUES (?,?,?,?,?,?,?,?,?,?,?)')
-        .run(id, payload.botId, payload.goal, payload.scope, payload.acceptance, payload.reviewPolicy,payload.startPaused?'paused':'auto',now,now,bot.configRevision,JSON.stringify(context));
+      this.db.prepare('INSERT INTO tasks(id,botId,goal,scope,acceptance,reviewPolicy,controlMode,createdAt,updatedAt,botConfigRevision,botContext,workdirRequest) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)')
+        .run(id, payload.botId, payload.goal, payload.scope, payload.acceptance, payload.reviewPolicy,payload.startPaused?'paused':'auto',now,now,bot.configRevision,JSON.stringify(context),payload.workdir?JSON.stringify(payload.workdir):null);
       this.db.prepare('INSERT INTO inputs(id,taskId,kind,content,createdAt) VALUES (?,?,?,?,?)')
         .run(randomUUID(), id, 'goal', payload.goal, now);
       this.event('task.created', id, { taskRevision: 1,...(source?{source}:{}) });
@@ -357,7 +365,8 @@ export class Store {
     return this.decorateTask(task);
   }
   private decorateTask(row:Task):Task {
-    const {botContext:_context,...task}=row as Task&{botContext?:string};
+    const {botContext:_context,workdirRequest:rawWorkdir,...rest}=row as Omit<Task,'workdirRequest'>&{botContext?:string;workdirRequest?:string|null};
+    const task:Task={...rest,workdirRequest:rawWorkdir?JSON.parse(rawWorkdir):null};
     let status=taskStatus(task);const run=this.latestRun(task.id);
     if(task.lifecycle==='open'||task.lifecycle==='review') {
       if(this.db.prepare("SELECT 1 FROM attentions WHERE taskId=? AND kind='recovery' AND state='open'").get(task.id))status='recovery';
@@ -370,9 +379,10 @@ export class Store {
     const managerReviewed=!!(run&&this.db.prepare("SELECT 1 FROM reviews JOIN results ON results.id=reviews.resultId WHERE results.runId=? AND reviews.actor LIKE 'manager:%' LIMIT 1").get(run.id));
     return {...task,status,managerReviewed};
   }
-  taskDetail(id: string): { task: Task; binding: Binding | null; bindingHistory:Binding[]; run:Run|null; input:RunInput|null; result:Result|null; attentions: Attention[]; events: { id: number; kind: string; data: string; createdAt: number }[] } {
+  taskDetail(id: string): { task: Task; binding: Binding | null; bindingHistory:Binding[]; run:Run|null; input:RunInput|null; result:Result|null; attentions: Attention[]; events: { id: number; kind: string; data: string; createdAt: number }[];wait:DispatchWait|null } {
     const task=this.getTask(id),binding=this.activeBinding(id),run=this.latestRun(id);
-    return { task,binding,bindingHistory:this.db.prepare("SELECT * FROM bindings WHERE taskId=? AND state='released' ORDER BY generation DESC").all(id) as unknown as Binding[],run,input:this.pendingInput(id)??(run?this.getRunInput(run.id):null),result:run&&run.taskRevision===task.taskRevision&&run.bindingId===binding?.id?this.runResult(run.id):null,
+    const wait=binding&&task.status==='unscheduled'&&this.db.prepare('SELECT 1 FROM waits WHERE taskId=?').get(id)?this.dispatchWait(id):null;
+    return { task,wait,binding,bindingHistory:this.db.prepare("SELECT * FROM bindings WHERE taskId=? AND state='released' ORDER BY generation DESC").all(id).map(row=>this.toBinding(row)),run,input:this.pendingInput(id)??(run?this.getRunInput(run.id):null),result:run&&run.taskRevision===task.taskRevision&&run.bindingId===binding?.id?this.runResult(run.id):null,
       attentions: this.db.prepare('SELECT * FROM attentions WHERE taskId=? ORDER BY createdAt,id').all(id) as unknown as Attention[],
       events: this.db.prepare('SELECT id,kind,data,createdAt FROM events WHERE taskId=? ORDER BY id DESC LIMIT 50').all(id) as unknown as { id: number; kind: string; data: string; createdAt: number }[],
     };
@@ -412,9 +422,23 @@ export class Store {
     const snapshotVersion = Number(this.db.prepare('SELECT coalesce(max(id),0) AS n FROM events').get()?.n);
     return { items: rows.map(task => this.decorateTask(task)), total, limit, offset, counts, snapshotVersion };
   }
+  private toBinding(row:unknown):Binding {
+    const {workdir,...binding}=row as Omit<Binding,'workdir'>&{workdir?:string|null};
+    return {...binding,workdir:workdir?JSON.parse(workdir) as WorkdirInfo:null};
+  }
   activeBinding(taskId: string): Binding | null {
-    const binding=this.db.prepare("SELECT * FROM bindings WHERE taskId=? AND state!='released'").get(taskId) as unknown as Binding | undefined;
-    return binding?{...binding}:null;
+    const binding=this.db.prepare("SELECT * FROM bindings WHERE taskId=? AND state!='released'").get(taskId);
+    return binding?this.toBinding(binding):null;
+  }
+  /** Active binding, or the most recent released one: where the task's files live. */
+  latestBinding(taskId:string):Binding|null {
+    const row=this.db.prepare("SELECT * FROM bindings WHERE taskId=? ORDER BY state='released',generation DESC LIMIT 1").get(taskId);
+    return row?this.toBinding(row):null;
+  }
+  setBindingWorkdir(bindingId:string,info:WorkdirInfo):Binding {
+    const binding=this.getBinding(bindingId);
+    this.db.prepare('UPDATE bindings SET workdir=? WHERE id=?').run(JSON.stringify(info),bindingId);
+    this.event('workdir.cleanup',binding.taskId,{bindingId,state:info.state});return this.getBinding(bindingId);
   }
   /** Only sessions actually created by this plugin, not user-authorized attachments.
    * Stale goal generations lack their original title input: leave those native/manual.
@@ -428,8 +452,8 @@ export class Store {
     return rows.map(binding=>({binding,task:this.getTask(binding.taskId)}));
   }
   getBinding(id: string): Binding {
-    const binding=this.db.prepare('SELECT * FROM bindings WHERE id=?').get(id) as unknown as Binding | undefined;
-    if(!binding)throw new AppError('not-found','会话关联不存在。');return {...binding};
+    const binding=this.db.prepare('SELECT * FROM bindings WHERE id=?').get(id);
+    if(!binding)throw new AppError('not-found','会话关联不存在。');return this.toBinding(binding);
   }
   nextBindingGeneration(taskId:string):number {return Number(this.db.prepare('SELECT coalesce(max(generation),0)+1 AS n FROM bindings WHERE taskId=?').get(taskId)?.n);}
   assertSessionAttachable(taskId:string,sessionId:string):void {
@@ -476,15 +500,15 @@ export class Store {
     }
     return {prepared:this.bindingReceipt(requestId,taskId,expectedRowVersion)!};
   }
-  beginBinding(requestId: string, taskId: string, expectedRowVersion: number, cwd: string): Binding {
+  beginBinding(requestId: string, taskId: string, expectedRowVersion: number, cwd: string,workdir?:WorkdirInfo): Binding {
     return this.command(requestId,'session.prepare',{taskId,expectedRowVersion,cwd},()=>{
       const task=this.getTask(taskId);
       if(task.rowVersion!==expectedRowVersion)throw new AppError('version-conflict','任务已经更新，请刷新后再准备会话。');
       if(task.lifecycle!=='open'||!task.scope||!task.acceptance)throw new AppError('not-ready','请先补全任务范围和验收条件。');
       const existing=this.activeBinding(taskId);if(existing)return existing;
       const generation=this.nextBindingGeneration(taskId);
-      const binding:Binding={id:randomUUID(),taskId,generation,taskRevision:task.taskRevision,requestedSessionId:`session-${randomUUID()}`,sessionId:null,cwd,state:'creating',createdAt:Date.now()};
-      this.db.prepare('INSERT INTO bindings(id,taskId,generation,taskRevision,requestedSessionId,sessionId,cwd,state,createdAt) VALUES (?,?,?,?,?,?,?,?,?)').run(binding.id,taskId,generation,task.taskRevision,binding.requestedSessionId,null,cwd,'creating',binding.createdAt);
+      const binding:Binding={id:randomUUID(),taskId,generation,taskRevision:task.taskRevision,requestedSessionId:`session-${randomUUID()}`,sessionId:null,cwd,state:'creating',createdAt:Date.now(),workdir:workdir??null};
+      this.db.prepare('INSERT INTO bindings(id,taskId,generation,taskRevision,requestedSessionId,sessionId,cwd,state,createdAt,workdir) VALUES (?,?,?,?,?,?,?,?,?,?)').run(binding.id,taskId,generation,task.taskRevision,binding.requestedSessionId,null,cwd,'creating',binding.createdAt,workdir?JSON.stringify(workdir):null);
       this.db.prepare('INSERT INTO outbox(id,kind,taskId,payload,createdAt) VALUES (?,?,?,?,?)').run(`binding:${binding.id}`,'session.create',taskId,JSON.stringify({bindingId:binding.id}),Date.now());
       this.db.prepare('UPDATE tasks SET rowVersion=rowVersion+1,updatedAt=? WHERE id=?').run(Date.now(),taskId);
       this.event('session.preparing',taskId,{bindingId:binding.id,generation});return binding;
@@ -550,12 +574,35 @@ export class Store {
     });
     return true;
   }
-  dispatchBlocker(taskId:string):'capacity'|'resource-conflict'|null {
-    const held=this.db.prepare('SELECT cwd FROM resources').all();
-    if(held.length>=this.maxRunningTasks)return 'capacity';
-    const binding=this.activeBinding(taskId);if(!binding)return null;
+  dispatchBlocker(taskId:string):'capacity'|'resource-conflict'|null {return this.dispatchWait(taskId)?.code??null;}
+  /** Directory and slot admission with FIFO fairness: earlier live waiters keep their place in line. */
+  dispatchWait(taskId:string):DispatchWait|null {
+    const goal=(id:string|null)=>id?String(this.db.prepare('SELECT goal FROM tasks WHERE id=?').get(id)?.goal??''):null;
     const contains=(parent:string,child:string)=>{const path=relative(parent,child);return path===''||(!isAbsolute(path)&&path!=='..'&&!path.startsWith(`..${sep}`));};
-    return held.some(r=>contains(String(r.cwd),binding.cwd)||contains(binding.cwd,String(r.cwd)))?'resource-conflict':null;
+    const overlaps=(a:string,b:string)=>contains(a,b)||contains(b,a);
+    const held=this.db.prepare('SELECT resources.cwd,runs.taskId FROM resources JOIN runs ON runs.id=resources.runId').all().map(r=>({cwd:String(r.cwd),taskId:String(r.taskId)}));
+    const binding=this.activeBinding(taskId);
+    const holder=binding?held.find(r=>r.taskId!==taskId&&overlaps(r.cwd,binding.cwd)):undefined;
+    if(holder)return {code:'resource-conflict',holderTaskId:holder.taskId,holderGoal:goal(holder.taskId)};
+    if(held.length>=this.maxRunningTasks)return {code:'capacity',holderTaskId:null,holderGoal:null};
+    const mine=this.db.prepare('SELECT seq FROM waits WHERE taskId=?').get(taskId);
+    // Only waiters that are still eligible and still have a live resource notification hold a place.
+    const earlier=this.db.prepare(`SELECT w.taskId,b.cwd FROM waits w JOIN tasks t ON t.id=w.taskId
+      JOIN bindings b ON b.taskId=w.taskId AND b.state='ready'
+      WHERE w.taskId!=? AND (? IS NULL OR w.seq<?) AND t.lifecycle='open' AND t.controlMode='auto'
+      AND NOT EXISTS (SELECT 1 FROM runs r WHERE r.taskId=w.taskId AND r.finishedAt IS NULL)
+      AND EXISTS (SELECT 1 FROM outbox o WHERE o.kind='manager.notify' AND o.taskId=w.taskId AND o.id LIKE 'manager-event:capacity:%' AND o.state IN ('pending','sending','entered'))
+      ORDER BY w.seq`).all(taskId,mine?.seq??null,mine?.seq??null).map(r=>({cwd:String(r.cwd),taskId:String(r.taskId)}));
+    const ahead=binding?earlier.find(r=>overlaps(r.cwd,binding.cwd)):undefined;
+    if(ahead)return {code:'resource-conflict',holderTaskId:ahead.taskId,holderGoal:goal(ahead.taskId)};
+    const runnable=earlier.filter(r=>!held.some(h=>overlaps(h.cwd,r.cwd)));
+    if(held.length+runnable.length>=this.maxRunningTasks)return {code:'capacity',holderTaskId:runnable[0]?.taskId??null,holderGoal:goal(runnable[0]?.taskId??null)};
+    return null;
+  }
+  /** Joins the FIFO line once; a later deferral of the same task keeps its original place. */
+  recordWait(taskId:string):void {
+    const seq=Number(this.db.prepare('SELECT coalesce(max(seq),0)+1 AS n FROM waits').get()?.n);
+    this.db.prepare('INSERT OR IGNORE INTO waits(taskId,createdAt,seq) VALUES (?,?,?)').run(taskId,Date.now(),seq);
   }
   reserveRun(requestId:string,taskId:string,expectedRowVersion:number):Run {
     return this.command(requestId,'task.dispatch',{taskId,expectedRowVersion},()=>{
@@ -568,6 +615,7 @@ export class Store {
       if(held.some(r=>r.taskId===taskId))throw new AppError('run-active','这个任务的上次执行尚未收敛。');
       const blocker=this.dispatchBlocker(taskId);
       if(blocker)throw new AppError(blocker,blocker==='capacity'?'执行名额已占用，请等待或核对已有执行。':'这个工作目录与另一执行重叠。');
+      this.db.prepare('DELETE FROM waits WHERE taskId=?').run(taskId);
       const pending=this.pendingInput(taskId);const id=randomUUID(),inputId=pending?.id??randomUUID(),now=Date.now();
       if(!pending)this.db.prepare('INSERT INTO inputs(id,taskId,kind,content,createdAt) VALUES (?,?,?,?,?)').run(inputId,taskId,'dispatch',task.goal,now);
       this.db.prepare('INSERT INTO runs(id,taskId,bindingId,sessionId,taskRevision,generation,inputId,state,createdAt) VALUES (?,?,?,?,?,?,?,?,?)').run(id,taskId,b.id,b.sessionId,task.taskRevision,b.generation,inputId,'queued',now);
@@ -863,7 +911,7 @@ export class Store {
       if(task.lifecycle!=='open')throw new AppError('task-ended','仅未完成任务可以解除关联；待验收成果请先返工或取消任务。');
       this.assertTaskSettled(taskId);const binding=this.activeBinding(taskId);if(!binding)throw new AppError('not-found','没有当前执行会话。');
       this.db.prepare("UPDATE bindings SET state='released' WHERE id=?").run(binding.id);
-      this.discardPendingWork(taskId);
+      this.discardPendingWork(taskId);this.db.prepare('DELETE FROM waits WHERE taskId=?').run(taskId);
       this.db.prepare("UPDATE tasks SET sessionId=NULL,controlMode='paused',rowVersion=rowVersion+1,updatedAt=? WHERE id=?").run(Date.now(),taskId);
       this.event('session.detached',taskId,{bindingId:binding.id,sessionId:binding.sessionId});return this.getTask(taskId);
     });
@@ -872,7 +920,7 @@ export class Store {
     return this.command(requestId,'task.cancel',{taskId,expectedRowVersion},()=>{
       const task=this.getTask(taskId);if(task.rowVersion!==expectedRowVersion)throw new AppError('version-conflict','任务已经更新，请刷新后取消。');
       if(!['open','review'].includes(task.lifecycle))throw new AppError('task-ended','任务已经结束。');
-      this.assertTaskSettled(taskId);this.discardPendingWork(taskId);
+      this.assertTaskSettled(taskId);this.discardPendingWork(taskId);this.db.prepare('DELETE FROM waits WHERE taskId=?').run(taskId);
       this.db.prepare("UPDATE tasks SET lifecycle='cancelled',controlMode='paused',rowVersion=rowVersion+1,updatedAt=? WHERE id=?").run(Date.now(),taskId);
       this.event('task.cancelled',taskId,{});return this.getTask(taskId);
     });

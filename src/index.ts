@@ -19,7 +19,23 @@ import { AppError, requiredText, optionalText,type WorkspaceStatus, type NewBot,
 export const name = 'super-bot';
 export const inject = ['connection', 'sessionController', 'workspaceRegistry','agents','tools','jobs','systemPrompt','workingDirectory','sessionProjections','webServer','permissionPresets','sessions','sessionPersistence','sessionTitle'];
 const roleModel=Schema.union([Schema.const(undefined),Schema.object({provider:Schema.string().required(),model:Schema.string().required(),reasoningEffort:Schema.string()})]);
-export const Config = Schema.object({ dataDir: Schema.string().description('Super Bot 本地数据目录'), fullAccess:Schema.boolean().default(true).description('默认开启 Bot 查询工具（含 Shell）及 Worker 原生 Full Access；false 关闭 Bot 原生工具并将 Worker 限为任务目录文件工具'),workspace:Schema.string().description('项目根目录；新任务在其下使用独立子目录或 Git worktree'),maxRunningTasks:Schema.natural().min(1).default(2).description('全局同时执行的 Worker 任务数'),managerWakesPerHour:Schema.natural().min(1).default(20).description('每个 Bot 每小时自动唤醒上限；达到后记录问题并暂停自动唤醒'),managerConcurrentWakes:Schema.natural().min(1).default(2).description('同时自动唤醒的 Bot 数'),managerTurnMinutes:Schema.natural().min(1).default(5).description('单次自动 Bot 轮次上限（分钟）'),managerModel:roleModel,workerModel:roleModel });
+const workdirHook=Schema.object({
+  description:Schema.string().description('写给 Bot 的用途说明：什么时候用这个 hook、args 是什么'),
+  create:Schema.string().required().description('创建命令模板（sh -c 执行）；可用 {name} {taskId} {args.x}，或环境变量 SB_NAME、SB_TASK_ID、SB_ARG_X；stdout 最后输出 SB_WORKDIR=<绝对路径>'),
+  remove:Schema.string().description('可选清理命令模板；可用 {name} {taskId} {workdir}；不配置则从不删除'),
+  cwd:Schema.string().description('命令执行目录，必须在 allowedRoots 内；默认第一个根目录'),
+  timeoutSeconds:Schema.natural().min(1).max(3600).default(300).description('超时秒数；应小于 Bot 单轮时限'),
+  argNames:Schema.array(Schema.string()).description('Bot 可以传入的参数名白名单'),
+});
+export const Config = Schema.object({ dataDir: Schema.string().description('Super Bot 本地数据目录'), fullAccess:Schema.boolean().default(true).description('默认开启 Bot 查询工具（含 Shell）及 Worker 原生 Full Access；false 关闭 Bot 原生工具并将 Worker 限为任务目录文件工具'),
+  allowedRoots:Schema.array(Schema.string()).description('Bot 为任务选择工作目录时允许的根目录（绝对路径；不能是 HOME 或 /）'),
+  defaultWorkdir:Schema.union([Schema.const('isolated'),Schema.const('worktree'),Schema.const('hook'),Schema.const('none')]).description('Bot 未指定 workdir 时的方式；未配置根目录时为 none（数据目录下的私有目录）'),
+  defaultIsolatedDir:Schema.string().description('isolated / worktree 目录所在位置，相对第一个根目录（默认 .super-bot-workspaces）'),
+  deniedPaths:Schema.array(Schema.string()).description('在内置敏感目录之外额外禁止的路径'),
+  workdirHook:Schema.union([Schema.const(undefined),workdirHook]),
+  workdirCleanup:Schema.union([Schema.const('manual'),Schema.const('on-complete')]).default('manual').description('任务完成或取消后是否自动清理隔离目录 / worktree / hook 目录；已有目录从不清理'),
+  workspace:Schema.string().description('已弃用：等同 allowedRoots: [workspace]'),
+  maxRunningTasks:Schema.natural().min(1).default(2).description('全局同时执行的 Worker 任务数'),managerWakesPerHour:Schema.natural().min(1).default(20).description('每个 Bot 每小时自动唤醒上限；达到后记录问题并暂停自动唤醒'),managerConcurrentWakes:Schema.natural().min(1).default(2).description('同时自动唤醒的 Bot 数'),managerTurnMinutes:Schema.natural().min(1).default(5).description('单次自动 Bot 轮次上限（分钟）'),managerModel:roleModel,workerModel:roleModel });
 
 export function apply(ctx: Context, config: RuntimeOptions & { dataDir?: string } = {}): void {
   const dataDir = resolve(config.dataDir ?? process.env.SUPER_BOT_DATA_DIR ?? join(process.env.DSH_HOME ?? join(homedir(), '.dsh'), 'super-bot'));
@@ -34,7 +50,7 @@ export function apply(ctx: Context, config: RuntimeOptions & { dataDir?: string 
   const runtime = require('@deepseek-ai/dsh-agent/package.json').version as string;
   const startedAt = Date.now();
   const status = (): WorkspaceStatus => ({ product: 'Super Bot', version: require('../package.json').version as string, runtime,
-    ...store.sqliteInfo(), startedAt });
+    ...store.sqliteInfo(), startedAt, configWarnings:execution.policy.warnings });
 
   async function invoke(endpoint: string, payload: Record<string, unknown>) {
     try {
@@ -48,7 +64,8 @@ export function apply(ctx: Context, config: RuntimeOptions & { dataDir?: string 
       }
       if (endpoint === 'manager.prepare') return {ok:true,value:await managers.prepare(requiredText(payload.requestId,'请求标识',200),requiredText(payload.botId,'Bot 标识',200))};
       if (endpoint === 'manager.replace') return {ok:true,value:await managers.replace(requiredText(payload.requestId,'请求标识',200),requiredText(payload.botId,'Bot 标识',200),payload.expectedGeneration as number)};
-      if (endpoint === 'manager.status') return {ok:true,value:store.managerInfo(requiredText(payload.botId,'Bot 标识',200))};
+      if (endpoint === 'manager.status') return {ok:true,value:{...store.managerInfo(requiredText(payload.botId,'Bot 标识',200)),wakeLimit:runtimeLimits(config).managerWakesPerHour}};
+      if (endpoint === 'workdir.cleanup') return {ok:true,value:await execution.cleanupWorkdir(requiredText(payload.id,'任务标识',200))};
       if (endpoint === 'bot.create') return {ok:true,value:await managers.createBot(requiredText(payload.requestId,'请求标识',200),payload as unknown as NewBot)};
       if (endpoint === 'bot.update') return {ok:true,value:await managers.updateBot(requiredText(payload.requestId,'请求标识',200),requiredText(payload.id,'Bot 标识',200),payload.expectedRevision as number,payload as unknown as NewBot)};
       if (endpoint === 'task.create') return { ok: true, value: store.createTask(requiredText(payload.requestId,'请求标识',200),payload as unknown as NewTask) };

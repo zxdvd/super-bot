@@ -2,10 +2,10 @@
 import type {Context} from '@deepseek-ai/cordis';
 import type {Agent,ModelSelection} from '@deepseek-ai/dsh-agent';
 import type {} from '@deepseek-ai/dsh-permission-presets';
+import type {WorkdirConfig} from './workdir.ts';
 
-export interface RuntimeOptions {
+export interface RuntimeOptions extends WorkdirConfig {
   fullAccess?:boolean;
-  workspace?:string;
   managerModel?:ModelSelection;
   workerModel?:ModelSelection;
   /** Global unconverged Worker runs (default 2). */
