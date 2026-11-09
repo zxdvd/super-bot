@@ -19,7 +19,7 @@ import { AppError, requiredText, optionalText,type WorkspaceStatus, type NewBot,
 export const name = 'super-bot';
 export const inject = ['connection', 'sessionController', 'workspaceRegistry','agents','tools','jobs','systemPrompt','workingDirectory','sessionProjections','webServer','permissionPresets','sessions','sessionPersistence','sessionTitle'];
 const roleModel=Schema.union([Schema.const(undefined),Schema.object({provider:Schema.string().required(),model:Schema.string().required(),reasoningEffort:Schema.string()})]);
-export const Config = Schema.object({ dataDir: Schema.string().description('Super Bot 本地数据目录'), fullAccess:Schema.boolean().default(false),workspace:Schema.string(),managerModel:roleModel,workerModel:roleModel });
+export const Config = Schema.object({ dataDir: Schema.string().description('Super Bot 本地数据目录'), fullAccess:Schema.boolean().default(true).description('Worker 默认使用原生 Full Access；false 显式启用仅任务目录文件工具的受限模式'),workspace:Schema.string(),managerModel:roleModel,workerModel:roleModel });
 
 export function apply(ctx: Context, config: RuntimeOptions & { dataDir?: string } = {}): void {
   const dataDir = resolve(config.dataDir ?? process.env.SUPER_BOT_DATA_DIR ?? join(process.env.DSH_HOME ?? join(homedir(), '.dsh'), 'super-bot'));

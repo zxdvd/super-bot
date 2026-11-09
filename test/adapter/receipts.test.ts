@@ -68,7 +68,7 @@ for(const scenario of ['human','accept','rework','large'] as const)test(`Manager
 test('Worker committed report retries do not reread changed files or bypass ended authority',async()=>{
  const directory=mkdtempSync(join(tmpdir(),'super-bot-report-')),store=new Store(':memory:');let execute:Handler=()=>{throw Error('Not installed');};let conclusions=0;
  const ctx={effect:(callback:()=>unknown)=>callback(),on:()=>()=>{},tools:{register:(tool:{execute:Handler})=>{execute=tool.execute;return ()=>{};}}} as unknown as Context;
- const execution=new DshExecution(ctx,store,directory);execution.install();
+ const execution=new DshExecution(ctx,store,directory,{fullAccess:false});execution.install();
  try{
   const bot=store.createBot('bot',{name:'Bot',instructions:'Files'}),task=store.createTask('task',{botId:bot.id,goal:'Facts',scope:'Own directory',acceptance:'Read facts',reviewPolicy:'human'});
   const binding=store.beginBinding('binding',task.id,task.rowVersion,directory);store.claimBindingCreation(binding.id);store.confirmBinding(binding.id,binding.requestedSessionId);
@@ -89,7 +89,7 @@ test('reinstalled execution adapter cannot revive authority while the old Agent 
  const idle=new Promise<void>(resolve=>{release=resolve;});let selection:{provider:string;model:string}|null=null;
  const agent:any={id:'synthetic-worker',status:'idle',model:{current:()=>({provider:'fake',model:'fake'})},inbox:{nextTurn:[],nextStep:[],remove:()=>{}},ctx:{tools:{restrict:()=>()=>{},guard:(callback:(args:any)=>unknown)=>{guard=callback;return ()=>{};}},on:()=>()=>{}},whenIdle:()=>idle,followup:()=>{deliveries++;agent.status='running';},cancel:()=>{agent.status='idle';release();}};
  const ctx={sessionProjections:{snapshot:()=>({values:{modelSelection:{next:selection}}})},effect:(callback:()=>unknown)=>callback(),on:()=>()=>{},tools:{register:(tool:{execute:Handler})=>{handlers.push(tool.execute);return ()=>{};}},sessionController:{resolveAgent:async()=>({agent})},workingDirectory:{get:()=>directory},jobs:{list:()=>[]},agents:{list:()=>[]}} as unknown as Context;
- const old=new DshExecution(ctx,store,directory),replacement=new DshExecution(ctx,store,directory);old.install();
+ const old=new DshExecution(ctx,store,directory,{fullAccess:false}),replacement=new DshExecution(ctx,store,directory,{fullAccess:false});old.install();
  try{
   const bot=store.createBot('bot',{name:'Bot',instructions:'Files'}),task=store.createTask('task',{botId:bot.id,goal:'Facts',scope:'Own directory',acceptance:'Read facts',reviewPolicy:'human'});
   const binding=store.beginBinding('binding',task.id,task.rowVersion,directory);store.claimBindingCreation(binding.id);store.confirmBinding(binding.id,binding.requestedSessionId);agent.id=binding.requestedSessionId;

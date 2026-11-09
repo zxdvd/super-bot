@@ -12,11 +12,13 @@
 ## 已完成
 
 - 聊天为主入口：普通问答、补全请求、Bot 委派 Worker、原对话交付、同任务返工和文件下载均已实际跑过。
-- 普通原生 Full Access Worker，可以使用宿主工具、Shell、Git 和子 Agent，不额外添加 Worker 工具白名单或步数/时长上限。Bot 用 GPT 6.1 Sol medium，Worker 用同模型 xhigh；路由与凭证留在宿主配置。
+- 默认使用普通原生 Full Access Worker（省略 `fullAccess` 或 `true`）；仅显式 `fullAccess: false` 使用受限 files 模式。Full Access 下可以使用宿主工具、Shell、Git 和子 Agent，不额外添加 Worker 工具白名单或步数/时长上限。Bot 用 GPT 6.1 Sol medium，Worker 用同模型 xhigh；路由与凭证留在宿主配置。
 - 四轮产品内 dogfooding：通知和交付恢复、多消息、任务补全/去重、respond 空字段修复、原生搜索插件、聊天旁工作面板、侧栏命名与整理。
 - 工作面板复用原生右栏，支持宽窄屏；入口按当前有效 Bot 会话核对。主聊天可显式置顶，Worker 自动短名，旧自动会话名可保守整理。
-- 最终代码检查为 **163 项通过（63 核心 + 100 适配）**，typecheck/build 通过；最近源码提交 `807b575`。同任务、同 Worker 在整理会话名后再次返工并交付已验证。
+- 最终代码检查为 **169 项通过（63 核心 + 106 适配）**，typecheck/build 通过；本轮默认权限与 CLI 委派回归见[证据](../specs/changes/2026-11-super-bot-mvp/evidence.md)。同任务、同 Worker 在整理会话名后再次返工并交付已验证。
 - Node 默认和日常宿主已使用 `24.21.0`。日常 profile 安装了指定的 dsh-plugins，实际原生 web_search 成功；不能将该本机配置当作插件包自带账号或搜索服务。
+- 独立 DSH Web rc.1 的 `smoke:chat` 已通过，包含真实原生 Bash → 文件回读 → Worker 报告 → Bot 原对话交付；模型为确定性夹具，无外部服务调用。
+- Bot 在所有权限模式下只使用管理工具，Shell/git/lark-cli 等请求通过 Task 派给 Worker；原生工具守卫阻止 Manager 绕过账本。files 模式直接说明“Worker 完整权限未开启”和 `config.fullAccess: true` 的开启方法。
 
 ## 从现有环境继续
 
@@ -30,6 +32,8 @@ fnm use 24.21.0                 # 旧终端仍用其他版本时
 npm ci
 npm run check
 ```
+
+本轮升级会使原先省略 `fullAccess` 的配置使用原生 Full Access；若要保留隔离测试行为，先显式配置 `fullAccess: false`。本轮未替日常 Web/Desktop 安装或重载插件，Desktop 仍未复验。
 
 依赖变化才需重装依赖。`npm run check` 会构建产物；正在使用本地 link 的客户端可能刷新。后端热替换只在 Bot、Worker 和后台工作均空闲时进行：
 

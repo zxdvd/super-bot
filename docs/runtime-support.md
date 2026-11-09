@@ -13,7 +13,7 @@
 | 部分会话历史授权 | 不提供 | 原生模型仍能读取既有上下文；仅支持明确授权整段历史，或另建全新会话 |
 | 输入送达与消费 | 已验证；存在宿主限制 | accepted/enqueued/entered 分开。已 claim 后取消可能丢失 Inbox 项且无 user/message，转人工核对，不推断已消费。`probe:run` |
 | files 模式工具范围 | 已验证 | read/write/edit 与报告；绝对路径、实际目录、符号链接检查；额外 scoped 工具再由执行 guard 拒绝。`smoke-directory.mjs`、`smoke-scoped-tools.mjs` |
-| Full Access 的 Shell、子 Agent | 已开放并用于真实修复 | 普通 DSH Session 的原生工具已实际执行 Bash 和子 Agent；由现有宿主配置能力，不额外裁剪工具。不能因此推断任意外部进程可停止 |
+| Full Access 的 Shell、子 Agent | 默认开放，显式 false 才使用 files | 普通 DSH Session 的原生工具已实际执行 Bash 和子 Agent；由现有宿主配置能力，不额外裁剪工具。不能因此推断任意外部进程可停止 |
 | ready 与最终验收 | 已验证 | ready 只是候选；执行收敛和文件完整哈希均需核对。默认人工；显式 Bot 授权保持独立审计。`smoke:execution`、`smoke:workflow`、`smoke:manager` |
 | 长文件验收 | 限制明确且已验证 | 每项只预览前 12,000 字节；完整文件用于哈希核验。超出预览范围必须人工检查全文。`smoke-manager-rework.mjs` |
 | 原生工具审批 | 已验证文件写入三路径 | 允许一次、拒绝、等待时停止；工作台只显示待办和跳转，决定来自原生 UI。独立 UI 第 13～14 轮、`smoke-approvals.mjs` |
@@ -32,6 +32,10 @@
 | 运行中热卸载/热替换 | 空闲插件原生 HMR 已实测 | 独立宿主验证 link 源码监听及 tgz→link 配置重组：同 PID、同版本换成新模块。真实 Super Bot 后端重挂载、前端 rebuilt SSE 通过。`dev:reload` 用于日常空闲重载，`dev` 用于隔离自动监听；活动执行期间不热替换 |
 | Desktop | 未验证 | 本机 `0.2.1-rc.5` 未接入验证；当前安装包目标是 Web rc.1 |
 | 真实模型质量、Token/费用 | 四轮 dogfooding 已完成；无精确费用归因 | Sol medium Bot 委派 Sol xhigh Full Access Worker，实际 Shell/子 Agent/测试、补充需求、原对话交付及同任务返工通过；多任务歧义、用户最终接受和费用评估仍待验证。自动审查超时等异常见接手说明 |
+
+Bot 在所有模式下只开放管理工具，并用执行守卫阻止直接使用原生/外部工具；Shell、git、lark-cli 等执行请求委派 Worker。显式 `fullAccess: false` 时，Bot 说明“Worker 完整权限未开启”，提示将当前 profile 的 Super Bot `config.fullAccess` 设为 `true`，空闲后重载。默认/true 的 Worker 不受 Manager 工具白名单影响。
+
+复跑旧目录、scoped-tools、预算等 files 隔离 smoke 时，须在专用测试 profile 显式设置 `fullAccess: false`；`smoke:chat` 的新增 Shell 场景使用默认 Full Access。
 
 files 模式目录限制是应用层约束，不是操作系统沙箱。Full Access 不附加该目录限制，也不把不同 Bot 作为安全租户。既有原生会话的历史、插件和用户手动操作仍属于当前单用户宿主。
 

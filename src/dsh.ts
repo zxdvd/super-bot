@@ -17,7 +17,7 @@ import {nameAutomaticSession,workerTitle} from './sidebar.ts';
 import { AppError,requiredText,optionalText,type Binding,type Run,type WorkReport,type ExistingSessionGrant,type ExistingSessionPreview } from './model.ts';
 import type { Store } from './store.ts';
 import { collectEvidence,containedPath,verifyEvidence,evidencePaths } from './evidence.ts';
-import {configureRole,type RuntimeOptions} from './runtime.ts';
+import {configureRole,fullAccessEnabled,type RuntimeOptions} from './runtime.ts';
 import { materialPrompt } from './materials.ts';
 
 declare module '@deepseek-ai/dsh-llm' {
@@ -66,7 +66,7 @@ export class DshExecution {
         const run=this.store.heldRuns().find(r=>r.sessionId===session.id&&r.finishedAt===null);
         if(run)this.store.runRecovery(run.id,modelFailureNote(event.data.reason.error.code));
       }
-      if(!this.options.fullAccess&&event.type==='working-directory/change') {
+      if(!fullAccessEnabled(this.options)&&event.type==='working-directory/change') {
         const run=this.store.heldRuns().find(r=>r.sessionId===session.id&&r.finishedAt===null);
         if(run&&event.data.cwd!==this.store.getBinding(run.bindingId).cwd) {
           this.store.runRecovery(run.id,'原生会话工作目录已改变，当前执行授权停止。请核对文件和原生会话。');
@@ -142,20 +142,20 @@ export class DshExecution {
     let input=this.store.getRunInput(run.id);
     if(!input.messageJson) {
       const supplement=`\nScheduling fact: Super Bot has reserved this working directory for the current run. Its ledger rejects concurrent runs in overlapping directories and keeps unresolved runs reserved. You do not need another confirmation that an earlier Super Bot run released this directory. This does not cover unrelated external processes.\n${input.kind==='answer'||input.kind==='rework'?`Additional user input (${input.kind}): ${input.content}`:''}`;
-      const message=createUserMessage({source:{kind:'super-bot',taskId,runId:run.id,inputId:run.inputId,taskRevision:run.taskRevision,generation:run.generation},content:[{type:'text',text:`You are executing a NEW attempt of one Super Bot task.\nCurrent run: ${run.id}. Reports from previous attempts do not complete this run. Re-check current facts and perform the authorized work; do not merely repeat an earlier conclusion. Submit a fresh super_bot_report for this run.\nBot configuration revision: ${task.botConfigRevision}\nBot responsibility: ${botContext.instructions}${materialPrompt(botContext.materials)}\nGoal: ${task.goal}\nAuthorized scope: ${task.scope}\nAcceptance criteria: ${task.acceptance}\nWorking directory: ${b.cwd}${supplement}\n${this.options.fullAccess?'Full Access is explicitly authorized. Use native tools including shell to implement and test the requested work. Keep work scoped to this task. Do not modify unrelated projects or credentials. Change host configuration only when this task explicitly authorizes that change. Report actual changed source files and test results.':'Use only read/write/edit in this directory, always with absolute file_path values. Do not change working directories. Shell and subagents are not enabled in this preview.'}\nReport with super_bot_report. Use waiting to ask a necessary question. For ready provide files and checks explaining every acceptance criterion. Never claim the task is accepted; the user decides.`}]});
+      const message=createUserMessage({source:{kind:'super-bot',taskId,runId:run.id,inputId:run.inputId,taskRevision:run.taskRevision,generation:run.generation},content:[{type:'text',text:`You are executing a NEW attempt of one Super Bot task.\nCurrent run: ${run.id}. Reports from previous attempts do not complete this run. Re-check current facts and perform the authorized work; do not merely repeat an earlier conclusion. Submit a fresh super_bot_report for this run.\nBot configuration revision: ${task.botConfigRevision}\nBot responsibility: ${botContext.instructions}${materialPrompt(botContext.materials)}\nGoal: ${task.goal}\nAuthorized scope: ${task.scope}\nAcceptance criteria: ${task.acceptance}\nWorking directory: ${b.cwd}${supplement}\n${fullAccessEnabled(this.options)?'This Worker uses the native Full Access preset. Use native tools including shell to implement and test the requested work. Keep work scoped to this task. Do not modify unrelated projects or credentials. Change host configuration only when this task explicitly authorizes that change. Report actual changed source files and test results.':'Use only read/write/edit in this directory, always with absolute file_path values. Do not change working directories. Worker 完整权限未开启：当前 fullAccess: false。Shell and external CLI tools are unavailable in files mode; report this limitation, never ask for a tool channel. To enable them, set fullAccess: true in the Super Bot config of the active profile cordis.patch.yml and reload when idle.'}\nReport with super_bot_report. Use waiting to ask a necessary question. For ready provide files and checks explaining every acceptance criterion. Never claim the task is accepted; the user decides.`}]});
       input=this.store.saveRunMessage(run.id,message.id,JSON.stringify(message));
     }
-    const releaseMask=this.options.fullAccess?()=>{}:agent.ctx.tools.restrict({allow:['read','write','edit','super_bot_report']});
+    const releaseMask=fullAccessEnabled(this.options)?()=>{}:agent.ctx.tools.restrict({allow:['read','write','edit','super_bot_report']});
     const releaseGuard=agent.ctx.tools.guard(exec=>{
       if(this.store.getRun(run.id).finishedAt!==null||this.store.getTask(taskId).controlMode==='manual')return 'This automatic run no longer has task authority.';
-      if(!this.options.fullAccess&&!['read','write','edit','super_bot_report'].includes(exec.name))return 'Only task file tools and super_bot_report are authorized for this run.';
-      if(this.options.fullAccess)return;
+      if(!fullAccessEnabled(this.options)&&!['read','write','edit','super_bot_report'].includes(exec.name))return 'Only task file tools and super_bot_report are authorized for this run.';
+      if(fullAccessEnabled(this.options))return;
       try{this.assertDirectory(agent,b.cwd);}catch(error){return error instanceof Error?error.message:'Working directory changed';}
-      if(this.options.fullAccess||!['read','write','edit'].includes(exec.name))return;
+      if(!['read','write','edit'].includes(exec.name))return;
       try{const args=exec.arguments as {file_path?:unknown};if(typeof args.file_path!=='string'||!isAbsolute(args.file_path))return 'Use an absolute file_path inside the task working directory.';containedPath(b.cwd,args.file_path);}catch(error){return error instanceof Error?error.message:'File path refused';}
     });
     let steps=0;let deadline:ReturnType<typeof setTimeout>|undefined;
-    const releaseBudget=this.options.fullAccess?()=>{}:agent.ctx.on('agent/pre-step',async(_payload,next)=>{
+    const releaseBudget=fullAccessEnabled(this.options)?()=>{}:agent.ctx.on('agent/pre-step',async(_payload,next)=>{
       if(++steps>40){await this.stopForBudget(run.id,'steps');throw new AppError('run-budget','执行达到步数上限。');}
       return next();
     });
@@ -170,7 +170,7 @@ export class DshExecution {
       if(!this.store.claimDispatch(run.id)){release();this.store.runRecovery(run.id,'投递记录已经发出，但回执不完整。没有重复投递，请核对原生会话。');return this.store.getRun(run.id);}
       agent.followup(freezeMessage(JSON.parse(input.messageJson!) as UserMessage));
       this.store.inputEnqueued(run.id);
-      if(!this.options.fullAccess){deadline=setTimeout(()=>{void this.stopForBudget(run.id,'time');},10*60*1000);deadline.unref();}
+      if(!fullAccessEnabled(this.options)){deadline=setTimeout(()=>{void this.stopForBudget(run.id,'time');},10*60*1000);deadline.unref();}
       const done=agent.whenIdle().then(()=>{
         if(this.disposed)return;
         this.assertQuiet(agent);
@@ -255,7 +255,7 @@ export class DshExecution {
     // Validate the ID through the ledger before using it as a directory segment.
     const task=this.store.getTask(taskId);
     const generation=this.store.nextBindingGeneration(taskId);
-    const cwd=this.store.activeBinding(taskId)?.cwd??(this.options.fullAccess&&this.options.workspace?realpathSync(this.options.workspace):undefined)??join(this.dataDir,'workspaces',generation===1?task.id:`${task.id}-g${generation}`);await mkdir(cwd,{recursive:true});
+    const cwd=this.store.activeBinding(taskId)?.cwd??(fullAccessEnabled(this.options)&&this.options.workspace?realpathSync(this.options.workspace):undefined)??join(this.dataDir,'workspaces',generation===1?task.id:`${task.id}-g${generation}`);await mkdir(cwd,{recursive:true});
     const b=this.store.beginBinding(requestId,taskId,rowVersion,await realpath(cwd));
     const current=this.store.getBinding(b.id);if(current.state==='ready')return current;
     const active=this.creating.get(b.id);if(active)return active;

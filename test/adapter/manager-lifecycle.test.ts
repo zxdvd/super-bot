@@ -15,6 +15,7 @@ function fixture(){
   let beforeResolve:((id:string)=>Promise<void>)|undefined;
   const titles=new Map<any,any>();
   const ctx={
+    permissionPresets:{set:()=>{}},
     sessionTitle:{get:(session:any)=>titles.get(session),rename:(session:any,title:string)=>{const value={title,source:{kind:'user'}};titles.set(session,value);return value;}},
     sessions:{flush:async()=>true},
     sessionProjections:{snapshot:(session:any)=>({values:{modelSelection:{next:agents.get(session.id).selection}}})},

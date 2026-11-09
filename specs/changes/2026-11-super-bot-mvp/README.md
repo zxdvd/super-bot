@@ -79,3 +79,7 @@
 ## 第四轮侧栏整理（2026-11-08）
 
 用户确认先改善命名、主聊天置顶和历史整理，并继续由真实产品 Bot/Worker dogfooding。Workspace 使用稳定项目名，Worker 使用短任务名；避免 Untitled 和第一项长任务标题污染整个项目分组。原生归档会影响执行，因此不能为了隐藏而归档仍可能恢复/返工的会话；归属、用户已有命名/置顶和活动状态必须核实。保留完整普通 Worker，优先原生能力，无新侧栏或存储系统。
+
+## 默认权限与 CLI 委派修复（2026-11-09）
+
+用户报告未配 fullAccess 时 Bot 因自身没有 Shell 而要求开启工具通道。改为 Worker 默认使用原生 Full Access；仅显式 `fullAccess: false` 保留旧 files 隔离/兼容行为，覆盖 DF-01 旧默认。Bot 不再直接使用原生执行工具，所有本机命令、外部 CLI/工具请求均通过账本建 Task 并派 Worker；成果预览继续走 detail。程序用工具列表和执行守卫强制角色边界，提示词负责识别工作意图与说明实际模式。files 模式明确说明 Worker 完整权限未开启和当前 profile 的 `config.fullAccess: true` 开启方法。Desktop 真实体验及真实飞书账号查询仍未复验。

@@ -20,6 +20,7 @@ function fixture() {
   let creates=0,renames=0,retitles=0,pins=0,flushes=0;
   let renameFailure=false,flushFailure=false;
   const ctx={
+    permissionPresets:{set:()=>{}},
     workspaceRegistry:{
       create:async(cwd:string,title=basename(cwd))=>{if(!workspaces.has(cwd))workspaces.set(cwd,{id:cwd,path:cwd,title,sessionIds:[],setTitle:async function(this:any,next:string){retitles++;this.title=next;},attachSession:async()=>{}});return workspaces.get(cwd);},
       get pinnedSessionIds(){return [...pinned];},get archivedSessionIds(){return [...archived];},

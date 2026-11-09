@@ -4,7 +4,7 @@ import {randomUUID} from 'node:crypto';
 import {writeFile} from 'node:fs/promises';
 import {setTimeout as delay} from 'node:timers/promises';
 import {hostClient} from './host-client.mjs';
-const client=await hostClient(),prefix=`chat:${randomUUID()}`;
+const client=await hostClient(process.argv[2]),prefix=`chat:${randomUUID()}`;
 async function call(action,payload={}) {
   const r=await (await client.post('/api/super-bot',{type:'client-request',rpcId:randomUUID(),method:'super-bot',payload:{action,...payload}})).json();
   assert.equal(r.result.ok,true,JSON.stringify(r));return r.result.value;
@@ -43,5 +43,18 @@ await wait(async()=>{const s=await inspect();return s.status==='idle'&&s.assista
 await say('读者是新同事，保持简短。');
 const answered=await wait(async()=>{const d=await call('task.detail',{id:questionTask.id});return d.task.lifecycle==='review'&&d.task.managerReviewed&&d;},'chat answer continues execution');
 assert.equal(answered.input.content,'读者是新同事，保持简短。');assert.equal((await page()).total,2);
-const result={ok:true,model:'deterministic fixture; no real-model quality claim',botId:bot.id,sessionId:manager.sessionId,taskId:questionTask.id,resultId:answered.result.id,checks:['ordinary chat creates no task','native message provenance','chat request automatically dispatches','readable delivery and verified download in same chat','unauthenticated file access denied','chat rework reuses task','acceptance remains an explicit user action','Worker question and human answer stay in Bot chat']};
+// A native local command must execute in the Worker, with no external CLI/service dependency.
+await wait(async()=>{const s=await inspect();return s.status==='idle'&&!s.pending;},'manager idle before CLI request');
+await say('请用 Shell 运行本机命令，把合成检查结果保存成文件。');
+const cliTask=await wait(async()=>{const p=await page();return p.items.find(t=>t.goal==='LOCAL_CLI_PROBE'&&t.lifecycle==='review'&&t.managerReviewed);},'CLI request delegates to Worker');
+const cliDetail=await call('task.detail',{id:cliTask.id});
+const worker=await probe({action:'inspect-session',sessionId:cliDetail.binding.sessionId});
+assert.ok(worker.toolResults.every(result=>!result.message.isError),JSON.stringify(worker.toolResults));
+assert.ok(worker.executedTools.includes('bash'));assert.ok(worker.modelTools.includes('bash'));
+assert.ok(!(await inspect()).executedTools.some(name=>name!=='super_bot_manage'));
+assert.deepEqual((await inspect()).modelTools,['super_bot_manage']);
+assert.equal(await (await client.get(`/api/super-bot-file?resultId=${cliDetail.result.id}&index=0`)).text(),'LOCAL_CLI_OK\n');
+await wait(async()=>{const s=await inspect();return s.status==='idle'&&s.assistantTexts.some(text=>text.includes(`#super-bot-task=${cliTask.id}`));},'CLI result delivered in Bot chat');
+assert.equal(cliDetail.result.humanAcceptedAt,null);assert.equal((await page()).total,3);
+const result={ok:true,model:'deterministic fixture; no real-model quality claim',botId:bot.id,sessionId:manager.sessionId,taskId:questionTask.id,resultId:answered.result.id,checks:['CLI request creates Task and executes native Bash only in Worker','ordinary chat creates no task','native message provenance','chat request automatically dispatches','readable delivery and verified download in same chat','unauthenticated file access denied','chat rework reuses task','acceptance remains an explicit user action','Worker question and human answer stay in Bot chat']};
 await writeFile('.runtime/chat-smoke.json',JSON.stringify(result,null,2));console.log(JSON.stringify(result,null,2));

@@ -9,7 +9,7 @@ import {Managers} from '../../src/manager.ts';
 import type {DshExecution} from '../../src/dsh.ts';
 import {collectEvidence} from '../../src/evidence.ts';
 
-async function fixture(t:TestContext,fullAccess=false) {
+async function fixture(t:TestContext,fullAccess?:boolean) {
   t.mock.timers.enable({apis:['setInterval']});
   const root=realpathSync(process.cwd());mkdirSync(join(root,'.runtime'),{recursive:true});
   const directory=mkdtempSync(join(root,'.runtime','delivery-adapter-'));let store=new Store(join(directory,'ledger.sqlite'));
@@ -25,9 +25,9 @@ async function fixture(t:TestContext,fullAccess=false) {
   const ready=store.pendingManagerEvents(bot.id)[0]!;
   const events:any[]=[],durable:any[]=[];const listeners=new Map<string,Function>();let handler:Function=()=>{};
   let flushMode:'ok'|'false'|'throw'|'blocked'='ok',allowFlush:()=>void=()=>{},followups=0,dispatches=0,cancels=0,guard:Function=()=>undefined,resolveIdle:()=>void=()=>{};
-  let idle=Promise.resolve();
+  let idle=Promise.resolve();let allowed:string[]=[],prompt:()=>string=()=>'';
   const session:any={id:manager.requestedSessionId,header:{cwd:directory},meta:{}};
-  const agent:any={id:session.id,session,status:'idle',model:{current:()=>({provider:'fake',model:'fake'}),select:()=>{}},inbox:{nextTurn:[],nextStep:[],remove:()=>{}},ctx:{tools:{restrict:()=>()=>{},guard:(fn:Function)=>{guard=fn;return ()=>{};}},on:()=>()=>{},systemPrompt:{section:()=>()=>{}}},whenIdle:()=>idle,followup:(message:any)=>{followups++;agent.status='running';idle=new Promise<void>(resolve=>{resolveIdle=resolve;});agent.lastMessage=message;},cancel:()=>{cancels++;agent.status='idle';resolveIdle();}};
+  const agent:any={id:session.id,session,status:'idle',model:{current:()=>({provider:'fake',model:'fake'}),select:()=>{}},inbox:{nextTurn:[],nextStep:[],remove:()=>{}},ctx:{tools:{restrict:(options:{allow:string[]})=>{allowed=options.allow;return ()=>{};},guard:(fn:Function)=>{guard=fn;return ()=>{};}},on:()=>()=>{},systemPrompt:{section:(section:{text:()=>string})=>{prompt=section.text;return ()=>{};}}},whenIdle:()=>idle,followup:(message:any)=>{followups++;agent.status='running';idle=new Promise<void>(resolve=>{resolveIdle=resolve;});agent.lastMessage=message;},cancel:()=>{cancels++;agent.status='idle';resolveIdle();}};
   const ctx={permissionPresets:{set:()=>{}},effect:(callback:()=>unknown)=>callback(),on:(name:string,callback:Function)=>{listeners.set(name,callback);return ()=>{};},agents:{list:()=>[agent]},tools:{register:(tool:any)=>{handler=tool.execute;return ()=>{};}},sessionController:{resolveAgent:async()=>({agent})},sessionProjections:{snapshot:()=>({values:{modelSelection:{next:{provider:'fake',model:'fake'}}}})},sessions:{flush:async()=>{if(flushMode==='blocked')await new Promise<void>(resolve=>{allowFlush=resolve;});if(flushMode==='throw')throw Error('Synthetic durability failure');if(flushMode==='false')return false;durable.splice(0,durable.length,...structuredClone(events));return true;}},sessionPersistence:{open:async()=>({read:async()=>({events:structuredClone(durable)}),close:async()=>{}})}} as unknown as Context;
   const execution={dispatch:async()=>{dispatches++;throw Error('Worker must not run on delivery recovery');},verifyResult:async()=>{}} as unknown as DshExecution;
   const retired:Managers[]=[];
@@ -41,7 +41,7 @@ async function fixture(t:TestContext,fullAccess=false) {
   const assistant=async(turn:number,content:any[]=[{type:'text',text:text()}],finish='stop',interrupted=false)=>emit('assistant/message',{turn,step:1,message:{id:`assistant-${events.length}`,role:'assistant',source:{kind:'model',provider:'fake',model:'fake'},content},stream:[{type:'chunk',time:Date.now(),chunk:{type:'finish',reason:{kind:finish}}}],...(interrupted?{interrupted:true}:{})},'append');
   const end=async(turn:number,success=true)=>{await emit('turn/end',{turn,reason:success?{kind:'completed'}:{kind:'error',error:{code:'SYNTHETIC_MODEL_FAILURE'}}});agent.status='idle';resolveIdle();await new Promise<void>(resolve=>setImmediate(resolve));};
   const state=()=>store.db.prepare('SELECT state,payload FROM outbox WHERE id=?').get(`manager-event:delivery:${report.resultId}`);
-  return {get store(){return store;},bot,manager,task,run,report,ready,agent,events,durable,pulse,enter,call,review,text,assistant,end,state,emit,beginNative:()=>{agent.status='running';idle=new Promise<void>(resolve=>{resolveIdle=resolve;});},checkpoint:()=> (ctx.sessions as any).flush(session),reinstallWhileActive:()=>{retired.push(managers);managers=new Managers(ctx,store,execution,directory,()=> 'https://example.test',{fullAccess});managers.install();},guard:(name:string)=>guard({name,arguments:{}}),counts:()=>({followups,dispatches,cancels}),setFlush:(mode:typeof flushMode)=>{flushMode=mode;},unblockFlush:()=>allowFlush(),reload:async(reopen=false)=>{await managers.dispose();if(reopen){store.close();store=new Store(join(directory,'ledger.sqlite'));}managers=new Managers(ctx,store,execution,directory,()=> 'https://example.test',{fullAccess});managers.install();},close:async()=>{agent.status='idle';resolveIdle();await managers.dispose();for(const old of retired)await old.dispose();store.close();assert.ok(directory.startsWith(join(root,'.runtime','delivery-adapter-')));rmSync(directory,{recursive:true,force:true});t.mock.timers.reset();}};
+  return {allowed:()=>allowed,prompt:()=>prompt(),get store(){return store;},bot,manager,task,run,report,ready,agent,events,durable,pulse,enter,call,review,text,assistant,end,state,emit,beginNative:()=>{agent.status='running';idle=new Promise<void>(resolve=>{resolveIdle=resolve;});},checkpoint:()=> (ctx.sessions as any).flush(session),reinstallWhileActive:()=>{retired.push(managers);managers=new Managers(ctx,store,execution,directory,()=> 'https://example.test',{fullAccess});managers.install();},guard:(name:string)=>guard({name,arguments:{}}),counts:()=>({followups,dispatches,cancels}),setFlush:(mode:typeof flushMode)=>{flushMode=mode;},unblockFlush:()=>allowFlush(),reload:async(reopen=false)=>{await managers.dispose();if(reopen){store.close();store=new Store(join(directory,'ledger.sqlite'));}managers=new Managers(ctx,store,execution,directory,()=> 'https://example.test',{fullAccess});managers.install();},close:async()=>{agent.status='idle';resolveIdle();await managers.dispose();for(const old of retired)await old.dispose();store.close();assert.ok(directory.startsWith(join(root,'.runtime','delivery-adapter-')));rmSync(directory,{recursive:true,force:true});t.mock.timers.reset();}};
 }
 
 test('model failure after committed review supplements final delivery without executing Worker or review again',async t=>{
@@ -118,16 +118,16 @@ test('a persisted visible final with no durable turn/end is uncertain, not blind
   }finally{await f.close();}
 });
 
-test('fullAccess remains available normally, but delivery-only turns reject native execution in the actual tool guard',async t=>{
+test('Manager routes native execution to Worker, including outside delivery-only recovery',async t=>{
   const f=await fixture(t,true);try {
-    assert.equal(f.guard('bash'),undefined);await f.pulse();await f.enter(1);await f.review();await f.end(1,false);
+    assert.match(String(f.guard('bash')),/Worker/);await f.pulse();await f.enter(1);await f.review();await f.end(1,false);
     await f.pulse();await f.enter(2);
     for(const name of ['bash','write','edit','subagent','super_bot_report'])assert.match(String(f.guard(name)),/Delivery-only/);
     assert.equal(f.guard('super_bot_manage'),undefined);
     await assert.rejects(f.call('foreign-detail',{action:'detail',taskId:'not-this-result'}),{code:'delivery-only'});
     await assert.rejects(f.call('dispatch',{action:'dispatch',taskId:f.task.id,expectedRowVersion:f.store.getTask(f.task.id).rowVersion}),{code:'delivery-only'});
     await f.assistant(2);await f.end(2);
-    assert.equal(f.state()?.state,'done');assert.equal(f.guard('bash'),undefined);assert.equal(f.counts().dispatches,0);
+    assert.equal(f.state()?.state,'done');assert.match(String(f.guard('bash')),/Worker/);assert.equal(f.counts().dispatches,0);
   }finally{await f.close();}
 });
 
@@ -157,7 +157,7 @@ for(const busy of ['running','user-inbox'] as const)test(`delivery reconciliatio
     f.setFlush('blocked');const pumping=f.pulse();await new Promise<void>(resolve=>setImmediate(resolve));
     if(busy==='running')f.agent.status='running';else f.agent.inbox.nextTurn.push({id:'real-user-pending'});
     f.unblockFlush();await pumping;
-    assert.equal(f.counts().followups,1);assert.equal(f.state()?.state,'pending');assert.equal(f.guard('bash'),undefined);
+    assert.equal(f.counts().followups,1);assert.equal(f.state()?.state,'pending');assert.match(String(f.guard('bash')),/Worker/);
   }finally{await f.close();}
 });
 
@@ -180,7 +180,18 @@ test('a retained native Inbox delivery restores its read-only scope without a se
     assert.match(String(f.guard('bash')),/Delivery-only/);
     await assert.rejects(f.call('no-rerun',{action:'dispatch',taskId:f.task.id,expectedRowVersion:f.store.getTask(f.task.id).rowVersion}),{code:'delivery-only'});
     await f.assistant(2);await f.end(2);assert.equal(f.state()?.state,'done');
-    assert.equal(f.guard('bash'),undefined,'native full access must return after this recovered delivery turn');
+    assert.match(String(f.guard('bash')),/Delegate.*Worker/,'normal coordination scope returns after delivery');
     assert.equal(f.counts().followups,2);assert.equal(f.counts().dispatches,0);
+  }finally{await f.close();}
+});
+
+for(const mode of [undefined,true,false])test(`Bot execution routing and capability instructions with fullAccess=${mode}`,async t=>{
+  const f=await fixture(t,mode);try {
+    assert.deepEqual(f.allowed(),['super_bot_manage']);
+    assert.equal(f.guard('super_bot_manage'),undefined);
+    for(const name of ['bash','shell','git','lark-cli','read','write','subagent','external_plugin_tool'])assert.match(String(f.guard(name)),mode===false?/Worker 完整权限未开启.*fullAccess: false/:/Delegate.*Worker/);
+    assert.match(f.prompt(),/lark-cli/);assert.match(f.prompt(),/Never ask the user to enable a tool channel/);
+    if(mode===false){assert.match(f.prompt(),/Worker 完整权限未开启/);assert.match(f.prompt(),/fullAccess: true.*cordis.patch.yml/);assert.match(f.prompt(),/BEFORE creating or dispatching/);}
+    else {assert.match(f.prompt(),/ALWAYS create and dispatch a Task/);assert.match(f.prompt(),/read-only CLI queries/);assert.doesNotMatch(f.prompt(),/Worker 完整权限未开启/);}
   }finally{await f.close();}
 });

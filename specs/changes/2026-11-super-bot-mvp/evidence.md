@@ -484,3 +484,16 @@ ELECTRON_RUN_AS_NODE=1 '/Applications/DeepSeek Harness.app/Contents/MacOS/DeepSe
 - 本轮未在日常 profile 执行探针、整理或真实聊天操作；未安装、HMR、dev:reload、重载/重启正在执行的插件或宿主；未修改 DSH 安装源码、其他仓库、真实 profile/凭证；未升产品版本（仍 0.1.3）、提交或推送 Git。权限/模型配置、schema 和开发重载脚本不在本轮改动范围。
 - 待外层在 Bot/Worker 空闲后加载，通过产品能力验证真实侧栏的新 Worker 名/项目名、已有真实历史的可整理覆盖、置顶→手动取消→再次打开/整理、用户改名、同任务返工，以及按钮反馈/宽窄屏。已有 Workspace 名或冷历史不是自动迁移承诺；不可安全推断的保留原生手动操作。构建通过不表示当前 GUI 已加载，也不等于真实浏览器或真实模型验收。
 - DF-08、SB-15/FV 不因源码交付勾选；所有既有和本次成果保持待人工验收，由 Bot 在原对话交付，用户决定是否接受。
+
+## 2026-11-09：默认 Full Access 与 CLI 委派修复
+
+- 起点 `9b3ec12`，`dev` 工作树干净。按约定读取 README、ROADMAP、handoff、活动 change；不访问用户实际飞书消息、日常 Session 或凭证。
+- 确认根因：Config 默认 false；Worker/角色配置用 truthy 判断，省略配置也落入 files 工具/预算分支。Manager 仅强调“file work”，files 提示没有准确开启方法；Full Access 时又不限制 Manager 原生执行工具，允许绕过 Task 自行尝试。
+- 红测：`fnm exec --using=24.21.0 node --import tsx --test test/adapter/runtime.test.ts test/adapter/delivery.test.ts` 在修复前 25 项中 5 项失败，分别观察到 schema=false、省略配置未设置原生 preset、Manager Bash guard 返回 undefined。原始输出仅留 `.runtime/permissions-red.log`。
+- 修复：统一 `fullAccessEnabled(options)` 为 `fullAccess !== false`；schema 默认 true，示例与升级说明同步。默认 Worker 使用原生 `danger-full-access`、不附加工具白名单或步数/时间预算；显式 false 保留原文件隔离。Manager 在所有模式只暴露 `super_bot_manage`，并以执行 guard 拦截其他工具；成果检查仍走 detail。提示明确 CLI/外部工具（包括 lark-cli 只读查询）必须建 Task 派 Worker，不能从 Bot 工具集推断 Worker 没有 Shell。files 模式先说明“Worker 完整权限未开启”及当前 profile 的 `config.fullAccess: true`，不要求开启工具通道。
+- 回归覆盖省略/true/false 三种模式、真实 dispatch 分支中的 preset/工具/预算、重复 dispatch 回执与人工接管撤权、Manager mask/guard/模式指令及交付恢复后的作用域。旧 files 夹具改为显式 false；账本、schema、停止与交付机制未改。
+- 最终 `npm run check` 退出 **0**：Node **24.21.0**，**63 核心 + 106 适配 = 169 项**，typecheck 与 Host/Client build 通过。日志 `.runtime/permissions-check.log`。`git diff --check` 通过。
+- `npm run probe:build` 与最终 `npm run smoke:chat -- .runtime/permissions-host.log` 均退出 **0**。使用新建独立 home `.runtime/access-smoke-1et6Bc/super-bot/.runtime/dsh`、profile `super-bot-access`、端口 3097；DSH Web **0.2.2-rc.1**，测试 overlay 直接加载本地 `lib/index.js` 与独立 probe 插件，省略 fullAccess 配置，并关闭该测试宿主 HMR。未改 DSH 安装源码、日常 profile 或现有 dsh-plugins。
+- chat smoke 从原生用户消息开始，不预建 Task：普通聊天零 Task；文件接单、原对话交付/下载、问答、同任务返工与显式接受通过；新增 Shell 请求创建第三项 Task，Worker 实际执行原生 Bash `printf` 写入合成文件，再 read/report，Bot 回原对话交付。核对 Worker 有 bash、工具结果无错误、下载内容为 `LOCAL_CLI_OK`；Bot 模型可见工具只有 super_bot_manage，实际调用也只有该工具，CLI 成果仍未人工接受。结果仅留 `.runtime/chat-smoke.json` 与 `.runtime/permissions-chat.log`。
+- 测试环境排障：首次 plugin add 因 PATH 无 pnpm 失败，改为专用 overlay 加载具体模块文件；初次 Shell smoke 夹具漏传原生 bash 必填 description，导致 ready 无有效文件而进入 recovery，没有假成功。补齐参数后完整 smoke 通过；最终源码检查后重启专用宿主再跑也通过。没有把这些夹具/接线错误归因为产品权限故障。
+- 边界：确定性模型证明接线与强制角色边界，不证明真实模型的自然语言判断。Desktop 原场景、真实 lark-cli 登录/读群消息、日常宿主加载与用户体验仍需复验；CF/SB-15/FV 不因本次测试勾选。外部 CLI 缺失或账号错误应由 Worker 报告实际错误，不能以“没有工具通道”替代调查。

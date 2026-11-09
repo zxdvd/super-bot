@@ -57,7 +57,7 @@ function fixture(t:TestContext) {
       resolveAgent:async(sessionId:string)=>agents.has(sessionId)?{agent:agents.get(sessionId)}:{error:'synthetic missing session'},
     },
   } as unknown as Context;
-  let execution=new DshExecution(ctx,store,directory),managers=new Managers(ctx,store,execution,directory,()=> 'https://example.test');
+  let execution=new DshExecution(ctx,store,directory,{fullAccess:false}),managers=new Managers(ctx,store,execution,directory,()=> 'https://example.test');
   const install=()=>{execution.install();managers.install();};install();
   const emit=async(event:any,sessionId=manager.requestedSessionId)=>{for(const listener of listeners.get('session/event')??[])await listener({id:sessionId},event);};
   const native=async(id:string,seq:number,text:string)=>emit({type:'user/message',seq,data:{id,source:{kind:'user',rpcId:`rpc:${id}`},content:[{type:'text',text}]}});
@@ -71,7 +71,7 @@ function fixture(t:TestContext) {
       agents.get(run.sessionId).finish();await new Promise<void>(resolve=>setImmediate(resolve));return report;
     },
     call:(callId:string,args:Record<string,unknown>,signal=new AbortController().signal)=>tools.get('super_bot_manage').execute(args,{agent:{id:manager.requestedSessionId},callId,signal}),
-    reload:async()=>{await managers.dispose();await execution.dispose();registrations.splice(0).forEach(off=>off());listeners.clear();store.close();store=new Store(database);execution=new DshExecution(ctx,store,directory);managers=new Managers(ctx,store,execution,directory,()=> 'https://example.test');install();},
+    reload:async()=>{await managers.dispose();await execution.dispose();registrations.splice(0).forEach(off=>off());listeners.clear();store.close();store=new Store(database);execution=new DshExecution(ctx,store,directory,{fullAccess:false});managers=new Managers(ctx,store,execution,directory,()=> 'https://example.test');install();},
     close:async()=>{await managers.dispose();await execution.dispose();registrations.splice(0).forEach(off=>off());store.close();assert.equal(realpathSync(directory),directory);assert.ok(directory.startsWith(join(root,'.runtime','p2-adapter-')));rmSync(directory,{recursive:true,force:true});t.mock.timers.reset();},
   };
 }

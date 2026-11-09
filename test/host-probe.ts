@@ -74,6 +74,7 @@ class ProbeAdapter extends LlmAdapter {
       else if(!prior) {
         const foreign=text.match(/CROSS_BOT:([^\s]+)/)?.[1];
         if(foreign)plan={action:'detail',taskId:foreign};
+        else if(trigger?.source?.kind==='user'&&text==='请用 Shell 运行本机命令，把合成检查结果保存成文件。')plan={action:'create',goal:'LOCAL_CLI_PROBE',scope:'只在任务目录运行合成 Shell 命令，不访问外部服务',acceptance:'result.md 内容为 LOCAL_CLI_OK'};
         else if(trigger?.source?.kind==='user'&&(text.includes('MANAGER_PROBE')||text==='请写一份简短的说明，包含两项事实，完成后给我文件。'||text==='请写一份说明，先确认读者。'))plan={action:'create',goal:text.includes('先确认读者')?'ASK_PROBE':'Manager 生成合成说明',scope:'专用任务目录，不访问网络',acceptance:'result.md 包含两项事实并已回读'};
         else if(trigger?.source?.kind==='user'&&(text==='读者是新同事，保持简短。'||text==='再加一句结论。'))plan={action:'list'};
         else if(trigger?.source?.kind==='super-bot-manager'){const target=text.match(/\nTask: ([a-f0-9-]{36})\n/)?.[1];plan=target?{action:'detail',taskId:target}:{action:'list'};}
@@ -132,11 +133,12 @@ class ProbeAdapter extends LlmAdapter {
       if(approvalProbe&&!calls.includes('write')&&options.sessionId)this.approvalWrites.add(options.sessionId);
       const hasAnswer=options.messages.some(m=>m.content.some(b=>b.type==='text'&&b.text.includes('Additional user input (answer):')));
       const needsAnswer=body.includes('Goal: ASK_PROBE')&&!hasAnswer;
-      const planned=body.includes('Goal: STEP_BUDGET_PROBE')?{name:'read',args:{file_path:join(cwd,'missing-budget-probe.txt')}}:approvalProbe&&calls.includes('write')&&!existsSync(file)&&!calls.includes('super_bot_report')?{name:'super_bot_report',args:{kind:'failed',summary:'审批路径结束，写入没有生成文件；请核对原生审批结果。'}}:
+      const localCli=body.includes('Goal: LOCAL_CLI_PROBE');
+      const planned=localCli&&!calls.includes('bash')?{name:'bash',args:{description:"生成本机 Shell 合成检查结果",command:"printf 'LOCAL_CLI_OK\\n' > result.md"}}:body.includes('Goal: STEP_BUDGET_PROBE')?{name:'read',args:{file_path:join(cwd,'missing-budget-probe.txt')}}:approvalProbe&&calls.includes('write')&&!existsSync(file)&&!calls.includes('super_bot_report')?{name:'super_bot_report',args:{kind:'failed',summary:'审批路径结束，写入没有生成文件；请核对原生审批结果。'}}:
         needsAnswer&&!calls.includes('super_bot_report')?{name:'super_bot_report',args:{kind:'waiting',summary:'请说明文档面向谁？'}}:
-        !calls.includes('write')?{name:'write',args:{file_path:body.includes('Goal: RELATIVE_PATH_PROBE')?'result.md':file,content:'# 合成成果\n\n事实一：这份文档由隔离测试模型生成。\n事实二：测试没有访问网络或使用模型凭证。\n'+(body.includes('Additional user input (rework):')?'\n修订：已按返工要求补充说明。\n':'')+(body.includes('Goal: LARGE_RESULT_PROBE')?'\n'+'x'.repeat(16000):'')}}:
+        !localCli&&!calls.includes('write')?{name:'write',args:{file_path:body.includes('Goal: RELATIVE_PATH_PROBE')?'result.md':file,content:'# 合成成果\n\n事实一：这份文档由隔离测试模型生成。\n事实二：测试没有访问网络或使用模型凭证。\n'+(body.includes('Additional user input (rework):')?'\n修订：已按返工要求补充说明。\n':'')+(body.includes('Goal: LARGE_RESULT_PROBE')?'\n'+'x'.repeat(16000):'')}}:
         !calls.includes('read')?{name:'read',args:{file_path:file}}:
-        !calls.includes('super_bot_report')?{name:'super_bot_report',args:{kind:'ready',summary:'已生成并回读两项事实的说明文件。',checks:'result.md 包含标题和两项事实；已用原生 read 工具回读核对。',files:[file]}}:null;
+        !calls.includes('super_bot_report')?{name:'super_bot_report',args:{kind:'ready',summary:localCli?'已执行本机 Shell 并生成合成结果。':'已生成并回读两项事实的说明文件。',checks:localCli?'原生 bash 执行后已 read 回读 LOCAL_CLI_OK。':'result.md 包含标题和两项事实；已用原生 read 工具回读核对。',files:[file]}}:null;
       if(planned) {
         const id=ToolCallId(randomUUID()),args=JSON.stringify(planned.args);
         yield {type:'block-start',index:0,blockType:'tool-call'};
@@ -293,7 +295,7 @@ export function apply(ctx:Context) {
         // Deliberately drop the successful receipt before persisting it, then reopen the ledger.
         ledger.close();ledger=new Store(ledgerPath);
         assert.equal(ledger.claimBindingCreation(binding.id),false);
-        const execution=new DshExecution(ctx,ledger,join(home!,'super-bot'));
+        const execution=new DshExecution(ctx,ledger,join(home!,'super-bot'),{fullAccess:false});
         const recovered=await execution.reconcileBinding(binding.id);
         assert.equal(recovered.sessionId,created.sessionId);assert.equal(recovered.state,'ready');
         assert.deepEqual(await execution.reconcileBinding(binding.id),recovered);
@@ -318,7 +320,7 @@ export function apply(ctx:Context) {
           }});
           return Reflect.get(target,key,target);
         }});
-        execution=new DshExecution(facade,faultLedger,join(home!,'super-bot','receipt-probes'));
+        execution=new DshExecution(facade,faultLedger,join(home!,'super-bot','receipt-probes'),{fullAccess:false});
         const binding=await execution.prepareSession('prepare',task.id,task.rowVersion);
         const resolved=await ctx.sessionController.resolveAgent(SessionId(binding.sessionId!));assert.ok('agent' in resolved);resolved.agent.model.select({provider,model:'deterministic'});
         const version=faultLedger.getTask(task.id).rowVersion;
@@ -345,8 +347,8 @@ export function apply(ctx:Context) {
         }});
         return Reflect.get(target,key,target);
       }});
-      const managerExecution=new DshExecution(managerFacade,managerLedger,join(home!,'super-bot','manager-fault'));
-      const managers=new Managers(managerFacade,managerLedger,managerExecution,join(home!,'super-bot','manager-fault'));
+      const managerExecution=new DshExecution(managerFacade,managerLedger,join(home!,'super-bot','manager-fault'),{fullAccess:false});
+      const managers=new Managers(managerFacade,managerLedger,managerExecution,join(home!,'super-bot','manager-fault'),()=>'',{fullAccess:false});
       const observe=ctx.on('session/event',(session,event)=>{
         if(event.type==='user/message'&&event.data.source.kind==='super-bot-manager'&&managerLedger.managerForSession(session.id))managerLedger.managerEventEntered(event.data.source.eventId,event.data.id);
       });
@@ -436,6 +438,7 @@ export function apply(ctx:Context) {
         assert.ok(body.sessionId);const resolved=await ctx.sessionController.resolveAgent(SessionId(body.sessionId));assert.ok('agent' in resolved);
         assert.ok(resolved.agent.session.header.cwd?.startsWith(join(home!,'super-bot')+'/'));
         return Response.json({ok:true,sessionId:resolved.agent.id,status:resolved.agent.status,pending:resolved.agent.inbox.nextTurn.length+resolved.agent.inbox.nextStep.length,stalled:adapter.stalled.has(resolved.agent.id),stalledAborted:adapter.stalled.get(resolved.agent.id)?.signal?.aborted??false,managerAttempts:adapter.managerAttempts.get(resolved.agent.id)??[],materialMarkers:adapter.calls.filter(call=>call.sessionId===body.sessionId&&(!call.purpose||call.purpose==='conversation')).at(-1)?.markers??[],assistantTexts:resolved.agent.session.snapshotEvents().filter(event=>event.type==='assistant/message').map(event=>event.data.message.content.filter(block=>block.type==='text').map(block=>block.text).join('')),historyMessageIds:resolved.agent.session.snapshotEvents().filter(event=>event.type==='user/message').map(event=>event.data.id),modelSteps:adapter.calls.filter(call=>call.sessionId===body.sessionId&&(!call.purpose||call.purpose==='conversation')).length,scopedProbeCalls:scopedCalls.get(resolved.agent.id)??0,scopedProbeAttempts:adapter.scopedAttempts.get(resolved.agent.id)??0,
+          toolResults:resolved.agent.session.snapshotEvents().filter(event=>event.type==='tool/result').map(event=>event.data),modelTools:adapter.calls.filter(call=>call.sessionId===body.sessionId&&(!call.purpose||call.purpose==='conversation')).at(-1)?.tools??[],executedTools:resolved.agent.session.snapshotEvents().filter(event=>event.type==='tool/call').map(event=>event.data.name),
           productTools:ctx.tools.definitions().map(tool=>tool.name).filter(name=>['super_bot_report','super_bot_manage'].includes(name))});
       }
       if(body.action==='select-test-model'||body.action==='native-prompt') {

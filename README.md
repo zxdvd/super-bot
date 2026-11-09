@@ -6,7 +6,7 @@
 
 当前为本地开发预览：与 Bot 聊天，由它创建任务、委派普通 Full Access Worker、检查成果并回到原对话交付；支持补充需求、同任务返工、停止和人工验收。首个交付形态是 DSH Web 插件，固定验证版本 `0.2.2-rc.1`；Desktop `0.2.1-rc.5` 尚未完成兼容验证。Super Bot 是独立产品，不属于 `dsh-plugins` 搜索插件集合。
 
-**2026-11-09 状态：** 已完成四轮真实 Bot/Worker dogfooding，覆盖代码修复、补充需求、交付、返工、聊天旁工作视图和侧栏整理；最终源码检查 163 项测试及 typecheck/build 通过。真实用户的最终接受、多任务歧义体验和精确费用评估仍待完成。新会话先读 [接手说明](docs/handoff.md)，验收范围见 [任务清单](specs/changes/2026-11-super-bot-mvp/tasks.md)。
+**2026-11-09 状态：** 已完成四轮真实 Bot/Worker dogfooding，覆盖代码修复、补充需求、交付、返工、聊天旁工作视图和侧栏整理；最新源码检查 169 项测试及 typecheck/build 通过。真实用户的最终接受、多任务歧义体验和精确费用评估仍待完成。新会话先读 [接手说明](docs/handoff.md)，验收范围见 [任务清单](specs/changes/2026-11-super-bot-mvp/tasks.md)。
 
 ## 产品边界
 
@@ -77,11 +77,11 @@ npm run dev
 `dev` 使用仓库 `.runtime/dsh-dev` 下的独立 home 和 `super-bot-dev` profile，监听 `127.0.0.1:3081`（可设 `SUPER_BOT_PORT`）。自动构建监听 `src`，Host HMR 监听 `lib/index.js`，Client HMR 刷新 `lib/client.js`；不需要重复打包、安装或重启宿主。从终端启动链接进入后点击左侧 Super Bot。该隔离环境不复用日常会话或模型凭证；有模型的日常入口仍是 web profile。退出用 Ctrl-C；再次运行保留任务数据。数据库默认在 `$DSH_HOME/super-bot/ledger.sqlite`，不要同时用多个宿主打开同一数据库。
 
 - `npm run check`：类型检查、核心账本测试、DSH 适配层测试、Host/Client 构建。`npm test` 单独运行不依赖 DSH 的账本测试。
-- `npm run smoke:chat`：在专用探针宿主上验证聊天接单、同对话交付、文件下载、提问回答及返工；仅确定性模型。
+- `npm run smoke:chat`：在专用探针宿主上验证聊天接单、同对话交付、文件下载、提问回答、返工与 Worker 原生 Shell 执行；仅确定性模型，不依赖外部服务。可传专用宿主日志：`npm run smoke:chat -- .runtime/permissions-host.log`。
 - `npm run smoke`：测试宿主运行时检查真实状态、WAL、未认证访问与跨域拒绝。
 - `npm pack --dry-run`：核对分发清单；运行数据和契约测试插件不进入安装包。
 
-Node 用 fnm 管理时，可用 `fnm exec --using=24.21.0 npm run dev`，无需改变机器默认版本。完整执行流程和可靠性门槛见任务清单。未启用 Manager 时，创建任务只保存目标，“开始执行”才调用原生会话中选定的模型。启用 Manager 后，完整且未暂停的任务会自动安排执行；需要先核对时，请在创建表单选择“先暂停”。Worker 使用普通 DSH Session。显式配置 `fullAccess: true` 后，使用原生 Full Access 预设和宿主可用工具，包括 Shell、Git 与子 Agent；Super Bot 不再附加工具白名单、目录守卫或执行步数/时长上限。`workspace` 指定项目目录，作为任务资源占用根；全局最多两个未收敛任务，同一项目不能并发派发写入任务。暂停阻止后续派发，停止请求取消并核对收敛。旧 files 模式保留用于兼容和隔离验证：只允许任务目录内 read/write/edit 与报告，每次最多 40 步或 10 分钟，目录变化和预算耗尽转核对。
+Node 用 fnm 管理时，可用 `fnm exec --using=24.21.0 npm run dev`，无需改变机器默认版本。完整执行流程和可靠性门槛见任务清单。未启用 Manager 时，创建任务只保存目标，“开始执行”才调用原生会话中选定的模型。启用 Manager 后，完整且未暂停的任务会自动安排执行；需要先核对时，请在创建表单选择“先暂停”。Worker 使用普通 DSH Session。默认（省略 `fullAccess` 或设为 `true`）使用原生 Full Access 预设和宿主可用工具，包括 Shell、Git 与子 Agent；Super Bot 不再附加工具白名单、目录守卫或执行步数/时长上限。`workspace` 指定项目目录，作为任务资源占用根；全局最多两个未收敛任务，同一项目不能并发派发写入任务。暂停阻止后续派发，停止请求取消并核对收敛。只有显式 `fullAccess: false` 才启用 files 模式，用于兼容和隔离验证：只允许任务目录内 read/write/edit 与报告，每次最多 40 步或 10 分钟，目录变化和预算耗尽转核对。
 
 
 ## 使用完整原生 Worker
@@ -91,7 +91,7 @@ Node 用 fnm 管理时，可用 `fnm exec --using=24.21.0 npm run dev`，无需�
 ```yaml
 - id: super-bot
   config:
-    fullAccess: true
+    fullAccess: true  # 默认值；仅隔离/兼容测试设为 false
     workspace: /absolute/path/project
     managerModel:
       provider: your-provider
@@ -103,7 +103,7 @@ Node 用 fnm 管理时，可用 `fnm exec --using=24.21.0 npm run dev`，无需�
       reasoningEffort: xhigh
 ```
 
-推理档位需由该 profile 的模型目录及提供方支持。未配置角色模型时仍使用原生会话选择；Worker 可继承 Bot 的选择。Full Access 是用户对本机执行的明确授权，项目目录不再作为安全沙箱。Super Bot 继续记录任务归属、输入、结果和执行收敛，不把模型报告当作人工验收。
+推理档位需由该 profile 的模型目录及提供方支持。未配置角色模型时仍使用原生会话选择；Worker 可继承 Bot 的选择。Worker 默认使用原生 Full Access，项目目录不作为安全沙箱。升级时，原先省略此键的配置也会使用 Full Access；需要保留旧 files 行为时显式设置 `fullAccess: false`。Super Bot 继续记录任务归属、输入、结果和执行收敛，不把模型报告当作人工验收。
 
 正式分发 tgz 时使用新版本和新文件名；复用同版本文件可能命中包管理器缓存。本地开发用上面的 `dev:reload` 或 `dev`，无需升版本。仅在 Bot、Worker 都空闲时更新/重新加载日常插件，并核实激活结果；插件清单显示新版本不能单独证明旧运行实例已替换。插件配置/业务模块可热替换，涉及 DSH 框架、共享宿主依赖的更改仍可能要求重启，以原生 HMR 诊断为准。
 
@@ -172,7 +172,7 @@ Worker 完成源码验证后，外层已在空闲时加载，核对真实侧栏�
 
 创建或打开 Bot 时自动准备当前对话；在原生界面选择模型。它可以通过聊天创建任务，也会接收新任务、回答、返工和执行结束的重要事件。仅完整且处于自动管理状态的任务可派发；默认由人最终验收。创建任务时明确授权的低风险任务可由 Bot 验收，记录不会伪装成人工接受。
 
-Full Access 下 Bot 同样保留原生工具，负责协调、检查和交付，并通过账本委派 Worker 实施。旧 files 模式的 Manager 仅开放管理工具。文件预览每项最多 12,000 字节，验收仍校验完整文件哈希；超过预览范围的成果转人工检查全文，即使任务允许 Bot 验收。任务按 Bot 隔离；自动返工最多 2 次，要求第三次时暂停并转人判断。自动管理每 Bot 同时一轮、全局最多两轮；files 模式每轮最多 12 步、Full Access 模式最多 24 步；自动唤醒的轮次另限 5 分钟，每 Bot 最近一小时最多 20 次自动唤醒。进度报告不唤醒 Manager。
+Bot 在所有模式下只开放 `super_bot_manage`，由工具列表和执行守卫共同约束；负责协调、通过 `detail` 检查成果并交付。需要本机命令、Shell、git、lark-cli 或其他外部工具的请求（包括只读群消息查询）必须建 Task 并派给 Worker；Bot 不在自己的会话试探工具，也不要求用户“开启工具通道”。显式 files 模式下，Bot 应直接说明“Worker 完整权限未开启”，提示在当前 profile 的 `cordis.patch.yml` 中把 Super Bot 的 `config.fullAccess` 设为 `true`（或移除显式 `false`），待 Bot/Worker 空闲后重载插件，再安排这类工作。文件预览每项最多 12,000 字节，验收仍校验完整文件哈希；超过预览范围的成果转人工检查全文，即使任务允许 Bot 验收。任务按 Bot 隔离；自动返工最多 2 次，要求第三次时暂停并转人判断。自动管理每 Bot 同时一轮、全局最多两轮；files 模式每轮最多 12 步、Full Access 模式最多 24 步；自动唤醒的轮次另限 5 分钟，每 Bot 最近一小时最多 20 次自动唤醒。进度报告不唤醒 Manager。
 
 Bot 之间轮流获得自动管理机会；同一 Bot 的用户回答、人工返工和恢复通知优先。一个管理会话暂不可用不会挡住其他 Bot，错误会显示在工作台。通知回执不明时取消该轮并保留核对状态，不自动重发未知通知。
 
