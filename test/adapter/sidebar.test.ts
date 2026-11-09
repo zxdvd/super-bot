@@ -63,10 +63,10 @@ test('DF08 new Worker proactively receives a short stable task title',async()=>{
 });
 test('DF08 new project Workspace uses stable directory name rather than first long goal',async()=>{
   const f=fixture();try{
-    const task=f.task();await f.execution.prepareSession('prepare',task.id,task.rowVersion);
-    assert.equal(f.workspaces.get(f.directory).title,basename(f.directory));
-    const second=f.task('second');await f.execution.prepareSession('prepare-second',second.id,second.rowVersion);
-    assert.equal(f.workspaces.get(f.directory).title,basename(f.directory));assert.equal(f.counts().retitles,0);
+    const task=f.task(),first=await f.execution.prepareSession('prepare',task.id,task.rowVersion);
+    assert.equal(f.workspaces.get(first.cwd).title,basename(first.cwd));
+    const second=f.task('second'),next=await f.execution.prepareSession('prepare-second',second.id,second.rowVersion);
+    assert.notEqual(first.cwd,next.cwd);assert.equal(f.workspaces.get(next.cwd).title,basename(next.cwd));assert.equal(f.counts().retitles,0);
   }finally{await f.close();}
 });
 
@@ -146,9 +146,9 @@ test('DF08 tidy is Bot-scoped, excludes attachments, ordinary and stale manager 
     f.store.attachExistingSession('attach',{taskId:attachedTask.id,expectedRowVersion:attachedTask.rowVersion,sessionId:'ordinary',cwd:f.directory,fullHistoryApproved:true,directoryApproved:true});
     const ordinary=f.agents.get('ordinary').session;f.titles.set(ordinary,{title:'ordinary automatic',source:{kind:'fallback'}});
     f.titles.delete(f.agents.get(b.sessionId!).session);
-    f.workspaces.get(f.directory).title=`Super Bot · ${task.goal.slice(0,40)}`;const oldTitle=f.workspaces.get(f.directory).title;
+    f.workspaces.get(b.cwd).title=`Super Bot · ${task.goal.slice(0,40)}`;const oldTitle=f.workspaces.get(b.cwd).title;
     const first=await f.sidebar.tidy(f.bot.id,m.sessionId!);assert.equal(first.renamed,1);assert.equal(first.failed,0);
-    assert.equal(f.titles.get(foreignSession).title,'foreign automatic');assert.equal(f.titles.get(ordinary).title,'ordinary automatic');assert.equal(f.workspaces.get(f.directory).title,oldTitle);assert.equal(f.counts().retitles,0);
+    assert.equal(f.titles.get(foreignSession).title,'foreign automatic');assert.equal(f.titles.get(ordinary).title,'ordinary automatic');assert.equal(f.workspaces.get(b.cwd).title,oldTitle);assert.equal(f.counts().retitles,0);
     const counts=f.counts();assert.equal((await f.sidebar.tidy(f.bot.id,m.sessionId!)).renamed,0);assert.equal(f.counts().renames,counts.renames);
     await assert.rejects(f.sidebar.tidy(other.id,m.sessionId!),{code:'sidebar-scope'});await assert.rejects(f.sidebar.pin(other.id,m.sessionId!),{code:'sidebar-scope'});
     f.store.releaseManager('release',f.bot.id,m.generation);await assert.rejects(f.sidebar.tidy(f.bot.id,m.sessionId!),{code:'sidebar-scope'});

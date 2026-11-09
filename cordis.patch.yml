@@ -4,3 +4,4 @@
       # Default: Bot query tools (including Shell) + native Full Access Worker. False: management-only Bot + files Worker.
       config:
         fullAccess: true
+        # workspace: /absolute/path/project  # New tasks use isolated subdirectories / Git worktrees.

@@ -13,6 +13,10 @@ export function containedPath(cwd:string,path:string):string {
   if(!rel||rel==='..'||rel.startsWith(`..${sep}`)||isAbsolute(rel))throw new AppError('path-outside','文件必须位于当前任务的专用工作目录。');
   return canonical;
 }
+function rejectSensitivePath(path:string):void {
+  if(path.split(/[\\/]/).some(part=>/^(?:\.ssh|\.aws|credentials|\.env(?:\..*)?)$/i.test(part)||/\.pem$/i.test(part)))
+    throw new AppError('evidence-sensitive','敏感文件不能作为任务成果。');
+}
 type InspectedEvidence=Evidence&{text:string;data:Buffer;truncated:boolean};
 export function evidencePaths(paths:unknown):string[] {
   if(!Array.isArray(paths)||paths.length<1||paths.length>10||paths.some(p=>typeof p!=='string'))throw new AppError('invalid-evidence','请提供 1～10 个任务目录内的文件路径。');
@@ -22,7 +26,7 @@ async function inspectFiles(cwd:string,paths:unknown,previewBytes=0):Promise<Ins
   const evidence:InspectedEvidence[]=[];let total=0;
   for(const path of evidencePaths(paths)) {
     let canonical:string;
-    try{canonical=containedPath(cwd,path);}catch(error){if(error instanceof AppError)throw error;throw new AppError('evidence-unavailable','任务成果目录无法读取，请恢复目录后再核对。');}
+    try{rejectSensitivePath(path);canonical=containedPath(cwd,path);rejectSensitivePath(canonical);}catch(error){if(error instanceof AppError)throw error;throw new AppError('evidence-unavailable','任务成果目录无法读取，请恢复目录后再核对。');}
     const maximum=Math.min(10*1024*1024,20*1024*1024-total);
     try {
       const file=await open(canonical,constants.O_RDONLY|constants.O_NONBLOCK);
@@ -38,7 +42,7 @@ async function inspectFiles(cwd:string,paths:unknown,previewBytes=0):Promise<Ins
         }
         total+=bytes;evidence.push({path:canonical,sha256:hash.digest('hex'),bytes,text:Buffer.concat(preview).toString('utf8'),data:Buffer.concat(preview),truncated:bytes>captured});
       }finally{await file.close();}
-    }catch(error){if(error instanceof AppError)throw error;throw new AppError('evidence-unavailable',`成果文件无法读取，请恢复文件或重新提交：${canonical}`);}
+    }catch(error){if(error instanceof AppError)throw error;throw new AppError('evidence-unavailable','成果文件无法读取，请恢复文件或重新提交。');}
   }
   return evidence;
 }

@@ -13,6 +13,7 @@ import { SessionId } from '@deepseek-ai/dsh-session/types';
 import { mkdir, realpath } from 'node:fs/promises';
 import { realpathSync } from 'node:fs';
 import { join,isAbsolute,basename } from 'node:path';
+import {taskWorkspace} from './task-workspace.ts';
 import {nameAutomaticSession,workerTitle} from './sidebar.ts';
 import { AppError,requiredText,optionalText,type Binding,type Run,type WorkReport,type ExistingSessionGrant,type ExistingSessionPreview } from './model.ts';
 import type { Store } from './store.ts';
@@ -255,7 +256,7 @@ export class DshExecution {
     // Validate the ID through the ledger before using it as a directory segment.
     const task=this.store.getTask(taskId);
     const generation=this.store.nextBindingGeneration(taskId);
-    const cwd=this.store.activeBinding(taskId)?.cwd??(fullAccessEnabled(this.options)&&this.options.workspace?realpathSync(this.options.workspace):undefined)??join(this.dataDir,'workspaces',generation===1?task.id:`${task.id}-g${generation}`);await mkdir(cwd,{recursive:true});
+    const cwd=this.store.activeBinding(taskId)?.cwd??(this.options.workspace?await taskWorkspace(this.options.workspace,task.id,generation):undefined)??join(this.dataDir,'workspaces',generation===1?task.id:`${task.id}-g${generation}`);await mkdir(cwd,{recursive:true});
     const b=this.store.beginBinding(requestId,taskId,rowVersion,await realpath(cwd));
     const current=this.store.getBinding(b.id);if(current.state==='ready')return current;
     const active=this.creating.get(b.id);if(active)return active;

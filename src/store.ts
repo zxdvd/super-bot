@@ -524,6 +524,13 @@ export class Store {
     });
     return true;
   }
+  dispatchBlocker(taskId:string):'capacity'|'resource-conflict'|null {
+    const held=this.db.prepare('SELECT cwd FROM resources').all();
+    if(held.length>=2)return 'capacity';
+    const binding=this.activeBinding(taskId);if(!binding)return null;
+    const contains=(parent:string,child:string)=>{const path=relative(parent,child);return path===''||(!isAbsolute(path)&&path!=='..'&&!path.startsWith(`..${sep}`));};
+    return held.some(r=>contains(String(r.cwd),binding.cwd)||contains(binding.cwd,String(r.cwd)))?'resource-conflict':null;
+  }
   reserveRun(requestId:string,taskId:string,expectedRowVersion:number):Run {
     return this.command(requestId,'task.dispatch',{taskId,expectedRowVersion},()=>{
       const task=this.getTask(taskId);const b=this.activeBinding(taskId);
@@ -533,9 +540,8 @@ export class Store {
       if(this.db.prepare("SELECT 1 FROM attentions WHERE taskId=? AND state='open'").get(taskId))throw new AppError('needs-attention','请先处理当前待办。');
       const held=this.db.prepare('SELECT resources.*,runs.taskId,tasks.botId FROM resources JOIN runs ON runs.id=resources.runId JOIN tasks ON tasks.id=runs.taskId').all();
       if(held.some(r=>r.taskId===taskId))throw new AppError('run-active','这个任务的上次执行尚未收敛。');
-      if(held.length>=2)throw new AppError('capacity','两个执行名额已占用，请等待或核对已有执行。');
-      const contains=(parent:string,child:string)=>{const path=relative(parent,child);return path===''||(!isAbsolute(path)&&path!=='..'&&!path.startsWith(`..${sep}`));};
-      if(held.some(r=>contains(String(r.cwd),b.cwd)||contains(b.cwd,String(r.cwd))))throw new AppError('resource-conflict','这个工作目录与另一执行重叠。');
+      const blocker=this.dispatchBlocker(taskId);
+      if(blocker)throw new AppError(blocker,blocker==='capacity'?'执行名额已占用，请等待或核对已有执行。':'这个工作目录与另一执行重叠。');
       const pending=this.pendingInput(taskId);const id=randomUUID(),inputId=pending?.id??randomUUID(),now=Date.now();
       if(!pending)this.db.prepare('INSERT INTO inputs(id,taskId,kind,content,createdAt) VALUES (?,?,?,?,?)').run(inputId,taskId,'dispatch',task.goal,now);
       this.db.prepare('INSERT INTO runs(id,taskId,bindingId,sessionId,taskRevision,generation,inputId,state,createdAt) VALUES (?,?,?,?,?,?,?,?,?)').run(id,taskId,b.id,b.sessionId,task.taskRevision,b.generation,inputId,'queued',now);

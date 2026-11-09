@@ -98,7 +98,7 @@ export class Managers {
               evidenceValidation={status:'verified'};
             }catch(error) {
               // Metadata remains readable; never return an unverified or partially verified preview.
-              if(!(error instanceof AppError)||!['evidence-changed','evidence-unavailable','evidence-size','invalid-evidence','path-outside'].includes(error.code))throw error;
+              if(!(error instanceof AppError)||!['evidence-changed','evidence-unavailable','evidence-size','invalid-evidence','path-outside','evidence-sensitive'].includes(error.code))throw error;
               evidenceValidation={status:'failed',code:error.code,message:error.message};
             }
           }
@@ -125,7 +125,7 @@ export class Managers {
             const model=exec.agent.model.current();if(!model)throw new AppError('model-required','管理会话没有模型。');resolved.agent.model.select(model);
           }
           try{return {run:await this.execution.dispatch(requestId,task.id,task.rowVersion,authorize)};}
-          catch(error){if(error instanceof AppError&&error.code==='capacity'){this.store.enqueueManager(bot.id,`capacity:${task.id}:${task.rowVersion}`,'容量等待：有名额后再次核对任务并派发。',task.id);return {deferred:true,message:'执行名额已占用，已等待容量通知。不要轮询。'};}throw error;}
+          catch(error){if(error instanceof AppError&&['capacity','resource-conflict'].includes(error.code)){this.store.enqueueManager(bot.id,`capacity:${task.id}:${task.rowVersion}`,'资源等待：名额和目录可用后再次核对任务并派发。',task.id);return {deferred:true,message:'执行名额或目录已占用，已排队等待资源通知。不要轮询。'};}throw error;}
         }
         if(data.action==='review') {
           const resultId=requiredText(data.resultId,'成果标识',200),saved=this.store.resultById(resultId);
@@ -398,7 +398,7 @@ export class Managers {
         let event=this.store.pendingManagerEvents(bot.id)[0];
         const deliveryPending=(event&&JSON.parse(event.payload).deliveryOnly)||this.store.managerNotifications(bot.id).some(item=>item.state==='entered'&&JSON.parse(item.payload).deliveryOnly);
         if(!event&&!deliveryPending)continue;
-        if(event?.id.startsWith('manager-event:capacity:')&&this.store.heldRuns().length>=2)continue;
+        if(event?.id.startsWith('manager-event:capacity:')&&event.taskId&&this.store.dispatchBlocker(event.taskId))continue;
         const resolved=await this.ctx.sessionController.resolveAgent(SessionId(manager.sessionId));
         if(this.closed)break;if('error' in resolved)throw new AppError('manager-unavailable','管理会话暂不可用；请打开管理会话核对。');const agent=resolved.agent;this.attachScope(agent);
         this.authority(agent.id,manager.id);

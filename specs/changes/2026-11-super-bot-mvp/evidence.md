@@ -523,3 +523,10 @@ ELECTRON_RUN_AS_NODE=1 '/Applications/DeepSeek Harness.app/Contents/MacOS/DeepSe
 - `npm run smoke:chat -- .runtime/manager-query-host.log` **退出 0**：独立新建 `.runtime/manager-query-smoke-*/super-bot/.runtime/dsh`、profile `super-bot-query`、DSH Web rc.1、端口 3097，测试 overlay 关闭 HMR，省略 fullAccess。不修改日常 profile/真实会话，不使用外部模型或 CLI 服务。
 - smoke 从原生聊天输入执行短查询：Bot 原生 Bash printf 实际返回 `BOT_QUERY_OK`，模型回复引用实际工具输出，Task 数仍为 0；模型可见工具精确八项。随后合成 sleep 工具请求在真实 NativeToolExecutor 路径产生 noWait 错误，仍为零 Task。文件修改请求则经 Task/Worker 原生 Bash 写文件，read/report 后 Bot 原对话交付，下载为 `LOCAL_CLI_OK`；保留普通聊天、源消息归属、文件下载与认证拒绝、问答、同任务返工、显式人工接受等共 **12 项 smoke 检查**。日志 `.runtime/manager-query-chat.log`，结果 `.runtime/chat-smoke.json`，都不提交。
 - 未验证：Desktop 实际运行、真实模型对短查询/复杂工作的语义分类、真实 lark-cli 账号/读群消息、实际 skill 内容执行、Bot 后台查询完成通知的交互体验、全套旧宿主 smoke。本轮 files 模式由适配测试验证，实际聊天 smoke 使用默认 Full Access。未安装/重载日常插件；CF/SB-15/FV 保持原验收状态。
+
+## 2026-11-09：Review 第一批 · P0-2 任务独立目录（含 P1-8）
+
+- `workspace` 改为项目根：新任务落在 `<root>/.super-bot-workspaces/<taskId>`（返工代际为 `-g<N>`）；Git 根用基于 `HEAD` 的 detached worktree，并自动写入本地 `.git/info/exclude`。不退回共享根目录，符号链接目录拒绝。
+- dispatch 遇 `resource-conflict` 与 `capacity` 同样入队资源等待通知并返回 deferred；pump 改用 `Store.dispatchBlocker` 判断名额与目录重叠，资源释放后再唤醒 Bot。
+- 成果拒绝 `.ssh`、`.aws`、`credentials`、`*.pem`、`.env*`（含符号链接别名）；读取失败错误不再回显绝对路径。
+- 回归：配置 workspace 连续两次 dispatch 得到两个独立目录且都在运行；旧绑定重叠目录 deferred、目录释放后 pump 唤醒；worktree 隔离写入、复用代际、主 checkout 状态干净；敏感文件拒绝。`npm run check` 通过。

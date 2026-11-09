@@ -199,3 +199,7 @@ DF-08 验证见 [侧栏整理 Dogfooding](../../../docs/dogfooding-sidebar-2026-
 - [x] 指令区分短只读查询与修改/多步骤/长任务；说明具体 fullAccess 配置及 Shell 非只读沙箱边界，不再要求开启工具通道。
 - [x] `npm run check`：65 核心 + 120 适配 = 185 项及 typecheck/build 通过。独立真实 DSH 宿主 `smoke:chat` 验证 Bot 原生 Bash 查询零 Task、精确工具列表、noWait 拒绝与 Worker 文件任务/原聊天交付回归。
 - [ ] 真实模型在 Desktop 使用 lark-cli/skill 查询，以及后台查询完成事件的实际交互体验；本轮只用合成数据及确定性模型，不代替这项验收。
+
+## Review 第一批（2026-11-09）
+
+- [x] P0-2：任务独立目录 / Git worktree；resource-conflict 入队等待；P1-8 敏感成果拒绝名单与错误不泄露绝对路径。
