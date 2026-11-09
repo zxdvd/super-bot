@@ -81,7 +81,7 @@ npm run dev
 - `npm run smoke`：测试宿主运行时检查真实状态、WAL、未认证访问与跨域拒绝。
 - `npm pack --dry-run`：核对分发清单；运行数据和契约测试插件不进入安装包。
 
-Node 用 fnm 管理时，可用 `fnm exec --using=24.21.0 npm run dev`，无需改变机器默认版本。完整执行流程和可靠性门槛见任务清单。未启用 Manager 时，创建任务只保存目标，“开始执行”才调用原生会话中选定的模型。启用 Manager 后，完整且未暂停的任务会自动安排执行；Bot 的 `create` 默认在同一次调用内准备 Worker 会话并派发（名额或目录占用时排队等待），缺省的范围/验收由 Bot 推断或使用保守默认值；`dispatch: false` 保留先澄清缺项的流程。需要先核对时，请在创建表单选择“先暂停”。Worker 使用普通 DSH Session。默认（省略 `fullAccess` 或设为 `true`）使用原生 Full Access 预设和宿主可用工具，包括 Shell、Git 与子 Agent；Super Bot 不再附加工具白名单、目录守卫或执行步数/时长上限。`workspace` 指定项目根；新任务使用其下 `.super-bot-workspaces/<taskId>` 独立目录，Git 项目创建基于已提交 `HEAD` 的 detached worktree（不复制未提交改动、忽略文件或依赖）。全局默认最多两个未收敛任务；不同任务目录可并发，旧绑定/人工关联的重叠目录排队等待。worktree 保留供检查和返工，不自动合并或删除；Git 项目会自动把 `/.super-bot-workspaces/` 写入本地 `.git/info/exclude`，不污染主 checkout 的 `git status`。暂停阻止后续派发，停止请求取消并核对收敛。只有显式 `fullAccess: false` 才启用 files 模式，用于兼容和隔离验证：只允许任务目录内 read/write/edit 与报告，每次最多 40 步或 10 分钟，目录变化和预算耗尽转核对。
+Node 用 fnm 管理时，可用 `fnm exec --using=24.21.0 npm run dev`，无需改变机器默认版本。完整执行流程和可靠性门槛见任务清单。未启用 Manager 时，创建任务只保存目标，“开始执行”才调用原生会话中选定的模型。启用 Manager 后，完整且未暂停的任务会自动安排执行；Bot 的 `create` 默认在同一次调用内准备 Worker 会话并派发（名额或目录占用时排队等待），缺省的范围/验收由 Bot 推断或使用保守默认值；`dispatch: false` 保留先澄清缺项的流程。需要先核对时，请在创建表单选择“先暂停”。Worker 使用普通 DSH Session。默认（省略 `fullAccess` 或设为 `true`）使用原生 Full Access 预设和宿主可用工具，包括 Shell、Git 与子 Agent；Super Bot 不再附加工具白名单、目录守卫或执行步数/时长上限。每个任务的工作目录由 Bot 按实际情况选择（见下文“任务工作目录”），配置只给出允许范围、默认策略和可选 hook。全局默认最多两个未收敛任务；不同目录可并发，同一或嵌套目录按先后顺序（FIFO）排队，Bot 会被告知排在哪个任务之后。暂停阻止后续派发，停止请求取消并核对收敛。只有显式 `fullAccess: false` 才启用 files 模式，用于兼容和隔离验证：只允许任务目录内 read/write/edit 与报告，每次最多 40 步或 10 分钟，目录变化和预算耗尽转核对。
 
 
 可选限额（Super Bot `config` 下，均为正整数）：`maxRunningTasks`（全局同时执行的 Worker 任务，默认 2）、`managerWakesPerHour`（每个 Bot 每小时自动唤醒，默认 20；达到后在状态里记录一次问题并保留通知，下一次成功唤醒后清除）、`managerConcurrentWakes`（同时唤醒的 Bot，默认 2）、`managerTurnMinutes`（单次自动 Bot 轮次上限，默认 5 分钟）。补交付最多 3 次、files 模式 40 步/10 分钟仍为固定值。
@@ -94,7 +94,7 @@ Node 用 fnm 管理时，可用 `fnm exec --using=24.21.0 npm run dev`，无需�
 - id: super-bot
   config:
     fullAccess: true  # 默认开放 Bot 查询工具（含 Shell）及 Worker Full Access；false 用于隔离/兼容测试
-    workspace: /absolute/path/project
+    allowedRoots: [/absolute/path/projects]  # 任务目录只能落在这些根之下
     managerModel:
       provider: your-provider
       model: gpt-6.1-sol
@@ -103,6 +103,42 @@ Node 用 fnm 管理时，可用 `fnm exec --using=24.21.0 npm run dev`，无需�
       provider: your-provider
       model: gpt-6.1-sol
       reasoningEffort: xhigh
+```
+
+## 任务工作目录
+
+Bot 在 `super_bot_manage` 的 `create`/`dispatch` 中可传 `workdir`，按任务选择目录（省略时用 `defaultWorkdir`）：
+
+| mode | 含义 | 必填 |
+| --- | --- | --- |
+| `existing` | 直接在已有目录工作（独占；同一/嵌套目录的后来任务排队） | `path` |
+| `isolated` | 在 `defaultIsolatedDir`（或 `under`）下新建 `<name>-<id8>` 空目录 | 无 |
+| `worktree` | 从 Git 仓库顶层的已提交 `base`（默认 `HEAD`）建 worktree，分支 `sb/<name>-<id8>`（或 `branch`） | `repo` |
+| `hook` | 运行配置的 `workdirHook.create`，读取 stdout 最后一行 `SB_WORKDIR=<dir>`（缺省为 hook cwd 下的 `<name>`） | 无 |
+
+所有路径解析 realpath 后必须位于 `allowedRoots` 内，且不能是 HOME、`/`、Super Bot 数据目录、`deniedPaths` 或 `.ssh`/`.aws`/`.env`/`*.pem` 等敏感位置；违反时返回 `workdir-rejected`，Bot 应换目录或询问用户。hook 的变量只通过环境变量传入（`SB_NAME`、`SB_TASK_ID`、`SB_WORKDIR`、`SB_ARG_<KEY>`，命令里的 `{name}`/`{args.x}` 会被替换为带引号的变量引用），参数名须在 `argNames` 中，值只允许字母数字和 `._/ -`；失败或超时（默认 300 秒，应小于 `managerTurnMinutes`）不重试，返回 `workdir-hook-failed` 并清理 hook 留下的空目录。同一请求重试不会重复运行 hook。
+
+清理默认手动（`workdirCleanup: manual`）：任务结束后可在任务详情的“工作目录”卡片点“清理”；`existing` 目录永不删除，worktree 有未提交改动时不强删，hook 需配置 `remove`。`on-complete` 会在接受或取消后自动清理，但之后成果文件下载会失效。
+
+旧配置 `workspace: <dir>` 仍可用：等价于 `allowedRoots: [<dir>]`，Git 根目录默认 worktree，并在状态里提示改用新键。`allowedRoots`/`workspace` 指向 HOME 或 `/` 时会被忽略并提示，任务回退到数据目录下的独立目录。
+
+示例（团队多仓工作区工具只是 hook 的一种用法，Super Bot 不内置任何特定工具）：
+
+```yaml
+- id: super-bot
+  config:
+    allowedRoots: [/Users/me/work]
+    defaultWorkdir: isolated          # isolated | worktree | hook | none
+    defaultIsolatedDir: .super-bot-workspaces
+    deniedPaths: [/Users/me/work/secrets]
+    workdirCleanup: manual            # manual | on-complete
+    workdirHook:
+      description: 用 team-workspace 创建包含多个仓库的工作区
+      cwd: /Users/me/work/workspaces
+      create: tw ws create {name} --repos {args.repos}   # 未输出 SB_WORKDIR 时使用 <cwd>/<name>
+      remove: tw ws rm {name}
+      argNames: [repos]
+      timeoutSeconds: 300
 ```
 
 推理档位需由该 profile 的模型目录及提供方支持。未配置角色模型时仍使用原生会话选择；Worker 可继承 Bot 的选择。Worker 默认使用原生 Full Access，项目目录不作为安全沙箱。升级时，原先省略此键的配置也会使用 Full Access；需要保留旧 files 行为时显式设置 `fullAccess: false`。Super Bot 继续记录任务归属、输入、结果和执行收敛，不把模型报告当作人工验收。
