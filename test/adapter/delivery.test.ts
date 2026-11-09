@@ -304,3 +304,38 @@ for(const variant of ['wrong-task','missing-index','wrong-path','bare-identifier
     await f.assistant(1,[{type:'text',text}]);await f.end(1);assert.equal(f.state()?.state,'pending');
   }finally{await f.close();}
 });
+
+test('explicit deliver closes the notification in one call, renders relative links and needs no link matching',async t=>{
+  const f=await fixture(t);try {
+    await f.pulse();await f.enter(1);await f.review();assert.equal(f.state()?.state,'pending');
+    const args={action:'deliver',taskId:f.task.id,resultId:f.report.resultId,text:'两项事实已写好；检查通过，真实模型质量未验证。'};
+    const first=await f.call('deliver',args);
+    assert.equal(f.state()?.state,'done');assert.equal(JSON.parse(String(f.state()?.payload)).chatDelivery.explicit,true);
+    assert.deepEqual(first.delivery.files,[{name:'result.md',url:`/api/super-bot-file?resultId=${f.report.resultId}&index=0`}]);
+    assert.equal(first.delivery.workUrl,`/#super-bot-task=${f.task.id}`);assert.equal(first.delivery.humanAcceptanceRequired,true);
+    assert.ok(first.delivery.markdown.includes(`(/api/super-bot-file?resultId=${f.report.resultId}&index=0)`));
+    assert.ok(!first.delivery.markdown.includes('example.test'));
+    assert.deepEqual(await f.call('deliver',args),first);
+    assert.deepEqual(await f.call('deliver-again',args),first);
+    await assert.rejects(f.call('deliver',{...args,text:'different'}),{code:'idempotency-conflict'});
+    // The model's visible reply has no links at all; delivery is still settled and nothing wakes again.
+    await f.assistant(1,[{type:'text',text:'请查看上面的交付卡片。'}]);await f.end(1);
+    for(let i=0;i<5;i++)await f.pulse(60000);
+    assert.equal(f.counts().followups,1);assert.equal(f.counts().dispatches,0);
+    assert.equal(f.store.taskDetail(f.task.id).events.filter((e:any)=>e.kind==='manager.delivered'&&JSON.stringify(e).includes(String(f.report.resultId))).length,1);
+    assert.equal(f.store.runResult(f.run.id)?.humanAcceptedAt,null);
+    await f.reload(true);assert.deepEqual(await f.call('deliver-after-reopen',args),first);
+  }finally{await f.close();}
+});
+
+test('delivery-only recovery may call deliver for its own result only',async t=>{
+  const f=await fixture(t);try {
+    await f.pulse();await f.enter(1);await f.review();await f.end(1,false);
+    await f.reload();await f.pulse();assert.equal(f.counts().followups,2);await f.enter(2);
+    await assert.rejects(f.call('wrong-result',{action:'deliver',taskId:f.task.id,resultId:'other',text:'x'}),{code:'delivery-only'});
+    const value=await f.call('scoped',{action:'deliver',taskId:f.task.id,resultId:f.report.resultId,text:'补交付'});
+    assert.equal(value.delivery.resultId,f.report.resultId);assert.equal(f.state()?.state,'done');
+    await f.assistant(2,[{type:'text',text:'已交付。'}]);await f.end(2);await f.pulse(120000);
+    assert.equal(f.counts().followups,2);assert.equal(f.counts().dispatches,0);
+  }finally{await f.close();}
+});

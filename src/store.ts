@@ -289,6 +289,21 @@ export class Store {
       this.event('manager.delivered',row.taskId as string|null,{eventId:id,sessionId,...proof,...(payload.resultId?{resultId:payload.resultId}:{})});return {};
     });
   }
+  /** Explicit chat delivery: records the plugin-rendered delivery and closes its notification in one transaction. */
+  managerDeliver<T extends {taskId:string;resultId:string;text:string}>(requestId:string,botId:string,sessionId:string,delivery:T):T {
+    return this.command(requestId,'manager.deliver',{botId,taskId:delivery.taskId,resultId:delivery.resultId,text:delivery.text},()=>{
+      const id=`manager-event:delivery:${delivery.resultId}`;
+      const row=this.db.prepare("SELECT state,payload FROM outbox WHERE id=? AND kind='manager.notify'").get(id);
+      if(row&&row.state==='done'&&JSON.parse(String(row.payload)).chatDelivery?.explicit)return JSON.parse(String(row.payload)).chatDelivery.delivery as T;
+      if(this.activeManager(botId)?.sessionId!==sessionId)throw new AppError('manager-stale','交付会话已经改变。');
+      const task=this.getTask(delivery.taskId),result=this.taskDetail(task.id).result;
+      if(task.botId!==botId||result?.id!==delivery.resultId||!['review','completed'].includes(task.lifecycle))throw new AppError('result-stale','交付成果已经改变。');
+      const receipt={sessionId,explicit:true,requestId,delivery};
+      if(row)this.db.prepare("UPDATE outbox SET state='done',payload=json_set(payload,'$.chatDelivery',json(?)) WHERE id=?").run(JSON.stringify(receipt),id);
+      this.event('manager.delivered',task.id,{eventId:row?id:null,sessionId,resultId:delivery.resultId,explicit:true});
+      return delivery;
+    });
+  }
   managerOrder():Bot[] {const bots=this.listBots(),id=this.get('managerCursor'),cursor=bots.findIndex(bot=>bot.id===id);return [...bots.slice(cursor+1),...bots.slice(0,cursor+1)];}
   managerProblem(botId:string,message:string):void {
     const key=`managerProblem:${botId}`;const prior=this.get(key);
@@ -806,7 +821,7 @@ export class Store {
         this.db.prepare('UPDATE tasks SET rowVersion=rowVersion+1,updatedAt=? WHERE id=?').run(Date.now(),taskId);
         if(verdict==='rework'&&reworks>=2)this.db.prepare("UPDATE tasks SET controlMode='paused' WHERE id=?").run(taskId);
       }
-      if(decision!=='rework')this.enqueueManager(botId,`delivery:${resultId}`,'成果已检查但尚需在当前对话交付。只读取这份成果并给出文件链接、检查与未验证项、人工确认入口；不得重新执行或改变任务。',taskId,5,{resultId,taskRevision:task.taskRevision,...chatReview});
+      if(decision!=='rework')this.enqueueManager(botId,`delivery:${resultId}`,'成果已检查但尚需在当前对话交付。用 super_bot_manage 的 deliver（taskId、resultId、简短说明：完成内容、检查与未验证项）交付，并原样回复返回的 markdown；不得重新执行或改变任务。',taskId,5,{resultId,taskRevision:task.taskRevision,...chatReview});
       this.event('manager.reviewed',taskId,{resultId,decision,note});return this.getTask(taskId);
     });
   }

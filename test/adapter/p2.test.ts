@@ -264,7 +264,7 @@ for(const damage of ['modified','deleted'] as const)test(`P2 ${damage} evidence 
     assert.deepEqual(after.task,before.task);assert.deepEqual(after.result,before.result);assert.deepEqual(after.attentions,before.attentions);assert.deepEqual(after.run,before.run);assert.deepEqual(after.events,before.events);
     assert.equal(after.evidenceValidation.status,'failed');assert.equal(after.evidenceValidation.code,damage==='modified'?'evidence-changed':'evidence-unavailable');assert.ok(after.evidenceValidation.message);
     assert.deepEqual(after.files,[],'no partially verified batch or changed bytes may escape');
-    assert.equal(after.delivery.workUrl,`https://example.test/#super-bot-task=${created.task.id}`);
+    assert.equal(after.delivery.workUrl,`/#super-bot-task=${created.task.id}`);
     const expected={code:damage==='modified'?'evidence-changed':'evidence-unavailable'};
     await assert.rejects(f.execution.accept('accept-damaged',created.task.id,after.task.rowVersion,report.resultId),expected);
     await assert.rejects(f.call('manager-accept',{action:'review',taskId:created.task.id,expectedRowVersion:after.task.rowVersion,resultId:report.resultId,verdict:'accept',note:'不能忽略校验失败'}),expected);

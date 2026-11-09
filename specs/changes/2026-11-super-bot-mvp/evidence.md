@@ -530,3 +530,10 @@ ELECTRON_RUN_AS_NODE=1 '/Applications/DeepSeek Harness.app/Contents/MacOS/DeepSe
 - dispatch 遇 `resource-conflict` 与 `capacity` 同样入队资源等待通知并返回 deferred；pump 改用 `Store.dispatchBlocker` 判断名额与目录重叠，资源释放后再唤醒 Bot。
 - 成果拒绝 `.ssh`、`.aws`、`credentials`、`*.pem`、`.env*`（含符号链接别名）；读取失败错误不再回显绝对路径。
 - 回归：配置 workspace 连续两次 dispatch 得到两个独立目录且都在运行；旧绑定重叠目录 deferred、目录释放后 pump 唤醒；worktree 隔离写入、复用代际、主 checkout 状态干净；敏感文件拒绝。`npm run check` 通过。
+
+## 2026-11-09：Review 第一批 · P0-3 显式 deliver
+
+- `super_bot_manage` 新增 `deliver`（taskId、resultId、text）。校验当前成果与生命周期后，`Store.managerDeliver` 在同一 SQLite 事务里写入 `manager.delivered`（explicit）并把 `manager-event:delivery:<resultId>` 置 done；同一请求重放返回同一回执，不同请求对已显式交付的成果返回首次回执，同一请求不同正文为 idempotency-conflict。
+- 链接由插件渲染为相对路径（文件 `/api/super-bot-file?resultId=…&index=N`、任务 `/#super-bot-task=…`），返回 `markdown` 供 Bot 原样回复；`detail.delivery` 同样改为相对链接，不再依赖 webOrigin。补交付作用域允许对本成果调用 deliver。
+- 回复文本链接识别保留为兜底（旧会话/旧模型），不再是主路径；c80f28d 的 3 次上限与退避不变。
+- 回归：deliver 后无链接的模型回复也不会再唤醒（5 分钟推进后 followups 仍为 1）、重放/重开返回同一回执、无绝对 origin；补交付轮次只能交付自己的成果。`npm run check` 通过。
