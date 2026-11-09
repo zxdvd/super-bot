@@ -41,7 +41,7 @@ async function fixture(t:TestContext,fullAccess?:boolean) {
   const assistant=async(turn:number,content:any[]=[{type:'text',text:text()}],finish='stop',interrupted=false)=>emit('assistant/message',{turn,step:1,message:{id:`assistant-${events.length}`,role:'assistant',source:{kind:'model',provider:'fake',model:'fake'},content},stream:[{type:'chunk',time:Date.now(),chunk:{type:'finish',reason:{kind:finish}}}],...(interrupted?{interrupted:true}:{})},'append');
   const end=async(turn:number,success=true)=>{await emit('turn/end',{turn,reason:success?{kind:'completed'}:{kind:'error',error:{code:'SYNTHETIC_MODEL_FAILURE'}}});agent.status='idle';resolveIdle();await new Promise<void>(resolve=>setImmediate(resolve));};
   const state=()=>store.db.prepare('SELECT state,payload FROM outbox WHERE id=?').get(`manager-event:delivery:${report.resultId}`);
-  return {allowed:()=>allowed,prompt:()=>prompt(),get store(){return store;},bot,manager,task,run,report,ready,agent,events,durable,pulse,enter,call,review,text,assistant,end,state,emit,beginNative:()=>{agent.status='running';idle=new Promise<void>(resolve=>{resolveIdle=resolve;});},checkpoint:()=> (ctx.sessions as any).flush(session),reinstallWhileActive:()=>{retired.push(managers);managers=new Managers(ctx,store,execution,directory,()=> 'https://example.test',{fullAccess});managers.install();},guard:(name:string)=>guard({name,arguments:{}}),counts:()=>({followups,dispatches,cancels}),setFlush:(mode:typeof flushMode)=>{flushMode=mode;},unblockFlush:()=>allowFlush(),reload:async(reopen=false)=>{await managers.dispose();if(reopen){store.close();store=new Store(join(directory,'ledger.sqlite'));}managers=new Managers(ctx,store,execution,directory,()=> 'https://example.test',{fullAccess});managers.install();},close:async()=>{agent.status='idle';resolveIdle();await managers.dispose();for(const old of retired)await old.dispose();store.close();assert.ok(directory.startsWith(join(root,'.runtime','delivery-adapter-')));rmSync(directory,{recursive:true,force:true});t.mock.timers.reset();}};
+  return {allowed:()=>allowed,prompt:()=>prompt(),get store(){return store;},bot,manager,task,run,report,ready,agent,events,durable,pulse,enter,call,review,text,assistant,end,state,emit,beginNative:()=>{agent.status='running';idle=new Promise<void>(resolve=>{resolveIdle=resolve;});},checkpoint:()=> (ctx.sessions as any).flush(session),reinstallWhileActive:()=>{retired.push(managers);managers=new Managers(ctx,store,execution,directory,()=> 'https://example.test',{fullAccess});managers.install();},guard:(name:string,args:Record<string,unknown>={})=>guard({name,arguments:args}),counts:()=>({followups,dispatches,cancels}),setFlush:(mode:typeof flushMode)=>{flushMode=mode;},unblockFlush:()=>allowFlush(),reload:async(reopen=false)=>{await managers.dispose();if(reopen){store.close();store=new Store(join(directory,'ledger.sqlite'));}managers=new Managers(ctx,store,execution,directory,()=> 'https://example.test',{fullAccess});managers.install();},close:async()=>{agent.status='idle';resolveIdle();await managers.dispose();for(const old of retired)await old.dispose();store.close();assert.ok(directory.startsWith(join(root,'.runtime','delivery-adapter-')));rmSync(directory,{recursive:true,force:true});t.mock.timers.reset();}};
 }
 
 test('model failure after committed review supplements final delivery without executing Worker or review again',async t=>{
@@ -118,16 +118,16 @@ test('a persisted visible final with no durable turn/end is uncertain, not blind
   }finally{await f.close();}
 });
 
-test('Manager routes native execution to Worker, including outside delivery-only recovery',async t=>{
+test('Bot queries are allowed normally but denied throughout delivery-only recovery',async t=>{
   const f=await fixture(t,true);try {
-    assert.match(String(f.guard('bash')),/Worker/);await f.pulse();await f.enter(1);await f.review();await f.end(1,false);
+    assert.equal(f.guard('bash',{command:'pwd',timeoutMs:1000}),undefined);await f.pulse();await f.enter(1);await f.review();await f.end(1,false);
     await f.pulse();await f.enter(2);
-    for(const name of ['bash','write','edit','subagent','super_bot_report'])assert.match(String(f.guard(name)),/Delivery-only/);
+    for(const name of ['skill','bash','read','read_image','job_output','job_list','job_kill','write','edit','subagent','super_bot_report'])assert.match(String(f.guard(name)),/Delivery-only/);
     assert.equal(f.guard('super_bot_manage'),undefined);
     await assert.rejects(f.call('foreign-detail',{action:'detail',taskId:'not-this-result'}),{code:'delivery-only'});
     await assert.rejects(f.call('dispatch',{action:'dispatch',taskId:f.task.id,expectedRowVersion:f.store.getTask(f.task.id).rowVersion}),{code:'delivery-only'});
     await f.assistant(2);await f.end(2);
-    assert.equal(f.state()?.state,'done');assert.match(String(f.guard('bash')),/Worker/);assert.equal(f.counts().dispatches,0);
+    assert.equal(f.state()?.state,'done');assert.equal(f.guard('bash',{command:'pwd',timeoutMs:1000}),undefined);assert.equal(f.counts().dispatches,0);
   }finally{await f.close();}
 });
 
@@ -157,7 +157,7 @@ for(const busy of ['running','user-inbox'] as const)test(`delivery reconciliatio
     f.setFlush('blocked');const pumping=f.pulse();await new Promise<void>(resolve=>setImmediate(resolve));
     if(busy==='running')f.agent.status='running';else f.agent.inbox.nextTurn.push({id:'real-user-pending'});
     f.unblockFlush();await pumping;
-    assert.equal(f.counts().followups,1);assert.equal(f.state()?.state,'pending');assert.match(String(f.guard('bash')),/Worker/);
+    assert.equal(f.counts().followups,1);assert.equal(f.state()?.state,'pending');assert.equal(f.guard('bash',{command:'pwd',timeoutMs:1000}),undefined);
   }finally{await f.close();}
 });
 
@@ -180,22 +180,60 @@ test('a retained native Inbox delivery restores its read-only scope without a se
     assert.match(String(f.guard('bash')),/Delivery-only/);
     await assert.rejects(f.call('no-rerun',{action:'dispatch',taskId:f.task.id,expectedRowVersion:f.store.getTask(f.task.id).rowVersion}),{code:'delivery-only'});
     await f.assistant(2);await f.end(2);assert.equal(f.state()?.state,'done');
-    assert.match(String(f.guard('bash')),/Delegate.*Worker/,'normal coordination scope returns after delivery');
+    assert.equal(f.guard('bash',{command:'pwd',timeoutMs:1000}),undefined,'query tools return after delivery');
     assert.equal(f.counts().followups,2);assert.equal(f.counts().dispatches,0);
   }finally{await f.close();}
 });
 
-for(const mode of [undefined,true,false])test(`Bot execution routing and capability instructions with fullAccess=${mode}`,async t=>{
+for(const mode of [undefined,true,false])test(`Bot query tools and routing follow fullAccess=${mode}`,async t=>{
   const f=await fixture(t,mode);try {
-    assert.deepEqual(f.allowed(),['super_bot_manage']);
+    const native=['skill','bash','read','read_image','job_output','job_list','job_kill'];
+    assert.deepEqual(f.allowed(),mode===false?['super_bot_manage']:[...native,'super_bot_manage']);
     assert.equal(f.guard('super_bot_manage'),undefined);
-    for(const name of ['bash','shell','git','lark-cli','read','write','subagent','external_plugin_tool'])assert.match(String(f.guard(name)),mode===false?/Worker 完整权限未开启.*fullAccess: false/:/Delegate.*Worker/);
+    for(const name of native) {
+      const result=f.guard(name,name==='bash'?{command:'lark-cli --help',timeoutMs:30000}:{});
+      if(mode===false)assert.match(String(result),/Bot Shell.*fullAccess: false/);else assert.equal(result,undefined);
+    }
+    for(const name of ['write','edit','subagent','subagent_fork','Worker','super_bot_report','external_plugin_tool'])assert.match(String(f.guard(name)),mode===false?/fullAccess: false/:/not available.*Worker/);
     assert.match(f.prompt(),/lark-cli/);assert.match(f.prompt(),/Never ask the user to enable a tool channel/);
-    if(mode===false){assert.match(f.prompt(),/Worker 完整权限未开启/);assert.match(f.prompt(),/fullAccess: true.*cordis.patch.yml/);assert.match(f.prompt(),/BEFORE creating or dispatching/);}
-    else {assert.match(f.prompt(),/ALWAYS create and dispatch a Task/);assert.match(f.prompt(),/read-only CLI queries/);assert.doesNotMatch(f.prompt(),/Worker 完整权限未开启/);}
+    if(mode===false){assert.match(f.prompt(),/Bot Shell 与 Worker 完整权限未开启/);assert.match(f.prompt(),/fullAccess: true.*cordis.patch.yml/);assert.match(f.prompt(),/BEFORE creating or dispatching/);}
+    else {assert.match(f.prompt(),/Run short read-only\/status queries directly/);assert.match(f.prompt(),/code\/file changes, multi-step work or long-running tasks, create and dispatch a Task/);assert.doesNotMatch(f.prompt(),/完整权限未开启/);}
   }finally{await f.close();}
 });
 
+test('Bot Bash requires explicit bounded foreground queries or nonblocking background mode',async t=>{
+  const f=await fixture(t);try {
+    for(const timeoutMs of [1,5000,30000])assert.equal(f.guard('bash',{command:'git status --short',timeoutMs}),undefined);
+    for(const timeoutMs of [0,-1,30001,60000,Infinity,NaN,'1000',null])assert.match(String(f.guard('bash',{command:'pwd',timeoutMs})),/timeoutMs.*30000/);
+    for(const run_in_background of [undefined,false,'true'])assert.match(String(f.guard('bash',{command:'pwd',run_in_background})),/pass timeoutMs/);
+    assert.equal(f.guard('bash',{command:'pwd',run_in_background:true}),undefined);
+    assert.match(String(f.guard('bash',{command:'pwd',run_in_background:true,timeoutMs:60000})),/timeoutMs/);
+  }finally{await f.close();}
+});
+
+test('Bot noWait rejects common sleep commands without forbidding text that mentions sleep',async t=>{
+  const f=await fixture(t);try {
+    for(const command of ['sleep 1',' /bin/sleep 1','pwd; sleep 1','pwd && sleep 1','(sleep 1)','if true; then sleep 1; fi','while true; do sleep 1; done','env sleep 1','command sleep 1','pwd\nsleep 1']) {
+      assert.match(String(f.guard('bash',{command,timeoutMs:1000})),/Do not sleep/);
+      assert.match(String(f.guard('bash',{command,run_in_background:true})),/Do not sleep/);
+    }
+    for(const command of ['echo sleep','git show -- sleep.md',"printf 'sleep is not a command here'"])assert.equal(f.guard('bash',{command,timeoutMs:1000}),undefined);
+  }finally{await f.close();}
+});
+
+test('Bot job output permits snapshots and at most five seconds of explicit waiting',async t=>{
+  const f=await fixture(t);try {
+    for(const args of [{},{wait:false},{wait:false,timeout_ms:60000},{wait:true,timeout_ms:1},{wait:true,timeout_ms:5000}])assert.equal(f.guard('job_output',args),undefined);
+    for(const timeout_ms of [undefined,0,-1,5001,30000,Infinity,NaN,'5000',null])assert.match(String(f.guard('job_output',{wait:true,timeout_ms})),/at most 5000/);
+  }finally{await f.close();}
+});
+
+test('revoking the Manager prevents every query tool as well as ledger mutations',async t=>{
+  const f=await fixture(t);try {
+    f.store.releaseManager('replace',f.bot.id,1);
+    for(const name of ['skill','bash','read','read_image','job_output','job_list','job_kill','super_bot_manage'])assert.match(String(f.guard(name,{command:'pwd',timeoutMs:1000})),/no longer has management authority/);
+  }finally{await f.close();}
+});
 
 for(const variant of ['missing','shortened'])test(`${variant} delivery links cannot cause unbounded wakes across turns and ledger reopen`,async t=>{
   const f=await fixture(t);try {

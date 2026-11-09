@@ -13,7 +13,7 @@
 | 部分会话历史授权 | 不提供 | 原生模型仍能读取既有上下文；仅支持明确授权整段历史，或另建全新会话 |
 | 输入送达与消费 | 已验证；存在宿主限制 | accepted/enqueued/entered 分开。已 claim 后取消可能丢失 Inbox 项且无 user/message，转人工核对，不推断已消费。`probe:run` |
 | files 模式工具范围 | 已验证 | read/write/edit 与报告；绝对路径、实际目录、符号链接检查；额外 scoped 工具再由执行 guard 拒绝。`smoke-directory.mjs`、`smoke-scoped-tools.mjs` |
-| Full Access 的 Shell、子 Agent | 默认开放，显式 false 才使用 files | 普通 DSH Session 的原生工具已实际执行 Bash 和子 Agent；由现有宿主配置能力，不额外裁剪工具。不能因此推断任意外部进程可停止 |
+| Worker Full Access 的 Shell、子 Agent | 默认开放，显式 false 才使用 files | 普通 DSH Session 的原生工具已实际执行 Bash 和子 Agent；由现有宿主配置能力，不额外裁剪工具。不能因此推断任意外部进程可停止 |
 | ready 与最终验收 | 已验证 | ready 只是候选；执行收敛和文件完整哈希均需核对。默认人工；显式 Bot 授权保持独立审计。`smoke:execution`、`smoke:workflow`、`smoke:manager` |
 | 长文件验收 | 限制明确且已验证 | 每项只预览前 12,000 字节；完整文件用于哈希核验。超出预览范围必须人工检查全文。`smoke-manager-rework.mjs` |
 | 原生工具审批 | 已验证文件写入三路径 | 允许一次、拒绝、等待时停止；工作台只显示待办和跳转，决定来自原生 UI。独立 UI 第 13～14 轮、`smoke-approvals.mjs` |
@@ -33,9 +33,13 @@
 | Desktop | 仅静态核对，体验未验证 | 本轮只读安装包为 `0.2.2-rc.1`，确认使用本地动态端口；未实际验证 Desktop 聊天/UI 兼容，产品验证目标仍为 Web rc.1 |
 | 真实模型质量、Token/费用 | 四轮 dogfooding 已完成；无精确费用归因 | Sol medium Bot 委派 Sol xhigh Full Access Worker，实际 Shell/子 Agent/测试、补充需求、原对话交付及同任务返工通过；多任务歧义、用户最终接受和费用评估仍待验证。自动审查超时等异常见接手说明 |
 
-Bot 在所有模式下只开放管理工具，并用执行守卫阻止直接使用原生/外部工具；Shell、git、lark-cli 等执行请求委派 Worker。显式 `fullAccess: false` 时，Bot 说明“Worker 完整权限未开启”，提示将当前 profile 的 Super Bot `config.fullAccess` 设为 `true`，空闲后重载。默认/true 的 Worker 不受 Manager 工具白名单影响。
+Bot 默认（省略 `fullAccess` 或 true）开放 `skill`、`bash`、`read`、`read_image`、`job_output`、`job_list`、`job_kill` 与 `super_bot_manage`。工具列表和执行 guard 双重约束，无 write/edit 或原生 Worker/subagent 工具。轻量只读/状态查询、lark-cli 查询及 Shell skill 可在 Bot 直接执行；代码/文件修改、多步骤和长任务仍委派 Worker。Shell 不构成只读沙箱，程序不声称能识别任意命令的副作用，意图分工由指令引导。
 
-复跑旧目录、scoped-tools、预算等 files 隔离 smoke 时，须在专用测试 profile 显式设置 `fullAccess: false`；`smoke:chat` 的新增 Shell 场景使用默认 Full Access。
+Bot Bash 也受 fullAccess 控制。显式 `fullAccess: false` 时只开放管理工具，Bot 说明“Bot Shell 与 Worker 完整权限未开启”，提示将当前 profile 的 Super Bot `config.fullAccess` 设为 `true`，空闲后重载；Worker 保留 files 模式。默认/true 的 Worker 不受 Manager 工具白名单及 noWait 影响。
+
+noWait 拒绝常见 sleep 调用；所有 preset 的 Bot bash 都须显式正数 `timeoutMs <= 30000` 或 `run_in_background: true`，同时指定超限 timeoutMs 仍拒绝。`job_output` 可用默认非等待快照，`wait: true` 需显式正数 `timeout_ms <= 5000`；拒绝其原生默认 30 秒等待。后台查询靠原生 job 事件通知，Bot 返回后不轮询，不用 job 工具代替账本控制 Worker。sleep 正则不是完整 Shell 解析器，不能防止刻意伪装的等待；时限约束是工具参数门槛，不是外部进程已停止的证明。仅补交付阶段与撤权后的原生工具仍被禁止。
+
+复跑旧目录、scoped-tools、预算等 files 隔离 smoke 时，须在专用测试 profile 显式设置 `fullAccess: false`；`smoke:chat` 使用默认 Full Access，核对 Bot 精确八项工具列表、直接 Bash 查询零 Task、真实 noWait 拒绝及 Worker Shell 文件任务。
 
 仅补交付通知每成果最多 3 次自动唤醒，后两次退避 30/60 秒；次数、结束输入与期限落在原 outbox payload，重启不重置。到限 unknown 并停止唤醒；未知发送、缺失结束记录及补交付轮次用户中断不自动重放。链接按路径与 resultId/index/taskId 识别，允许相对地址、参数换序与不同端口；仍以原生持久化最终回复和成功 turn/end 为准。识别历史交付不承诺旧端口的下载地址在重启后仍可打开，可从当前工作面板查看成果。
 
@@ -50,4 +54,4 @@ files 模式目录限制是应用层约束，不是操作系统沙箱。Full Acc
 
 `/api/super-bot-file` 是宿主认证下的只读成果入口，仅按 resultId 与文件索引查询账本；无任意路径参数。返回前核对实际文件哈希与大小，单文件保持 10 MiB 上限。聊天交付链接可直接进入对应任务详情，下载文件不会接受成果。
 
-`npm run smoke:chat` 在真实隔离宿主上使用无网络确定性模型验证完整链路；不是语言理解或成果质量评测。2026-11-07 聊天增量基线为 52 项核心、16 项适配测试及 11 项真实宿主契约通过；截至 2026-11-09，源码检查为 63 项核心、100 项适配测试通过，typecheck/build 通过。真实模型过程见[第三轮记录](dogfooding-2026-11-08.md)与[侧栏整理记录](dogfooding-sidebar-2026-11-09.md)；Desktop、任意外部服务与完整产品体验仍未验收。
+`npm run smoke:chat` 在真实隔离宿主上使用无网络确定性模型验证完整链路；不是语言理解或成果质量评测。2026-11-07 聊天增量基线为 52 项核心、16 项适配测试及 11 项真实宿主契约通过；截至 2026-11-09，源码检查为 65 项核心、120 项适配测试通过，typecheck/build 通过。真实模型过程见[第三轮记录](dogfooding-2026-11-08.md)与[侧栏整理记录](dogfooding-sidebar-2026-11-09.md)；Desktop、任意外部服务与完整产品体验仍未验收。

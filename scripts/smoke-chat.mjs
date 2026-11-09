@@ -18,6 +18,19 @@ const say=text=>probe({action:'native-prompt',sessionId:manager.sessionId,text})
 const inspect=()=>probe({action:'inspect-session',sessionId:manager.sessionId});
 const page=()=>call('task.list',{botId:bot.id});
 await say('你好，请简短介绍职责。');assert.equal((await page()).total,0);
+const managerTools=['skill','bash','read','read_image','job_output','job_list','job_kill','super_bot_manage'].sort();
+await say('请用 Shell 做一次只读查询，直接告诉我结果，不创建任务。');
+const querySession=await inspect();
+assert.equal((await page()).total,0);
+assert.deepEqual(querySession.modelTools.slice().sort(),managerTools);
+assert.deepEqual(querySession.executedTools,['bash']);
+assert.ok(querySession.toolResults.every(result=>!result.message.isError),JSON.stringify(querySession.toolResults));
+assert.ok(querySession.assistantTexts.some(text=>text.includes('BOT_QUERY_OK')));
+await say('BOT_NOWAIT_PROBE');
+const blockedSession=await inspect();
+assert.equal((await page()).total,0);
+assert.deepEqual(blockedSession.executedTools,['bash','bash']);
+assert.ok(blockedSession.toolResults.some(result=>result.message.isError&&JSON.stringify(result).includes('Do not sleep or poll')),JSON.stringify(blockedSession.toolResults));
 const request='请写一份简短的说明，包含两项事实，完成后给我文件。';await say(request);
 const task=await wait(async()=>{const p=await page();assert.ok(p.total<=1);return p.items.find(t=>t.lifecycle==='review'&&t.managerReviewed);},'chat creates and completes one task');
 let detail=await call('task.detail',{id:task.id});
@@ -43,7 +56,7 @@ await wait(async()=>{const s=await inspect();return s.status==='idle'&&s.assista
 await say('读者是新同事，保持简短。');
 const answered=await wait(async()=>{const d=await call('task.detail',{id:questionTask.id});return d.task.lifecycle==='review'&&d.task.managerReviewed&&d;},'chat answer continues execution');
 assert.equal(answered.input.content,'读者是新同事，保持简短。');assert.equal((await page()).total,2);
-// A native local command must execute in the Worker, with no external CLI/service dependency.
+// File-changing commands still belong to a Task/Worker; no external CLI/service dependency.
 await wait(async()=>{const s=await inspect();return s.status==='idle'&&!s.pending;},'manager idle before CLI request');
 await say('请用 Shell 运行本机命令，把合成检查结果保存成文件。');
 const cliTask=await wait(async()=>{const p=await page();return p.items.find(t=>t.goal==='LOCAL_CLI_PROBE'&&t.lifecycle==='review'&&t.managerReviewed);},'CLI request delegates to Worker');
@@ -51,10 +64,10 @@ const cliDetail=await call('task.detail',{id:cliTask.id});
 const worker=await probe({action:'inspect-session',sessionId:cliDetail.binding.sessionId});
 assert.ok(worker.toolResults.every(result=>!result.message.isError),JSON.stringify(worker.toolResults));
 assert.ok(worker.executedTools.includes('bash'));assert.ok(worker.modelTools.includes('bash'));
-assert.ok(!(await inspect()).executedTools.some(name=>name!=='super_bot_manage'));
-assert.deepEqual((await inspect()).modelTools,['super_bot_manage']);
+assert.ok((await inspect()).executedTools.every(name=>name==='super_bot_manage'||name==='bash'));
+assert.deepEqual((await inspect()).modelTools.slice().sort(),managerTools);
 assert.equal(await (await client.get(`/api/super-bot-file?resultId=${cliDetail.result.id}&index=0`)).text(),'LOCAL_CLI_OK\n');
 await wait(async()=>{const s=await inspect();return s.status==='idle'&&s.assistantTexts.some(text=>text.includes(`#super-bot-task=${cliTask.id}`));},'CLI result delivered in Bot chat');
 assert.equal(cliDetail.result.humanAcceptedAt,null);assert.equal((await page()).total,3);
-const result={ok:true,model:'deterministic fixture; no real-model quality claim',botId:bot.id,sessionId:manager.sessionId,taskId:questionTask.id,resultId:answered.result.id,checks:['CLI request creates Task and executes native Bash only in Worker','ordinary chat creates no task','native message provenance','chat request automatically dispatches','readable delivery and verified download in same chat','unauthenticated file access denied','chat rework reuses task','acceptance remains an explicit user action','Worker question and human answer stay in Bot chat']};
+const result={ok:true,model:'deterministic fixture; no real-model quality claim',botId:bot.id,sessionId:manager.sessionId,taskId:questionTask.id,resultId:answered.result.id,checks:['Bot exposes exactly seven native query tools plus management','read-only Bot Bash returns real output with zero Tasks','native executor rejects Bot sleep with zero Tasks','file-changing CLI request creates Task and executes native Bash in Worker','ordinary chat creates no task','native message provenance','chat request automatically dispatches','readable delivery and verified download in same chat','unauthenticated file access denied','chat rework reuses task','acceptance remains an explicit user action','Worker question and human answer stay in Bot chat']};
 await writeFile('.runtime/chat-smoke.json',JSON.stringify(result,null,2));console.log(JSON.stringify(result,null,2));

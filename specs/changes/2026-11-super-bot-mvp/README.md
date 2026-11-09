@@ -80,10 +80,16 @@
 
 用户确认先改善命名、主聊天置顶和历史整理，并继续由真实产品 Bot/Worker dogfooding。Workspace 使用稳定项目名，Worker 使用短任务名；避免 Untitled 和第一项长任务标题污染整个项目分组。原生归档会影响执行，因此不能为了隐藏而归档仍可能恢复/返工的会话；归属、用户已有命名/置顶和活动状态必须核实。保留完整普通 Worker，优先原生能力，无新侧栏或存储系统。
 
-## 默认权限与 CLI 委派修复（2026-11-09）
+## 默认权限与 CLI 委派修复（2026-11-09，Bot 工具策略已由下文覆盖）
 
 用户报告未配 fullAccess 时 Bot 因自身没有 Shell 而要求开启工具通道。改为 Worker 默认使用原生 Full Access；仅显式 `fullAccess: false` 保留旧 files 隔离/兼容行为，覆盖 DF-01 旧默认。Bot 不再直接使用原生执行工具，所有本机命令、外部 CLI/工具请求均通过账本建 Task 并派 Worker；成果预览继续走 detail。程序用工具列表和执行守卫强制角色边界，提示词负责识别工作意图与说明实际模式。files 模式明确说明 Worker 完整权限未开启和当前 profile 的 `config.fullAccess: true` 开启方法。Desktop 真实体验及真实飞书账号查询仍未复验。
 
 ## 仅补交付通知循环修复（2026-11-09）
 
 针对仅交付通知 entered 无条件翻回 pending 导致重复唤醒，复用现有 outbox 的 attempts 与 payload，持久化最多 3 次补交付及 30/60 秒退避。只在真实输入所在轮次持久化结束后重排；到限 unknown 并只记录一次问题，不重跑 Worker。历史 pending 通知先核对，不因升级增加一轮尝试。交付检测按路径与成果/任务 ID 核对有效链接，不依赖完整 origin；保留最终回复、成功 turn/end、持久化及版本约束。Desktop 动态端口已经静态确认，另一台机器的真实账本未读取；证据与未验证范围见 evidence。
+
+## 用户批准：Bot 原生查询工具（2026-11-09）
+
+在 c80f28d 之后修改 e8e967b 的 Manager 管理工具独占策略。默认/true 时开放 skill、bash、read、read_image、job_output、job_list、job_kill，加已有 super_bot_manage；不给 write/edit 或原生 Worker/subagent。轻量只读查询、lark-cli 查询和 Shell skill 直接在 Bot 执行；修改、多步骤和长任务仍由 Task/Worker 承担，Worker 默认 Full Access 不变。显式 false 同时关闭 Bot 七项原生工具并保留 files Worker，提示具体 config.fullAccess 开启方法。
+
+程序强制白名单、撤权、仅补交付作用域与 noWait：Bash 显式最多 30 秒或后台返回，拒绝常见 sleep；job_output 显式等待最多 5 秒，不等原生默认 30 秒。后台事件由宿主通知，不增加 Agent Loop 或通用路由框架。命令只读/修改的语义由指令分工，Shell 不是只读沙箱。保留上一提交的补交付上限、退避及持久化门槛。确定性聊天验证与真实模型/桌面验收分开记录。

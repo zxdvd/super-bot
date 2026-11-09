@@ -15,10 +15,11 @@
 - 默认使用普通原生 Full Access Worker（省略 `fullAccess` 或 `true`）；仅显式 `fullAccess: false` 使用受限 files 模式。Full Access 下可以使用宿主工具、Shell、Git 和子 Agent，不额外添加 Worker 工具白名单或步数/时长上限。Bot 用 GPT 6.1 Sol medium，Worker 用同模型 xhigh；路由与凭证留在宿主配置。
 - 四轮产品内 dogfooding：通知和交付恢复、多消息、任务补全/去重、respond 空字段修复、原生搜索插件、聊天旁工作面板、侧栏命名与整理。
 - 工作面板复用原生右栏，支持宽窄屏；入口按当前有效 Bot 会话核对。主聊天可显式置顶，Worker 自动短名，旧自动会话名可保守整理。
-- 最终代码检查为 **181 项通过（65 核心 + 116 适配）**，typecheck/build 通过；默认权限、CLI 委派及补交付循环修复见[证据](../specs/changes/2026-11-super-bot-mvp/evidence.md)。同任务、同 Worker 在整理会话名后再次返工并交付已验证。
+- 最终代码检查为 **185 项通过（65 核心 + 120 适配）**，typecheck/build 通过；Bot 查询工具、默认权限及补交付循环修复见[证据](../specs/changes/2026-11-super-bot-mvp/evidence.md)。同任务、同 Worker 在整理会话名后再次返工并交付已验证。
 - Node 默认和日常宿主已使用 `24.21.0`。日常 profile 安装了指定的 dsh-plugins，实际原生 web_search 成功；不能将该本机配置当作插件包自带账号或搜索服务。
-- 独立 DSH Web rc.1 的 `smoke:chat` 已通过，包含真实原生 Bash → 文件回读 → Worker 报告 → Bot 原对话交付；模型为确定性夹具，无外部服务调用。
-- Bot 在所有权限模式下只使用管理工具，Shell/git/lark-cli 等请求通过 Task 派给 Worker；原生工具守卫阻止 Manager 绕过账本。files 模式直接说明“Worker 完整权限未开启”和 `config.fullAccess: true` 的开启方法。
+- 独立 DSH Web rc.1 的 `smoke:chat` 已通过，包含 Bot 直接 Bash 查询零 Task、noWait 拒绝，以及原生 Bash → 文件回读 → Worker 报告 → Bot 原对话交付；模型为确定性夹具，无外部服务调用。
+- 用户批准覆盖 e8e967b 的管理工具独占设计：Bot 默认有 skill/bash/read/read_image/job_output/job_list/job_kill 加管理工具，短查询直接执行；修改、多步骤、长任务仍委派 Worker。不提供 write/edit 或原生 Worker/subagent 工具。Bot Bash 同样受 fullAccess 控制，false 时说明“Bot Shell 与 Worker 完整权限未开启”和 `config.fullAccess: true` 开启方法。
+- noWait 强制 Bash 显式最多 30 秒或后台返回，拒绝常见 sleep；job_output 等待需显式最多 5 秒；后台事件自行通知。Shell 不是只读沙箱，语义分工由指令引导。仅补交付恢复/撤权的执行限制保留，细节见 [运行能力](runtime-support.md)。
 - 仅补交付通知已加持久化 3 次上限及 30/60 秒退避；旧版本 attempts=14 的 pending 通知会先核对历史，已交付则结束，未交付则停止自动唤醒并保留 unknown。重复 turn/end、重载和旧端口链接均有回归。
 
 ## 从现有环境继续
@@ -34,7 +35,7 @@ npm ci
 npm run check
 ```
 
-本轮升级会使原先省略 `fullAccess` 的配置使用原生 Full Access；若要保留隔离测试行为，先显式配置 `fullAccess: false`。本轮未替日常 Web/Desktop 安装或重载插件，Desktop 真实体验仍未复验。只读检查本机 Desktop 安装包现为 0.2.2-rc.1，其本地宿主使用动态端口；此前文档中的 rc.5 是较早环境记录。
+本轮升级会使默认/true 的 Bot 重新获得上述七项查询工具；省略 `fullAccess` 的 Worker 继续使用原生 Full Access；若要保留隔离测试行为，先显式配置 `fullAccess: false`。本轮未替日常 Web/Desktop 安装或重载插件，Desktop 真实体验仍未复验。只读检查本机 Desktop 安装包现为 0.2.2-rc.1，其本地宿主使用动态端口；此前文档中的 rc.5 是较早环境记录。
 
 依赖变化才需重装依赖。`npm run check` 会构建产物；正在使用本地 link 的客户端可能刷新。后端热替换只在 Bot、Worker 和后台工作均空闲时进行：
 

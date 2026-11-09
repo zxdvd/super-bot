@@ -181,7 +181,7 @@ DF-08 验证见 [侧栏整理 Dogfooding](../../../docs/dogfooding-sidebar-2026-
 ## 默认权限与 CLI 委派修复（2026-11-09）
 
 - [x] Worker 省略配置即采用原生 Full Access；显式 `fullAccess: false` 保留文件工具、目录、预算约束。schema、运行时、示例及升级说明同步。
-- [x] Bot 在所有模式用工具列表及执行 guard 强制只走管理工具；CLI/外部工具委派及 files 开启方式进入指令。省略/true/false、交付恢复后的作用域与 Worker 撤权回归通过。
+- [x] 历史验证（e8e967b；已由下文批准的查询工具设计覆盖）：Bot 在所有模式用工具列表及执行 guard 强制只走管理工具；CLI/外部工具委派及 files 开启方式进入指令。省略/true/false、交付恢复后的作用域与 Worker 撤权回归通过。
 - [x] `npm run check`（169 项）与独立宿主 `smoke:chat` 通过；后者从聊天开始完成实际原生 Bash、回读、报告、原对话交付，未接入外部服务。
 - [ ] Desktop 真实模型重试 lark-cli 读群消息；本轮没有访问真实聊天或替日常 profile 重载，不能以确定性 smoke 代替此项体验验收。
 
@@ -191,3 +191,11 @@ DF-08 验证见 [侧栏整理 Dogfooding](../../../docs/dogfooding-sidebar-2026-
 - [x] 链接按路径/resultId/index/taskId 核对；相对链接、参数换序、端口变化可确认交付；缺失/错误标识仍不冒充已交付。保留成功结束与持久化门槛。
 - [x] `npm run check`：181 项测试、typecheck/build 通过。只读核实本机 Desktop rc.1 使用本地动态端口；不改安装包或日常会话。
 - [ ] 在用户另一台机器加载后复验实际账本和 Desktop 对话；本轮本地合成测试不代替该体验验证。
+
+## 用户批准：Bot 原生查询工具（2026-11-09）
+
+- [x] 默认/true 的 Bot 工具列表为七项原生查询工具加管理工具；false 仅管理工具，Worker files/默认 Full Access 行为不变。schema、示例及配置说明同步。
+- [x] 执行 guard 强制白名单、Bash 显式最多 30 秒或后台返回、常见 sleep 拒绝、job_output 显式等待最多 5 秒；保留撤权与仅补交付限制。适配回归覆盖省略/true/false、边界参数、交付后恢复查询工具。
+- [x] 指令区分短只读查询与修改/多步骤/长任务；说明具体 fullAccess 配置及 Shell 非只读沙箱边界，不再要求开启工具通道。
+- [x] `npm run check`：65 核心 + 120 适配 = 185 项及 typecheck/build 通过。独立真实 DSH 宿主 `smoke:chat` 验证 Bot 原生 Bash 查询零 Task、精确工具列表、noWait 拒绝与 Worker 文件任务/原聊天交付回归。
+- [ ] 真实模型在 Desktop 使用 lark-cli/skill 查询，以及后台查询完成事件的实际交互体验；本轮只用合成数据及确定性模型，不代替这项验收。

@@ -511,3 +511,15 @@ ELECTRON_RUN_AS_NODE=1 '/Applications/DeepSeek Harness.app/Contents/MacOS/DeepSe
 - 最终 `npm run check` 退出 **0**：Node **24.21.0**，**65 核心 + 116 适配 = 181 项**，typecheck、Host/Client build 通过。首次完整检查的 TypeScript 可空 input 收窄错误已修正，以上为修正后实际全量结果；日志 `.runtime/delivery-loop-check.log`。`git diff --check` 通过。
 - `npm run probe:build` 与 `npm run smoke:chat -- .runtime/delivery-loop-host.log` 均退出 **0**。新建独立 `.runtime/delivery-smoke-*/super-bot/.runtime/dsh`，profile `super-bot-delivery`，DSH Web rc.1、端口 3097、关闭测试宿主 HMR、仅确定性模型。原生聊天接单、Shell Worker、文件下载、同对话交付、问答、同任务返工及显式人工接受链路通过。该 smoke 验证正常聊天无回归；故障/退避由上面的确定性事件回归验证，不混称为真实模型质量测试。输出 `.runtime/delivery-loop-chat.log`，测试会话/账本不入仓库。
 - 未验证：远端实际账本、远端 Desktop 运行、真实模型改写链接的所有形式；未替日常 profile 安装或重载。旧端口链接的历史交付识别不保证旧下载地址仍可打开，当前工作面板仍是查看成果入口。首版最终用户体验验收保持未勾选。
+
+## 2026-11-09：用户批准 Bot 原生查询工具与 noWait
+
+- 基线 `c80f28d`，开始于干净 `dev`。读取 AGENTS、README、ROADMAP、handoff 及活动 change 后实施；本次覆盖 e8e967b 的 Bot 管理工具独占策略，保留默认 Worker Full Access 和 c80f28d 补交付修复。不改账本/schema、Worker 执行或宿主安装源码。
+- 参考用户提供的 `deepseek-ai/dsh-superagent-prototype` sessions.ts 片段及 sleep 正则，没有声称拉取/验证原型最新版本。只读核对本仓库安装的 rc.1 Bash/Jobs/Tools SDK：Bash 必填 description/command，standard 默认等待 60 秒；job_output 的 wait 默认 false，但 wait=true 未指定 timeout_ms 时默认等 30 秒。后台 job 由宿主向原 Session 通知。
+- [Manager](../../../src/manager.ts) 默认/true 白名单为 skill、bash、read、read_image、job_output、job_list、job_kill 和 super_bot_manage；guard 再拒绝其他工具，保留撤权及仅补交付限制。[noWait](../../../src/manager-tools.ts) 对所有 preset 要求正数 timeoutMs <=30000 或 run_in_background=true；显式超限仍拒绝。拒绝常见 sleep；job_output 等待必须显式正数 timeout_ms <=5000。不实现通用 Shell 解析器或只读安全沙箱。
+- 指令允许短只读/状态/lark-cli/Shell skill 查询直接在 Bot 执行，不建 Task；代码/文件修改、多步骤和长任务仍经账本委派 Worker，后台查询保留 job ID 后返回等原生事件。语义分类是模型职责，程序强制可用工具和等待参数。Bot 原生工具也受 fullAccess 控制：显式 false 只留管理工具并提示当前 profile 的 config.fullAccess:true 开启方法；不让用户开启不存在的工具通道。schema 说明与示例同步。
+- 定向 `node --import tsx --test test/adapter/delivery.test.ts`：**39/39** 通过。新增 4 项边界/撤权测试并更新模式及补交付作用域断言，覆盖缺省/true/false 精确工具集、允许查询、拒绝 write/edit/subagent/外部工具、Bash 前后台与无效/超限参数、sleep 常见语法及纯文本误判、job_output 非等待和 5 秒边界、旧 Manager 撤权。上次补交付上限、退避、重开、重复 turn/end 和链接识别回归保留。
+- `npm run check` **退出 0**：Node **24.21.0**，**65 核心 + 120 适配 = 185 项**，typecheck 和 Host/Client build 通过；日志 `.runtime/manager-query-check.log`。`npm run probe:build` **退出 0**，日志 `.runtime/manager-query-probe-build.log`。
+- `npm run smoke:chat -- .runtime/manager-query-host.log` **退出 0**：独立新建 `.runtime/manager-query-smoke-*/super-bot/.runtime/dsh`、profile `super-bot-query`、DSH Web rc.1、端口 3097，测试 overlay 关闭 HMR，省略 fullAccess。不修改日常 profile/真实会话，不使用外部模型或 CLI 服务。
+- smoke 从原生聊天输入执行短查询：Bot 原生 Bash printf 实际返回 `BOT_QUERY_OK`，模型回复引用实际工具输出，Task 数仍为 0；模型可见工具精确八项。随后合成 sleep 工具请求在真实 NativeToolExecutor 路径产生 noWait 错误，仍为零 Task。文件修改请求则经 Task/Worker 原生 Bash 写文件，read/report 后 Bot 原对话交付，下载为 `LOCAL_CLI_OK`；保留普通聊天、源消息归属、文件下载与认证拒绝、问答、同任务返工、显式人工接受等共 **12 项 smoke 检查**。日志 `.runtime/manager-query-chat.log`，结果 `.runtime/chat-smoke.json`，都不提交。
+- 未验证：Desktop 实际运行、真实模型对短查询/复杂工作的语义分类、真实 lark-cli 账号/读群消息、实际 skill 内容执行、Bot 后台查询完成通知的交互体验、全套旧宿主 smoke。本轮 files 模式由适配测试验证，实际聊天 smoke 使用默认 Full Access。未安装/重载日常插件；CF/SB-15/FV 保持原验收状态。

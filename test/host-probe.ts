@@ -53,6 +53,22 @@ class ProbeAdapter extends LlmAdapter {
       const trigger=options.messages.findLast(m=>m.role==='user'&&(m.source?.kind==='user'||m.source?.kind==='super-bot-manager'));
       const text=trigger?.content.filter(b=>b.type==='text').map(b=>b.text).join('')??'';
       const later=trigger?options.messages.slice(options.messages.indexOf(trigger)+1):[];
+      // These fixtures exercise the actual scoped native executor, not a mocked Shell result.
+      const query=trigger?.source?.kind==='user'&&text==='请用 Shell 做一次只读查询，直接告诉我结果，不创建任务。';
+      const noWait=trigger?.source?.kind==='user'&&text==='BOT_NOWAIT_PROBE';
+      if(query||noWait) {
+        const called=later.some(m=>m.content.some(b=>b.type==='tool-call'&&b.name==='bash'));
+        const hasBash=options.tools?.some(tool=>tool.name==='bash');
+        if(hasBash&&!called) {
+          const id=ToolCallId(randomUUID()),args=JSON.stringify({description:'合成 Bot 查询/等待守卫验证',command:noWait?'sleep 1':"printf 'BOT_QUERY_OK\\n'",timeoutMs:1000});
+          yield {type:'block-start',index:0,blockType:'tool-call'};yield {type:'tool-call-delta',index:0,id,name:'bash',argumentsDelta:args};
+          yield {type:'block-end',index:0,block:{type:'tool-call',id,name:'bash',arguments:args}};yield {type:'finish',reason:{kind:'tool-calls'}};return;
+        }
+        const output=later.filter(m=>m.role==='tool').flatMap(m=>m.content.filter(b=>b.type==='text').map(b=>b.text)).join('\n');
+        const reply=hasBash?`查询工具实际返回：${output}`:'Bot Shell 与 Worker 完整权限未开启，请将当前 profile 的 Super Bot config.fullAccess 设为 true，空闲后重载插件。';
+        yield {type:'block-start',index:0,blockType:'text'};yield {type:'text-delta',index:0,text:reply};
+        yield {type:'block-end',index:0,block:{type:'text',text:reply}};yield {type:'finish',reason:{kind:'stop'}};return;
+      }
       const calls=later.flatMap(m=>m.content.filter(b=>b.type==='tool-call'&&b.name==='super_bot_manage'));
       const last=calls.at(-1);const prior=last?.type==='tool-call'?JSON.parse(last.arguments) as Record<string,unknown>:null;
       let value:Record<string,any>|undefined;

@@ -1,6 +1,6 @@
 # 实施路线
 
-状态：2026-11-09 已完成四轮真实模型 dogfooding：Bot 委派普通 Full Access Worker 修复问题、安装搜索插件、实现聊天旁工作视图与侧栏整理，并在原对话交付；181 项测试通过。日常 web profile 使用 Node 24.21.0 和本地 link/HMR。七项成果保持待人工验收，完整个人体验验收尚未完成。开发成果保存到 `dev` 分支，新会话从[接手说明](docs/handoff.md)继续。
+状态：2026-11-09 已完成四轮真实模型 dogfooding：Bot 委派普通 Full Access Worker 修复问题、安装搜索插件、实现聊天旁工作视图与侧栏整理，并在原对话交付；185 项测试通过。日常 web profile 使用 Node 24.21.0 和本地 link/HMR。七项成果保持待人工验收，完整个人体验验收尚未完成。开发成果保存到 `dev` 分支，新会话从[接手说明](docs/handoff.md)继续。
 
 目标：用户选中 Bot 后直接聊天，自然交代一件事，由 Bot 自行安排执行、跟进并回到同一对话交付。工作面板负责按需查看、异常处理和确定性控制。
 
@@ -16,6 +16,6 @@
 
 已有 SB-00～14 保留：Bot/任务账本、Manager 与 Worker、普通会话、文件证据、返工、停止恢复、并发预算、备份和安装生命周期。复用一个 SQLite、现有 Outbox 与 DSH 原生聊天；只补入口、对话行为和必要工具，不重做 Agent Loop 或聊天数据库。旧测试作为底层回归基线，新体验单独验收。
 
-当前用真实 Bot 委派完整 DSH Worker 修复本仓库，验证聊天接单、Shell/测试、子 Agent、报告和回到原对话交付。Bot 使用 Sol medium，Worker 使用 Sol xhigh，Worker 默认 Full Access（仅显式 `fullAccess: false` 使用 files）；Bot 只通过管理工具建 Task/派 Worker，CLI 与外部工具请求同样委派。Desktop、外部订阅、自动记忆、Bot 协商、独立 App/Web、第二执行引擎和云端部署后置。
+当前用真实 Bot 委派完整 DSH Worker 修复本仓库，验证聊天接单、Shell/测试、子 Agent、报告和回到原对话交付。Bot 使用 Sol medium，Worker 使用 Sol xhigh，Worker 默认 Full Access（仅显式 `fullAccess: false` 使用 files）；Bot 默认开放七项原生查询工具和管理工具，短查询直接执行，修改/多步骤/长任务通过 Task 派 Worker；显式 false 同时关闭 Bot 原生工具。Desktop、外部订阅、自动记忆、Bot 协商、独立 App/Web、第二执行引擎和云端部署后置。
 
 权威方案见 [聊天主流程](specs/changes/2026-11-super-bot-mvp/06-chat-first.md)，实施与证据维护在 [任务清单](specs/changes/2026-11-super-bot-mvp/tasks.md)。

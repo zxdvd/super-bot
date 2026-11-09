@@ -1,6 +1,6 @@
 - insert:
     - id: super-bot
       name: '@zxdvd/super-bot'
-      # Worker uses native Full Access by default; opt into files isolation with false.
+      # Default: Bot query tools (including Shell) + native Full Access Worker. False: management-only Bot + files Worker.
       config:
         fullAccess: true
