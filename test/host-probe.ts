@@ -140,7 +140,8 @@ class ProbeAdapter extends LlmAdapter {
         await new Promise<void>(resolve=>{if(options.signal?.aborted)resolve();else options.signal?.addEventListener('abort',()=>resolve(),{once:true});});
         options.signal?.throwIfAborted();
       }
-      const cwd=body.match(/Working directory: (.+)/)?.[1];assert.ok(cwd);
+      // The dispatch line may carry a note after the path, e.g. "(private task directory). Work only inside it…".
+      const cwd=body.match(/Working directory: (.+?)(?: \(.*)?$/m)?.[1];assert.ok(cwd);
       const later=options.messages.slice(options.messages.indexOf(workInput)+1);
       const calls=later.flatMap(m=>m.content.filter(b=>b.type==='tool-call').map(b=>b.name));
       const file=join(cwd,'result.md');
