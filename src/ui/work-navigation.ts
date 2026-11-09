@@ -55,7 +55,7 @@ export async function openBotConversation(api: WorkspaceApi, botId: string, navi
   try { binding = await api.call<ManagerBinding>('manager.prepare', { botId, requestId: crypto.randomUUID() }); }
   catch (error) { if (navigation.aborted) return; throw error; }
   if (navigation.aborted) return;
-  if (binding.botId !== botId || binding.state !== 'ready' || !binding.sessionId) throw new Error('对话尚未准备好，请在工作与设置中查看状态。');
+  if (binding.botId !== botId || binding.state !== 'ready' || !binding.sessionId) throw new Error('对话尚未准备好，请在“工作”的设置（⋯）中查看状态。');
   api.openSession(binding.sessionId);
 }
 

@@ -8,18 +8,16 @@ const fileUrl = (resultId: string, index: number) => `/api/super-bot-file?result
 
 function Review({ w, detail }: { w: WorkspaceState; detail: Detail }) {
   const { task } = detail, result = detail.result!;
-  const accept = () => w.mutate('result.accept', {
-    requestId: `accept:${result.id}:${task.rowVersion}`, id: task.id, expectedRowVersion: task.rowVersion, resultId: result.id,
-  });
   const reject = (text: string, requestId: string) => w.mutate('result.reject', {
     requestId, id: task.id, expectedRowVersion: task.rowVersion, resultId: result.id, text,
   });
   return <>
     <p className="muted">
-      请在任务会话检查文件。接受前会重新核对内容是否改变。{task.controlMode === 'paused' && '当前暂停的是自动管理，你仍可检查并接受成果。'}
+      检查文件后点上方“接受成果”；接受前会重新核对内容是否改变。{task.controlMode === 'paused' && '当前暂停的是自动管理，你仍可检查并接受成果。'}
     </p>
-    <button className="primary" disabled={w.locked || task.lifecycle !== 'review'} onClick={accept}>接受此成果并完成任务</button>
-    <ReplyForm key={result.id} label="返工要求" busy={w.locked} submit={reject}/>
+    <details className="rework"><summary>要求返工</summary>
+      <ReplyForm key={result.id} label="返工要求" busy={w.locked} submit={reject}/>
+    </details>
   </>;
 }
 

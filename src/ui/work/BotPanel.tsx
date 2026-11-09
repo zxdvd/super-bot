@@ -1,7 +1,8 @@
-/** Bot-level controls: sidebar helpers, Bot settings and the manager conversation status. */
+/** Settings page: Bot definition, manager conversation, sidebar helpers and ledger maintenance. */
 import type { Bot } from '../../model.ts';
-import { Hint } from '../kit.tsx';
-import { time } from './format.ts';
+import type { BackupInfo } from '../../backups.ts';
+import { Hint, Section } from '../kit.tsx';
+import { managerOpener } from './SystemIssues.tsx';
 import type { WorkspaceState } from './useWorkspace.ts';
 
 const TIDY_HINT = '整理仅处理已加载且可确认由当前 Bot 自动创建的会话，不唤醒未加载历史。已有项目分组名请在原生侧栏菜单改名；'
@@ -9,7 +10,7 @@ const TIDY_HINT = '整理仅处理已加载且可确认由当前 Bot 自动创�
 
 function SidebarActions({ w, bot }: { w: WorkspaceState; bot: Bot }) {
   const sessionId = bot.managerSessionId;
-  if (!sessionId) return null;
+  if (!sessionId) return <p className="muted">启用管理对话后可置顶与整理侧栏。</p>;
   const pin = () => w.mutate('sidebar.pin', { botId: bot.id, sessionId }, () => w.setSidebarNotice({
     botId: bot.id, text: '已置顶主聊天。你可随时在原生侧栏取消；打开或整理不会重新置顶。',
   }));
@@ -19,52 +20,66 @@ function SidebarActions({ w, bot }: { w: WorkspaceState; bot: Bot }) {
       text: `已整理 ${value.renamed} 个会话名，保留 ${value.kept} 个，失败 ${value.failed} 个`
         + `${value.failed ? '（可重试，不会重新执行任务）' : ''}。不改已有项目分组名、用户名称、置顶或归档。`,
     }));
-  return <div className="actions">
-    <button disabled={w.locked} onClick={pin}>置顶主聊天</button>
-    <button disabled={w.locked} onClick={tidy}>整理自动会话名</button>
-  </div>;
+  return <>
+    <div className="actions">
+      <button disabled={w.locked} onClick={pin}>置顶主聊天</button>
+      <button disabled={w.locked} onClick={tidy}>整理自动会话名</button>
+    </div>
+    {w.sidebarNotice?.botId === bot.id && <p className="muted" role="status">{w.sidebarNotice.text}</p>}
+    <Hint>{TIDY_HINT}</Hint>
+  </>;
 }
 
-function ManagerStatus({ w, bot }: { w: WorkspaceState; bot: Bot }) {
-  const info = w.managerInfo;
-  if (info?.binding?.state !== 'ready') return null;
-  const binding = info.binding, limit = info.wakeLimit ?? 20;
-  const replace = () => w.mutate<{ sessionId: string }>('manager.replace', {
+function ManagerSection({ w, bot }: { w: WorkspaceState; bot: Bot }) {
+  const info = w.managerInfo, binding = info?.binding, limit = info?.wakeLimit ?? 20, openManager = managerOpener(w);
+  const replace = () => binding && w.mutate<{ sessionId: string }>('manager.replace', {
     requestId: `replace:${binding.id}`, botId: bot.id, expectedGeneration: binding.generation,
   }, value => w.api.openSession(value.sessionId));
-  return <details><summary className="muted">管理会话设置</summary>
-    <p className="muted">更换会创建新对话，并从账本恢复工作。旧对话和任务均保留。</p>
-    <button disabled={w.locked} onClick={replace}>更换管理会话</button>
-    <p className="muted">待处理通知 {info.pending} · 最近一小时自动唤醒 {info.hourlyWakes}/{limit}</p>
-    {info.uncertain > 0 && <p>有 {info.uncertain} 条通知送达待核对，请在管理对话读取最新账本。</p>}
-    {info.hourlyWakes >= limit && <p>最近一小时自动管理额度已用完；队列保留，仍可在管理对话手动处理。</p>}
-  </details>;
+  return <Section title="管理对话">
+    <p className="muted">在管理对话选择模型后，Bot 会读取账本并安排完整、未暂停的任务。默认仍由你最终验收。</p>
+    <div className="actions">
+      <button disabled={w.locked} onClick={() => void openManager()}>{bot.managerSessionId ? '打开管理对话' : '启用管理对话'}</button>
+      {binding?.state === 'ready' && <button disabled={w.locked} onClick={() => void replace()}>更换管理会话</button>}
+    </div>
+    {info && <p className="muted">待处理通知 {info.pending} · 最近一小时自动唤醒 {info.hourlyWakes}/{limit}</p>}
+    {binding?.state === 'ready' && <Hint>更换会创建新对话，并从账本恢复工作。旧对话和任务均保留。</Hint>}
+  </Section>;
+}
+
+function Maintenance({ w }: { w: WorkspaceState }) {
+  const warnings = w.status?.configWarnings ?? [];
+  return <Section title="账本与运行信息">
+    {w.status && <p className="muted">DSH {w.status.runtime} · 本地 SQLite / {w.status.journalMode.toUpperCase()} · 关闭面板不删除任务。</p>}
+    <button disabled={w.locked}
+      onClick={() => w.mutate<BackupInfo>('backup.create', { requestId: crypto.randomUUID() }, w.setBackupInfo)}>备份账本</button>
+    {w.backupInfo && <div className="notice" ref={w.backupNotice} role="status">
+      <div><strong>账本备份已保存</strong><p className="wrap">{w.backupInfo.path}</p><p className="muted">{w.backupInfo.scope}</p></div>
+      <button onClick={() => w.setBackupInfo(undefined)}>关闭</button>
+    </div>}
+    {warnings.length > 0 && <div className="notice" role="status">
+      <div><strong>配置提示</strong>{warnings.map(text => <p key={text} className="wrap">{text}</p>)}</div>
+    </div>}
+  </Section>;
 }
 
 export function BotPanel({ w, bot }: { w: WorkspaceState; bot: Bot }) {
-  const info = w.managerInfo, limit = info?.wakeLimit ?? 20;
-  const openManager = () => bot.managerSessionId ? w.api.openSession(bot.managerSessionId)
-    : w.mutate<{ sessionId: string }>('manager.prepare', { requestId: crypto.randomUUID(), botId: bot.id },
-      value => w.api.openSession(value.sessionId));
-  return <>
-    <SidebarActions w={w} bot={bot}/>
-    {w.sidebarNotice?.botId === bot.id && <p className="muted" role="status">{w.sidebarNotice.text}</p>}
-    <Hint>{TIDY_HINT}</Hint>
-    <details className="bot-intro advanced"><summary>Bot 设置与管理</summary>
-      <h2>{bot.name}</h2><p>{bot.instructions}</p>
-      <p className="muted">配置版本 {bot.configRevision} · 参考文本 {bot.materials.length} 份</p>
-      {bot.materials.length > 0 && <details><summary className="muted">已保存的参考文本</summary>
-        {bot.materials.map(material => <p key={material.path} className="wrap">{material.path} · {material.bytes} 字节</p>)}
-      </details>}
-      <button disabled={w.locked} onClick={() => w.setForm(w.form === 'bot-edit' ? null : 'bot-edit')}>编辑 Bot 设置</button>{' '}
-      <button disabled={w.locked} onClick={openManager}>{bot.managerSessionId ? '打开 Bot 管理对话' : '启用 Bot 管理对话'}</button>
-      <Hint>在管理对话选择模型后，Bot 会读取账本并安排完整、未暂停的任务。默认仍由你最终验收。</Hint>
-      <ManagerStatus w={w} bot={bot}/>
-      {info && info.hourlyWakes >= limit && info.pending > 0 && <p className="notice" role="status">
-        最近一小时已自动管理 {limit} 次，{info.pending} 条通知正在等待额度恢复。仍可打开管理对话手动处理。
-      </p>}
-      {info?.problem && <p className="notice" role="alert">{info.problem.message} · {time(info.problem.at)}</p>}
-    </details>
-    {info?.problem && <p className="notice" role="alert">{info.problem.message}</p>}
-  </>;
+  return <div className="settings">
+    {!w.sessionId && w.bots.length > 0 && <Section title="Bot">
+      <div className="toolbar">
+        <select aria-label="选择 Bot" disabled={w.busy} value={w.botId} onChange={e => w.pickBot(e.target.value)}>
+          {w.bots.map(b => <option key={b.id} value={b.id}>{b.name}</option>)}
+        </select>
+        <button disabled={w.locked} onClick={() => w.setForm(w.form === 'bot' ? null : 'bot')}>＋ 新 Bot</button>
+      </div>
+    </Section>}
+    <Section title="职责与参考材料" aside={<button className="small" disabled={w.locked}
+      onClick={() => w.setForm(w.form === 'bot-edit' ? null : 'bot-edit')}>编辑</button>}>
+      <h2>{bot.name}</h2><p className="full-text muted">{bot.instructions}</p>
+      <p className="caption">配置版本 {bot.configRevision} · 参考文本 {bot.materials.length} 份</p>
+      {bot.materials.map(material => <p key={material.path} className="wrap caption">{material.path} · {material.bytes} 字节</p>)}
+    </Section>
+    <ManagerSection w={w} bot={bot}/>
+    <Section title="侧栏"><SidebarActions w={w} bot={bot}/></Section>
+    <Maintenance w={w}/>
+  </div>;
 }

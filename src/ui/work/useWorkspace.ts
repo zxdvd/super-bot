@@ -4,12 +4,17 @@ import type { Bot, TaskPage, WorkspaceStatus } from '../../model.ts';
 import type { BackupInfo } from '../../backups.ts';
 import type { WorkspaceApi } from './api.ts';
 import type { Detail, FormKind, ManagerInfo } from './types.ts';
-import { forgetView, rememberBot, rememberedBot, rememberedView, rememberView } from './storage.ts';
+import {
+  forgetView, markSeen, rememberBot, rememberedBot, rememberedView, rememberView, seenResults, type WorkView,
+} from './storage.ts';
 
 export interface WorkspaceProps {
   api: WorkspaceApi; initialBotId?: string; initialTaskId?: string; sessionId?: string; compact?: boolean; onReturn?: () => void;
 }
 export const PAGE_SIZE = 25;
+/** Inbox and board read every open and review task (up to this many each) plus the most recent ones. */
+export const INBOX_LIMIT = 100, RECENT_LIMIT = 30;
+export type Page = TaskPage & { truncated?: boolean };
 const ACTIVE = ['queued', 'running', 'stopping', 'approval'];
 
 async function existing<T>(query: Promise<T>): Promise<T | undefined> {
@@ -17,7 +22,7 @@ async function existing<T>(query: Promise<T>): Promise<T | undefined> {
   catch (error) { if (error instanceof Error && 'code' in error && error.code === 'not-found') return; throw error; }
 }
 
-export function useWorkspace({ api, initialBotId, initialTaskId, sessionId, compact }: WorkspaceProps) {
+export function useWorkspace({ api, initialBotId, initialTaskId, sessionId }: WorkspaceProps) {
   const preferredBot = useRef(initialBotId ?? rememberedBot());
   const savedView = useRef(sessionId ? undefined : rememberedView());
   const restoredView = useRef(!initialTaskId && savedView.current?.botId === initialBotId ? savedView.current : undefined);
@@ -29,7 +34,9 @@ export function useWorkspace({ api, initialBotId, initialTaskId, sessionId, comp
   const [backupInfo, setBackupInfo] = useState<BackupInfo>();
   const [sidebarNotice, setSidebarNotice] = useState<{ botId: string; text: string }>();
   const [status, setStatus] = useState<WorkspaceStatus>(); const [bots, setBots] = useState<Bot[]>([]);
-  const [botId, setBotId] = useState(initialBotId ?? ''); const [page, setPage] = useState<TaskPage>();
+  const [botId, setBotId] = useState(initialBotId ?? ''); const [page, setPage] = useState<Page>();
+  const [view, setViewState] = useState<WorkView>(restoredView.current?.view ?? 'inbox');
+  const [seen, setSeen] = useState(seenResults); const [now, setNow] = useState(Date.now);
   const [selected, setSelected] = useState(initialTaskId ?? ''); const [detail, setDetail] = useState<Detail>();
   const [query, setQuery] = useState(restoredView.current?.query ?? '');
   const [filter, setFilter] = useState(restoredView.current?.filter ?? '');
@@ -39,11 +46,14 @@ export function useWorkspace({ api, initialBotId, initialTaskId, sessionId, comp
   const [busy, setBusy] = useState(false); const [form, setForm] = useState<FormKind>(null);
   const [refresh, setRefresh] = useState(0); const [synced, setSynced] = useState(0);
   useEffect(() => { if (backupInfo) backupNotice.current?.scrollIntoView({ block: 'nearest' }); }, [backupInfo]);
-  useEffect(() => { if (compact) scroller.current?.scrollTo({ top: 0 }); }, [compact, selected]);
   viewScope.current = `${botId}:${selected}`;
   useEffect(() => {
-    if (botId && !sessionId) rememberView({ botId, selected, query, filter, offset });
-  }, [botId, selected, query, filter, offset, sessionId]);
+    if (botId && !sessionId) rememberView({ botId, selected, query, filter, offset, view: view === 'settings' ? 'inbox' : view });
+  }, [botId, selected, query, filter, offset, sessionId, view]);
+  // Opening a finished task marks its result as seen, so the inbox stops surfacing it.
+  const openedResult = detail?.task.lifecycle === 'completed' ? detail.task : undefined;
+  useEffect(() => { if (openedResult) setSeen(markSeen([[openedResult.id, openedResult.updatedAt]])); },
+    [openedResult?.id, openedResult?.updatedAt]);
   const closeEdit = () => setForm(current => current === 'edit' ? null : current);
   const deselect = () => { setSelected(''); setDetail(undefined); };
 
@@ -66,14 +76,23 @@ export function useWorkspace({ api, initialBotId, initialTaskId, sessionId, comp
       }
       savedView.current = undefined;
     }
+    const listQuery = { botId, q: query, lifecycle: filter, offset, limit: PAGE_SIZE };
+    async function inbox(signal: AbortSignal): Promise<Page | undefined> {
+      const read = (lifecycle: string, limit: number) =>
+        existing(api.call<TaskPage>('task.list', { botId, q: '', lifecycle, offset: 0, limit }, signal));
+      const [open, review, recent] = await Promise.all([read('open', INBOX_LIMIT), read('review', INBOX_LIMIT), read('', RECENT_LIMIT)]);
+      if (!open || !review || !recent) return undefined;
+      const items = [...new Map([...open.items, ...review.items, ...recent.items].map(task => [task.id, task])).values()];
+      const truncated = open.total > open.items.length || review.total > review.items.length;
+      return { ...recent, items, offset: 0, limit: items.length, truncated };
+    }
     async function pull() {
       let cadence = 5000;
       if (document.visibilityState === 'hidden') { timer = setTimeout(pull, 5000); return; }
       try {
         const [s, b, p, d, m] = await Promise.all([
           api.call<WorkspaceStatus>('status', {}, signal), api.call<Bot[]>('bot.list', {}, signal),
-          botId ? existing(api.call<TaskPage>('task.list', { botId, q: query, lifecycle: filter, offset, limit: PAGE_SIZE }, signal))
-            : undefined,
+          botId ? view === 'list' ? existing(api.call<TaskPage>('task.list', listQuery, signal)) : inbox(signal) : undefined,
           selected ? existing(api.call<Detail>('task.detail', { id: selected }, signal)) : undefined,
           botId ? existing(api.call<ManagerInfo>('manager.status', { botId }, signal)) : undefined,
         ]);
@@ -84,10 +103,11 @@ export function useWorkspace({ api, initialBotId, initialTaskId, sessionId, comp
           pendingSelection.current = '';
         }
         if (p?.items.some(t => ACTIVE.includes(t.status))) cadence = 1000;
-        const gone = !d || d.task.botId !== botId || (p && selected !== initialTaskId && !p.items.some(t => t.id === selected));
+        const filtered = view === 'list' && p && selected !== initialTaskId && !p.items.some(t => t.id === selected);
+        const gone = !d || d.task.botId !== botId || filtered;
         if (selected && gone) { deselect(); closeEdit(); } else setDetail(d);
-        setOnline(true); setLoading(false); setSynced(Date.now()); failures = 0;
-        if (p && offset > 0 && offset >= p.total) {
+        setOnline(true); setLoading(false); setSynced(Date.now()); setNow(Date.now()); failures = 0;
+        if (view === 'list' && p && offset > 0 && offset >= p.total) {
           setOffset(Math.max(0, Math.floor((p.total - 1) / PAGE_SIZE) * PAGE_SIZE)); deselect(); closeEdit();
         }
         if (botId && !b.some(bot => bot.id === botId)) switchToAvailableBot(b);
@@ -99,7 +119,7 @@ export function useWorkspace({ api, initialBotId, initialTaskId, sessionId, comp
       timer = setTimeout(pull, Math.min(30000, cadence * 2 ** failures));
     }
     pull(); return () => { controller.abort(); clearTimeout(timer); };
-  }, [api, botId, selected, query, filter, offset, refresh]);
+  }, [api, botId, selected, query, filter, offset, refresh, view]);
 
   async function mutate<T>(action: string, payload: Record<string, unknown>, done?: (value: T) => void): Promise<boolean> {
     if (!online || busy || sessionId && api.currentSession?.() !== sessionId) return false;
@@ -130,12 +150,20 @@ export function useWorkspace({ api, initialBotId, initialTaskId, sessionId, comp
     if (next.query !== undefined) setQuery(next.query);
     setOffset(next.offset ?? 0); deselect();
   };
+  /** Switching views keeps the open task; leaving for settings closes it. */
+  const setView = (next: WorkView) => {
+    setViewState(next); if (next === 'settings') deselect();
+    setForm(current => current === 'bot' || current === 'bot-edit' ? current : null);
+    if (next === 'list') setOffset(0);
+  };
+  const markAllSeen = (tasks: readonly { id: string; updatedAt: number }[]) => setSeen(markSeen(tasks.map(t => [t.id, t.updatedAt])));
   const bot = bots.find(b => b.id === botId);
   return {
     api, sessionId, scroller, backupNotice, bot, bots, botId, status, page, selected, detail, query, filter, offset,
     managerInfo, backupInfo, setBackupInfo, sidebarNotice, setSidebarNotice, online, loading, error, setError,
     connectionError, setConnectionError, busy, locked: !online || busy, form, setForm, setRefresh, synced,
     mutate, pickBot, select, deselect, resetView, setOffset, setQuery, setFilter, setSelected, setManagerInfo,
+    view, setView, seen, markAllSeen, now,
   };
 }
 export type WorkspaceState = ReturnType<typeof useWorkspace>;

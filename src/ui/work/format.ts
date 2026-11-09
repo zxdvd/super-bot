@@ -63,3 +63,79 @@ export const workdirModeLabels: Record<WorkdirInfo['mode'], string> = {
 export const workdirStateLabels: Record<WorkdirInfo['state'], string> = {
   provisioned: '使用中', removed: '已清理', 'remove-failed': '清理未完成',
 };
+
+/** Six user-facing stages; pause, takeover and review policy stay secondary tags. */
+export type Stage = 'needs-you' | 'review' | 'running' | 'waiting' | 'done' | 'cancelled';
+export type StageTone = 'neutral' | 'attention' | 'success' | 'danger' | 'info';
+export const stageLabels: Record<Stage, string> = {
+  'needs-you': '等你处理', review: '待验收', running: '执行中', waiting: '待安排', done: '已完成', cancelled: '已取消',
+};
+export const stageTones: Record<Stage, StageTone> = {
+  'needs-you': 'attention', review: 'info', running: 'success', waiting: 'neutral', done: 'neutral', cancelled: 'neutral',
+};
+const NEEDS_YOU = ['needs-input', 'approval', 'recovery', 'manual'];
+const RUNNING = ['running', 'queued', 'stopping'];
+
+export function stage(task: Task): Stage {
+  if (task.lifecycle === 'cancelled') return 'cancelled';
+  if (task.lifecycle === 'completed') return 'done';
+  if (task.lifecycle === 'review') return 'review';
+  if (NEEDS_YOU.includes(task.status)) return 'needs-you';
+  return RUNNING.includes(task.status) ? 'running' : 'waiting';
+}
+/** The short status a row shows: the stage, refined by the concrete reason where that helps. */
+export function stageText(task: Task): string {
+  const s = stage(task);
+  if (s === 'needs-you' || s === 'running') return labels[task.status];
+  if (s === 'waiting' && task.status === 'paused') return labels.paused;
+  return stageLabels[s];
+}
+export const stageTone = (task: Task): StageTone => task.status === 'recovery' ? 'danger' : stageTones[stage(task)];
+
+/** A finished result counts as new for a few days until its task is opened. */
+export const RESULT_FRESH_MS = 3 * 24 * 3600 * 1000;
+export function unseenResult(task: Task, seenAt: number | undefined, now: number): boolean {
+  return task.lifecycle === 'completed' && (seenAt ?? 0) < task.updatedAt && now - task.updatedAt < RESULT_FRESH_MS;
+}
+
+export type InboxSection = 'attention' | 'active' | 'recent';
+export function inboxSection(task: Task, seenAt: number | undefined, now: number): InboxSection {
+  const s = stage(task);
+  if (s === 'needs-you' || s === 'review' || unseenResult(task, seenAt, now)) return 'attention';
+  return s === 'running' || s === 'waiting' ? 'active' : 'recent';
+}
+const urgency = (task: Task) => task.status === 'recovery' ? 0 : task.status === 'approval' ? 1 : task.status === 'needs-input' ? 2
+  : task.lifecycle === 'review' ? 3 : task.status === 'manual' ? 4 : RUNNING.includes(task.status) ? 5 : 6;
+const byUrgency = (a: Task, b: Task) => urgency(a) - urgency(b) || b.updatedAt - a.updatedAt;
+
+/** Inbox order: what needs the user (most urgent first), what is moving, then a short recent tail. */
+export function inboxGroups(tasks: readonly Task[], seen: Record<string, number>, now: number, recentLimit = 8) {
+  const groups: Record<InboxSection, Task[]> = { attention: [], active: [], recent: [] };
+  for (const task of tasks) groups[inboxSection(task, seen[task.id], now)].push(task);
+  groups.attention.sort(byUrgency); groups.active.sort(byUrgency);
+  groups.recent = groups.recent.sort((a, b) => b.updatedAt - a.updatedAt).slice(0, recentLimit);
+  return groups;
+}
+
+export type BoardColumn = Exclude<Stage, 'cancelled'>;
+export const boardColumns: readonly BoardColumn[] = ['waiting', 'running', 'needs-you', 'review', 'done'];
+export const boardTitles: Record<BoardColumn, string> = {
+  waiting: '待安排', running: '执行中', 'needs-you': '需要你', review: '待验收', done: '已完成',
+};
+/** Board columns by stage; cancelled tasks stay out of the board. */
+export function boardGroups(tasks: readonly Task[]): Record<BoardColumn, Task[]> {
+  const groups: Record<BoardColumn, Task[]> = { waiting: [], running: [], 'needs-you': [], review: [], done: [] };
+  for (const task of tasks) { const s = stage(task); if (s !== 'cancelled') groups[s].push(task); }
+  for (const key of boardColumns) groups[key].sort(byUrgency);
+  return groups;
+}
+
+/** Compact relative time for rows: 刚刚 / 5 分钟前 / 3 小时前 / 2 天前, then the date. */
+export function ago(value: number, now: number): string {
+  const minutes = Math.floor((now - value) / 60000);
+  if (minutes < 1) return '刚刚';
+  if (minutes < 60) return `${minutes} 分钟前`;
+  if (minutes < 24 * 60) return `${Math.floor(minutes / 60)} 小时前`;
+  if (minutes < 7 * 24 * 60) return `${Math.floor(minutes / 1440)} 天前`;
+  return time(value);
+}

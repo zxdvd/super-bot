@@ -1,8 +1,9 @@
 import { useEffect, useRef, useState, type FormEvent } from 'react';
-import type { Bot } from '../model.ts';
+import type { Bot, TaskPage } from '../model.ts';
 import { Workspace, type WorkspaceApi } from './Workspace.tsx';
 import { styles } from './styles.ts';
 import { readTaskLink } from './work-navigation.ts';
+import { stage } from './work/format.ts';
 
 const DEFAULT_INSTRUCTIONS = '你是我的长期助手。自然地与我交流，理解我的目标，必要时澄清，主动安排已授权的工作，并回来交付结果。';
 const message = (error: unknown, fallback: string) => error instanceof Error ? error.message : fallback;
@@ -24,6 +25,26 @@ function WorkFrame({ api, work, error, setError, close }: {
       <Workspace api={api} key={work.taskId ?? work.botId} initialBotId={work.botId} initialTaskId={work.taskId}/>
     </div>
   </div>;
+}
+
+/** One read per Bot on the home list: how many tasks need the user, wait for review, or are running. */
+function BotCounts({ api, botId }: { api: WorkspaceApi; botId: string }) {
+  const [counts, setCounts] = useState<{ needs: number; review: number; running: number }>();
+  useEffect(() => {
+    const controller = new AbortController();
+    api.call<TaskPage>('task.list', { botId, lifecycle: 'open', limit: 100 }, controller.signal).then(page => {
+      if (controller.signal.aborted) return;
+      const count = (key: string) => page.items.filter(task => stage(task) === key).length;
+      setCounts({ needs: count('needs-you'), review: page.counts.review, running: count('running') });
+    }).catch(() => { /* Counts are a hint; the work view reports errors. */ });
+    return () => controller.abort();
+  }, [api, botId]);
+  if (!counts) return null;
+  return <span className="bot-counts">
+    {counts.needs > 0 && <span className="badge attention">需要你 {counts.needs}</span>}
+    {counts.review > 0 && <span className="badge info">待验收 {counts.review}</span>}
+    {counts.running > 0 && <span className="badge success">进行中 {counts.running}</span>}
+  </span>;
 }
 
 /** Native DSH owns the conversation, composer, model choice and history. */
@@ -83,9 +104,10 @@ export function BotHome({ api }: { api: WorkspaceApi }) {
     {loading ? <p className="muted">正在读取你的 Bot…</p> : <>
       {bots.map(bot => <article key={bot.id} className="bot-row">
         <button disabled={busy} className="bot-open" onClick={() => void chat(bot)}>
-          <strong>{bot.name}</strong><div className="muted">继续聊天 →</div>
+          <span className="bot-name"><strong>{bot.name}</strong><BotCounts api={api} botId={bot.id}/></span>
+          <div className="muted">继续聊天 →</div>
         </button>
-        <button disabled={busy} onClick={() => { api.beginNavigation(); setWork({ botId: bot.id }); }}>工作与设置</button>
+        <button disabled={busy} onClick={() => { api.beginNavigation(); setWork({ botId: bot.id }); }}>工作</button>
       </article>)}
       {(creating || bots.length === 0) && <form className="form" onSubmit={create} style={{ marginTop: 28 }}>
         <h2>{bots.length ? '新建 Bot' : '创建你的第一个 Bot'}</h2>
