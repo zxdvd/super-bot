@@ -17,7 +17,7 @@
 | ready 与最终验收 | 已验证 | ready 只是候选；执行收敛和文件完整哈希均需核对。默认人工；显式 Bot 授权保持独立审计。`smoke:execution`、`smoke:workflow`、`smoke:manager` |
 | 长文件验收 | 限制明确且已验证 | 每项只预览前 12,000 字节；完整文件用于哈希核验。超出预览范围必须人工检查全文。`smoke-manager-rework.mjs` |
 | 原生工具审批 | 已验证文件写入三路径 | 允许一次、拒绝、等待时停止；工作台只显示待办和跳转，决定来自原生 UI。独立 UI 第 13～14 轮、`smoke-approvals.mjs` |
-| 人工接管 | 已验证 | 原生用户输入撤销旧 Run 授权；收敛前限制不解除；旧 driver 空闲后允许新人工轮次使用原生工具。旧 Stop 回执不取消新工作。`smoke-handoff.mjs` |
+| 人工接管 | 已验证；排队/插话语义已按适配层回归修正 | 执行中的排队（下一轮）或插话（下一步）不撤销当前 Run，插话进入当前自动轮次。自动轮次结束后，未收敛 Run 上新开启的人工轮次才记为接管，并立即解除旧限制，不 cancel 用户自己的轮次。旧 Stop 回执不取消新工作。`smoke-handoff.mjs`、`test/adapter/intervention.test.ts` |
 | 普通停止与未知停止 | 已验证 | cancel 回执不算结束；真实 10 秒不响应取消转恢复；迟到收敛不伪造成功。`smoke:execution`、`smoke-stop-timeout.mjs` |
 | Worker 预算 | Full Access 不附加预算；files 已验证 | 以下只适用于旧 files 模式：每 Run 最多 40 步或 10 分钟；实际 40 步和 600,026 ms 计时通过。预算后暂停并核对，不自动重试。`smoke-budget.mjs` |
 | Manager 约束 | 已验证 | 单 Bot 一轮、全局两轮；实际 12 步、自动轮次 5 分钟、每小时 20 次唤醒及换会话不重置额度均通过 `smoke-manager-budget.mjs`。files 模式手动管理对话受 12 步限制，Full Access 为 24 步，没有自动轮次计时器；`smoke-manager-capacity.mjs` 真实两轮占位、第三轮排队与释放后进入通过 |

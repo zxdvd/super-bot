@@ -40,6 +40,7 @@ export function modelFailureNote(code:string):string {
 export class DshExecution {
   private creating=new Map<string,Promise<Binding>>();
   private running=new Map<string,{agent:Agent;release:()=>void;done:Promise<void>}>();
+  private autoTurns=new Set<string>();
   private disposed=false;
   readonly policy:WorkdirPolicy;
   constructor(private ctx:Context,private store:Store,private dataDir:string,private options:RuntimeOptions={}) {this.policy=workdirPolicy(options,dataDir);}
@@ -82,16 +83,23 @@ export class DshExecution {
       if(event.type==='approval/decided')this.store.nativeApprovalDecided(session.id,event.data.id,event.data.outcome);
       if(event.type==='user/message'&&event.data.source.kind==='super-bot') {
         const source=event.data.source;
-        if(this.store.heldRuns().some(r=>r.id===source.runId&&r.sessionId===session.id&&r.inputId===source.inputId))this.store.inputEntered(source.runId,event.data.id,event.seq);
-      }
-      const messages=event.type==='agent/inbox/spliced'?event.data.inserted:event.type==='user/message'?[event.data]:[];
-      for(const message of messages)if(message.source.kind==='user'&&'rpcId' in message.source) {
-        const previous=this.store.heldRuns().find(run=>run.sessionId===session.id&&run.finishedAt===null);
-        const changed=this.store.nativeIntervention(session.id,message.id);
-        if(changed&&previous) {
-          const active=this.running.get(previous.id),input=this.store.getRunInput(previous.id);
-          if(active){if(input.messageId)active.agent.inbox.remove(input.messageId as UserMessage['id']);active.agent.cancel({kind:'user'},{keepInbox:true});}
+        if(this.store.heldRuns().some(r=>r.id===source.runId&&r.sessionId===session.id&&r.inputId===source.inputId)) {
+          this.store.inputEntered(source.runId,event.data.id,event.seq);
+          this.autoTurns.add(source.runId);
         }
+      }
+      if(event.type==='turn/end') {
+        for(const run of this.store.heldRuns())if(run.sessionId===session.id)this.autoTurns.delete(run.id);
+      }
+      // Queue/steer must not look like takeover. Only a human user/message that
+      // starts a new turn while no automatic turn is running marks intervention.
+      // Do not cancel: that would abort the user's own turn. Release immediately;
+      // whenIdle() may follow the new driver, so the idle listener would be late.
+      if(event.type==='user/message'&&event.data.source.kind==='user'&&'rpcId' in event.data.source) {
+        const previous=this.store.heldRuns().find(run=>run.sessionId===session.id&&run.finishedAt===null);
+        if(previous&&this.autoTurns.has(previous.id))return;
+        const changed=this.store.nativeIntervention(session.id,event.data.id);
+        if(changed&&previous)this.running.get(previous.id)?.release();
       }
     });
     // A process restart cannot infer absence of an external effect from an idle fresh Agent.
@@ -171,6 +179,7 @@ export class DshExecution {
     try {
       if(!this.store.claimDispatch(run.id)){release();this.store.runRecovery(run.id,'投递记录已经发出，但回执不完整。没有重复投递，请核对原生会话。');return this.store.getRun(run.id);}
       agent.followup(freezeMessage(JSON.parse(input.messageJson!) as UserMessage));
+      this.autoTurns.add(run.id);
       this.store.inputEnqueued(run.id);
       if(!fullAccessEnabled(this.options)){deadline=setTimeout(()=>{void this.stopForBudget(run.id,'time');},10*60*1000);deadline.unref();}
       const done=agent.whenIdle().then(()=>{
@@ -265,7 +274,7 @@ export class DshExecution {
     const cancelled=this.store.cancelTask(requestId,taskId,rowVersion);await this.autoCleanup(taskId);return cancelled;
   }
   async dispose():Promise<void> {
-    this.disposed=true;
+    this.disposed=true;this.autoTurns.clear();
     for(const [id,{agent}]of this.running){this.store.runRecovery(id,'插件退出时执行尚未核对，重新启用后请核对原生会话。');const input=this.store.getRunInput(id);if(input.messageId)agent.inbox.remove(input.messageId as UserMessage['id']);agent.cancel({kind:'user'},{keepInbox:true});}
     await Promise.allSettled([...this.running.values()].map(r=>r.done));
   }
