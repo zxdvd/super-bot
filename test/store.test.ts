@@ -143,6 +143,7 @@ test('failed binding event rolls back intent, outbox and task version together',
     store.db.exec("CREATE TRIGGER reject_binding BEFORE INSERT ON events WHEN NEW.kind='session.preparing' BEGIN SELECT RAISE(ABORT,'binding fault'); END");
     assert.throws(()=>store.beginBinding('prepare',task.id,1,'/tmp/test'),/binding fault/);
     assert.equal(store.activeBinding(task.id),null);assert.equal(store.getTask(task.id).rowVersion,1);
-    assert.equal(store.db.prepare('SELECT count(*) AS n FROM outbox').get()?.n,0);
+    assert.equal(store.db.prepare("SELECT count(*) AS n FROM outbox WHERE kind!='manager.notify'").get()?.n,0);
+    assert.equal(store.managerInfo(bot.id).pending,1);
   }finally{store.close();}
 });

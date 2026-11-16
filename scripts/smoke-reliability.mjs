@@ -47,6 +47,7 @@ async function stop(signal='SIGTERM') {
 const scenario=async name=>run(['scripts/smoke-steering.mjs',name],{env:{...env,SUPER_BOT_TEST_LOG:log,SUPER_BOT_TEST_FULL_ACCESS:process.env.SUPER_BOT_TEST_FULL_ACCESS??'false'},stdio:'inherit'});
 try {
   await launch();
+  await run(['scripts/smoke-notification-owner.mjs'],{env:{...env,SUPER_BOT_TEST_LOG:log},stdio:'inherit'});
   for(const name of ['steer','queue','normal','handoff','background','error','missing'])await scenario(name);
   await scenario('restart-prepare');await stop('SIGKILL');
   await rename(log,join(base,'host-before-restart.log'));

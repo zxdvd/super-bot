@@ -101,7 +101,7 @@ test('a replacement binding never presents an old result as its current candidat
     assert.equal(store.taskDetail(task.id).result,null);assert.equal(store.runResult(run.id)?.id,report.resultId);
     const manager=store.beginManager('manager',task.botId,'/tmp/manager');store.confirmManager(manager.id,manager.requestedSessionId);
     const revised=store.reviseTask('revise',task.id,detached.rowVersion,{goal:'New goal',scope:'New directory',acceptance:'New result'});
-    assert.ok(store.pendingManagerEvents(task.botId).some(event=>event.id.includes(`revision:${task.id}:2`)));
+    assert.ok(store.managerNotifications(task.botId).some(event=>event.id.includes(`revision:${task.id}:2`)&&event.state==='pending'));
     const next=store.beginBinding('prepare-new',task.id,revised.rowVersion,'/tmp/new-task');store.confirmBinding(next.id,next.requestedSessionId);
     assert.equal(store.taskDetail(task.id).result,null);assert.equal(store.pendingInput(task.id),null);
     assert.throws(()=>store.workerReport(run.id,'late-old-revision',ready),/执行或目标已改变/);
@@ -328,9 +328,9 @@ test('enabling a Manager queues each eligible existing task without duplicating 
     const bot=store.createBot('bot',{name:'Existing backlog',instructions:'Own files'});
     const tasks=Array.from({length:4},(_,n)=>store.createTask(`task-${n}`,{botId:bot.id,goal:`Existing task ${n}`,scope:'Own directory',acceptance:'Read result',reviewPolicy:'human',startPaused:n===3}));
     const manager=store.beginManager('manager',bot.id,'/tmp/backlog-manager');store.confirmManager(manager.id,manager.requestedSessionId);
-    assert.equal(store.managerInfo(bot.id).pending,3);assert.deepEqual(new Set(store.pendingManagerEvents(bot.id).map(event=>event.taskId)),new Set(tasks.slice(0,3).map(task=>task.id)));
+    assert.equal(store.managerInfo(bot.id).pending,4);assert.deepEqual(new Set(store.pendingManagerEvents(bot.id).map(event=>event.taskId)),new Set(tasks.slice(0,3).map(task=>task.id)));
     store.releaseManager('replace',bot.id,manager.generation);const replacement=store.beginManager('replacement',bot.id,'/tmp/backlog-manager');store.confirmManager(replacement.id,replacement.requestedSessionId);
-    assert.equal(store.managerInfo(bot.id).pending,3);
+    assert.equal(store.managerInfo(bot.id).pending,4);
   }finally{store.close();}
 });
 test('evidence hashes detect changed content and outside symlink paths',async()=>{

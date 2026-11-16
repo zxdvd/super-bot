@@ -59,3 +59,7 @@ files 模式目录限制是应用层约束，不是操作系统沙箱。Full Acc
 ### 持久 Run 恢复（schema 9）
 
 新增原进程 Run↔turn/事件坐标、边界最终报告和 Job/子 Agent quiet 证明。只有完整连续持久日志匹配时才补结算并暂停，不重投、不自动接受、不新唤醒 Manager。缺结束/未知后台/legacy Run 保留资源与 recovery；schema 8→9 不回填猜测。隔离 files/Full Access 宿主含 6 个 SIGKILL 窗口、各重复恢复两次；详见 reliability-verification.md。生产更新须空闲且先备份；回退使用升级前备份与匹配旧插件，不能降级当前账本。
+
+### Manager 通知预就绪与未知回执
+
+未启用/未就绪通知持久保留；安全入队前错误最多 5 次指数退避，未知入队永不盲重发。普通 unknown 仅按稳定身份与持久最终回复/end 补 done，每条最多 3 次只读核对、每批 10 条；缺证据保留人工决定。仅补交付原 3 次上限不变。新增 owner-only handled / retry-unsent RPC，不给模型新权限、不自动验收。schema 9 的 outbox 元数据兼容扩展；详见 [通知可靠性](notification-reliability.md) 及 `npm run smoke:notifications`。

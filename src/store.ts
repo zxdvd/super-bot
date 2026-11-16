@@ -209,17 +209,56 @@ export class Store {
       for(const row of this.db.prepare("SELECT id FROM tasks WHERE botId=? AND controlMode='auto' AND lifecycle IN ('open','review') ORDER BY createdAt,id").all(manager.botId)) {
         const task=this.getTask(String(row.id));
         if(task.status!=='unscheduled'&&!(task.status==='review'&&!task.managerReviewed))continue;
-        if(!this.db.prepare("SELECT 1 FROM outbox WHERE kind='manager.notify' AND state='pending' AND taskId=? AND json_extract(payload,'$.botId')=?").get(task.id,manager.botId))this.enqueueManager(manager.botId,`backlog:${id}:${task.id}`,'管理会话已准备好，请从账本恢复这项现有工作。',task.id);
+        if(!this.db.prepare("SELECT 1 FROM outbox WHERE kind='manager.notify' AND state IN ('pending','sending','entered','unknown','blocked') AND taskId=? AND json_extract(payload,'$.botId')=?").get(task.id,manager.botId))this.enqueueManager(manager.botId,`backlog:${id}:${task.id}`,'管理会话已准备好，请从账本恢复这项现有工作。',task.id);
       }
       this.event('manager.ready',null,{botId:manager.botId,sessionId});return this.activeManager(manager.botId)!;
     });
   }
   enqueueManager(botId:string,key:string,reason:string,taskId:string|null,priority=0,delivery?:{resultId:string;taskRevision:number;reviewSessionId?:string;reviewCallId?:string}):void {
-    if(!this.getBot(botId).managerSessionId)return;
-    this.db.prepare('INSERT OR IGNORE INTO outbox(id,kind,taskId,payload,createdAt) VALUES (?,?,?,?,?)').run(`manager-event:${key}`,'manager.notify',taskId,JSON.stringify({botId,reason,taskId,priority,...(delivery?{deliveryOnly:true,...delivery}:{})}),Date.now());
+    this.getBot(botId); // Readiness is a delivery gate, never permission to lose a durable notification.
+    this.db.prepare('INSERT OR IGNORE INTO outbox(id,kind,taskId,payload,createdAt) VALUES (?,?,?,?,?)').run(`manager-event:${key}`,'manager.notify',taskId,JSON.stringify({botId,reason,taskId,priority,notifyWhilePaused:/^(budget-stopped:|recovery:|approval:|settled:|delivery:)/.test(key),...(delivery?{deliveryOnly:true,...delivery}:{})}),Date.now());
   }
   pendingManagerEvents(botId:string):ManagerEvent[] {
-    return this.db.prepare("SELECT id,taskId,payload,state,createdAt FROM outbox WHERE kind='manager.notify' AND state='pending' AND json_extract(payload,'$.botId')=? AND coalesce(json_extract(payload,'$.nextAttemptAt'),0)<=? ORDER BY coalesce(json_extract(payload,'$.priority'),0) DESC,createdAt,id LIMIT 10").all(botId,Date.now()) as unknown as ManagerEvent[];
+    return this.db.prepare("SELECT id,taskId,payload,state,createdAt FROM outbox WHERE kind='manager.notify' AND state='pending' AND (taskId IS NULL OR json_extract(payload,'$.notifyWhilePaused')=1 OR EXISTS (SELECT 1 FROM tasks WHERE tasks.id=outbox.taskId AND controlMode='auto')) AND json_extract(payload,'$.botId')=? AND coalesce(json_extract(payload,'$.nextAttemptAt'),0)<=? ORDER BY coalesce(json_extract(payload,'$.priority'),0) DESC,createdAt,id LIMIT 10").all(botId,Date.now()) as unknown as ManagerEvent[];
+  }
+  /** No enqueue has been attempted: persist bounded backoff without consuming a wake attempt. */
+  deferManagerEvent(id:string,reason:string,until:number,error=false):void {
+    const row=this.db.prepare("SELECT payload FROM outbox WHERE id=? AND kind='manager.notify' AND state='pending'").get(id);if(!row)return;
+    const payload=JSON.parse(String(row.payload)),failures=Number(payload.preflightFailures??0)+Number(error);
+    const blocked=error&&failures>=5;
+    this.db.prepare("UPDATE outbox SET state=?,payload=json_set(payload,'$.preflightFailures',?,'$.deferReason',?,'$.nextAttemptAt',?) WHERE id=? AND state='pending'").run(blocked?'blocked':'pending',failures,reason,error?Date.now()+30000*2**Math.min(failures-1,4):until,id);
+    if(blocked)this.managerProblem(payload.botId,'通知在入队前连续失败 5 次，已停止自动重试；请核对后显式 retry-unsent。通知没有被丢弃。',id);
+  }
+  managerWakeAvailableAt(botId:string):number {
+    const row=this.db.prepare("SELECT min(at) at FROM (SELECT createdAt at FROM events WHERE kind='manager.wake' AND json_extract(data,'$.botId')=? UNION ALL SELECT json_extract(payload,'$.deliveredAt') at FROM outbox WHERE kind='manager.notify' AND json_extract(payload,'$.botId')=? AND NOT EXISTS (SELECT 1 FROM events WHERE kind='manager.wake' AND json_extract(data,'$.eventId')=outbox.id)) WHERE at>=?").get(botId,botId,Date.now()-3600000);
+    return Math.max(Date.now()+1000,Number(row?.at??Date.now())+3600001);
+  }
+  claimManagerReconciliation(botId:string):ManagerEvent[] {
+    const rows=this.db.prepare("SELECT id,payload,taskId,state,createdAt FROM outbox WHERE kind='manager.notify' AND state IN ('unknown','entered') AND json_extract(payload,'$.botId')=? AND coalesce(json_extract(payload,'$.reconcileAttempts'),0)<3 AND coalesce(json_extract(payload,'$.nextReconcileAt'),0)<=? ORDER BY createdAt,id LIMIT 10").all(botId,Date.now());
+    for(const row of rows) {
+      const attempts=Number(JSON.parse(String(row.payload)).reconcileAttempts??0)+1;
+      this.db.prepare("UPDATE outbox SET state=CASE WHEN ?=3 THEN 'unknown' ELSE state END,payload=json_set(payload,'$.reconcileAttempts',?,'$.nextReconcileAt',?,'$.reconcileNote',?) WHERE id=?").run(attempts,attempts,Date.now()+30000*2**(attempts-1),attempts===3?'持久证据自动核对已达 3 次；缺证据时请检查原会话，明确处理后 handled；不会重发。':'等待可归属的持久输入、最终回复与正常结束；不会重发。',row.id);
+    }
+    return rows as unknown as ManagerEvent[];
+  }
+  quarantinedManagerInput(sessionId:string,eventId:string,messageId:string,botId:string,managerId:string):boolean {
+    return !!this.db.prepare("SELECT 1 FROM outbox JOIN managers ON managers.id=? AND managers.requestedSessionId=? AND managers.botId=? WHERE outbox.id=? AND kind='manager.notify' AND outbox.state IN ('unknown','handled','superseded','blocked') AND json_extract(payload,'$.botId')=? AND json_extract(payload,'$.messageId')=?").get(managerId,sessionId,botId,eventId,botId,messageId);
+  }
+  resolveManagerNotification(requestId:string,botId:string,id:string,action:'handled'|'retry-unsent',acknowledged:unknown):void {
+    if(acknowledged!==true||!['handled','retry-unsent'].includes(action))throw new AppError('confirmation-required','请明确确认核对结果；未知入队结果不能自动重发。');
+    this.command(requestId,'manager.notification.resolve',{botId,id,action,acknowledged:true},()=>{
+      const row=this.db.prepare("SELECT state,payload,taskId,attempts FROM outbox WHERE id=? AND kind='manager.notify' AND json_extract(payload,'$.botId')=?").get(id,botId);
+      if(!row)throw new AppError('not-found','通知不存在。');
+      if(action==='retry-unsent') {
+        if(row.state!=='blocked'||Number(row.attempts)!==0||JSON.parse(String(row.payload)).messageId!=null)throw new AppError('notification-uncertain','只有未入队且已停止重试的通知可以重试；未知投递须人工核对，不能重发。');
+        this.db.prepare("UPDATE outbox SET state='pending',payload=json_set(payload,'$.preflightFailures',0,'$.nextAttemptAt',0,'$.deferReason','用户确认重试未入队通知') WHERE id=?").run(id);
+      }else {
+        if(!['unknown','blocked'].includes(String(row.state)))throw new AppError('notification-active','通知仍在处理或已经结束。');
+        this.db.prepare("UPDATE outbox SET state='handled' WHERE id=?").run(id);
+      }
+      if(JSON.parse(this.get(`managerProblem:${botId}`)??'null')?.eventId===id)this.managerProblem(botId,'');
+      this.event('manager.notification-resolved',(row.taskId??null) as string|null,{botId,eventId:id,action,actor:'user'});return {};
+    });
   }
   claimManagerEvent(id:string,messageId:string,messageJson:string):boolean {
     this.db.exec('BEGIN IMMEDIATE');
@@ -230,8 +269,11 @@ export class Store {
       if(payload.deliveryOnly&&Number(row.attempts)>=DELIVERY_ATTEMPT_LIMIT) {
         this.stopManagerDeliveryRetries(id,payload.botId);this.db.exec('COMMIT');return false;
       }
+      if((Number(row.attempts)>0||payload.messageId!=null)&&!(payload.deliveryOnly&&typeof payload.messageId==='string'&&payload.messageId.length>0&&payload.deliveryAttemptEnd?.messageId===payload.messageId)) {
+        this.db.prepare("UPDATE outbox SET state='unknown' WHERE id=?").run(id);this.db.exec('COMMIT');return false;
+      }
       if((payload.nextAttemptAt??0)>Date.now()){this.db.exec('COMMIT');return false;}
-      const claimed=this.db.prepare("UPDATE outbox SET state='sending',attempts=attempts+1,payload=json_set(payload,'$.messageId',?,'$.messageJson',?,'$.deliveredAt',?) WHERE id=? AND state='pending'").run(messageId,messageJson,Date.now(),id).changes===1;
+      const claimed=this.db.prepare("UPDATE outbox SET state='sending',attempts=attempts+1,payload=json_set(payload,'$.messageId',?,'$.messageJson',?,'$.deliveredAt',?,'$.reconcileAttempts',0,'$.nextReconcileAt',0,'$.preflightFailures',0) WHERE id=? AND state='pending'").run(messageId,messageJson,Date.now(),id).changes===1;
       if(claimed) {
         const row=this.db.prepare('SELECT taskId,payload FROM outbox WHERE id=?').get(id)!;const botId=JSON.parse(String(row.payload)).botId as string;
         this.set('managerCursor',botId);
@@ -240,8 +282,8 @@ export class Store {
       this.db.exec('COMMIT');return claimed;
     }catch(error){this.db.exec('ROLLBACK');throw error;}
   }
-  managerEventEntered(id:string,messageId:string):void {
-    this.db.prepare("UPDATE outbox SET state='entered' WHERE id=? AND state='sending' AND json_extract(payload,'$.messageId')=?").run(id,messageId);
+  managerEventEntered(id:string,messageId:string,durable=false):void {
+    this.db.prepare("UPDATE outbox SET state='entered' WHERE id=? AND (state='sending' OR (?=1 AND state='unknown')) AND json_extract(payload,'$.messageId')=?").run(id,Number(durable),messageId);
   }
   managerEventUnknown(id:string):void {
     // Idle/entry alone is not permission to repeat a notification.
@@ -249,7 +291,7 @@ export class Store {
   }
   private stopManagerDeliveryRetries(id:string,botId:string):void {
     const changed=this.db.prepare("UPDATE outbox SET state='unknown',payload=json_set(payload,'$.deliveryRetryExhausted',json('true')) WHERE id=? AND coalesce(json_extract(payload,'$.deliveryRetryExhausted'),0)=0").run(id).changes;
-    if(changed)this.managerProblem(botId,'成果补交付已达到 3 次上限，已停止自动唤醒。请在 Bot 对话或工作面板核对成果；未重新执行 Worker。');
+    if(changed)this.managerProblem(botId,'成果补交付已达到 3 次上限，已停止自动唤醒。请在 Bot 对话或工作面板核对成果；未重新执行 Worker。',id);
   }
   managerDeliveryAttemptEnded(id:string,messageId:string,proof:{sessionId:string;turn:number;endSeq:number}):void {
     this.db.exec('BEGIN IMMEDIATE');
@@ -274,11 +316,13 @@ export class Store {
   resetUnconfirmedManagerEvents():void {
     // Older versions requeued entered attempts without an end proof. Reconcile those before any fresh wake.
     this.db.prepare("UPDATE outbox SET state='entered' WHERE kind='manager.notify' AND state='pending' AND attempts>0 AND json_extract(payload,'$.deliveryOnly')=1 AND json_extract(payload,'$.deliveryAttemptEnd') IS NULL AND json_extract(payload,'$.messageId') IS NOT NULL").run();
+    // A legacy pending row with any prior enqueue hint is NOT proof that delivery never happened.
+    this.db.prepare("UPDATE outbox SET state='unknown' WHERE kind='manager.notify' AND state='pending' AND (attempts>0 OR json_extract(payload,'$.messageId') IS NOT NULL) AND NOT (coalesce(json_extract(payload,'$.deliveryOnly'),0)=1 AND json_extract(payload,'$.messageId') IS NOT NULL AND coalesce(json_extract(payload,'$.deliveryAttemptEnd.messageId')=json_extract(payload,'$.messageId'),0)=1)").run();
     // Keep entered delivery attempts until the adapter verifies their durable turn/end; never requeue on restart alone.
     this.db.prepare("UPDATE outbox SET state='unknown' WHERE kind='manager.notify' AND (state='sending' OR (state='entered' AND coalesce(json_extract(payload,'$.deliveryOnly'),0)!=1))").run();
   }
-  managerNotifications(botId:string):ManagerEvent[] {
-    return this.db.prepare("SELECT id,taskId,payload,state,createdAt FROM outbox WHERE kind='manager.notify' AND state NOT IN ('done','superseded') AND json_extract(payload,'$.botId')=?").all(botId) as unknown as ManagerEvent[];
+  managerNotifications(botId:string,limit=-1):ManagerEvent[] {
+    return this.db.prepare("SELECT id,taskId,payload,state,createdAt FROM outbox WHERE kind='manager.notify' AND state NOT IN ('done','superseded','handled') AND json_extract(payload,'$.botId')=? ORDER BY createdAt DESC,id LIMIT ?").all(botId,limit) as unknown as ManagerEvent[];
   }
   supersedeManagerDelivery(id:string):void {
     this.db.prepare("UPDATE outbox SET state='superseded' WHERE id=? AND kind='manager.notify' AND json_extract(payload,'$.deliveryOnly')=1 AND state!='done'").run(id);
@@ -288,7 +332,7 @@ export class Store {
   }
   managerNotificationDelivered(id:string,sessionId:string,proof:{turn:number;messageId:string;seq:number;endSeq:number}):void {
     this.command(`manager-delivered:${id}`,'manager.delivered',{id,sessionId,...proof},()=>{
-      const row=this.db.prepare("SELECT taskId,payload,state FROM outbox WHERE id=? AND kind='manager.notify'").get(id);if(!row||row.state==='superseded')return {};
+      const row=this.db.prepare("SELECT taskId,payload,state FROM outbox WHERE id=? AND kind='manager.notify'").get(id);if(!row||['done','superseded','handled'].includes(String(row.state)))return {};
       const payload=JSON.parse(String(row.payload));
       if(this.activeManager(payload.botId)?.sessionId!==sessionId)throw new AppError('manager-stale','交付会话已经改变。');
       if(payload.deliveryOnly) {
@@ -296,6 +340,7 @@ export class Store {
         if(task.taskRevision!==payload.taskRevision||result?.id!==payload.resultId||!['review','completed'].includes(task.lifecycle))throw new AppError('result-stale','交付成果已经改变。');
       }else if(row.state!=='entered'&&row.state!=='unknown')return {};
       this.db.prepare("UPDATE outbox SET state='done',payload=json_set(payload,'$.chatDelivery',json(?)) WHERE id=?").run(JSON.stringify({sessionId,...proof}),id);
+      if(JSON.parse(this.get(`managerProblem:${payload.botId}`)??'null')?.eventId===id)this.managerProblem(payload.botId,'');
       this.event('manager.delivered',row.taskId as string|null,{eventId:id,sessionId,...proof,...(payload.resultId?{resultId:payload.resultId}:{})});return {};
     });
   }
@@ -315,13 +360,13 @@ export class Store {
     });
   }
   managerOrder():Bot[] {const bots=this.listBots(),id=this.get('managerCursor'),cursor=bots.findIndex(bot=>bot.id===id);return [...bots.slice(cursor+1),...bots.slice(0,cursor+1)];}
-  managerProblem(botId:string,message:string):void {
+  managerProblem(botId:string,message:string,eventId?:string):void {
     const key=`managerProblem:${botId}`;const prior=this.get(key);
     if(!message){this.db.prepare('DELETE FROM metadata WHERE key=?').run(key);return;}
-    if(prior&&JSON.parse(prior).message===message)return;
-    this.set(key,JSON.stringify({message,at:Date.now()}));
+    if(prior&&JSON.parse(prior).message===message&&JSON.parse(prior).eventId===eventId)return;
+    this.set(key,JSON.stringify({message,at:Date.now(),...(eventId?{eventId}:{})}));
   }
-  managerInfo(botId:string) {return {binding:this.activeManager(botId),pending:Number(this.db.prepare("SELECT count(*) AS n FROM outbox WHERE kind='manager.notify' AND state='pending' AND json_extract(payload,'$.botId')=?").get(botId)?.n),uncertain:Number(this.db.prepare("SELECT count(*) AS n FROM outbox WHERE kind='manager.notify' AND state='unknown' AND json_extract(payload,'$.botId')=?").get(botId)?.n),hourlyWakes:this.managerWakeCount(botId,Date.now()-3600000),problem:JSON.parse(this.get(`managerProblem:${botId}`)??'null') as {message:string;at:number}|null};}
+  managerInfo(botId:string) {return {binding:this.activeManager(botId),notifications:this.db.prepare("SELECT id,state,attempts,json_extract(payload,'$.deferReason') deferReason,json_extract(payload,'$.nextAttemptAt') nextAttemptAt,json_extract(payload,'$.reconcileAttempts') reconcileAttempts,json_extract(payload,'$.reconcileNote') reconcileNote FROM outbox WHERE kind='manager.notify' AND state NOT IN ('done','superseded','handled') AND json_extract(payload,'$.botId')=? ORDER BY createdAt,id LIMIT 20").all(botId),pending:Number(this.db.prepare("SELECT count(*) AS n FROM outbox WHERE kind='manager.notify' AND state='pending' AND json_extract(payload,'$.botId')=?").get(botId)?.n),uncertain:Number(this.db.prepare("SELECT count(*) AS n FROM outbox WHERE kind='manager.notify' AND state='unknown' AND json_extract(payload,'$.botId')=?").get(botId)?.n),hourlyWakes:this.managerWakeCount(botId,Date.now()-3600000),problem:JSON.parse(this.get(`managerProblem:${botId}`)??'null') as {message:string;at:number}|null};}
   releaseManager(requestId:string,botId:string,expectedGeneration:number):ManagerBinding {
     return this.command(requestId,'manager.replace',{botId,expectedGeneration},()=>{
       const manager=this.activeManager(botId);if(!manager||manager.generation!==expectedGeneration)throw new AppError('manager-stale','管理会话已经改变，请刷新。');

@@ -79,7 +79,7 @@ for(const mode of ['false','throw'] as const)test(`a ${mode} durability result c
     await f.pulse();await f.enter(1);await f.review();await f.assistant(1);f.setFlush(mode);await f.end(1);
     assert.equal(f.state()?.state,'pending');assert.equal(f.durable.length,0);
     await f.pulse();assert.equal(f.state()?.state,'pending');assert.equal(f.counts().followups,1);
-    f.setFlush('ok');await f.reload(true);await f.pulse();
+    f.setFlush('ok');await f.reload(true);await f.pulse(30000);
     assert.equal(f.state()?.state,'done');assert.equal(f.counts().followups,1);
   }finally{await f.close();}
 });
@@ -347,6 +347,6 @@ test('hitting the configurable hourly wake limit records one problem and stops w
     await f.pulse();assert.equal(f.counts().followups,1);
     const problem=f.store.managerInfo(f.bot.id).problem;assert.match(String(problem?.message),/1 次上限/);
     await f.pulse(5000);assert.deepEqual(f.store.managerInfo(f.bot.id).problem,problem);assert.equal(f.counts().followups,1);
-    assert.equal(f.store.pendingManagerEvents(f.bot.id).some((e:any)=>e.id==='manager-event:extra:1'),true);
+    assert.equal(f.store.managerNotifications(f.bot.id).some((e:any)=>e.id==='manager-event:extra:1'&&e.state==='pending'),true);
   }finally{await f.close();}
 });

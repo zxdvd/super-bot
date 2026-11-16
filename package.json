@@ -57,6 +57,7 @@
     "smoke:execution": "node scripts/smoke-execution.mjs",
     "smoke:workflow": "node scripts/smoke-workflow.mjs",
     "smoke:manager": "node scripts/smoke-manager.mjs",
+    "smoke:notifications": "node scripts/smoke-notifications.mjs",
     "smoke:chat": "node scripts/smoke-chat.mjs",
     "seed:ui": "node scripts/seed-ui.mjs",
     "restore:ledger": "node scripts/restore-ledger.mjs",

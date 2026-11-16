@@ -54,6 +54,7 @@ export function apply(ctx: Context, config: RuntimeOptions & { dataDir?: string 
 
   async function invoke(endpoint: string, payload: Record<string, unknown>) {
     try {
+      if(endpoint==='manager.notification.resolve'){managers.resolveNotification(requiredText(payload.requestId,'请求标识',200),requiredText(payload.botId,'Bot 标识',200),requiredText(payload.eventId,'通知标识',300),payload.resolution as 'handled'|'retry-unsent',payload.acknowledged);return {ok:true,value:store.managerInfo(String(payload.botId))};}
       if (endpoint === 'status') return { ok: true, value: status() };
       if (endpoint === 'backup.create') return {ok:true,value:await createLedgerBackup(store,dataDir,requiredText(payload.requestId,'请求标识',200))};
       if (endpoint === 'bot.list') return { ok: true, value: store.listBots() };
