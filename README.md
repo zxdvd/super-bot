@@ -240,7 +240,7 @@ npm run restore:ledger -- /absolute/path/backup.sqlite /absolute/path/new-super-
 
 如果只有 tgz，先解包，然后用 `node /absolute/path/package/scripts/restore-ledger.mjs /absolute/path/backup.sqlite /absolute/path/new-super-bot-data` 调用包内脚本。
 
-恢复脚本检查完整性和 schema，拒绝覆盖现有目录。恢复后的未完成任务全部暂停并产生待核对事项，旧管理通知不自动重放；备份之后真实文件或会话可能已经变化，需要逐项核对。原账本与备份不会被修改。当前 schema 为 7，恢复脚本接受 schema 6～7 的备份；schema 6 在新宿主首次打开时事务升级。其他版本会拒绝，需先使用对应版本处理。升级前应先备份；旧插件不能打开已升级账本。回退时停止宿主，使用旧版插件、对应旧版恢复脚本和升级前的备份恢复到新目录，不能覆盖或降级当前数据库。
+恢复脚本检查完整性和 schema，拒绝覆盖现有目录。恢复后的未完成任务全部暂停并产生待核对事项，旧管理通知不自动重放；备份之后真实文件或会话可能已经变化，需要逐项核对。原账本与备份不会被修改。当前 schema 为 9，恢复脚本接受 schema 6～9 的备份；旧账本在新宿主首次打开时事务升级。schema 9 新增 Run 的原进程轮次/事件坐标与后台收敛证据；旧 Run 不补造证据，未完成且证据不足时仍保留资源待核对。其他版本会拒绝，需先使用对应版本处理。升级前应先备份；旧插件不能打开已升级账本。回退时停止宿主，使用旧版插件、对应旧版恢复脚本和升级前的备份恢复到新目录，不能覆盖或降级当前数据库。
 
 启动宿主时设置 `SUPER_BOT_DATA_DIR=/absolute/path/new-super-bot-data`，或在插件配置中设置 `dataDir`（配置优先）。继续使用原 DSH home，或先恢复对应会话与成果目录；仅修改数据目录不会搬迁那些文件。切回原账本时，停止宿主并撤销该设置。不要同时运行两个宿主操作同一组会话/成果。
 
@@ -258,3 +258,5 @@ DSH_HOME=/absolute/path/dsh-home dsh plugin --profile profile-name add /absolute
 运行 `npm run smoke:reliability`：每次新建 `.runtime/reliability-*` 下的 DSH home/profile、操作系统 HOME、账本和工作目录，使用无网络确定性 provider。通过真实宿主的 prompt/updateQueue、持久事件与原生文件/报告工具验证插话、续轮、正常/异常结束、未收敛后台作业和进程强制重启；只停止该脚本自己启动的宿主，不连接日常 profile。
 
 默认使用 files 模式，以证明旧工具约束确实在人工续轮前解除；`SUPER_BOT_TEST_FULL_ACCESS=true npm run smoke:reliability` 验证默认 Full Access 路径。脚本不继承模型凭证或生产 dataDir，日志中的本机启动 token 不要分享。结果只证明宿主/账本契约，不替代真实模型质量、浏览器 ↑ 按钮和 Desktop 验收。详见 [可靠性验证](docs/reliability-verification.md)。
+
+重启只读核对持久会话日志：仅在自动输入身份、所属 turn/start/end、边界最终报告及原进程后台安静证据全部匹配时幂等补结算；补结算后暂停任务，不唤醒 Manager、不自动验收或重投模型/工具。只有 ready、缺少权威 turn/end、后台效果未知或旧版本无证据时保留占用并解释 recovery。恢复 Agent 时仅移除可精确归属旧 Run 的待处理自动输入，保留人工输入；不为恢复主动打开会话。

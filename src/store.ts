@@ -3,7 +3,7 @@ import { mkdirSync } from 'node:fs';
 import { dirname,relative,isAbsolute,sep } from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
 import schemaVersion from '../schema-version.json' with {type:'json'};
-import { AppError, requiredText, optionalText, taskStatus, type ChatSource, type Bot, type Task, type NewBot, type NewTask, type TaskPage, type ControlMode, type Attention, type Binding, type Run, type RunInput, type WorkReport, type Result,type ManagerBinding,type ManagerEvent,type ExistingSessionGrant,type ReferenceMaterial,type TaskBotContext,type DispatchWait,type WorkdirInfo,botDraft } from './model.ts';
+import { AppError, requiredText, optionalText, taskStatus, type ChatSource, type Bot, type Task, type NewBot, type NewTask, type TaskPage, type ControlMode, type Attention, type Binding, type Run, type RunInput, type WorkReport, type Result,type ManagerBinding,type ManagerEvent,type ExistingSessionGrant,type ReferenceMaterial,type TaskBotContext,type DispatchWait,type WorkdirInfo,type RunTurn,botDraft } from './model.ts';
 import {parseWorkdirRequest} from './workdir.ts';
 
 const DELIVERY_ATTEMPT_LIMIT=3;
@@ -59,6 +59,7 @@ export class Store {
           inputId TEXT NOT NULL REFERENCES inputs(id), state TEXT NOT NULL,
           createdAt INTEGER NOT NULL, finishedAt INTEGER, note TEXT NOT NULL DEFAULT ''
         );
+        CREATE TABLE IF NOT EXISTS run_turns (runId TEXT PRIMARY KEY REFERENCES runs(id),turn INTEGER,startSeq INTEGER,inputSeq INTEGER,endSeq INTEGER,endKind TEXT,quiet INTEGER NOT NULL DEFAULT 0,reportId TEXT);
         CREATE UNIQUE INDEX IF NOT EXISTS runs_active_task ON runs(taskId) WHERE finishedAt IS NULL;
         CREATE UNIQUE INDEX IF NOT EXISTS runs_active_session ON runs(sessionId) WHERE finishedAt IS NULL;
         CREATE TABLE IF NOT EXISTS resources (runId TEXT PRIMARY KEY REFERENCES runs(id),cwd TEXT NOT NULL UNIQUE);
@@ -379,10 +380,10 @@ export class Store {
     const managerReviewed=!!(run&&this.db.prepare("SELECT 1 FROM reviews JOIN results ON results.id=reviews.resultId WHERE results.runId=? AND reviews.actor LIKE 'manager:%' LIMIT 1").get(run.id));
     return {...task,status,managerReviewed};
   }
-  taskDetail(id: string): { task: Task; binding: Binding | null; bindingHistory:Binding[]; run:Run|null; input:RunInput|null; result:Result|null; attentions: Attention[]; events: { id: number; kind: string; data: string; createdAt: number }[];wait:DispatchWait|null } {
+  taskDetail(id: string): { task: Task; binding: Binding | null; bindingHistory:Binding[]; run:Run|null; runHeld:boolean; runTurn:RunTurn|null; input:RunInput|null; result:Result|null; attentions: Attention[]; events: { id: number; kind: string; data: string; createdAt: number }[];wait:DispatchWait|null } {
     const task=this.getTask(id),binding=this.activeBinding(id),run=this.latestRun(id);
     const wait=binding&&task.status==='unscheduled'&&this.db.prepare('SELECT 1 FROM waits WHERE taskId=?').get(id)?this.dispatchWait(id):null;
-    return { task,wait,binding,bindingHistory:this.db.prepare("SELECT * FROM bindings WHERE taskId=? AND state='released' ORDER BY generation DESC").all(id).map(row=>this.toBinding(row)),run,input:this.pendingInput(id)??(run?this.getRunInput(run.id):null),result:run&&run.taskRevision===task.taskRevision&&run.bindingId===binding?.id?this.runResult(run.id):null,
+    return { task,wait,runHeld:!!(run&&this.db.prepare('SELECT 1 FROM resources WHERE runId=?').get(run.id)),runTurn:run?this.runTurn(run.id):null,binding,bindingHistory:this.db.prepare("SELECT * FROM bindings WHERE taskId=? AND state='released' ORDER BY generation DESC").all(id).map(row=>this.toBinding(row)),run,input:this.pendingInput(id)??(run?this.getRunInput(run.id):null),result:run&&run.taskRevision===task.taskRevision&&run.bindingId===binding?.id?this.runResult(run.id):null,
       attentions: this.db.prepare('SELECT * FROM attentions WHERE taskId=? ORDER BY createdAt,id').all(id) as unknown as Attention[],
       events: this.db.prepare('SELECT id,kind,data,createdAt FROM events WHERE taskId=? ORDER BY id DESC LIMIT 50').all(id) as unknown as { id: number; kind: string; data: string; createdAt: number }[],
     };
@@ -555,6 +556,26 @@ export class Store {
     return input?{...input}:null;
   }
   heldRuns():Run[] {return this.db.prepare('SELECT runs.* FROM runs JOIN resources ON resources.runId=runs.id').all() as unknown as Run[];}
+  runTurn(runId:string):RunTurn|null {return this.db.prepare('SELECT * FROM run_turns WHERE runId=?').get(runId) as unknown as RunTurn??null;}
+  finalReport(runId:string):{id:string;kind:string}|null {
+    return this.db.prepare("SELECT id,kind FROM reports WHERE runId=? AND kind!='progress' LIMIT 1").get(runId) as {id:string;kind:string}??null;
+  }
+  associateRunTurn(runId:string,turn:number,startSeq:number,inputSeq:number):void {
+    if(!this.runTurn(runId))return; // Legacy attempts are never backfilled from a guess.
+    if(![turn,startSeq,inputSeq].every(Number.isSafeInteger)||turn<1||startSeq<0||inputSeq<=startSeq)throw new AppError('turn-proof','自动轮次归属坐标无效。');
+    this.command(`turn:${runId}`,'run.turn',{runId,turn,startSeq,inputSeq},()=>{
+      if(this.getRunInput(runId).state!=='entered')throw new AppError('turn-proof','自动输入未确认进入上下文。');
+      this.db.prepare('UPDATE run_turns SET turn=?,startSeq=?,inputSeq=? WHERE runId=?').run(turn,startSeq,inputSeq,runId);return {};
+    });
+  }
+  observeRunEnd(runId:string,endSeq:number,endKind:string,quiet:boolean):void {
+    const proof=this.runTurn(runId);if(!proof||proof.inputSeq===null)return;
+    if(!Number.isSafeInteger(endSeq)||endSeq<=proof.inputSeq)throw new AppError('turn-proof','自动轮次结束坐标无效。');
+    const reportId=this.finalReport(runId)?.id??null;
+    this.command(`turn-end:${runId}`,'run.turn-end',{runId,endSeq,endKind,quiet,reportId},()=>{
+      this.db.prepare('UPDATE run_turns SET endSeq=?,endKind=?,quiet=?,reportId=? WHERE runId=?').run(endSeq,endKind,Number(quiet),reportId,runId);return {};
+    });
+  }
   nativeIntervention(sessionId:string,messageId:string):boolean {
     const binding=this.db.prepare("SELECT * FROM bindings WHERE sessionId=? AND state='ready'").get(sessionId) as unknown as Binding|undefined;
     if(!binding)return false;const task=this.getTask(binding.taskId);if(!['open','review'].includes(task.lifecycle))return false;
@@ -619,6 +640,7 @@ export class Store {
       const pending=this.pendingInput(taskId);const id=randomUUID(),inputId=pending?.id??randomUUID(),now=Date.now();
       if(!pending)this.db.prepare('INSERT INTO inputs(id,taskId,kind,content,createdAt) VALUES (?,?,?,?,?)').run(inputId,taskId,'dispatch',task.goal,now);
       this.db.prepare('INSERT INTO runs(id,taskId,bindingId,sessionId,taskRevision,generation,inputId,state,createdAt) VALUES (?,?,?,?,?,?,?,?,?)').run(id,taskId,b.id,b.sessionId,task.taskRevision,b.generation,inputId,'queued',now);
+      this.db.prepare('INSERT INTO run_turns(runId) VALUES (?)').run(id);
       this.db.prepare('INSERT INTO resources VALUES (?,?)').run(id,b.cwd);
       this.db.prepare('INSERT INTO outbox(id,kind,taskId,payload,createdAt) VALUES (?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET payload=excluded.payload').run(`input:${inputId}`,'input.deliver',taskId,JSON.stringify({runId:id,inputId}),now);
       this.db.prepare('UPDATE tasks SET rowVersion=rowVersion+1,updatedAt=? WHERE id=?').run(now,taskId);
@@ -650,7 +672,7 @@ export class Store {
       this.event('input.entered',run.taskId,{runId:id,messageId,seq});return {};
     });
   }
-  runRecovery(id:string,note:string):void {
+  runRecovery(id:string,note:string,notify=true):void {
     if(this.getRun(id).finishedAt!==null)return;
     this.command(`recovery:${id}`,'run.recovery',{id,note},()=>{
       const run=this.getRun(id);if(run.finishedAt!==null)return {};
@@ -658,7 +680,7 @@ export class Store {
       this.db.prepare("UPDATE inputs SET state='unknown' WHERE id=? AND state!='entered'").run(run.inputId);
       this.db.prepare("UPDATE attentions SET state='stale' WHERE taskId=? AND kind='approval' AND state='open'").run(run.taskId);
       this.db.prepare('INSERT OR IGNORE INTO attentions(id,taskId,kind,question,taskRevision,createdAt) VALUES (?,?,?,?,?,?)').run(`run:${id}`,run.taskId,'recovery',note,run.taskRevision,Date.now());
-      this.enqueueManager(this.getTask(run.taskId).botId,`recovery:${id}`,`执行待核对：${note}\n请打开任务详情及原生会话 ${run.sessionId} 核对输入、文件和后台活动；未知执行仍保留占用，不会自动重投或重跑。`,run.taskId,10);
+      if(notify)this.enqueueManager(this.getTask(run.taskId).botId,`recovery:${id}`,`执行待核对：${note}\n请打开任务详情及原生会话 ${run.sessionId} 核对输入、文件和后台活动；未知执行仍保留占用，不会自动重投或重跑。`,run.taskId,10);
       this.event('run.recovery',run.taskId,{runId:id,note});return {};
     });
   }
@@ -717,10 +739,11 @@ export class Store {
     if(!outcome.accepted)throw new AppError('report-stale','当前执行或目标已改变，报告未成为当前成果。');
     return outcome;
   }
-  settleRun(id:string):void {
+  settleRun(id:string,notify=true):void {
     if(this.getRun(id).finishedAt!==null)return;
     this.command(`settle:${id}`,'run.settle',{id},()=>{
       const run=this.getRun(id);const task=this.getTask(run.taskId);
+      if(run.state==='cancelling')throw new AppError('stop-pending','停止意图尚待结算，不能补成功。');
       if(this.db.prepare("SELECT 1 FROM attentions WHERE taskId=? AND kind='approval' AND state='open'").get(task.id))throw new AppError('approval-pending','原生审批尚未得到结果，不能确认执行结束。');
       const last=this.db.prepare("SELECT kind,data FROM reports WHERE runId=? AND kind!='progress' ORDER BY createdAt DESC LIMIT 1").get(id) as {kind:WorkReport['kind'];data:string}|undefined;
       if(!last||this.getRunInput(id).state!=='entered'||task.controlMode==='manual')throw new AppError('no-result','执行已空闲，但没有可确认的最终报告。');
@@ -730,7 +753,8 @@ export class Store {
       const kind=last.kind==='ready'?'review':last.kind==='waiting'?'input':'recovery';
       this.db.prepare('INSERT OR IGNORE INTO attentions(id,taskId,kind,question,taskRevision,createdAt) VALUES (?,?,?,?,?,?)').run(`run:${id}`,run.taskId,kind,last.kind==='ready'?'成果与执行已核对，请检查证据并验收。':report.summary,run.taskRevision,Date.now());
       this.db.prepare('UPDATE tasks SET lifecycle=?,rowVersion=rowVersion+1,updatedAt=? WHERE id=?').run(last.kind==='ready'?'review':'open',Date.now(),run.taskId);
-      this.enqueueManager(task.botId,`settled:${id}`,`执行已结束，报告类型 ${last.kind}。请读当前账本和成果，不要重放旧输入。`,task.id);
+      if(!notify){this.db.prepare("UPDATE tasks SET controlMode='paused' WHERE id=?").run(run.taskId);this.event('run.reconciled',run.taskId,{runId:id});}
+      if(notify)this.enqueueManager(task.botId,`settled:${id}`,`执行已结束，报告类型 ${last.kind}。请读当前账本和成果，不要重放旧输入。`,task.id);
       this.event('run.settled',run.taskId,{runId:id,kind:last.kind});return {};
     });
   }
@@ -766,7 +790,7 @@ export class Store {
       this.event('run.stop-requested',taskId,{runId:run.id});return {runId:run.id,requested:true as const};
     });
   }
-  settleCancelled(id:string):void {
+  settleCancelled(id:string,notify=true):void {
     if(this.getRun(id).finishedAt!==null)return;
     this.command(`cancelled:${id}`,'run.cancelled',{id},()=>{
       const run=this.getRun(id);if(run.state!=='cancelling')throw new AppError('stop-not-requested','没有停止请求。');
@@ -778,7 +802,7 @@ export class Store {
       const input=this.getRunInput(id);if(input.attentionId&&input.state==='discarded')this.db.prepare("UPDATE attentions SET state='open' WHERE id=? AND state='responding'").run(input.attentionId);
       this.db.prepare('DELETE FROM resources WHERE runId=?').run(id);
       this.db.prepare('UPDATE tasks SET rowVersion=rowVersion+1,updatedAt=? WHERE id=?').run(Date.now(),run.taskId);
-      if(budget)this.enqueueManager(this.getTask(run.taskId).botId,`budget-stopped:${id}`,`${run.note} 已确认停止；不会自动重试。请在任务详情检查进展并明确核对后再安排。`,run.taskId,10);
+      if(budget&&notify)this.enqueueManager(this.getTask(run.taskId).botId,`budget-stopped:${id}`,`${run.note} 已确认停止；不会自动重试。请在任务详情检查进展并明确核对后再安排。`,run.taskId,10);
       this.event('run.cancelled',run.taskId,{runId:id});return {};
     });
   }

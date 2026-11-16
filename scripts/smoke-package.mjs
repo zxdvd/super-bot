@@ -5,6 +5,7 @@ import {readFile,writeFile} from 'node:fs/promises';
 import {resolve} from 'node:path';
 import {DatabaseSync} from 'node:sqlite';
 import {hostClient} from './host-client.mjs';
+import schemaVersion from '../schema-version.json' with {type:'json'};
 const mode=process.argv[2]??'prepare';assert.ok(['prepare','restored','retained'].includes(mode));
 const client=await hostClient('.runtime/package-host.log');assert.equal(new URL(client.base).port,'3082');
 async function raw(action,payload={}){return(await(await client.post('/api/super-bot',{type:'client-request',rpcId:randomUUID(),method:'super-bot',payload:{action,...payload}})).json()).result;}
@@ -18,7 +19,7 @@ if(mode==='prepare'){
  const detail=await call('task.detail',{id:task.id});
  const blocked=await raw('task.dispatch',{requestId:prefix+':dispatch',id:task.id,expectedRowVersion:detail.task.rowVersion});assert.equal(blocked.ok,false);assert.equal(blocked.error.code,'model-required');assert.equal((await call('task.detail',{id:task.id})).run,null);
  const manager=await call('manager.prepare',{requestId:prefix+':manager',botId:bot.id});
- const backup=await call('backup.create',{requestId:prefix+':backup'});assert.deepEqual(await call('backup.create',{requestId:prefix+':backup'}),backup);assert.equal(backup.schema,7);
+ const backup=await call('backup.create',{requestId:prefix+':backup'});assert.deepEqual(await call('backup.create',{requestId:prefix+':backup'}),backup);assert.equal(backup.schema,schemaVersion);
  const db=new DatabaseSync(backup.path,{readOnly:true});try{const saved=JSON.parse(db.prepare('SELECT botContext FROM tasks WHERE id=?').get(task.id).botContext);assert.equal(saved.materials[0].text,'SB_PACKAGE_REFERENCE_A\n');}finally{db.close();}
  await writeFile(referencePath,'SB_PACKAGE_REFERENCE_B\n');
  const saved={prefix,botId:bot.id,taskId:task.id,sessionId:binding.sessionId,managerSessionId:manager.sessionId,backup,backupHash:createHash('sha256').update(await readFile(backup.path)).digest('hex')};await writeFile(record,JSON.stringify(saved,null,2));

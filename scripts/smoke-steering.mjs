@@ -66,6 +66,7 @@ if(scenario==='restart-prepare') {
   }
   await probe('release-stalled-model',t.sid);
   await until(async()=>{const s=await probe('inspect-session',t.sid);return {ok:scenario==='queue'?s.stalled&&s.scopedProbeCalls===1:s.status==='idle'};},'worker/native converged');
+  await until(async()=>{const d=await call('task.detail',{id:t.id});return {ok:d.run?.finishedAt!==null&&(scenario!=='queue'||d.task.controlMode==='manual')};},'durable automatic reconciliation');
   const end=await snapshot(t,`${scenario}: after auto end`);
   if(scenario==='steer') {
     assert.equal(end.d.run.state,'settled');assert.equal(end.d.task.controlMode,'auto');assert.ok(end.d.result);
@@ -106,6 +107,7 @@ if(scenario==='restart-prepare') {
 }else if(scenario==='normal'||scenario==='error'||scenario==='missing') {
   const t=await start(scenario==='error'?'MODEL_FAILURE_PROBE':scenario==='missing'?'RELIABILITY_MISSING_REPORT':'Normal completion');
   await until(async()=>({ok:(await probe('inspect-session',t.sid)).status==='idle'}),'end');
+  await until(async()=>({ok:(await call('task.detail',{id:t.id})).run?.finishedAt!==null}),'durable end reconciliation');
   const end=await snapshot(t,scenario);
   assert.equal(end.d.run.state,scenario==='normal'?'settled':'interrupted');
   if(scenario==='normal')assert.ok(end.d.result);else assert.equal(end.d.result,null);
@@ -121,6 +123,7 @@ if(scenario==='restart-prepare') {
   }
   await probe('release-stalled-model',t.sid);
   await until(async()=>{const s=await probe('inspect-session',t.sid);return {ok:s.stalled&&s.scopedProbeCalls===1};},'native scope released');
+  await until(async()=>({ok:(await call('task.detail',{id:t.id})).run?.state==='cancelled'}),'durable cancellation reconciliation');
   const after=await snapshot(t,'handoff: native turn running');
   assert.equal(after.d.run.state,'cancelled');
   assert.equal(after.d.run.state,'cancelled');

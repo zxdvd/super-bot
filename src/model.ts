@@ -118,3 +118,9 @@ export interface ChatSource { sessionId:string; messageId:string; seq:number; te
 
 /** Why a prepared task is not running yet; holder is the task that has (or is ahead in line for) the slot or directory. */
 export interface DispatchWait {code:'capacity'|'resource-conflict';holderTaskId:string|null;holderGoal:string|null}
+
+/** Immutable process-observed boundary; quiet is evidence from the original process, not a fresh Job list. */
+export interface RunTurn {
+  runId:string; turn:number|null; startSeq:number|null; inputSeq:number|null;
+  endSeq:number|null; endKind:string|null; quiet:number; reportId:string|null;
+}

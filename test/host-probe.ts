@@ -26,7 +26,7 @@ declare module '@deepseek-ai/dsh-llm' {
   }
 }
 export const name = 'super-bot-probe';
-export const inject = ['sessions','llm','tools','sessionController','workspaceRegistry','connection','agents','jobs','workingDirectory','sessionProjections'];
+export const inject = ['sessionPersistence','sessions','llm','tools','sessionController','workspaceRegistry','connection','agents','jobs','workingDirectory','sessionProjections'];
 const provider = 'super-bot-probe';
 const toolName = 'super_bot_probe_report';
 const scopedToolName='super_bot_scoped_probe';
@@ -209,6 +209,14 @@ export function apply(ctx:Context) {
   if (!home?.endsWith('/super-bot/.runtime/dsh')) throw new Error('Probe requires the dedicated Super Bot test home');
   const adapter=new ProbeAdapter();
   const scopedCalls=new Map<string,number>();
+  const crashArms=new Map<string,string>(),crashHeld=new Set<string>();
+  // Test-only barrier: the persistence listener still flushes in parallel, but
+  // the adapter's awaited flush cannot return before this process is killed.
+  ctx.on('session/flush',async session=>{
+    if(crashArms.get(session.id)==='end-durable'&&session.snapshotEvents().some(e=>e.type==='turn/end'&&e.data.reason.kind==='completed')) {
+      crashHeld.add(session.id);await new Promise<void>(()=>{});
+    }
+  });
   const readyJobs=new Map<string,{id:ReturnType<Context['jobs']['start']>;finish:(outcome:JobOutcome)=>void}>();
   // The dev home is nested in the source repository. Bound native turn diffs to
   // each synthetic workspace, so concurrent product edits are not attributed to it.
@@ -422,6 +430,26 @@ export function apply(ctx:Context) {
           assert.ok(body.text&&body.text.length<=500);await ctx.sessionController.prompt({requestId:randomUUID() as SessionRequestId,sessionId:agent.id,mode:'queue',content:[{type:'text',text:body.text}]},new AbortController().signal);
         }else await ctx.tools.execute({agent,signal:new AbortController().signal,calls:[{type:'tool-call',id:ToolCallId(randomUUID()),name:scopedToolName,arguments:'{}'}]});
         return Response.json({ok:true,scopedProbeCalls:scopedCalls.get(agent.id)??0});
+      }
+      if(body.action==='arm-crash'||body.action==='crash-inspect') {
+        assert.ok(body.sessionId);const resolved=await ctx.sessionController.resolveAgent(SessionId(body.sessionId));assert.ok('agent' in resolved);const agent=resolved.agent;
+        assert.ok(agent.session.header.cwd?.startsWith(join(home!,'super-bot')+'/'));assert.equal(agent.model.current()?.provider,provider);
+        if(body.action==='arm-crash') {
+          assert.ok(body.text);crashArms.set(agent.id,body.text);
+          if(body.text==='ready-before-end')agent.ctx.on('agent/turn-stopping',async()=>{crashHeld.add(agent.id);await new Promise<void>(()=>{});});
+          if(body.text==='pending-input') {
+            const followup=agent.followup.bind(agent);
+            agent.followup=message=>{agent.followup=followup;agent.send(message,'next-turn',false);agent.send(createUserMessage({source:{kind:'user',rpcId:randomUUID()},content:[{type:'text',text:'Retained synthetic human input'}]}),'next-turn',false);};
+          }
+          if(body.text==='receipt-loss') {
+            const followup=agent.followup.bind(agent);
+            agent.followup=message=>{agent.followup=followup;followup(message);throw new Error('Synthetic receipt loss after real inbox acceptance');};
+          }
+          return Response.json({ok:true});
+        }
+        const handle=await ctx.sessionPersistence.open(agent.id,'read');
+        try {const events=(await handle.read()).events;return Response.json({ok:true,held:crashHeld.has(agent.id),end:events.findLast(e=>e.type==='turn/end')??null,inputs:events.filter(e=>e.type==='user/message'&&e.data.source.kind==='super-bot').length,modelCalls:adapter.calls.filter(c=>c.sessionId===agent.id).length});}
+        finally{await handle.close();}
       }
       if(body.action==='checkpoint-session') {
         assert.ok(body.sessionId);const resolved=await ctx.sessionController.resolveAgent(SessionId(body.sessionId));assert.ok('agent' in resolved);

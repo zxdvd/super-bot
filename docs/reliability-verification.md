@@ -35,11 +35,33 @@ files（证明工具约束解除）和默认 Full Access 各跑一遍，以下 8
 
 完整 `npm run check` 通过：23 个 UI 文件行长检查、TypeScript、87 个单元测试、139 个适配层测试（含本次新增 6 项收敛回归）、build；合计 226。隔离宿主矩阵独立于 npm check 执行。
 
-## 第二阶段：重启恢复仍缺什么
+## 第二阶段：持久证据与崩溃窗口
 
-1. 自动 Run 的 turn/seq 关联仍主要为进程内 Set，重启统一把 unfinished Run 变为 recovery；尚不能从持久消息/最终报告/所属 turn/end 做精确、幂等的只读重建。应先落持久关联与分类器，再评估何种事实足以安全补结算，未知副作用不自动恢复执行。
-2. 需要细化崩溃窗口：入队未 entered、ready 已提交但 end/结算未提交、turn/end 持久化失败、结算事务/回执丢失、人工下一轮已开始后宿主重启、停止超时后迟到结束。现有一次真实 SIGKILL 只覆盖 running/entered 路径。
-3. 重启后后台 CLI/子 Agent 的外部效果不能由“新 Job 列表为空”证明停止；不能自动清空 resources 或盲目重投。未消费的旧 Inbox、人工新消息和恢复动作的排序需要单独验证。
-4. 兜底 whenIdle 路径仍不是每个 input 的持久完成证明；下一阶段应统一按所属 turn 的持久证据结算，并保持同一事务/幂等约束，避免仅凭历史 ready 报告补成功。
+阶段二起点为 `63294bf`。实现于 `src/dsh.ts`、`src/run-proof.ts`、`src/store.ts`：新 Run 预留证据行，自动输入 entered 时记录 turn/startSeq/inputSeq；原进程在该 turn/end 同步记录 endSeq/endKind、最终报告 ID 和 Job/子 Agent 已收敛的快照。随后调用 SessionStore.flush，再通过 SessionPersistence 只读验证连续日志、完整输入身份、唯一所属轮次与结束事件。DSH 持久事件是不可变连续前缀，append 本身为 best effort，flush 才是持久屏障；尾部缺失或坐标不符不推断成功。启动恢复不 resolveAgent、不检查新进程空 Job 列表、不执行模型/工具。结算和资源释放在同一 SQLite 事务；恢复成功暂停任务，不新发 Manager 唤醒、不验收成果。
 
-未验证：真实模型工作质量、浏览器 ↑ 按钮点击/QueueDock 样式、Desktop、真实外部 CLI 作业跨重启的存活。浏览器最小补验仅需在一次测试 Worker 运行时排队一条消息并点 ↑，确认输入进入当前轮且按钮不因插件取消而变灰；核心宿主路径已真实覆盖，不把这项 UI 核对当成已完成。
+恢复宿主沿用同一隔离 home/profile/账本。每个窗口执行 prepare → SIGKILL → restart/verify → SIGKILL → restart/verify，并重复原 dispatch request 验证 Run/Input ID 不变且不会再次发输入：
+
+| 窗口 | 持久事实与恢复断言 |
+| --- | --- |
+| ready 已保存，turn/end 前崩溃 | ready 不是结束证明；interrupted/recovery，原资源保留，模型调用 0 |
+| 原 turn/end 持久化后、账本结算前崩溃 | 测试 flush hook 阻塞但真实持久化监听器并行完成；原进程 quiet + 精确 completed 日志，补 settled/paused，释放资源，无人工接受 |
+| 账本已结算、进程清理前后重启 | 保持原 settled/结果 ID，无二次结算/调用/输入 |
+| inbox 接受后 dispatch 回执丢失 | 保留原 interrupted Run 与锁，不把重试当新尝试，无自动输入重投 |
+| turn/end 时有未知后台 Job | quiet=0，即使重启后注册表为空也不能释放，仍 recovery/锁定 |
+| 未 entered 的自动输入与人工输入一起持久排队 | 空闲兜底标 recovery；恢复不主动加载 Agent，之后 Agent 创建时仅清除精确匹配的旧自动输入，人工输入保留，不唤醒、不把 unknown 改成 entered |
+
+另有适配层故障注入：日志缺尾/断序/重复输入/错身份/跨轮、aborted、flush false/抛错、Stop 与 flush 竞争、SQLite 结算中断回滚后重开、旧版本迁移和重复恢复。Stop 只终结旧 Run，不取消已经开始的人工 driver；人工续轮不会阻止旧轮次按持久证据结算，也不会让旧成果被误验收。
+
+### 迁移与运维边界
+
+- 实际前版 schema 为 8（上文阶段一旧运维说明曾滞后）；本次升级到 9，事务新增 run_turns，旧 Run 无证据行，不从历史 ready 或新 Job 空表补造证据。已有 settled 不重开，旧 interrupted 不自动复活，历史锁保留。旧插件拒绝打开 schema 9；部署前备份，回退只能用对应旧插件/恢复脚本与升级前备份到新目录。
+- 恢复只收敛账本，不恢复执行、不重投模型/工具、不自动验收；未知效果须人工核对。显式备份恢复流程仍统一暂停并待核对，与原 profile 重启后的证据补结算是两条路径。
+- quiet 仅覆盖宿主可追踪 Job/子 Agent。任意 detached OS 进程、外部系统副作用不受证明；没有权威 end 或边界 quiet 时宁可保留锁。持久化/读取无限挂起需运维处理，不超时猜测完成。
+- 极窄窗口（原进程观察 end 前即崩溃、证据事务未提交、旧输入正在被另一个已运行 driver 领取）仍保守 recovery；不承诺通用跨系统 exactly-once。隔离 SIGKILL 不是整机断电/fsync 硬件验证。
+- 本阶段不更新/重启公司生产、不修改现有任务、配置或账本。浏览器 ↑ 按钮/QueueDock、Desktop、真实模型质量与真实外部 CLI 跨重启存活未重测。最小 UI 补验仍是运行中排队并点 ↑，确认当前轮消费且按钮不因插件取消变灰。
+
+### 阶段二最终验证
+
+`npm run check`：行长检查、TypeScript、87 个单元测试 + 160 个适配层测试（共 247）、build 全通过。files 与 Full Access 均通过原 8 场景 + 新增 6 崩溃窗口（每窗口恢复两次）；恢复后模型调用均 0、原 Run/Input ID 不变、未自动验收，安全窗口释放锁，未知窗口保留锁。最终证据目录为 `.runtime/reliability-23nUE3/`（files）与 `.runtime/reliability-r8vQdI/`（Full Access）；原始宿主日志含本机 token，不外传。
+
+补结算不会新增 Manager 唤醒；既有 Manager 通知/投递队列仍按原规则运行，不代表全宿主启动时禁用其他既有任务。恢复补结算的任务被暂停，即使 reviewPolicy=bot，Manager 也不能自动验收或继续派发。完整通知/投递可靠性不在本阶段扩展。

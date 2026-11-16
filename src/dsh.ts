@@ -9,6 +9,9 @@ import type {} from '@deepseek-ai/dsh-working-directory';
 import type {} from '@deepseek-ai/dsh-session-projection';
 import type { Agent } from '@deepseek-ai/dsh-agent';
 import { createUserMessage,freezeMessage,type UserMessage } from '@deepseek-ai/dsh-llm';
+import type {Session,SessionStore} from '@deepseek-ai/dsh-session';
+import type {} from '@deepseek-ai/dsh-session-persistence';
+import {verifyRunTurn} from './run-proof.ts';
 import { SessionId } from '@deepseek-ai/dsh-session/types';
 import { realpath } from 'node:fs/promises';
 import { realpathSync } from 'node:fs';
@@ -39,8 +42,11 @@ export function modelFailureNote(code:string):string {
 
 export class DshExecution {
   private creating=new Map<string,Promise<Binding>>();
-  private running=new Map<string,{agent:Agent;release:()=>void;done:Promise<void>;finishTurn:(completed:boolean)=>void}>();
+  private running=new Map<string,{agent:Agent;release:()=>void;done:Promise<void>;finishTurn:(completed:boolean,endSeq?:number,endKind?:string)=>void}>();
   private autoTurns=new Set<string>();
+  private turnStarts=new Map<string,{turn:number;seq:number}>();
+  private finishing=new Map<string,Promise<void>>();
+  private pendingHuman=new Map<string,string[]>();
   private disposed=false;
   readonly policy:WorkdirPolicy;
   constructor(private ctx:Context,private store:Store,private dataDir:string,private options:RuntimeOptions={}) {this.policy=workdirPolicy(options,dataDir);}
@@ -50,7 +56,7 @@ export class DshExecution {
       output:{schema:{type:'object',properties:{accepted:{type:'boolean'},resultId:{type:'string'}},required:['accepted'],additionalProperties:false},render:(_args,value)=>[{type:'text',text:JSON.stringify(value)}]},
       execute:async(args,exec)=>{
         const run=this.store.heldRuns().find(r=>r.sessionId===exec.agent?.id&&r.finishedAt===null);
-        if(!run)throw new AppError('report-scope','当前会话没有可报告的执行。');
+        if(!run||this.finishing.has(run.id))throw new AppError('report-scope','当前会话没有可报告的执行。');
         const data=args as Record<string,unknown>;const binding=this.store.getBinding(run.bindingId);
         const report:WorkReport={kind:data.kind as WorkReport['kind'],summary:requiredText(data.summary,'报告内容'),checks:optionalText(data.checks,'验收说明')};
         if(report.kind==='ready')report.requestedFiles=evidencePaths(data.files);
@@ -63,8 +69,19 @@ export class DshExecution {
         if(report.kind!=='progress')exec.concludeTurn();return result;
       },
     },{when:({agent})=>this.store.heldRuns().some(r=>r.sessionId===agent.id&&r.finishedAt===null)}));
+    this.ctx.on('agent/created',({agent})=>{
+      if(this.disposed)return;
+      for(const run of this.store.heldRuns())if(run.sessionId===agent.id&&!this.running.has(run.id)) {
+        const input=this.store.getRunInput(run.id);
+        for(const message of [...agent.inbox.nextTurn,...agent.inbox.nextStep]) {
+          const source=message.source;
+          if(message.id===input.messageId&&source.kind==='super-bot'&&source.runId===run.id&&source.inputId===run.inputId&&source.taskId===run.taskId&&source.taskRevision===run.taskRevision&&source.generation===run.generation)agent.inbox.remove(message.id);
+        }
+      }
+    });
     this.ctx.on('session/event',(session,event)=>{
       if(this.disposed)return;
+      if(event.type==='turn/start')this.turnStarts.set(session.id,{turn:event.data.turn,seq:event.seq});
       if(event.type==='turn/end'&&event.data.reason.kind==='error') {
         const run=this.store.heldRuns().find(r=>r.sessionId===session.id&&r.finishedAt===null);
         if(run)this.store.runRecovery(run.id,modelFailureNote(event.data.reason.error.code));
@@ -85,13 +102,16 @@ export class DshExecution {
         const source=event.data.source;
         if(this.store.heldRuns().some(r=>r.id===source.runId&&r.sessionId===session.id&&r.inputId===source.inputId)) {
           this.store.inputEntered(source.runId,event.data.id,event.seq);
+          const start=this.turnStarts.get(session.id);
+          if(start)this.store.associateRunTurn(source.runId,start.turn,start.seq,event.seq);
           this.autoTurns.add(source.runId);
         }
       }
       if(event.type==='turn/end') {
         for(const run of this.store.heldRuns())if(run.sessionId===session.id&&this.autoTurns.delete(run.id)) {
-          this.running.get(run.id)?.finishTurn(event.data.reason.kind==='completed');
+          this.running.get(run.id)?.finishTurn(event.data.reason.kind==='completed',event.seq,event.data.reason.kind);
         }
+        this.turnStarts.delete(session.id);
       }
       // Queue/steer must not look like takeover. Only a human user/message that
       // starts a new turn while no automatic turn is running marks intervention.
@@ -100,12 +120,48 @@ export class DshExecution {
       if(event.type==='user/message'&&event.data.source.kind==='user'&&'rpcId' in event.data.source) {
         const previous=this.store.heldRuns().find(run=>run.sessionId===session.id&&run.finishedAt===null);
         if(previous&&this.autoTurns.has(previous.id))return;
+        if(previous&&this.finishing.has(previous.id)){const ids=this.pendingHuman.get(previous.id)??[];ids.push(event.data.id);this.pendingHuman.set(previous.id,ids);return;}
         const changed=this.store.nativeIntervention(session.id,event.data.id);
         if(changed&&previous){this.running.get(previous.id)?.release();this.running.delete(previous.id);}
       }
     });
-    // A process restart cannot infer absence of an external effect from an idle fresh Agent.
-    for(const run of this.store.heldRuns())if(run.finishedAt===null)this.store.runRecovery(run.id,'宿主重新加载，需要核对上次输入和执行；没有自动重投。');
+    // No Agent is resolved or woken. Only old-process certificates plus durable log facts may settle.
+    for(const run of this.store.heldRuns())if(run.finishedAt===null) {
+      const proof=this.store.runTurn(run.id);
+      if(!proof?.quiet||proof.endSeq===null)this.store.runRecovery(run.id,proof?'重启后缺少原进程的归属结束/后台收敛证据，保留占用；没有自动重投。':'旧版 Run 没有持久轮次证据，请人工核对；没有自动重投。',false);
+      else this.scheduleReconciliation(run.id);
+    }
+  }
+  /** Useful to callers/tests before inspecting startup reconciliation; never executes model work. */
+  async whenReconciled():Promise<void> {await Promise.all([...this.finishing.values()]);}
+  private scheduleReconciliation(runId:string,session?:Session):void {
+    const done=Promise.resolve().then(()=>this.reconcileRun(runId,session)).catch(error=>{
+      if(!this.disposed)this.store.runRecovery(runId,error instanceof AppError?error.message:'持久执行证据无法读取，请人工核对；没有重投。',!!session);
+    }).finally(()=>{
+      if(!this.disposed)for(const id of this.pendingHuman.get(runId)??[])this.store.nativeIntervention(this.store.getRun(runId).sessionId,id);
+      this.pendingHuman.delete(runId);this.finishing.delete(runId);
+    });
+    this.finishing.set(runId,done);
+  }
+  private async reconcileRun(runId:string,session?:Session):Promise<void> {
+    const run=this.store.getRun(runId);if(run.finishedAt!==null||this.disposed)return;
+    const proof=this.store.runTurn(runId);if(!proof)throw new AppError('run-proof','旧版执行没有可归属的持久证据。');
+    if(session&&!await (this.ctx.sessions as unknown as SessionStore).flush(session))throw new AppError('run-proof','宿主未确认轮次持久保存，保留占用。');
+    const handle=await this.ctx.sessionPersistence.open(SessionId(run.sessionId),'read');
+    let followups:string[];
+    try {
+      if(handle.header.id!==run.sessionId)throw new AppError('run-proof','持久会话身份不符。');
+      followups=verifyRunTurn(run,this.store.getRunInput(runId),proof,(await handle.read()).events);
+    }finally{await handle.close();}
+    const current=this.store.getRun(runId);
+    if(this.disposed||current.finishedAt!==null)return;
+    if(current.state!=='cancelling'&&(!proof.reportId||this.store.finalReport(runId)?.id!==proof.reportId))throw new AppError('run-proof','没有绑定到结束边界的最终报告；不会推断完成。');
+    const task=this.store.getTask(run.taskId),binding=this.store.activeBinding(run.taskId);
+    if(task.taskRevision!==run.taskRevision||binding?.id!==run.bindingId||binding.generation!==run.generation||binding.sessionId!==run.sessionId)throw new AppError('run-proof','任务或会话绑定已改变，不能补结算。');
+    // No awaits between settlement and native takeover: later human work cannot
+    // become an automatic scheduling/review opportunity in between these writes.
+    if(current.state==='cancelling')this.store.settleCancelled(runId,!!session);else this.store.settleRun(runId,!!session);
+    for(const id of followups)this.store.nativeIntervention(run.sessionId,id);
   }
   private assertQuiet(agent:Agent):void {
     if(agent.status!=='idle'||agent.inbox.nextTurn.length||agent.inbox.nextStep.length)throw new AppError('session-busy','任务会话有活动或待处理输入，请先在原生会话核对。');
@@ -179,16 +235,17 @@ export class DshExecution {
     // Finalize at our own turn/end, after its tools have returned, checking
     // external work separately. whenIdle() is only the no-turn/failure fallback.
     let finalized=false;
-    const finishTurn=(completed:boolean)=>{
+    const finishTurn=(_completed:boolean,endSeq?:number,endKind?:string)=>{
       if(finalized||this.disposed)return;
       finalized=true;this.autoTurns.delete(run.id);
       try {
-        this.assertExternalQuiet(agent);
-        if(this.store.getRun(run.id).state==='cancelling')this.store.settleCancelled(run.id);
-        else if(this.store.getRun(run.id).finishedAt===null) {
-          if(!completed)throw new AppError('turn-incomplete','自动轮次未正常结束，请核对原生会话、文件和后台活动。');
-          this.store.settleRun(run.id);
-        }
+        let quiet=true,note='';
+        try{this.assertExternalQuiet(agent);}catch(error){quiet=false;note=error instanceof AppError?error.message:'后台效果尚未核对。';}
+        if(endSeq!==undefined&&endKind)this.store.observeRunEnd(run.id,endSeq,endKind,quiet);
+        if(this.store.getRun(run.id).finishedAt!==null)return;
+        if(!quiet)throw new AppError('run-proof',note);
+        if(endSeq===undefined)throw new AppError('run-proof','没有可归属的自动轮次结束事件；仅会话空闲不足以补成功。');
+        this.scheduleReconciliation(run.id,agent.session);
       }catch(error){this.store.runRecovery(run.id,error instanceof AppError?error.message:'执行状态待核对，请打开原生会话检查。');}
       finally{release();this.running.delete(run.id);}
     };
@@ -260,6 +317,7 @@ export class DshExecution {
   async stop(requestId:string,taskId:string,rowVersion:number) {
     const receipt=this.store.requestStop(requestId,taskId,rowVersion);
     if(this.store.getRun(receipt.runId).finishedAt!==null)return receipt;
+    if(this.finishing.has(receipt.runId))return receipt; // Do not cancel a following human driver while the old end is being verified.
     const active=this.running.get(receipt.runId);
     if(!active){if(this.store.getRun(receipt.runId).finishedAt===null)this.store.runRecovery(receipt.runId,'停止请求已记录，但当前宿主没有这个执行句柄，请核对原生会话。');return receipt;}
     const input=this.store.getRunInput(receipt.runId);
@@ -295,6 +353,7 @@ export class DshExecution {
     this.disposed=true;this.autoTurns.clear();
     for(const [id,{agent}]of this.running){this.store.runRecovery(id,'插件退出时执行尚未核对，重新启用后请核对原生会话。');const input=this.store.getRunInput(id);if(input.messageId)agent.inbox.remove(input.messageId as UserMessage['id']);agent.cancel({kind:'user'},{keepInbox:true});}
     await Promise.allSettled([...this.running.values()].map(r=>r.done));
+    await this.whenReconciled();
   }
   async prepareSession(requestId:string,taskId:string,rowVersion:number,workdir?:WorkdirRequest):Promise<Binding> {
     const receipt=this.store.bindingReceipt(requestId,taskId,rowVersion);

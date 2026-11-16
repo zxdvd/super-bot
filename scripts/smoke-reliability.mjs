@@ -22,7 +22,7 @@ try {await run([cli,'--profile','reliability','--from-default-profile','web','--
 finally {await init.close();}
 const patch=join(base,'host.patch.json');
 await writeFile(patch,JSON.stringify([{id:'hmr',disabled:true},{insert:[
-  {id:'super-bot',name:join(root,'lib/index.js'),config:{fullAccess:process.env.SUPER_BOT_TEST_FULL_ACCESS==='true',maxRunningTasks:8}},
+  {id:'super-bot',name:join(root,'lib/index.js'),config:{fullAccess:process.env.SUPER_BOT_TEST_FULL_ACCESS==='true',maxRunningTasks:16}},
   {id:'super-bot-contract-probe',name:join(root,'.runtime/probe-plugin/index.js')},
 ]}]));
 let active;
@@ -51,5 +51,13 @@ try {
   await scenario('restart-prepare');await stop('SIGKILL');
   await rename(log,join(base,'host-before-restart.log'));
   await launch();await scenario('restart-verify');
+  for(const window of ['ready-before-end','end-durable','settled','receipt-loss','unknown-job','pending-input']) {
+    const crash=phase=>run(['scripts/smoke-run-recovery.mjs',phase,window],{env:{...env,SUPER_BOT_TEST_LOG:log},stdio:'inherit'});
+    await crash('prepare');await stop('SIGKILL');
+    await rename(log,join(base,`host-${window}-before.log`));
+    await launch();await crash('verify');await stop('SIGKILL');
+    await rename(log,join(base,`host-${window}-first-recovery.log`));
+    await launch();await crash('verify');
+  }
   console.log(`PASS all isolated reliability scenarios; fullAccess=${process.env.SUPER_BOT_TEST_FULL_ACCESS==='true'}; evidence: ${base}`);
 } finally {await stop();}

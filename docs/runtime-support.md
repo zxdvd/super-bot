@@ -55,3 +55,7 @@ files 模式目录限制是应用层约束，不是操作系统沙箱。Full Acc
 `/api/super-bot-file` 是宿主认证下的只读成果入口，仅按 resultId 与文件索引查询账本；无任意路径参数。返回前核对实际文件哈希与大小，单文件保持 10 MiB 上限。聊天交付链接可直接进入对应任务详情，下载文件不会接受成果。
 
 `npm run smoke:chat` 在真实隔离宿主上使用无网络确定性模型验证完整链路；不是语言理解或成果质量评测。2026-11-07 聊天增量基线为 52 项核心、16 项适配测试及 11 项真实宿主契约通过；截至 2026-11-09，源码检查为 65 项核心、120 项适配测试通过，typecheck/build 通过。真实模型过程见[第三轮记录](dogfooding-2026-11-08.md)与[侧栏整理记录](dogfooding-sidebar-2026-11-09.md)；Desktop、任意外部服务与完整产品体验仍未验收。
+
+### 持久 Run 恢复（schema 9）
+
+新增原进程 Run↔turn/事件坐标、边界最终报告和 Job/子 Agent quiet 证明。只有完整连续持久日志匹配时才补结算并暂停，不重投、不自动接受、不新唤醒 Manager。缺结束/未知后台/legacy Run 保留资源与 recovery；schema 8→9 不回填猜测。隔离 files/Full Access 宿主含 6 个 SIGKILL 窗口、各重复恢复两次；详见 reliability-verification.md。生产更新须空闲且先备份；回退使用升级前备份与匹配旧插件，不能降级当前账本。

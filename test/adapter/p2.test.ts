@@ -33,11 +33,13 @@ function fixture(t:TestContext,workspace=false,extra:(directory:string)=>Record<
     finally{toolSet.dispose();}
   };
   let delivered:any;
+  const workerEvents=new Map<string,any[]>();
   const titles=new Map<any,any>();
   const ctx={
     permissionPresets:{set:()=>{}},
     sessionTitle:{get:(session:any)=>titles.get(session),rename:(session:any,title:string)=>{const value={title,source:{kind:'user'}};titles.set(session,value);return value;}},
     sessions:{get:(id:string)=>agents.get(id)?.session,flush:async()=>true},
+    sessionPersistence:{open:async(id:string)=>({header:{id},read:async()=>({events:structuredClone(workerEvents.get(id)??[])}),close:async()=>{}})},
     effect:(callback:()=>unknown)=>callback(),
     on:(name:string,callback:Function)=>{const list=listeners.get(name)??[];list.push(callback);listeners.set(name,list);return ()=>{list.splice(list.indexOf(callback),1);};},
     tools:{register:(tool:any,options:any)=>{tools.set(tool.name,tool);const off=registry.register(tool,options);registrations.push(off);return off;}},
@@ -51,8 +53,8 @@ function fixture(t:TestContext,workspace=false,extra:(directory:string)=>Record<
         const agent:any={id:sessionId,session:{id:sessionId,header:{cwd:workspaceId}},status:'idle',
           model:{current:()=>({provider:'synthetic',model:'synthetic'}),select:()=>{}},inbox:{nextTurn:[],nextStep:[],remove:()=>{}},
           ctx:{systemPrompt:{section:()=>()=>{}},tools:{restrict:()=>()=>{},guard:()=>()=>{}},on:()=>()=>{}},
-          followup:(message:any)=>{delivered=message;agent.status='running';idle=new Promise<void>(resolve=>{resolveIdle=resolve;});},
-          whenIdle:()=>idle,finish:()=>{agent.status='idle';resolveIdle();},cancel:()=>{agent.status='idle';resolveIdle();}};
+          followup:(message:any)=>{delivered=message;agent.status='running';agent.turn=(agent.turn??0)+1;void emit({type:'turn/start',data:{turn:agent.turn}},sessionId);idle=new Promise<void>(resolve=>{resolveIdle=resolve;});},
+          whenIdle:()=>idle,finish:()=>{void emit({type:'turn/end',data:{turn:agent.turn,reason:{kind:'completed'}}},sessionId);agent.status='idle';resolveIdle();},cancel:()=>{agent.status='idle';resolveIdle();}};
         agents.set(sessionId,agent);return {sessionId};
       },
       resolveAgent:async(sessionId:string)=>agents.has(sessionId)?{agent:agents.get(sessionId)}:{error:'synthetic missing session'},
@@ -61,7 +63,7 @@ function fixture(t:TestContext,workspace=false,extra:(directory:string)=>Record<
   const options=()=>({fullAccess:workspace,...(workspace?{workspace:directory}:{}),...extra(directory)});
   let execution=new DshExecution(ctx,store,directory,options()),managers=new Managers(ctx,store,execution,directory,()=> 'https://example.test',options());
   const install=()=>{execution.install();managers.install();};install();
-  const emit=async(event:any,sessionId=manager.requestedSessionId)=>{for(const listener of listeners.get('session/event')??[])await listener({id:sessionId},event);};
+  const emit=async(event:any,sessionId=manager.requestedSessionId)=>{if(sessionId!==manager.requestedSessionId){const events=workerEvents.get(sessionId)??[];event={...event,seq:events.length,...(event.type==='user/message'?{surfaceOp:'append'}:{})};events.push(event);workerEvents.set(sessionId,events);}for(const listener of listeners.get('session/event')??[])await listener({id:sessionId},event);};
   const native=async(id:string,seq:number,text:string)=>emit({type:'user/message',seq,data:{id,source:{kind:'user',rpcId:`rpc:${id}`},content:[{type:'text',text}]}});
   return {get store(){return store;},get execution(){return execution;},bot,manager,directory,tools,emit,native,nativeResult,ctx,agents,get managers(){return managers;},
     schemas:()=>registry.schemas(),
@@ -397,7 +399,7 @@ test('overlapping legacy bindings defer and pump waits for both capacity and dir
     assert.ok(f.store.pendingManagerEvents(f.bot.id)[0].id.startsWith('manager-event:capacity:'));
     await f.ctx.sessionController.create({workspaceId:f.directory as any,sessionId:f.manager.requestedSessionId as any});
     await (f.managers as any).pump();assert.equal(f.agents.get(f.manager.requestedSessionId).status,'idle');
-    const input=f.store.getRunInput(first.run.id);await f.emit({type:'user/message',seq:1,data:{id:input.messageId,source:{kind:'super-bot',runId:first.run.id,inputId:input.id}}},first.run.sessionId);
+    const input=f.store.getRunInput(first.run.id);await f.emit({type:'user/message',seq:1,data:JSON.parse(input.messageJson!)},first.run.sessionId);
     f.store.workerReport(first.run.id,'failed',{kind:'failed',summary:'Synthetic stop'});
     f.agents.get(first.run.sessionId).finish();await new Promise<void>(resolve=>setImmediate(resolve));
     assert.equal(f.store.dispatchBlocker(tasks[1].id),null);
