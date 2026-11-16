@@ -18,6 +18,7 @@ import { Store } from '../src/store.ts';
 import { DshExecution } from '../src/dsh.ts';
 import { Managers } from '../src/manager.ts';
 import { SessionId } from '@deepseek-ai/dsh-session/types';
+import type {SessionStore} from '@deepseek-ai/dsh-session';
 
 declare module '@deepseek-ai/dsh-llm' {
   interface MessageSourceMap {
@@ -25,7 +26,7 @@ declare module '@deepseek-ai/dsh-llm' {
   }
 }
 export const name = 'super-bot-probe';
-export const inject = ['llm','tools','sessionController','workspaceRegistry','connection','agents','jobs','workingDirectory','sessionProjections'];
+export const inject = ['sessions','llm','tools','sessionController','workspaceRegistry','connection','agents','jobs','workingDirectory','sessionProjections'];
 const provider = 'super-bot-probe';
 const toolName = 'super_bot_probe_report';
 const scopedToolName='super_bot_scoped_probe';
@@ -37,6 +38,7 @@ class ProbeAdapter extends LlmAdapter {
   scopedAttempts=new Map<string,number>();
   managerAttempts=new Map<string,Record<string,unknown>[]>();
   heldManagerInputs=new Set<string>();
+  reliabilityHeld=new Set<string>();
   stalled=new Map<string,{release:()=>void;signal?:AbortSignal}>();
   async listModels() { return [{provider,id:'deterministic',name:'Super Bot 测试模型（无网络）'}]; }
   async resolveModel(p:string,m:string) { return {provider:p,id:m,name:m,context:{contextWindow:200000},defaultMaxTokens:1000}; }
@@ -123,13 +125,24 @@ class ProbeAdapter extends LlmAdapter {
       yield {type:'block-end',index:0,block:{type:'text',text:reply}};yield {type:'finish',reason:{kind:'stop'}};return;
     }
     const latestInput=options.messages.findLast(m=>m.role==='user'&&(m.source?.kind==='super-bot'||m.source?.kind==='user'));
-    const workInput=latestInput?.source?.kind==='super-bot'?latestInput:undefined;
+    const reliabilityInput=options.messages.findLast(m=>m.role==='user'&&m.source?.kind==='super-bot'&&m.content.some(b=>b.type==='text'&&b.text.includes('Goal: RELIABILITY_')));
+    const workInput=reliabilityInput??(latestInput?.source?.kind==='super-bot'?latestInput:undefined);
     if(latestInput?.source?.kind==='user'&&latestInput.content.some(block=>block.type==='text'&&block.text.includes('NATIVE_HOLD_PROBE'))) {
       assert.ok(options.sessionId);await new Promise<void>(release=>this.stalled.set(options.sessionId!,{release,signal:options.signal}));
       this.stalled.delete(options.sessionId);options.signal?.throwIfAborted();
     }
     if(workInput) {
       const body=workInput.content.filter(b=>b.type==='text').map(b=>b.text).join('');
+      if(body.includes('Goal: RELIABILITY_HOLD')&&options.sessionId&&!this.reliabilityHeld.has(options.sessionId)) {
+        this.reliabilityHeld.add(options.sessionId);
+        await new Promise<void>(release=>this.stalled.set(options.sessionId!,{release,signal:options.signal}));
+        this.stalled.delete(options.sessionId);options.signal?.throwIfAborted();
+      }
+      if(body.includes('Goal: RELIABILITY_MISSING_REPORT')) {
+        yield {type:'block-start',index:0,blockType:'text'};
+        yield {type:'block-end',index:0,block:{type:'text',text:'No report on purpose.'}};
+        yield {type:'finish',reason:{kind:'stop'}};return;
+      }
       if(body.includes('Goal: MODEL_FAILURE_PROBE'))throw new LlmError('Synthetic missing credential; no provider request was made','MISSING_CREDENTIAL');
       if(body.includes('Goal: UNRESPONSIVE_MODEL_PROBE')) {
         assert.ok(options.sessionId);
@@ -395,7 +408,7 @@ export function apply(ctx:Context) {
   }
   ctx.effect(()=>ctx.connection.fetch.register({path:'/api/super-bot-probe',methods:['POST'],requestBody:'buffered',
     fetch:async request=>{try{
-      const body=await request.json() as {action?:string;sessionId?:string;text?:string};
+      const body=await request.json() as {action?:string;sessionId?:string;text?:string;itemId?:string};
       if(body.action==='ready-job-status'||body.action==='ready-job-cancel'||body.action==='ready-job-finish') {
         assert.ok(body.sessionId);const job=readyJobs.get(body.sessionId);assert.ok(job);
         if(body.action==='ready-job-cancel')ctx.jobs.kill(job.id,SessionId(body.sessionId),'Synthetic late settlement');
@@ -409,6 +422,19 @@ export function apply(ctx:Context) {
           assert.ok(body.text&&body.text.length<=500);await ctx.sessionController.prompt({requestId:randomUUID() as SessionRequestId,sessionId:agent.id,mode:'queue',content:[{type:'text',text:body.text}]},new AbortController().signal);
         }else await ctx.tools.execute({agent,signal:new AbortController().signal,calls:[{type:'tool-call',id:ToolCallId(randomUUID()),name:scopedToolName,arguments:'{}'}]});
         return Response.json({ok:true,scopedProbeCalls:scopedCalls.get(agent.id)??0});
+      }
+      if(body.action==='checkpoint-session') {
+        assert.ok(body.sessionId);const resolved=await ctx.sessionController.resolveAgent(SessionId(body.sessionId));assert.ok('agent' in resolved);
+        assert.ok(resolved.agent.session.header.cwd?.startsWith(join(home!,'super-bot')+'/'));
+        assert.equal(await (ctx.sessions as unknown as SessionStore).flush(resolved.agent.session),true);return Response.json({ok:true});
+      }
+      if(body.action==='promote-steer') {
+        assert.ok(body.sessionId&&body.itemId);
+        const resolved=await ctx.sessionController.resolveAgent(SessionId(body.sessionId));assert.ok('agent' in resolved);
+        assert.ok(resolved.agent.session.header.cwd?.startsWith(join(home!,'super-bot')+'/'));
+        assert.equal(resolved.agent.model.current()?.provider,provider);
+        await ctx.sessionController.updateQueue({sessionId:resolved.agent.id,itemId:body.itemId as ReturnType<typeof createUserMessage>['id'],action:{kind:'steer'}});
+        return Response.json({ok:true});
       }
       if(body.action==='release-stalled-model') {
         assert.ok(body.sessionId);adapter.stalled.get(body.sessionId)?.release();return Response.json({ok:true});
@@ -454,7 +480,7 @@ export function apply(ctx:Context) {
       if(body.action==='inspect-session') {
         assert.ok(body.sessionId);const resolved=await ctx.sessionController.resolveAgent(SessionId(body.sessionId));assert.ok('agent' in resolved);
         assert.ok(resolved.agent.session.header.cwd?.startsWith(join(home!,'super-bot')+'/'));
-        return Response.json({ok:true,sessionId:resolved.agent.id,status:resolved.agent.status,pending:resolved.agent.inbox.nextTurn.length+resolved.agent.inbox.nextStep.length,stalled:adapter.stalled.has(resolved.agent.id),stalledAborted:adapter.stalled.get(resolved.agent.id)?.signal?.aborted??false,managerAttempts:adapter.managerAttempts.get(resolved.agent.id)??[],materialMarkers:adapter.calls.filter(call=>call.sessionId===body.sessionId&&(!call.purpose||call.purpose==='conversation')).at(-1)?.markers??[],assistantTexts:resolved.agent.session.snapshotEvents().filter(event=>event.type==='assistant/message').map(event=>event.data.message.content.filter(block=>block.type==='text').map(block=>block.text).join('')),historyMessageIds:resolved.agent.session.snapshotEvents().filter(event=>event.type==='user/message').map(event=>event.data.id),modelSteps:adapter.calls.filter(call=>call.sessionId===body.sessionId&&(!call.purpose||call.purpose==='conversation')).length,scopedProbeCalls:scopedCalls.get(resolved.agent.id)??0,scopedProbeAttempts:adapter.scopedAttempts.get(resolved.agent.id)??0,
+        return Response.json({ok:true,events:resolved.agent.session.snapshotEvents().filter(e=>['turn/start','turn/end','user/message','agent/inbox/spliced'].includes(e.type)).map(e=>({seq:e.seq,type:e.type,data:e.data})),pendingItems:[...resolved.agent.inbox.nextTurn.map(m=>({id:m.id,target:'next-turn'})),...resolved.agent.inbox.nextStep.map(m=>({id:m.id,target:'next-step'}))],sessionId:resolved.agent.id,status:resolved.agent.status,pending:resolved.agent.inbox.nextTurn.length+resolved.agent.inbox.nextStep.length,stalled:adapter.stalled.has(resolved.agent.id),stalledAborted:adapter.stalled.get(resolved.agent.id)?.signal?.aborted??false,managerAttempts:adapter.managerAttempts.get(resolved.agent.id)??[],materialMarkers:adapter.calls.filter(call=>call.sessionId===body.sessionId&&(!call.purpose||call.purpose==='conversation')).at(-1)?.markers??[],assistantTexts:resolved.agent.session.snapshotEvents().filter(event=>event.type==='assistant/message').map(event=>event.data.message.content.filter(block=>block.type==='text').map(block=>block.text).join('')),historyMessageIds:resolved.agent.session.snapshotEvents().filter(event=>event.type==='user/message').map(event=>event.data.id),modelSteps:adapter.calls.filter(call=>call.sessionId===body.sessionId&&(!call.purpose||call.purpose==='conversation')).length,scopedProbeCalls:scopedCalls.get(resolved.agent.id)??0,scopedProbeAttempts:adapter.scopedAttempts.get(resolved.agent.id)??0,
           toolResults:resolved.agent.session.snapshotEvents().filter(event=>event.type==='tool/result').map(event=>event.data),modelTools:adapter.calls.filter(call=>call.sessionId===body.sessionId&&(!call.purpose||call.purpose==='conversation')).at(-1)?.tools??[],executedTools:resolved.agent.session.snapshotEvents().filter(event=>event.type==='tool/call').map(event=>event.data.name),
           productTools:ctx.tools.definitions().map(tool=>tool.name).filter(name=>['super_bot_report','super_bot_manage'].includes(name))});
       }

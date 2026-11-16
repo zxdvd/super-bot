@@ -62,7 +62,8 @@
     "restore:ledger": "node scripts/restore-ledger.mjs",
     "test:adapter": "node --import tsx --test test/adapter/*.test.ts",
     "build:watch": "node scripts/build.mjs --watch",
-    "dev:reload": "node scripts/dev-reload.mjs"
+    "dev:reload": "node scripts/dev-reload.mjs",
+    "smoke:reliability": "node scripts/smoke-reliability.mjs"
   },
   "devDependencies": {
     "@deepseek-ai/cordis": "4.1.0",

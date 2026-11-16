@@ -1,13 +1,15 @@
 /** Queue or steer on a running Worker must not abort the automatic turn. */
 import {test} from 'node:test';
 import assert from 'node:assert/strict';
-import {mkdtempSync,realpathSync,rmSync,mkdirSync} from 'node:fs';
+import {mkdtempSync,realpathSync,rmSync,mkdirSync,writeFileSync} from 'node:fs';
 import {resolve} from 'node:path';
 import type {Context} from '@deepseek-ai/cordis';
 import {Store} from '../../src/store.ts';
 import {DshExecution} from '../../src/dsh.ts';
+import {collectEvidence} from '../../src/evidence.ts';
 
 async function fixture() {
+  let external:'job'|'child'|undefined;
   mkdirSync(resolve('.runtime'),{recursive:true});
   const directory=realpathSync(mkdtempSync(resolve('.runtime/intervention-'))),store=new Store(':memory:');
   const bot=store.createBot('bot',{name:'接管回归',instructions:'合成测试'});
@@ -26,11 +28,11 @@ async function fixture() {
     tools:{register:()=>()=>{}},
     sessionController:{resolveAgent:async()=>({agent})},
     sessionProjections:{snapshot:()=>({values:{modelSelection:{next:{provider:'fake',model:'fake'}}}})},
-    workingDirectory:{get:()=>directory},jobs:{list:()=>[]},agents:{list:()=>[],isOwnedBy:()=>false}} as unknown as Context;
+    workingDirectory:{get:()=>directory},jobs:{list:()=>external==='job'?[{owner:agent.id,status:'running'}]:[]},agents:{list:()=>external==='child'?[{}]:[],isOwnedBy:()=>external==='child'}} as unknown as Context;
   const execution=new DshExecution(ctx,store,directory,{fullAccess:true});execution.install();
   const emit=async(type:string,data:any)=>{for(const fn of sessionEvents)await fn(agent.session,{type,data,seq:1,time:Date.now()});};
   const run=await execution.dispatch('dispatch',task.id,store.getTask(task.id).rowVersion);
-  return {directory,store,task,agent,run,emit,execution,cancels:()=>cancels,removed:()=>removed,released:()=>released,
+  return {directory,store,task,agent,run,emit,execution,setExternal:(value:'job'|'child')=>{external=value;},cancels:()=>cancels,removed:()=>removed,released:()=>released,
     finishIdle:()=>{agent.status='idle';finish();},
     close:async()=>{agent.status='idle';finish();await execution.dispose();store.close();rmSync(directory,{recursive:true,force:true});}};
 }
@@ -66,7 +68,7 @@ test('a human new turn after the automatic turn ends records takeover without ca
     await f.emit('turn/start',{turn:1});
     await f.emit('agent/inbox/spliced',{inserted:[user('next','自动轮结束后再说')]});
     await f.emit('turn/end',{turn:1,reason:{kind:'completed'}});
-    assert.equal(f.store.getRun(f.run.id).finishedAt,null);assert.equal(f.store.getTask(f.task.id).controlMode,'auto');
+    assert.equal(f.store.getRun(f.run.id).state,'interrupted','missing report is reconciled at its own turn end');assert.equal(f.store.getTask(f.task.id).controlMode,'auto');
     f.agent.status='running';
     await f.emit('turn/start',{turn:2});
     await f.emit('user/message',user('next','自动轮结束后再说'));
@@ -77,5 +79,57 @@ test('a human new turn after the automatic turn ends records takeover without ca
     assert.equal(f.released(),true,'old restrictions must drop immediately so whenIdle following the new driver is not required');
     f.finishIdle();await new Promise<void>(resolve=>setImmediate(resolve));
     assert.equal(f.store.getRun(f.run.id).state,'interrupted');assert.equal(f.store.heldRuns().length,1);
+  }finally{await f.close();}
+});
+
+
+test('ready settles at its own turn/end before queued human work, without waiting for whole-session idle',async()=>{
+  const f=await fixture();try {
+    await f.emit('user/message',JSON.parse(f.store.getRunInput(f.run.id).messageJson!));
+    const file=resolve(f.directory,'result.md');writeFileSync(file,'Synthetic evidence');
+    f.store.workerReport(f.run.id,'ready',{kind:'ready',summary:'Checked',checks:'Read file',evidence:await collectEvidence(f.directory,[file])});
+    await f.emit('agent/inbox/spliced',{inserted:[user('followup','New work')]});
+    await f.emit('turn/end',{turn:1,reason:{kind:'completed'}});
+    assert.equal(f.agent.status,'running');assert.equal(f.store.getRun(f.run.id).state,'settled');
+    assert.equal(f.store.heldRuns().length,0);assert.equal(f.released(),true);
+    await f.emit('turn/start',{turn:2});await f.emit('user/message',user('followup','New work'));
+    assert.equal(f.store.getRun(f.run.id).state,'settled');assert.equal(f.store.getTask(f.task.id).controlMode,'manual');
+    assert.equal(f.cancels(),0);assert.equal(f.store.taskDetail(f.task.id).attentions.some(a=>a.kind==='recovery'),false);
+    await f.execution.dispose();assert.equal(f.cancels(),0,'disposing old execution cannot cancel the human turn');
+  }finally{await f.close();}
+});
+
+for(const reason of ['aborted','error'])test(`${reason} turn with a ready report is recovery, never successful settlement`,async()=>{
+  const f=await fixture();try {
+    await f.emit('user/message',JSON.parse(f.store.getRunInput(f.run.id).messageJson!));
+    const file=resolve(f.directory,'result.md');writeFileSync(file,'Candidate only');
+    f.store.workerReport(f.run.id,'ready',{kind:'ready',summary:'Candidate',checks:'Read file',evidence:await collectEvidence(f.directory,[file])});
+    await f.emit('turn/end',{turn:1,reason:reason==='error'?{kind:reason,error:{code:'SYNTHETIC'}}:{kind:reason,reason:{kind:'user'}}});
+    assert.equal(f.store.getRun(f.run.id).state,'interrupted');assert.equal(f.store.heldRuns().length,1);
+    assert.equal(f.store.getTask(f.task.id).lifecycle,'open');assert.equal(f.released(),true);
+  }finally{await f.close();}
+});
+
+test('stopped automatic turn settles cancellation before the native follow-up',async()=>{
+  const f=await fixture();try {
+    await f.emit('user/message',JSON.parse(f.store.getRunInput(f.run.id).messageJson!));
+    f.store.requestStop('stop',f.task.id,f.store.getTask(f.task.id).rowVersion);
+    await f.emit('turn/end',{turn:1,reason:{kind:'aborted',reason:{kind:'user'}}});
+    assert.equal(f.store.getRun(f.run.id).state,'cancelled');assert.equal(f.store.heldRuns().length,0);
+    await f.emit('turn/start',{turn:2});await f.emit('user/message',user('takeover','Continue manually'));
+    assert.equal(f.store.getRun(f.run.id).state,'cancelled');assert.equal(f.store.getTask(f.task.id).controlMode,'manual');
+    assert.equal(f.released(),true);assert.equal(f.cancels(),0);
+  }finally{await f.close();}
+});
+
+for(const kind of ['job','child'] as const)test(`turn/end cannot settle ready while a ${kind} still runs`,async()=>{
+  const f=await fixture();try {
+    await f.emit('user/message',JSON.parse(f.store.getRunInput(f.run.id).messageJson!));
+    const file=resolve(f.directory,'result.md');writeFileSync(file,'Candidate only');
+    f.store.workerReport(f.run.id,'ready',{kind:'ready',summary:'Candidate',checks:'Read file',evidence:await collectEvidence(f.directory,[file])});
+    f.setExternal(kind);await f.emit('turn/end',{turn:1,reason:{kind:'completed'}});
+    assert.equal(f.store.getRun(f.run.id).state,'interrupted');assert.equal(f.store.heldRuns().length,1);
+    assert.equal(f.store.getTask(f.task.id).lifecycle,'open');assert.equal(f.released(),true);
+    assert.equal(f.cancels(),0);
   }finally{await f.close();}
 });

@@ -39,7 +39,7 @@ export function modelFailureNote(code:string):string {
 
 export class DshExecution {
   private creating=new Map<string,Promise<Binding>>();
-  private running=new Map<string,{agent:Agent;release:()=>void;done:Promise<void>}>();
+  private running=new Map<string,{agent:Agent;release:()=>void;done:Promise<void>;finishTurn:(completed:boolean)=>void}>();
   private autoTurns=new Set<string>();
   private disposed=false;
   readonly policy:WorkdirPolicy;
@@ -89,7 +89,9 @@ export class DshExecution {
         }
       }
       if(event.type==='turn/end') {
-        for(const run of this.store.heldRuns())if(run.sessionId===session.id)this.autoTurns.delete(run.id);
+        for(const run of this.store.heldRuns())if(run.sessionId===session.id&&this.autoTurns.delete(run.id)) {
+          this.running.get(run.id)?.finishTurn(event.data.reason.kind==='completed');
+        }
       }
       // Queue/steer must not look like takeover. Only a human user/message that
       // starts a new turn while no automatic turn is running marks intervention.
@@ -99,7 +101,7 @@ export class DshExecution {
         const previous=this.store.heldRuns().find(run=>run.sessionId===session.id&&run.finishedAt===null);
         if(previous&&this.autoTurns.has(previous.id))return;
         const changed=this.store.nativeIntervention(session.id,event.data.id);
-        if(changed&&previous)this.running.get(previous.id)?.release();
+        if(changed&&previous){this.running.get(previous.id)?.release();this.running.delete(previous.id);}
       }
     });
     // A process restart cannot infer absence of an external effect from an idle fresh Agent.
@@ -107,6 +109,9 @@ export class DshExecution {
   }
   private assertQuiet(agent:Agent):void {
     if(agent.status!=='idle'||agent.inbox.nextTurn.length||agent.inbox.nextStep.length)throw new AppError('session-busy','任务会话有活动或待处理输入，请先在原生会话核对。');
+    this.assertExternalQuiet(agent);
+  }
+  private assertExternalQuiet(agent:Agent):void {
     if(this.ctx.jobs.list(agent.id).some(job=>job.owner===agent.id&&['running','stopping'].includes(job.status)))throw new AppError('job-active','后台工作尚未停止，不能开始或确认执行结束。');
     if(this.ctx.agents.list().some(child=>this.ctx.agents.isOwnedBy(child.id,agent)))throw new AppError('child-active','会话仍有子 Agent，需要先核对。');
   }
@@ -170,11 +175,25 @@ export class DshExecution {
       return next();
     });
     let released=false;const release=()=>{if(released)return;released=true;clearTimeout(deadline);releaseStatus();releaseBudget();releaseGuard();releaseMask();};
-    // DSH publishes idle after the aborted driver converges, before it can wake
-    // queued human work. whenIdle() can follow that new driver, so it is too late
-    // to release an interrupted Run's restrictions for a native handoff.
+    // A driver may start the queued human turn without an idle transition.
+    // Finalize at our own turn/end, after its tools have returned, checking
+    // external work separately. whenIdle() is only the no-turn/failure fallback.
+    let finalized=false;
+    const finishTurn=(completed:boolean)=>{
+      if(finalized||this.disposed)return;
+      finalized=true;this.autoTurns.delete(run.id);
+      try {
+        this.assertExternalQuiet(agent);
+        if(this.store.getRun(run.id).state==='cancelling')this.store.settleCancelled(run.id);
+        else if(this.store.getRun(run.id).finishedAt===null) {
+          if(!completed)throw new AppError('turn-incomplete','自动轮次未正常结束，请核对原生会话、文件和后台活动。');
+          this.store.settleRun(run.id);
+        }
+      }catch(error){this.store.runRecovery(run.id,error instanceof AppError?error.message:'执行状态待核对，请打开原生会话检查。');}
+      finally{release();this.running.delete(run.id);}
+    };
     const releaseStatus=agent.ctx.on('agent/status',({status})=>{
-      if(status==='idle'&&this.store.getRun(run.id).finishedAt!==null&&this.store.getTask(taskId).controlMode==='manual'){release();this.running.delete(run.id);}
+      if(status==='idle')finishTurn(true);
     });
     try {
       if(!this.store.claimDispatch(run.id)){release();this.store.runRecovery(run.id,'投递记录已经发出，但回执不完整。没有重复投递，请核对原生会话。');return this.store.getRun(run.id);}
@@ -183,11 +202,10 @@ export class DshExecution {
       this.store.inputEnqueued(run.id);
       if(!fullAccessEnabled(this.options)){deadline=setTimeout(()=>{void this.stopForBudget(run.id,'time');},10*60*1000);deadline.unref();}
       const done=agent.whenIdle().then(()=>{
-        if(this.disposed)return;
-        this.assertQuiet(agent);
-        if(this.store.getRun(run.id).state==='cancelling')this.store.settleCancelled(run.id);else this.store.settleRun(run.id);
-      }).catch(error=>{if(!this.disposed)this.store.runRecovery(run.id,error instanceof AppError?error.message:'执行状态待核对，请打开原生会话检查。');}).finally(()=>{clearTimeout(deadline);release();this.running.delete(run.id);});
-      this.running.set(run.id,{agent,release,done});
+        if(this.disposed||finalized)return;
+        this.assertQuiet(agent);finishTurn(true);
+      }).catch(error=>{if(!this.disposed&&!finalized)this.store.runRecovery(run.id,error instanceof AppError?error.message:'执行状态待核对，请打开原生会话检查。');}).finally(()=>{this.autoTurns.delete(run.id);release();this.running.delete(run.id);});
+      this.running.set(run.id,{agent,release,done,finishTurn});
       return this.store.getRun(run.id);
     }catch(error){
       // A throw may happen AFTER the inbox accepted the message. Keep the mask until idle.
@@ -196,7 +214,7 @@ export class DshExecution {
         if(input.messageId)agent.inbox.remove(input.messageId as UserMessage['id']);
         agent.cancel({kind:'user'},{keepInbox:true});
         const done=agent.whenIdle().catch(()=>{}).finally(()=>{release();this.running.delete(run.id);});
-        this.running.set(run.id,{agent,release,done});
+        this.running.set(run.id,{agent,release,done,finishTurn});
       }
       throw error;
     }
