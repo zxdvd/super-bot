@@ -182,7 +182,7 @@ export function useWorkspace({ api, initialBotId, initialLink, sessionId, mirror
         if (owner?.id !== botId) throw new Error('当前对话归属已改变，请重新打开 Bot 的工作视图。');
       }
       const scoped = sessionId && ['task.dispatch', 'attention.respond', 'result.accept', 'result.reject',
-        'run.recover', 'run.recover-and-continue'].includes(action);
+        'run.recover', 'run.recover-and-continue', 'manager.notification.resolve'].includes(action);
       const result = await api.call<T>(action, scoped ? { ...payload, sessionId } : payload);
       if (!current()) return false;
       done?.(result); setRefresh(n => n + 1); return true;
@@ -198,8 +198,8 @@ export function useWorkspace({ api, initialBotId, initialLink, sessionId, mirror
     preferredBot.current = id; rememberBot(id); setBotId(id); setManagerInfo(undefined); setPage(undefined);
     deselect(); setOffset(0); setFilter(''); setQuery(''); setForm(null);
   }
-  /** Opens one task; list and filter changes use resetView instead. */
-  const select = (id: string) => { deselect(); setSelected(id); setForm(null); setError(''); };
+  /** Opens one task or an exact result; list and filter changes use resetView instead. */
+  const select = (id: string, target?: WorkLink) => { deselect(); setSelected(id); setLink(target); setForm(null); setError(''); };
   const resetView = (next: { filter?: string; query?: string; offset?: number }) => {
     if (next.filter !== undefined) setFilter(next.filter);
     if (next.query !== undefined) setQuery(next.query);

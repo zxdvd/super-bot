@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { mkdirSync, mkdtempSync, realpathSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
 import { test, type TestContext } from 'node:test';
 import { Context } from '@deepseek-ai/cordis';
 import { AgentModel, modelSelectionProjectionDefinition as selection } from '@deepseek-ai/dsh-agent';
@@ -31,6 +32,7 @@ function fixture(t: TestContext) {
   const logs = new Map<string, Session>(), agents = new Map<string, ReturnType<typeof mockAgent>>();
   const effects: Array<() => void | Promise<void>> = [], listeners = new Map<string, Function[]>();
   const tools = new Map<string, { execute: Function }>();
+  const migrationHints = new Set<string>();
   let resolves = 0;
   let reads = 0;
   function makeSession(id: string) {
@@ -89,7 +91,17 @@ function fixture(t: TestContext) {
     jobs: { list: () => [] },
     permissionPresets: { set: () => {} },
     workingDirectory: { get: (session: Session) => agents.get(session.id)?.cwd },
-    sessionController: { resolveAgent(id: string) { resolves++; return agents.has(id) ? { agent: agents.get(id) } : { error: 'cold' }; } },
+    sessionController: {
+      resolveAgent(id: string) { resolves++; return agents.has(id) ? { agent: agents.get(id) } : { error: 'cold' }; },
+      async projections({ sessionId }: { sessionId: string }) {
+        const session = logs.get(sessionId);
+        if (!session) return null;
+        const { lastUsed, pending } = pick(session);
+        const values = { modelSelection: { lastUsed, next: pending ?? lastUsed } };
+        return migrationHints.has(sessionId) ? { kind: 'migration-required', values }
+          : { kind: 'sequenced', asOfSeq: session.seq - 1, values };
+      },
+    },
     sessionProjections: { snapshot(session: Session) { const { lastUsed, pending } = pick(session); return { values: { modelSelection: { lastUsed, next: pending ?? lastUsed } } }; } },
     sessionPersistence: { async open(id: string, access: string) {
       assert.equal(access, 'read');
@@ -153,7 +165,8 @@ function fixture(t: TestContext) {
     seed.settleRun(run.id);
     if (continueTask) seed.respondAttention(`answer-${run.id}`, `run:${run.id}`, seed.getTask(scope.task.id).rowVersion, 'Synthetic answer');
   }
-  return { a, b, seed, logs, agents, mount, call, mockAgent, begin, enter, end, resolveCount: () => resolves, readCount: () => reads,
+  return { a, b, seed, logs, agents, mount, close, call, mockAgent, begin, enter, end, migrationHints,
+    resolveCount: () => resolves, readCount: () => reads,
     manage: (callId: string, scope: typeof a, args: Record<string, unknown>, agent?: ReturnType<typeof mockAgent>) => {
       return tools.get('super_bot_manage')!.execute(args, { callId, agent: agent ?? { id: scope.chat.id }, signal: new AbortController().signal });
     } };
@@ -167,7 +180,7 @@ function reply(session: Session, turn: number, step: number, model = sol as type
     content: [{ type: 'text', text: 'synthetic model output' }] }) }, { surfaceOp: 'append' }).seq;
 }
 
-test('task detail binds each historical model to its own native step and then-effective header across reload', async t => {
+test('detail polls keep the preview lightweight and expanded history binds each Run across reload', async t => {
   const f = fixture(t), { a, b } = f;
   const first = f.begin(a, 'a1'); f.enter(a, first, 1);
   const inheritedHeader = header(a.worker, sol, 'initial'); reply(a.worker, 1, 1);
@@ -189,28 +202,48 @@ test('task detail binds each historical model to its own native step and then-ef
 
   await f.mount();
   const aDetail = (await f.call('task.detail')).value;
-  const bDetail = (await f.call('task.detail', b)).value;
-  assert.equal(aDetail.model.current.reasoningEffort, 'medium');
-  assert.deepEqual(aDetail.model.runs.map((run: { runId: string }) => run.runId), [second.run.id, first.run.id]);
-  const [secondFacts, firstFacts] = aDetail.model.runs;
+  assert.deepEqual(aDetail.model, { current: medium, expected: { ...medium, source: 'native-selection' } });
+  assert.equal((await f.call('task.detail', b)).value.model.current.reasoningEffort, 'medium');
+  assert.deepEqual((await f.call('task.detail')).value.model, aDetail.model);
+  assert.equal(f.readCount(), 0, 'detail must use the native projection, not the history reader');
+  assert.equal((await f.call('task.model-history', b, { sessionId: a.chat.id })).error.code, 'not-found');
+  assert.equal((await f.call('task.model-history', a, { sessionId: a.worker.id })).error.code, 'not-found');
+  assert.equal((await f.call('task.model-history', a, { sessionId: 'ordinary-native-session' })).error.code, 'not-found');
+  assert.equal((await f.call('task.model-history', a, { owner: 'desktop' })).error.code, 'invalid-input');
+  assert.equal((await f.call('task.model-history', a, { runId: isolated.run.id })).error.code, 'invalid-input');
+  assert.equal(f.readCount(), 0, 'out-of-scope queries must not read native events');
+  const aHistory = (await f.call('task.model-history')).value;
+  const bHistory = (await f.call('task.model-history', b)).value;
+  assert.equal(aHistory.taskId, a.task.id);
+  assert.deepEqual(aHistory.runs.map((run: { runId: string }) => run.runId), [second.run.id, first.run.id]);
+  assert.deepEqual(aHistory.runs.map((run: { sessionId: string }) => run.sessionId), [a.worker.id, a.worker.id]);
+  assert.equal(f.readCount(), 2, 'each explicitly queried session is read once');
+  const [secondFacts, firstFacts] = aHistory.runs;
   assert.deepEqual(secondFacts.actual.map((call: any) => [call.turn, call.step, call.provider, call.model, call.reasoningEffort, call.headerSeq]),
     [[2, 1, sol.provider, sol.model, 'xhigh', inheritedHeader], [2, 2, otherModel.provider, otherModel.model, null, changedHeader]]);
   assert.equal(secondFacts.actual[0].eventSeq, replyWithoutHeader);
   assert.equal(firstFacts.actual[0].reasoningEffort, 'xhigh');
-  assert.deepEqual(bDetail.model.runs[0].actual, []);
-  assert.equal(bDetail.model.runs[1].actual[0].reasoningEffort, 'medium');
-  assert.equal(bDetail.model.runs[1].actual[0].headerSeq, bHeader);
+  assert.deepEqual(bHistory.runs[0].actual, []);
+  assert.equal(bHistory.runs[1].actual[0].reasoningEffort, 'medium');
+  assert.equal(bHistory.runs[1].actual[0].headerSeq, bHeader);
   assert.equal((await f.call('task.detail', b, { sessionId: a.chat.id })).error.code, 'not-found');
 
   await f.mount({ workerModel: { ...otherModel, reasoningEffort: ReasoningEffortId('high') } });
   const reloaded = (await f.call('task.detail')).value;
   assert.deepEqual(reloaded.model.current, aDetail.model.current);
-  assert.deepEqual(reloaded.model.runs, aDetail.model.runs);
   assert.equal(reloaded.model.expected.source, 'role-override');
   assert.equal(reloaded.model.expected.reasoningEffort, 'high');
   assert.deepEqual((await f.call('task.detail')).value.model, reloaded.model);
-  assert.equal(f.resolveCount(), 0, 'polling/reload must not resolve either cold native session');
-  assert.ok(f.readCount() > 0);
+  assert.equal(f.readCount(), 2);
+  assert.deepEqual((await f.call('task.model-history')).value, aHistory);
+  await f.close();
+  const ledger = new DatabaseSync(join(a.cwd, '..', 'ledger.sqlite'), { readOnly: true });
+  try {
+    const count = ledger.prepare('SELECT count(*) AS total FROM runs WHERE taskId = ?');
+    assert.equal(count.get(a.task.id)?.total, 2);
+    assert.equal(count.get(b.task.id)?.total, 2);
+  } finally { ledger.close(); }
+  assert.equal(f.resolveCount(), 0, 'polling and explicit history must not resolve either cold native session');
 });
 
 test('chat previews model provenance before dispatch and snapshots the chosen route on the actual Run', async t => {
@@ -224,7 +257,7 @@ test('chat previews model provenance before dispatch and snapshots the chosen ro
     f.manage(id, scope, { action: 'model-preview', taskId }, scope === a ? manager : other);
   assert.deepEqual(await preview(a, 'unselected'), { current: null, expected: null });
   await assert.rejects(preview(a, 'cross-bot', b.task.id), { code: 'manager-scope' });
-  assert.equal((await f.call('task.detail')).value.model.runs.length, 0);
+  assert.deepEqual((await f.call('task.model-history')).value, { taskId: a.task.id, runs: [] });
   assert.equal(f.resolveCount(), 0);
   const native = await preview(b, 'native-choice');
   assert.deepEqual(native.expected, { ...otherModel, reasoningEffort: 'low', source: 'native-selection' });
@@ -241,7 +274,9 @@ test('chat previews model provenance before dispatch and snapshots the chosen ro
   worker.model.select(otherModel);
   const detail = (await f.call('task.detail')).value;
   assert.deepEqual(detail.model.current, { ...otherModel, reasoningEffort: null });
-  assert.deepEqual(detail.model.runs[0], { runId: run.id, sessionId: a.worker.id, createdAt: run.createdAt, expected: planned, actual: [] });
+  assert.deepEqual((await f.call('task.model-history')).value.runs[0], {
+    runId: run.id, sessionId: a.worker.id, createdAt: run.createdAt, expected: planned, actual: [],
+  });
   assert.deepEqual((await f.manage('dispatch', a, args, manager)).expectedModel, planned);
   assert.equal(worker.delivered.length, 1);
 
@@ -249,7 +284,7 @@ test('chat previews model provenance before dispatch and snapshots the chosen ro
   assert.deepEqual(await preview(a, 'role'), {
     current: { ...otherModel, reasoningEffort: null }, expected: { ...medium, source: 'role-override' },
   });
-  assert.deepEqual((await f.call('task.detail')).value.model.runs[0].expected, planned);
+  assert.deepEqual((await f.call('task.model-history')).value.runs[0].expected, planned);
 });
 
 test('a bare header and an error-only attempt do not prove a request, and a later native turn cannot fill the gap', async t => {
@@ -264,9 +299,11 @@ test('a bare header and an error-only attempt do not prove a request, and a late
   reply(a.worker, 2, 1); a.worker.append('step/end', { turn: 2, step: 1 });
   a.worker.append('turn/end', { turn: 2, reason: { kind: 'completed' } });
   await f.mount({ workerModel: medium });
+  f.migrationHints.add(a.worker.id);
   const { model } = (await f.call('task.detail')).value;
-  assert.deepEqual(model.runs[0].actual, []);
-  assert.equal(model.expected.reasoningEffort, 'medium');
+  assert.deepEqual(model, { current: null, expected: { ...medium, source: 'role-override' } });
+  assert.equal(f.readCount(), 0, 'a migration hint cannot trigger raw history as a fallback');
+  assert.deepEqual((await f.call('task.model-history')).value.runs[0].actual, []);
   assert.equal(f.resolveCount(), 0);
 });
 
@@ -286,9 +323,9 @@ test('legacy Runs bind only exact native inputs and preserve output-bearing retr
   b.worker.append('step/end', { turn: 1, step: 1 }); b.worker.append('turn/end', { turn: 1, reason: error });
   f.seed.runRecovery(failed.run.id, 'Failed before entering input', false);
   await f.mount({ workerModel: medium });
-  const actual = (await f.call('task.detail')).value.model.runs[0].actual;
+  const actual = (await f.call('task.model-history')).value.runs[0].actual;
   assert.deepEqual(actual.map((call: any) => [call.evidence, call.model, call.reasoningEffort, call.headerSeq]),
     [['assistant/attempt', sol.model, 'xhigh', retryHeader], ['assistant/message', otherModel.model, null, null]]);
   assert.equal(actual[0].eventSeq, attemptSeq);
-  assert.deepEqual((await f.call('task.detail', b)).value.model.runs[0].actual, []);
+  assert.deepEqual((await f.call('task.model-history', b)).value.runs[0].actual, []);
 });

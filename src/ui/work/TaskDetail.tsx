@@ -1,5 +1,5 @@
 /** One task in a drawer: header with the one main action, open questions, result, workdir, definition, session and audit. */
-import type { Attention, ReloadReceipt } from '../../model.ts';
+import type { Attention } from '../../model.ts';
 import { ownerLabel, type MirrorDetail, type MirrorEvent, type ResultRecord } from '../../mirror.ts';
 import { useEffect, useRef } from 'react';
 import { workUrl, type WorkLink } from '../../work-links.ts';
@@ -9,7 +9,8 @@ import { ReplyForm, TaskForm } from './forms.tsx';
 import { ChildWaitHistory, CurrentChildWaits } from './ChildWaits.tsx';
 import { ModelHistory, ModelPreview } from './ModelDetails.tsx';
 import { RecoveryPanel } from './RecoveryPanel.tsx';
-import { deliveryLabels, ResultCard, ResultReport } from './ResultCard.tsx';
+import { ResultCard, ResultFiles, ResultLoadReceipt, ResultReport } from './ResultCard.tsx';
+import { deliveryLabels, ResultDeliveryCheck } from './SystemIssues.tsx';
 import { SessionControls } from './SessionControls.tsx';
 import type { Detail } from './types.ts';
 import type { WorkspaceState } from './useWorkspace.ts';
@@ -162,20 +163,25 @@ export function LinkedTaskContent({ w, detail, link, close, onReturn }: {
         : <p role="status">{current?.state === 'resolved' ? '这个问题已回答。' : '这个问题链接已失效或不属于此任务。'}</p>}
     </>;
   }
-  const belongs = task.id === link.taskId && detail.linkedResultBelongs === true;
-  const current = belongs && result?.id === link.resultId;
-  const newer = belongs && result && !current ? result : undefined;
+  const linked = detail.linkedResult?.id === link.resultId && detail.linkedResult.taskId === link.taskId
+    && task.id === link.taskId ? detail.linkedResult : undefined;
+  const current = !!linked && result?.id === linked.id;
+  const newer = linked && result && !current ? result : undefined;
   return <>
     <TaskDetailHeader w={w} detail={detail} close={close} controls={current && task.lifecycle === 'review'} onReturn={onReturn}/>
-    {current ? <ResultCard w={w} detail={detail}/> : !belongs ? <p role="status">这个成果链接无效或不属于此任务。</p>
-      : newer ? <div className="attention-box result">
-        <p role="status">这份成果已被新版替代。</p>
-        {['review', 'completed'].includes(task.lifecycle)
-          ? <a href={workUrl({ kind: 'result', taskId: task.id, resultId: newer.id })}>查看新版成果</a>
-          : <p>新版仍在处理中，请等 Bot 交付。</p>}
-      </div> : <p role="status">这份成果当前不可验收。若任务正在返工，请等新版交付。</p>}
+    {current ? <ResultCard w={w} detail={detail} onReturn={onReturn}/> : linked ? <div className="attention-box result">
+      <h3>历史成果 · 只读</h3>
+      <p role="status">{newer ? '这份成果已被新版替代。' : '这份成果当前不可验收。'}</p>
+      <p className="clamp">{linked.summary}</p>
+      <ResultReport summary={linked.summary} checks={linked.checks}/>
+      <ResultFiles result={linked} sessionId={w.sessionId}/>
+      {newer && ['review', 'completed'].includes(task.lifecycle)
+        && <a href={workUrl({ kind: 'result', taskId: task.id, resultId: newer.id })}>查看新版成果</a>}
+      <ResultDeliveryCheck w={w} result={linked} status={detail.linkedChatDelivery} onReturn={onReturn} historical/>
+    </div> : <p role="status">这个成果链接无效或不属于此任务。</p>}
     {current && <Progress detail={detail}/>}
-    {current && detail.model && <ModelHistory model={detail.model} runId={result.runId}/>}
+    {current && detail.model && <ModelHistory key={`${w.sessionId}:${task.id}:${result.runId}`} api={w.api}
+      sessionId={w.sessionId} taskId={task.id} runId={result.runId}/>}
     {current && <ChildWaitHistory detail={detail} api={w.api} runId={result.runId}/>}
   </>;
 }
@@ -183,17 +189,9 @@ export function LinkedTaskContent({ w, detail, link, close, onReturn }: {
 const runLabels: Record<string, string> = {
   queued: '待投递', running: '执行中', settled: '已收敛', failed: '失败', cancelling: '正在停止', cancelled: '已取消', interrupted: '中断',
 };
-function ReloadFact({ receipt }: { receipt: Pick<ReloadReceipt, 'at' | 'build'> & Partial<ReloadReceipt> }) {
-  return <details className="advanced"><summary>关联构建已热载 · {time(receipt.at)} · 原生重载回执</summary>
-    <p className="wrap">构建 {receipt.build}</p>
-    {receipt.from && <p className="wrap">宿主 PID {receipt.pid} · 实例 {receipt.from} → {receipt.to}</p>}
-  </details>;
-}
-
 function Progress({ detail }: { detail: Detail | MirrorDetail }) {
   const { task, run, result } = detail, progress = detail.progress;
-  const reloadEligible = 'reloadEligible' in detail && detail.reloadEligible;
-  if (!run && !progress?.worker && !reloadEligible) return null;
+  if (!run && !progress?.worker) return null;
   const currentRun = progress && progress.runId !== run?.id ? null : run;
   const events: MirrorEvent[] = detail.events;
   const legacy = !progress ? events.find(e => e.report?.kind === 'progress' && e.report.runId === run?.id) : undefined;
@@ -213,9 +211,6 @@ function Progress({ detail }: { detail: Detail | MirrorDetail }) {
         ? `${accepted.actor === 'user' ? '用户' : 'Bot'}接受 ${time(accepted.at)}`
         : task.lifecycle === 'review' ? '待验收' : '暂无验收记录'}</dd></>}
     </dl>}
-    {progress?.reload ? <ReloadFact receipt={progress.reload}/>
-      : reloadEligible && <p className="muted">宿主热载 · 暂无可归属此成果的回执。</p>}
-    {reloadEligible && result && <p className="muted wrap">成果 ID {result.id}</p>}
   </Section>;
 }
 
@@ -249,6 +244,8 @@ function MirrorTaskContent({ w, detail, owner, close }: {
       <h3>{task.lifecycle === 'review' ? '成果 · 待来源端验收' : task.lifecycle === 'completed' ? '成果 · 已接受' : '成果记录'}</h3>
       {chatDelivery && <p className="muted">{deliveryLabels[chatDelivery]}</p>}
       <MirrorResult result={result}/>
+      {detail.progress?.reload && <ResultLoadReceipt host={`创建端 ${ownerLabel[owner]}`} resultId={result.id}
+        receipt={detail.progress.reload}/>}
     </div>}
     <Definition w={w} detail={detail}/>
     {(history.length > 0 || records.reviews.length > 0) && <details className="advanced"><summary>历史成果与验收记录</summary>
@@ -299,9 +296,10 @@ export function TaskDrawer({ w, compact, onReturn }: { w: WorkspaceState; compac
         <Attentions w={w} detail={detail}/>
         <CurrentChildWaits detail={detail} api={w.api} online={w.online}/>
         <Progress detail={detail}/>
-        <ResultCard w={w} detail={detail}/>
+        <ResultCard w={w} detail={detail} onReturn={onReturn}/>
         <ChildWaitHistory detail={detail} api={w.api}/>
-        {detail.model && <ModelHistory model={detail.model}/>}
+        {detail.model && detail.run && <ModelHistory key={`${w.sessionId}:${detail.task.id}:${detail.run.id}`} api={w.api}
+          sessionId={w.sessionId} taskId={detail.task.id} runId={detail.run.id}/>}
         <WorkdirCard w={w} detail={detail}/>
         {w.form === 'edit' ? <TaskForm key={detail.task.id} task={detail.task} busy={w.locked} cancel={() => w.setForm(null)}
           submit={data => w.mutate('task.revise', { ...data, id: detail.task.id }, () => w.setForm(null))}/>

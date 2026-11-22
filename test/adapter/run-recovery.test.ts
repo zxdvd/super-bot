@@ -9,6 +9,7 @@ import type {Context} from '@deepseek-ai/cordis';
 import {Store} from '../../src/store.ts';
 import {DshExecution} from '../../src/dsh.ts';
 import {verifyRunTurn,type RunEvent} from '../../src/run-proof.ts';
+import schemaVersion from '../../schema-version.json' with {type:'json'};
 
 function attempt(store:Store) {
   const bot=store.createBot('bot',{name:'Crash proof',instructions:'Synthetic only'});
@@ -116,7 +117,7 @@ test('schema 8 migration preserves old runs and locks without inventing turn evi
   try {
     const f=attempt(store);store.close();
     const old=new DatabaseSync(path);old.exec('DROP TABLE run_turns; PRAGMA user_version=8;');old.close();
-    store=new Store(path);assert.equal(store.db.prepare('PRAGMA user_version').get()?.user_version,9);assert.equal(store.runTurn(f.run.id),null);
+    store=new Store(path);assert.equal(store.db.prepare('PRAGMA user_version').get()?.user_version,schemaVersion);assert.equal(store.runTurn(f.run.id),null);
     const a=adapter(store,f.events,f.run.sessionId);await a.execution.whenReconciled();await a.execution.dispose();
     assert.equal(a.reads(),0);assert.equal(store.getRun(f.run.id).state,'interrupted');assert.equal(store.heldRuns().length,1);
   }finally{store.close();rmSync(dir,{recursive:true,force:true});}

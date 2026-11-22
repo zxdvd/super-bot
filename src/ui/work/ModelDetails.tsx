@@ -1,5 +1,6 @@
-import type { ModelRoute, RunModels, TaskModels, WorkerModelPlan } from '../../model.ts';
-import { Section } from '../kit.tsx';
+import { useEffect, useState } from 'react';
+import type { ModelRoute, RunModels, TaskModelHistory, WorkerModelPlan, WorkerModelPreview } from '../../model.ts';
+import type { WorkspaceApi } from './api.ts';
 import { time } from './format.ts';
 
 const sourceLabels: Record<WorkerModelPlan['source'], string> = {
@@ -17,7 +18,7 @@ function expected(plan: WorkerModelPlan | null) {
 }
 
 export function ModelPreview({ model, showExpected, canStartManually }: {
-  model: TaskModels; showExpected: boolean; canStartManually: boolean;
+  model: WorkerModelPreview; showExpected: boolean; canStartManually: boolean;
 }) {
   return <dl className="full-text">
     {showExpected && <><dt>下次派发预计 Worker 模型</dt><dd>{expected(model.expected)}</dd></>}
@@ -46,14 +47,42 @@ function RunModelEvidence({ run, title }: { run: RunModels; title: string }) {
   </div>;
 }
 
-export function ModelHistory({ model, runId }: { model: TaskModels; runId?: string }) {
-  const first = runId ? model.runs.find(run => run.runId === runId) : model.runs[0];
-  if (!first) return null;
+type HistoryScope = { api: WorkspaceApi; taskId: string; sessionId?: string };
+
+export function loadModelHistory({ api, taskId, sessionId }: HistoryScope, receive: (history: TaskModelHistory | null) => void) {
+  const controller = new AbortController(), { signal } = controller;
+  const nativeSession = api.currentSession?.();
+  const current = () => !signal.aborted && nativeSession === api.currentSession?.();
+  if (sessionId && nativeSession !== sessionId) { receive(null); return; }
+  const unsubscribe = api.watchCurrentSession?.(() => {
+    if (signal.aborted) return;
+    controller.abort(); receive(null);
+  });
+  void api.call<TaskModelHistory>('task.model-history', { id: taskId, ...(sessionId ? { sessionId } : {}) }, signal)
+    .then(history => { if (current()) receive(history.taskId === taskId ? history : null); })
+    .catch(() => { if (current()) receive(null); });
+  return () => { controller.abort(); unsubscribe?.(); };
+}
+
+function ExpandedModelHistory({ api, taskId, sessionId, runId }: HistoryScope & { runId: string }) {
+  const [model, setModel] = useState<TaskModelHistory | null>();
+  useEffect(() => loadModelHistory({ api, taskId, sessionId }, setModel), [api, taskId, sessionId]);
+  if (model === undefined) return <p role="status">正在读取执行模型…</p>;
+  const first = model?.runs.find(run => run.runId === runId);
+  if (!model || !first) return <p role="status">执行模型未知。可收起后重新读取。</p>;
   const history = model.runs.filter(run => run.runId !== first.runId);
-  return <Section title="执行模型">
+  return <>
     <RunModelEvidence run={first} title="本轮实际模型"/>
     {history.length > 0 && <details className="advanced"><summary>其他 Run（{history.length}）</summary>
       {history.map(run => <RunModelEvidence key={run.runId} run={run} title={`${time(run.createdAt)} · 实际模型`}/>)}
     </details>}
-  </Section>;
+  </>;
+}
+
+export function ModelHistory(props: HistoryScope & { runId: string }) {
+  const [expanded, setExpanded] = useState(false);
+  return <details className="advanced" onToggle={event => setExpanded(event.currentTarget.open)}>
+    <summary>执行模型</summary>
+    {expanded && <ExpandedModelHistory {...props}/>}
+  </details>;
 }

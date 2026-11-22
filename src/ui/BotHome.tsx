@@ -90,7 +90,7 @@ export function BotHome({ api }: { api: WorkspaceApi }) {
     let controller: AbortController | undefined, revision = 0;
     const navigate = () => {
       controller?.abort(); controller = new AbortController(); const signal = controller.signal;
-      const link = workLinkForUrl(new URL(location.href), location.origin); if (!link) return;
+      const current = new URL(location.href), link = workLinkForUrl(current, current); if (!link) return;
       const navigation = api.beginNavigation(), opening = ++revision;
       setWork(null); setError('');
       readTaskLink(api, link.taskId, signal, navigation).then(task => {

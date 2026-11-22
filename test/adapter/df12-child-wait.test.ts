@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { test, type TestContext } from 'node:test';
@@ -56,9 +57,11 @@ async function fixture(t: TestContext, version: NativeVersion) {
   const parents = new Map<object, FakeAgent>();
   let wait: ReturnType<typeof deferred<boolean>> | undefined;
   let nativeService: object | undefined;
+  let afterEvidenceRead: (() => void) | undefined;
   function nativeWait(agent: Agent) {
     assert.equal(agent, worker);
     waitCalls++;
+    if (waitCalls === 2) afterEvidenceRead?.();
     return wait?.promise ?? Promise.resolve(false);
   }
   const tree = version === 'rc.1' ? { waitForChildren: nativeWait } : {
@@ -171,6 +174,11 @@ async function fixture(t: TestContext, version: NativeVersion) {
   const run = await api('task.dispatch', { requestId: 'dispatch', expectedRowVersion: initial.task.rowVersion });
   return {
     api, worker, other, run, startTurn, turnEnd, makeChild,
+    onEvidenceRead: (callback: () => void) => { afterEvidenceRead = callback; },
+    download: (resultId: string) => fetch(new Request(
+      `http://localhost/api/super-bot-file?resultId=${resultId}&index=0&sessionId=${manager.requestedSessionId}`),
+    connection.browserPeer),
+    file,
     injectWrongTurn(turn: number) {
       const spoof = Session.create(worker.id);
       emit('session/event', spoof, spoof.append('turn/start', { turn }));
@@ -191,6 +199,24 @@ async function fixture(t: TestContext, version: NativeVersion) {
     async reload() { await close(); await apply(ctx, { dataDir, fullAccess: true }); },
   };
 }
+
+test('ready downloads the exact bytes read before the final native quiet check', async t => {
+  const f = await fixture(t, 'rc.1');
+  const submitted = Buffer.from([0, 255, 128, 10]);
+  writeFileSync(f.file, submitted);
+  f.startTurn(1);
+  f.onEvidenceRead(() => writeFileSync(f.file, 'changed after validation'));
+  const { resultId } = await f.ready('ready-with-file-change');
+  assert.ok(resultId);
+  f.turnEnd(1);
+  const detail = await f.api('task.detail', { resultId });
+  assert.equal(detail.linkedResult.evidence[0].bytes, submitted.length);
+  assert.equal(detail.linkedResult.evidence[0].sha256, createHash('sha256').update(submitted).digest('hex'));
+  assert.equal(detail.linkedResult.humanAcceptedAt, null);
+  const response = await f.download(resultId);
+  assert.equal(response.status, 200);
+  assert.deepEqual(Buffer.from(await response.arrayBuffer()), submitted);
+});
 
 for (const version of ['rc.1', 'rc.5'] as const) {
   test(`${version} registered ready exposes and retains a same-Run native wait through task.detail`, async t => {

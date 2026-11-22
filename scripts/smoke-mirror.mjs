@@ -46,10 +46,17 @@ await symlink(join(root, 'node_modules/marked'), join(bundle, 'node_modules/mark
 await copyFile(join(root, 'cordis.patch.yml'), join(bundle, 'cordis.patch.yml'));
 const commonBuild = { bundle: true, platform: 'node', format: 'esm', packages: 'external', absWorkingDir: root };
 await build({ ...commonBuild, entryPoints: ['test/host-probe.ts'], outfile: join(bundle, 'lib/probe.js') });
-const built = spawn(process.execPath, [join(root, 'scripts/build.mjs')], {
-  cwd: root, stdio: 'inherit', env: { ...process.env, SUPER_BOT_BUILD_OUTDIR: join(bundle, 'lib') },
-});
-assert.equal(await new Promise((resolve, reject) => { built.once('error', reject); built.once('exit', resolve); }), 0);
+const prebuilt = process.env.SUPER_BOT_TEST_BUILD_DIR;
+if (prebuilt) {
+  for (const name of ['index.js', 'index.js.map', 'client.js', 'client.js.map']) {
+    await copyFile(join(prebuilt, name), join(bundle, 'lib', name));
+  }
+} else {
+  const built = spawn(process.execPath, [join(root, 'scripts/build.mjs')], {
+    cwd: root, stdio: 'inherit', env: { ...process.env, SUPER_BOT_BUILD_OUTDIR: join(bundle, 'lib') },
+  });
+  assert.equal(await new Promise((resolve, reject) => { built.once('error', reject); built.once('exit', resolve); }), 0);
+}
 
 async function configure(role, options = {}) {
   const { profile, data } = roles[role];
@@ -101,7 +108,7 @@ async function launch(role, generation) {
   }, `${role} native ready`, 300);
   assert.equal(new URL(url).hostname, '127.0.0.1');
   const client = await authenticateHost(url);
-  return { ...client, pid: child.pid, logPath, injections: announcement?.injections };
+  return { ...client, launchUrl: url, pid: child.pid, logPath, injections: announcement?.injections };
 }
 
 async function stop(role, abrupt = false) {
@@ -149,7 +156,7 @@ async function makeBot(host, name) {
 
 const rolesUnderTest = ['web', 'desktop'];
 const owners = { web: 'desktop', desktop: 'web' };
-async function verifyClient(role, host) {
+async function verifyClient(role, host, candidate) {
   let boot;
   if (role === 'desktop') boot = host.injections.find(row => row.name === '__DSH_BOOT__')?.value;
   else {
@@ -166,7 +173,13 @@ async function verifyClient(role, host) {
   assert.equal(path.origin, host.base);
   const asset = await host.get(path.pathname + path.search);
   assert.equal(asset.status, 200);
-  assert.match(await asset.text(), /mirror\.catalog/);
+  const script = await asset.text();
+  assert.match(script, /mirror\.catalog/);
+  if (candidate) {
+    // DSH's single-resource combo appends a separator and rewrites the debug trailer.
+    const executable = text => text.replace(/\/\/# source(?:Mapping)?URL=[^\r\n]*(?:\r?\n)?$/, '').replace(/\n;\n$/, '\n');
+    assert.ok(executable(script) === executable(candidate), `${role} serves the candidate client executable`);
+  }
   return entry.rev;
 }
 const ledger = role => join(roles[role].data, 'ledger.sqlite');
@@ -267,6 +280,25 @@ async function restrictedTransport(role, taskId) {
 
 const files = {};
 try {
+  if (process.env.SUPER_BOT_TEST_RESULT_ATTACHMENTS === '1') {
+    assert.ok(prebuilt, 'Pass SUPER_BOT_TEST_BUILD_DIR from the isolated build');
+    const { smokeResultAttachments } = await import('./smoke-result-attachments.mjs');
+    await smokeResultAttachments({ root, base, bundle, ledger, configure, patch, launch, stop, rpc, call, makeBot, probe, wait, verifyClient });
+  } else if (process.env.SUPER_BOT_TEST_CHAT_LINKS === '1') {
+    const { smokeChatResultLinks } = await import('./smoke-chat-result-links.mjs');
+    await smokeChatResultLinks({ base, configure, launch, stop, rpc, call, makeBot, probe, wait });
+  } else await smokeMirror();
+} finally {
+  await Promise.all([...children.keys()].map(role => stop(role)));
+}
+
+async function smokeMirror() {
+  if (process.env.SUPER_BOT_TEST_BOT_MEMORY === '1') {
+    assert.ok(prebuilt, 'Pass SUPER_BOT_TEST_BUILD_DIR from the isolated build');
+    const { smokeBotMemory } = await import('./smoke-bot-memory.mjs');
+    const data = Object.fromEntries(rolesUnderTest.map(role => [role, roles[role].data]));
+    return smokeBotMemory({ base, bundle, data, configure, launch, rpc, call, makeBot, probe, wait, verifyClient });
+  }
   await Promise.all(rolesUnderTest.map(role => configure(role, { hmr: false })));
   const hosts = {}, oldBots = {}, oldTasks = {}, identities = {}, newBots = {}, work = {}, proof = {};
   for (const role of rolesUnderTest) {
@@ -345,7 +377,9 @@ try {
     assert.ok(evidenceFile.startsWith(`${base}/`));
     const original = await readFile(evidenceFile);
     await writeFile(evidenceFile, 'Synthetic changed bytes');
-    assert.equal((await local.get(filePath)).status, 409, 'original evidence route still checks the content hash');
+    const retained = await local.get(filePath);
+    assert.equal(retained.status, 200);
+    assert.deepEqual(Buffer.from(await retained.arrayBuffer()), original);
     assert.equal((await detail(remote, role, bot.id, task.id)).result.fileCount, 1);
     await writeFile(evidenceFile, original);
     const localBefore = await call(local, 'task.detail', { id: task.id });
@@ -482,6 +516,4 @@ try {
   files.desktop.previousPort = oldDesktopPort;
   await writeFile(join(base, 'proof.json'), JSON.stringify(files, null, 2));
   console.log(`PASS ${skipHmr ? '' : 'native HMR and '}exit/reconnect both ways; Desktop carrier ${oldDesktopPort} → ${files.desktop.reconnectPort}; proof ${base}/proof.json`);
-} finally {
-  await Promise.all([...children.keys()].map(role => stop(role)));
 }

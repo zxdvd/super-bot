@@ -4,9 +4,9 @@
 
 DSH 已提供 [Host HMR](https://github.com/deepseek-ai/deepseek-harness/blob/master/packages/boot/hmr/README.md) 和 [Client HMR](https://github.com/deepseek-ai/deepseek-harness/blob/master/packages/client/hmr/README.md)。本项目复用这些机制，不实现另一套插件加载器。
 
-DSH `0.2.2-rc.1` 要求 Node `>=24.9.0`，安装命令和运行中的宿主都必须满足。使用 fnm 时可执行 `fnm default 24.21.0`，并在当前终端执行 `fnm use 24.21.0`；新终端用 `node --version` 核对。更改默认版本不会替换已经启动的宿主进程：旧宿主需要等 Bot、Worker 空闲后正常退出，再用 Node 24 启动原 profile。只用 Node 24 执行 `dev:reload` 不能修复 Node 22 宿主的运行环境。
+DSH Web `0.2.2-rc.1` 和 `0.2.2-rc.5` 均要求 Node `>=24.9.0`。从用于构建和启动宿主的终端执行 `node --version`。用 fnm 时，可在当前终端执行 `fnm use 24.22.1`。已运行的旧 Node 宿主需要等 Bot、Worker 空闲后正常退出，再用兼容的 Node 版本启动原 profile。
 
-- `npm run dev`：独立 `.runtime/dsh-dev` home，`super-bot-dev` profile，本地 link、esbuild watch 和 Host HMR。默认端口 3081，可通过 `SUPER_BOT_PORT` 修改。
+- `npm run dev` 使用独立 `.runtime/dsh-dev` home 和 `super-bot-dev` profile，并在本工作目录的 `lib/` 持续写入构建。请在同一 `lib/` 未被其他宿主使用时运行。默认端口 3081，可通过 `SUPER_BOT_PORT` 修改。
 - `npm run dev:reload`（DF-09）先向已链接的活插件取得许可，再暂存构建。HTTP 请求只登记提交并写入该实例的私有触发文件。`hmr.watchConfig()` 把回调送入下一次原生 HMR 事务，由回调复核许可、发布产物并调用 `hmr.reconcileProfile(['super-bot'])`。`Applied` 回执需要旧实例清理完成，以及同进程新实例识别到本次构建标识。首次启用、等待和取消用法见 [本地开发预览](../README.md#本地开发预览)。
 - Web 默认 Host HMR 的 `root: []` 只监听配置；手动路径不自动监听后端源码。Client HMR 自动发现前端构建文件变化并发出 rebuilt 通知。
 - 正式发布仍使用带版本的 tgz；本地迭代不需要升版本或重新打包。共享框架/宿主依赖发生变化时，仍以 DSH 的 restart-required 诊断为准。

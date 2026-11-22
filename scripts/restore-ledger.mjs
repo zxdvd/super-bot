@@ -30,4 +30,4 @@ try {
   restored.exec('COMMIT');
 }finally{restored.close();}
 try{await copyFile(source+'.json',join(destination,'backup-manifest.json'),constants.COPYFILE_EXCL);}catch(error){if(error.code!=='ENOENT')throw error;}
-console.log(JSON.stringify({ok:true,dataDir:destination,...before,note:'账本已恢复到新目录；未完成任务全部暂停并标记待核对。先停止宿主，再把插件 dataDir 指向此目录。原账本/备份未改变；DSH 会话和成果文件需按清单保留。'},null,2));
+console.log(JSON.stringify({ok:true,dataDir:destination,...before,note:'账本已恢复到新目录；未完成任务全部暂停并标记待核对。先停止宿主，再把插件 dataDir 指向此目录。账本中已保存的成果附件随备份恢复。请另行保留 DSH 会话和没有附件副本的原文件。'},null,2));

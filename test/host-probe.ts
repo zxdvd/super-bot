@@ -88,7 +88,27 @@ class ProbeAdapter extends LlmAdapter {
         this.stalled.delete(options.sessionId);options.signal?.throwIfAborted();
       }
       let plan:Record<string,unknown>|null=null;
-      if(value?.task?.goal==='MANAGER_STEP_PROBE')plan={action:'detail',taskId:value.task.id};
+      const remember=text.match(/^请把「(.+)」保存为以后的默认工作约定。$/);
+      const delegate=text.match(/^请写一份合成说明 ([ABC])。(?:这一次请(.+))?$/);
+      const workConvention=text.match(/^请核对这项任务的实际工作约定：([a-f0-9-]+)$/);
+      const decision=text==='上次为什么选蓝色主题？'||text==='请查另一 Bot 的决策条目。';
+      const convention=text==='现在默认工作约定是什么？';
+      if(trigger?.source?.kind==='user'&&(remember||delegate||decision||convention||workConvention)) {
+        if(!prior) {
+          if(remember)plan={action:'memory-save-convention',text:remember[1]};
+          else if(delegate)plan={action:'create',goal:`MEMORY_WORK_${delegate[1]}`,...(delegate[2]?{conventionOverride:delegate[2]}:{})};
+          else if(workConvention)plan={action:'detail',taskId:workConvention[1]};
+          else plan={action:'memory-index'};
+        }else if(prior.action==='memory-index') {
+          const entry=convention?'work-convention.md':'decisions/theme.md';
+          if(value?.markdown?.includes(`](${entry})`)||text==='请查另一 Bot 的决策条目。')plan={action:'memory-read',entry};
+        }
+        if(!plan) {
+          const reply=value?.source?`${value.text}\n\n${value.source}`:JSON.stringify(value?.botContext?.workConvention??value??{});
+          yield {type:'block-start',index:0,blockType:'text'};yield {type:'text-delta',index:0,text:reply};
+          yield {type:'block-end',index:0,block:{type:'text',text:reply}};yield {type:'finish',reason:{kind:'stop'}};return;
+        }
+      }else if(value?.task?.goal==='MANAGER_STEP_PROBE')plan={action:'detail',taskId:value.task.id};
       else if(!prior) {
         const foreign=text.match(/CROSS_BOT:([^\s]+)/)?.[1];
         if(foreign)plan={action:'detail',taskId:foreign};
@@ -127,7 +147,8 @@ class ProbeAdapter extends LlmAdapter {
       const workerQuestion=value?.pendingQuestions?.[0];
       const clarification=value?.attentions?.find((a:any)=>a.kind==='input'&&a.state==='open'&&!a.id.startsWith('run:'));
       let reply='已核对当前状态。';
-      if(prior?.action==='deliver')reply='请查看上面的交付卡片。';
+      if(trigger?.source?.kind==='user'&&text.startsWith('CHAT_LINK_MARKDOWN:'))reply=text.slice('CHAT_LINK_MARKDOWN:'.length);
+      else if(prior?.action==='deliver')reply='请查看上面的交付卡片。';
       else if(detail?.delivery&&(prior?.action==='review'||text.startsWith('DF14_SHOW_RESULT:'))) {
         reply=`等待你确认。\n${detail.delivery.chatMarkdown}`;
       }else if(workerQuestion)reply=`${workerQuestion.question}\n${workerQuestion.markdown}`;
@@ -178,13 +199,15 @@ class ProbeAdapter extends LlmAdapter {
       const needsAnswer=body.includes('Goal: ASK_PROBE')&&!hasAnswer;
       const localCli=body.includes('Goal: LOCAL_CLI_PROBE');
       const progressProbe=body.includes('Goal: MIRROR_PROGRESS_PROBE');
+      const revisedReceipt=body.includes('Goal: DF14_RECEIPT_PROBE')&&body.includes('Additional user input (rework):');
       const reports=progressProbe?later.flatMap(m=>m.content.flatMap(b=>b.type==='tool-call'&&b.name==='super_bot_report'?[JSON.parse(b.arguments).kind]:[])):[];
       const planned=progressProbe&&!reports.includes('progress')?{name:'super_bot_report',args:{kind:'progress',summary:'MIRROR_NATIVE_PROGRESS'}}:
         localCli&&!calls.includes('bash')?{name:'bash',args:{description:"生成本机 Shell 合成检查结果",command:"printf 'LOCAL_CLI_OK\\n' > result.md"}}:body.includes('Goal: STEP_BUDGET_PROBE')?{name:'read',args:{file_path:join(cwd,'missing-budget-probe.txt')}}:approvalProbe&&calls.includes('write')&&!existsSync(file)&&!calls.includes('super_bot_report')?{name:'super_bot_report',args:{kind:'failed',summary:'审批路径结束，写入没有生成文件；请核对原生审批结果。'}}:
         needsAnswer&&!calls.includes('super_bot_report')?{name:'super_bot_report',args:{kind:'waiting',summary:'请说明文档面向谁？'}}:
-        !localCli&&!calls.includes('write')?{name:'write',args:{file_path:body.includes('Goal: RELATIVE_PATH_PROBE')?'result.md':file,content:'# 合成成果\n\n事实一：这份文档由隔离测试模型生成。\n事实二：测试没有访问网络或使用模型凭证。\n'+(body.includes('Additional user input (rework):')?'\n修订：已按返工要求补充说明。\n':'')+(body.includes('Goal: LARGE_RESULT_PROBE')?'\n'+'x'.repeat(16000):'')}}:
+        !localCli&&!calls.includes('write')?{name:'write',args:{file_path:body.includes('Goal: RELATIVE_PATH_PROBE')?'result.md':file,content:'# 合成成果\n\n事实一：这份文档由隔离测试模型生成。\n事实二：测试没有访问网络或使用模型凭证。\n'+(body.includes('Additional user input (rework):')?'\n修订：已按返工要求补充说明。\n':'')+(body.includes('Goal: LARGE_RESULT_PROBE')?'\n'+'x'.repeat(16000):'')+
+           (body.includes('Goal: MEMORY_WORK_A')?'\n蓝色主题便于区分合成环境。\n合成归档按季度组织。\n':'')}}:
         !calls.includes('read')?{name:'read',args:{file_path:file}}:
-        (progressProbe?!reports.includes('ready'):!calls.includes('super_bot_report'))?{name:'super_bot_report',args:{kind:'ready',summary:localCli?'已执行本机 Shell 并生成合成结果。':'已生成并回读两项事实的说明文件。',checks:localCli?'原生 bash 执行后已 read 回读 LOCAL_CLI_OK。':'result.md 包含标题和两项事实；已用原生 read 工具回读核对。',files:[file]}}:null;
+        (progressProbe?!reports.includes('ready'):!calls.includes('super_bot_report'))?{name:'super_bot_report',args:{kind:'ready',summary:localCli?'已执行本机 Shell 并生成合成结果。':revisedReceipt?'已提交合成说明的修订版。':'已生成并回读两项事实的说明文件。',checks:localCli?'原生 bash 执行后已 read 回读 LOCAL_CLI_OK。':revisedReceipt?'已回读修订版新增的结论。':'result.md 包含标题和两项事实；已用原生 read 工具回读核对。',files:[file]}}:null;
       if(planned) {
         const id=ToolCallId(randomUUID()),args=JSON.stringify(planned.args);
         yield {type:'block-start',index:0,blockType:'tool-call'};

@@ -3,10 +3,12 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import type { Context } from '@deepseek-ai/cordis';
 import type { ISidebarRight } from '@deepseek-ai/dsh-client-ui-sidebar-right/client';
-import type { Bot, ManagerBinding, Task } from '../../src/model.ts';
+import type { Bot, ManagerBinding, Task, TaskModelHistory } from '../../src/model.ts';
+import { loadModelHistory } from '../../src/ui/work/ModelDetails.tsx';
 import { Store } from '../../src/store.ts';
-import { parseWorkLink, workUrl, type WorkLink } from '../../src/work-links.ts';
+import { parseWorkLink, resultFileUrl, workUrl, type WorkLink } from '../../src/work-links.ts';
 import { LinkedTaskContent, TaskDetailHeader } from '../../src/ui/work/TaskDetail.tsx';
+import { ResultLoadReceipt, ResultReport } from '../../src/ui/work/ResultCard.tsx';
 import { SessionControls } from '../../src/ui/work/SessionControls.tsx';
 import { ReplyForm } from '../../src/ui/work/forms.tsx';
 import type { WorkspaceState } from '../../src/ui/work/useWorkspace.ts';
@@ -16,7 +18,7 @@ import { parseMirrorQuery } from '../../src/mirror-host.ts';
 import { readLocalMirror } from '../../src/mirror-queries.ts';
 import type { SessionOrigin } from '../../src/mirror.ts';
 import { resultHeading, workGroup, type WorkspaceApi } from '../../src/ui/Workspace.tsx';
-import { WORK_TAB, openBotConversation, openWorkLink, readSessionBot, readTaskLink, toggleSessionWork, watchSessionBot, watchSessionOrigin, workLinkForUrl, type SessionBotState } from '../../src/ui/work-navigation.ts';
+import { WORK_TAB, chatDeliveryLink, openBotConversation, openWorkLink, readSessionBot, readTaskLink, toggleSessionWork, watchSessionBot, watchSessionOrigin, workLinkForUrl, type SessionBotState } from '../../src/ui/work-navigation.ts';
 
 function fixture() {
   const store = new Store(':memory:');
@@ -43,6 +45,47 @@ function source(initial?: string) {
 function apiWith(call: WorkspaceApi['call'], opened: string[] = []): WorkspaceApi {
   return { call, openSession: id => { opened.push(id); }, beginNavigation: () => new AbortController().signal, openBot: async () => {} };
 }
+
+test('execution model history drops requests after task and native session switches', async () => {
+  const current = source('chat-a');
+  const requests: (ReturnType<typeof deferred<TaskModelHistory>> & { signal?: AbortSignal })[] = [];
+  const received: (TaskModelHistory | null)[] = [];
+  const api = apiWith(<T>(action: string, payload?: Record<string, unknown>, signal?: AbortSignal) => {
+    assert.equal(action, 'task.model-history');
+    assert.deepEqual(payload, { id: requests.length ? 'task-b' : 'task-a', sessionId: current.getSnapshot() });
+    const request = deferred<TaskModelHistory>();
+    requests.push({ ...request, signal });
+    return request.promise as Promise<T>;
+  });
+  api.currentSession = current.getSnapshot;
+  api.watchCurrentSession = current.subscribe;
+  const load = (taskId: string) => loadModelHistory({ api, taskId, sessionId: 'chat-a' }, value => received.push(value));
+  const a = load('task-a');
+  a?.(); // The previous drawer unmounts when selection changes.
+  const b = load('task-b');
+  requests[0]!.resolve({ taskId: 'task-a', runs: [] });
+  await flush();
+  assert.deepEqual(received, []);
+  assert.equal(requests[0]!.signal?.aborted, true);
+  current.select('chat-other');
+  current.select('chat-a');
+  requests[1]!.reject(new Error('late failure'));
+  await flush();
+  assert.deepEqual(received, [null]);
+  assert.equal(requests[1]!.signal?.aborted, true);
+  b?.();
+  const mismatched = load('task-b');
+  requests[2]!.resolve({ taskId: 'task-a', runs: [] });
+  await flush();
+  assert.equal(received.at(-1), null);
+  mismatched?.();
+  const active = load('task-b');
+  requests[3]!.resolve({ taskId: 'task-b', runs: [] });
+  await flush();
+  assert.deepEqual(received.at(-1), { taskId: 'task-b', runs: [] });
+  active?.();
+  assert.equal(current.listeners.size, 0);
+});
 
 test('work ownership is read-only and follows only current ready native Bot conversations', () => {
   const f = fixture(); try {
@@ -306,7 +349,7 @@ test('native work links use the current Bot tab, deduplicate repeated clicks, an
 test('work link parser preserves explicit identity and allows only same-origin root work URLs', () => {
   const taskId = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', resultId = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb';
   const question: WorkLink = { kind: 'question', taskId, attentionId: `run:${resultId}` };
-  const result: WorkLink = { kind: 'result', taskId, resultId }, origin = 'https://host.example';
+  const result: WorkLink = { kind: 'result', taskId, resultId }, origin = new URL('https://host.example');
   for (const link of [question, result, { kind: 'task', taskId }] as const) {
     assert.deepEqual(parseWorkLink(workUrl(link).slice(1)), link);
     assert.deepEqual(workLinkForUrl(new URL(workUrl(link), origin), origin), link);
@@ -318,6 +361,70 @@ test('work link parser preserves explicit identity and allows only same-origin r
   assert.equal(workLinkForUrl(new URL(`https://other.example${workUrl(result)}`), origin), undefined);
   assert.equal(workLinkForUrl(new URL(`/other${workUrl(result).slice(1)}`, origin), origin), undefined);
   assert.equal(workLinkForUrl(new URL(`/?resultId=${resultId}#super-bot-task=${taskId}`, origin), origin), undefined);
+});
+
+test('native delivery compatibility accepts exact loopback routes and rejects external or malformed lookalikes', () => {
+  const taskId = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', resultId = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb';
+  const origin = new URL('http://127.0.0.1:3201'), old = 'http://127.0.0.1:3200';
+  const work = { kind: 'result', taskId, resultId } as const;
+  const path = workUrl(work), file = `/api/super-bot-file?index=0&resultId=${resultId}`;
+  const parse = (url: string) => chatDeliveryLink(new URL(url), origin);
+  assert.deepEqual(parse(old + path), work);
+  assert.deepEqual(parse(origin.origin + path), work);
+  assert.deepEqual(parse(old + file), { kind: 'file', resultId, index: 0 });
+  for (const href of [`https://example.org${path}`, `http://localhost:3200${path}`, `http://user@127.0.0.1:3200${path}`,
+    `${old}${path}&resultId=${resultId}`, `${old}/?token=unexpected${path.slice(1)}`, `${old}${file}&index=1`,
+    `${old}${file.replace('index=0', 'index=9007199254740992')}`]) assert.equal(parse(href), 'blocked', href);
+  assert.equal(parse(old + workUrl({ kind: 'question', taskId, attentionId: `run:${resultId}` })), undefined);
+  assert.equal(parse('https://example.org/article'), undefined);
+
+  const desktop = new URL('dsh-app://app/');
+  assert.equal(desktop.origin, 'null', 'WHATWG URL alone does not identify the registered Desktop document');
+  assert.deepEqual(chatDeliveryLink(new URL(old + path), desktop), work);
+  assert.deepEqual(chatDeliveryLink(new URL(old + file), desktop), { kind: 'file', resultId, index: 0 });
+  assert.deepEqual(workLinkForUrl(new URL(path, desktop), desktop), work);
+  const question = { kind: 'question', taskId, attentionId: `run:${resultId}` } as const;
+  assert.deepEqual(workLinkForUrl(new URL(workUrl(question), desktop), desktop), question);
+  assert.equal(workLinkForUrl(new URL(path, 'dsh-app://shell/'), desktop), undefined);
+  assert.equal(chatDeliveryLink(new URL(old + path), new URL('dsh-app://shell/')), 'blocked');
+  assert.equal(chatDeliveryLink(new URL(file, 'app://other/'), desktop), 'blocked');
+  assert.equal(new URL(resultFileUrl(resultId, 0, 'session-example'), desktop).href,
+    `dsh-app://app/api/super-bot-file?resultId=${resultId}&index=0&sessionId=session-example`);
+});
+
+test('a Desktop chat link opens only after checking the exact result in its current native Bot conversation', async () => {
+  const f = fixture(), current = source(f.ma.requestedSessionId);
+  const result = { kind: 'result', taskId: f.ta.id, resultId: crypto.randomUUID() } as const;
+  const parsed = chatDeliveryLink(new URL(workUrl(result), 'http://127.0.0.1:3200'), new URL('dsh-app://app/'));
+  assert.deepEqual(parsed, result);
+  const detail = { task: f.ta, linkedResult: { id: result.resultId, taskId: f.ta.id } };
+  const openings: unknown[] = [], pending = deferred<typeof detail>();
+  const sidebar = { mounted: current, active: () => undefined, tabsIn: () => [],
+    openTab: (...args: unknown[]) => openings.push(args) } as unknown as Context['sidebarRight'];
+  const api = apiWith(async <T>(action: string, payload?: Record<string, unknown>) => {
+    if (action === 'bot.for-session') return f.store.botForSession(String(payload?.sessionId)) as T;
+    assert.equal(action, 'task.detail');
+    assert.equal(payload?.resultId, result.resultId);
+    assert.equal(payload?.id, result.taskId);
+    if (payload?.sessionId !== f.ma.requestedSessionId) throw new Error('Wrong native Bot');
+    return pending.promise as Promise<T>;
+  });
+  const signal = new AbortController().signal;
+  try {
+    const late = openWorkLink(api, sidebar, result, signal, true);
+    await flush();
+    current.select(f.mb.requestedSessionId); current.select(f.ma.requestedSessionId);
+    pending.resolve(detail);
+    assert.equal(await late, undefined);
+    current.select(f.mb.requestedSessionId);
+    assert.equal(await openWorkLink(api, sidebar, result, signal, true), undefined);
+    current.select('ordinary-session');
+    assert.equal(await openWorkLink(api, sidebar, result, signal, true), undefined);
+    assert.deepEqual(openings, []);
+    current.select(f.ma.requestedSessionId);
+    assert.equal(await openWorkLink(api, sidebar, result, signal, true), 'sidebar');
+    assert.deepEqual(openings, [[WORK_TAB, { params: { sessionId: f.ma.requestedSessionId, botId: f.a.id, href: workUrl(result) } }]]);
+  } finally { f.store.close(); }
 });
 
 test('work grouping preserves human review and does not relabel a report as completed', () => {
@@ -422,8 +529,9 @@ test('the linked task drawer offers only the exact answer or explicitly selected
     f.store.saveRunMessage(run.id, `msg-${key}`, '{}'); f.store.claimDispatch(run.id); f.store.inputEntered(run.id, `msg-${key}`, 1);
     return run;
   };
-  const drawer = (link: Exclude<WorkLink, { kind: 'task' }>, resultBelongs = false): any[] => LinkedTaskContent({ w, close, link,
-    detail: { ...f.store.taskDetail(f.ta.id), linkedResultBelongs: resultBelongs } }).props.children;
+  const drawer = (link: Exclude<WorkLink, { kind: 'task' }>, reloadEligible = false): any[] => LinkedTaskContent({ w, close, link,
+    detail: { ...f.store.taskDetail(f.ta.id), reloadEligible,
+      linkedResult: link.kind === 'result' ? f.store.resultById(link.resultId) : null } }).props.children;
   try {
     for (const task of [f.ta, f.tb]) {
       const binding = f.store.beginBinding(`binding-${task.id}`, task.id, task.rowVersion, `/synthetic/${task.id}`);
@@ -446,23 +554,49 @@ test('the linked task drawer offers only the exact answer or explicitly selected
     assert.equal(answer.attentionId, question.attentionId);
     const responding = drawer(question)[1];
     assert.ok(!responding.type(responding.props).props.children.some((node: any) => node?.type === ReplyForm));
-    const ready = (key: string) => {
+    const ready = (key: string, checks = 'Read the delivered file') => {
       const run = inTask(f.ta.id, key);
-      const { resultId } = f.store.workerReport(run.id, key, { kind: 'ready', summary: key, checks: 'Verified',
+      const { resultId } = f.store.workerReport(run.id, key, { kind: 'ready', summary: key, checks,
         evidence: [{ path: '/synthetic/result.md', sha256: key, bytes: 1 }] });
       f.store.settleRun(run.id); return { kind: 'result', taskId: f.ta.id, resultId: resultId! } as const;
     };
-    const old = ready('old');
+    const selfReported = 'Worker says Web loaded. Desktop unverified.';
+    const old = ready('old', selfReported);
     assert.match(drawer(question)[1].props.children, /已回答/);
-    assert.equal(drawer(old, true)[0].props.controls, true);
+    assert.equal(drawer(old)[0].props.controls, true);
+    const cardChildren = (link: typeof old, eligible: boolean): any[] => {
+      const card = drawer(link, eligible)[1];
+      return card.type(card.props).props.children;
+    };
+    const loadPanel = (link: typeof old, eligible: boolean) => {
+      const entry = cardChildren(link, eligible).find(node => node?.type === ResultLoadReceipt);
+      return entry?.type(entry.props).props.children;
+    };
+    const reportView = cardChildren(old, true).find(node => node?.type === ResultReport);
+    const checkBlock = reportView.type(reportView.props).props.children[2].props.children;
+    assert.equal(checkBlock[0].props.children, 'Worker 自述的检查与未验证项');
+    assert.equal(checkBlock[1].props.children, selfReported);
+    assert.match(loadPanel(old, true)[0].props.children.join(''), /本端宿主 · 暂无匹配/);
+    f.store.recordDevReload(`/synthetic/${f.ta.id}`, { resultId: old.resultId, build: 'old-build', from: 'before', to: 'after', pid: 42 });
+    const matched = loadPanel(old, true);
+    assert.match(matched[0].props.children.join(''), /本端宿主 · 原生回执已确认插件热载/);
+    assert.equal(matched[2].props.children.join(''), '构建 old-build');
+    assert.match(matched[3].props.children.join(''), /宿主 PID 42 · 实例 before → after/);
     f.store.rejectResult('rework', f.ta.id, f.store.getTask(f.ta.id).rowVersion, old.resultId, '再修一版');
-    assert.equal(drawer(old, true)[0].props.controls, false);
+    assert.equal(drawer(old)[0].props.controls, false);
     const latest = ready('latest');
-    const [oldHead, oldNotice] = drawer(old, true);
+    assert.equal(f.store.taskDetail(f.ta.id).progress.reload, null);
+    assert.match(loadPanel(latest, true)[0].props.children.join(''), /暂无匹配/);
+    assert.equal(loadPanel(latest, false), undefined, 'ordinary file results keep the existing compact card');
+    const [oldHead, oldNotice] = drawer(old);
     assert.equal(oldHead.props.controls, false);
-    assert.match(oldNotice.props.children[0].props.children, /已被新版替代/);
-    assert.equal(oldNotice.props.children[1].props.href, workUrl(latest));
-    const [newHead, newCard] = drawer(latest, true);
+    const [, replacement, summary, report, files, next] = oldNotice.props.children;
+    assert.match(replacement.props.children, /已被新版替代/);
+    assert.equal(summary.props.children, 'old');
+    assert.equal(report.props.checks, selfReported);
+    assert.equal(files.props.result.id, old.resultId);
+    assert.equal(next.props.href, workUrl(latest));
+    const [newHead, newCard] = drawer(latest);
     assert.equal(newHead.props.controls, true);
     assert.equal(newCard.props.detail.result.id, latest.resultId);
     const [foreignHead, foreignNotice] = drawer({ ...old, resultId: f.tb.id });

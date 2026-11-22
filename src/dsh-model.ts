@@ -1,7 +1,8 @@
 /** Read native model selections and attribute request evidence without opening an Agent. */
 import type { Context } from '@deepseek-ai/cordis';
-import { modelSelectionProjectionDefinition, type ModelSelection } from '@deepseek-ai/dsh-agent';
-import type { Session, SessionEvent } from '@deepseek-ai/dsh-session';
+import type { ModelSelection } from '@deepseek-ai/dsh-agent';
+import type {} from '@deepseek-ai/dsh-api-session-controller';
+import type { Session, SessionEvent, SessionStore } from '@deepseek-ai/dsh-session';
 import type {} from '@deepseek-ai/dsh-session-persistence';
 import type {} from '@deepseek-ai/dsh-session-projection';
 import { SessionId } from '@deepseek-ai/dsh-session/types';
@@ -22,7 +23,23 @@ export function nativeModel(ctx: Context, session: Session) {
   return ctx.sessionProjections.snapshot(session, ['modelSelection']).values.modelSelection?.next ?? undefined;
 }
 
-type NativeLog = { events: readonly SessionEvent[]; ownStart: number; selection: ModelRoute | null };
+export async function observeNativeModel(ctx: Context, id: string, session?: Session): Promise<ModelRoute | null> {
+  try {
+    const sessionId = SessionId(id);
+    // The Web client also augments Context.sessions; this adapter runs on the Host.
+    const live = session ?? (ctx.sessions as unknown as SessionStore | undefined)?.get?.(sessionId);
+    if (live?.id === id) {
+      const chosen = nativeModel(ctx, live);
+      return chosen ? modelRoute(chosen) : null;
+    }
+    // Cold preparation is read-only and reused by DSH while the persistence revision matches.
+    const snapshot = await ctx.sessionController.projections?.({ sessionId }, AbortSignal.timeout(5000));
+    const chosen = snapshot?.kind === 'sequenced' ? snapshot.values.modelSelection?.next : null;
+    return chosen ? modelRoute(chosen) : null;
+  } catch { return null; }
+}
+
+type NativeLog = { events: readonly SessionEvent[]; ownStart: number };
 
 export async function readModelLog(ctx: Context, id: string): Promise<NativeLog | undefined> {
   try {
@@ -34,11 +51,7 @@ export async function readModelLog(ctx: Context, id: string): Promise<NativeLog 
       if (events.some((event, index) => event.seq !== index)) return;
       const ownStart = handle.inheritedEventCount;
       if (!Number.isSafeInteger(ownStart) || ownStart < 0 || ownStart > events.length) return;
-      const projection = modelSelectionProjectionDefinition;
-      let state = projection.init(handle.header, ownStart);
-      for (const event of events) state = projection.apply(state, event);
-      const next = state.pending ?? state.lastUsed;
-      return { events, ownStart, selection: next ? modelRoute(next) : null };
+      return { events, ownStart };
     } finally { await handle.close(); }
   } catch { /* Unavailable, corrupt or incompatible logs leave model evidence unknown. */ }
 }

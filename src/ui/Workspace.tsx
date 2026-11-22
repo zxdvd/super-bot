@@ -89,11 +89,11 @@ function NewTask({ w }: { w: WorkspaceState }) {
       t => { w.setForm(null); w.select(t.id); })}/>;
 }
 
-function Body({ w, bot }: { w: WorkspaceState; bot: Bot }) {
+function Body({ w, bot, onReturn }: { w: WorkspaceState; bot: Bot; onReturn?: () => void }) {
   if (w.view === 'settings') return <BotPanel w={w} bot={bot}/>;
   if (w.view === 'board') return <Board w={w}/>;
   if (w.view === 'list') return <><TaskFilters w={w}/><TaskList w={w}/></>;
-  return <Inbox w={w}/>;
+  return <Inbox w={w} onReturn={onReturn}/>;
 }
 
 export function Workspace(props: WorkspaceProps) {
@@ -106,7 +106,7 @@ export function Workspace(props: WorkspaceProps) {
         {w.mirror ? w.online && <><TaskFilters w={w}/><TaskList w={w}/></> : <>
           <BotForms w={w}/>
           {w.online && w.bots.length === 0 && w.form !== 'bot' && <Welcome w={w}/>}
-          {bot && <><NewTask w={w}/><Body w={w} bot={bot}/></>}
+          {bot && <><NewTask w={w}/><Body w={w} bot={bot} onReturn={props.onReturn}/></>}
         </>}
       </>}
     </div></div>

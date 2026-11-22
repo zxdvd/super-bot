@@ -22,10 +22,10 @@ import {cleanupWorkdir,provisionWorkdir,workdirPolicy,workdirSummary,type Workdi
 import {nameAutomaticSession,workerTitle} from './sidebar.ts';
 import { AppError,requiredText,optionalText,type Binding,type Run,type Task,type WorkReport,type ExistingSessionGrant,type ExistingSessionPreview } from './model.ts';
 import type { ChildWaitDetail,ChildWaitMember,RecoveryContinuation,RecoveryDetail,RecoveryInput,RecoveryInputKind,
-  RunChildWait,TaskModels } from './model.ts';
-import { actualModelRequests,modelRoute,nativeModel,readModelLog,workerModelPlan } from './dsh-model.ts';
+  RunChildWait,RunModels,WorkerModelPreview } from './model.ts';
+import { actualModelRequests,modelRoute,nativeModel,observeNativeModel,readModelLog,workerModelPlan } from './dsh-model.ts';
 import type { Store } from './store.ts';
-import { collectEvidence,containedPath,verifyEvidence,evidencePaths } from './evidence.ts';
+import { captureEvidence,containedPath,verifyEvidence,evidencePaths,type CapturedEvidence } from './evidence.ts';
 import {configureRole,fullAccessEnabled,type RuntimeOptions} from './runtime.ts';
 import { materialPrompt } from './materials.ts';
 import { ReloadAdmission } from './reload-admission.ts';
@@ -33,6 +33,10 @@ import { ReloadAdmission } from './reload-admission.ts';
 declare module '@deepseek-ai/dsh-llm' {
   interface MessageSourceMap {'super-bot':{kind:'super-bot';taskId:string;runId:string;inputId:string;taskRevision:number;generation:number}}
 }
+
+const CODE_DELIVERY = `For code work, after reading the applicable project instructions and before editing, record the opening Git HEAD and relevant staged, unstaged, and untracked changes. Keep the baseline scoped to the files you expect to touch. Preserve existing work, including changes in files you edit. If Git or the baseline is unavailable, state what you could verify.
+In ready, use summary for what changed and checks for commands actually run, their outcomes, and what remains unverified. Make the opening HEAD, relevant existing changes, and this run's attributable diff visible in the summary or a concise attachment. Compare with the opening state, including for files you both found dirty and edited. Treat the full diff against HEAD as worktree context. If you cannot attribute a change, say so. Attach a scoped diff when useful and include actual changed source where available. For any relevant host, identify a matching native load receipt for this result and build, or say that loading there is unverified. Only reload when authorized.
+For ordinary non-code work, keep the report brief and use the checks and files relevant to that task.`;
 
 /** Host defaults are not a model selection made for this conversation. */
 export function selectedModel(ctx:Context,agent:Agent) {
@@ -149,6 +153,7 @@ export class DshExecution {
             throw new AppError('report-stale','当前执行授权已结束或正在停止。');
           }
         };
+        let captured: CapturedEvidence[] | undefined;
         if(report.kind==='ready') {
           const agent=exec.agent!,revision=treeCheck?.revision;
           let joined=await this.waitForTreeWork(agent,exec.signal,treeCheck,this.childWait(run,agent,'ready'));
@@ -156,7 +161,7 @@ export class DshExecution {
           this.assertChildrenQuiet(agent);
           this.assertObservedTreeQuiet(treeCheck);
           if(!joined&&treeCheck?.revision===revision&&!hasPendingChildResult(agent)&&!receipt) {
-            report.evidence=await collectEvidence(binding.cwd,report.requestedFiles);
+            captured=await captureEvidence(binding.cwd,report.requestedFiles);
             // File I/O yields. Require a fresh native observation before using the evidence.
             joined=await this.waitForTreeWork(agent,exec.signal,treeCheck,this.childWait(run,agent,'ready'));
             assertCurrent();
@@ -176,7 +181,7 @@ export class DshExecution {
           if(report.kind!=='progress')exec.concludeTurn();
           return receipt;
         }
-        const result=this.store.workerReport(run.id,exec.callId,report);
+        const result=this.store.workerReport(run.id,exec.callId,report,captured);
         if(report.kind!=='progress') {
           if(treeCheck)treeCheck.reportRevision=treeCheck.revision;
           exec.concludeTurn();
@@ -513,8 +518,12 @@ export class DshExecution {
     const taskId=run.taskId,task=this.store.getTask(taskId),botContext=this.store.taskBotContext(taskId);
     let input=this.store.getRunInput(run.id);
     if(!input.messageJson) {
+      const convention=botContext.workConvention;
+      const conventionPrompt=convention
+        ? `\nWork convention recorded for this task (${convention.source}). Follow it within the current task scope and authorization:\n${convention.text}`
+        : '';
       const supplement=`\nScheduling fact: Super Bot has reserved this working directory for the current run. Its ledger rejects concurrent runs in overlapping directories and keeps unresolved runs reserved. You do not need another confirmation that an earlier Super Bot run released this directory. This does not cover unrelated external processes.\n${input.kind==='answer'||input.kind==='rework'?`Additional user input (${input.kind}): ${input.content}`:''}`;
-      const message=createUserMessage({source:{kind:'super-bot',taskId,runId:run.id,inputId:run.inputId,taskRevision:run.taskRevision,generation:run.generation},content:[{type:'text',text:`You are executing a NEW attempt of one Super Bot task.\nCurrent run: ${run.id}. Reports from previous attempts do not complete this run. Re-check current facts and perform the authorized work; do not merely repeat an earlier conclusion. Submit a fresh super_bot_report for this run.\nBot configuration revision: ${task.botConfigRevision}\nBot responsibility: ${botContext.instructions}${materialPrompt(botContext.materials)}\nGoal: ${task.goal}\nAuthorized scope: ${task.scope}\nAcceptance criteria: ${task.acceptance}\nWorking directory: ${workdirSummary(b.cwd,b.workdir)}. Work only inside it; do not change other checkouts or directories.${supplement}\n${fullAccessEnabled(this.options)?'This Worker uses the native Full Access preset. Use native tools including shell to implement and test the requested work. Keep work scoped to this task. Do not modify unrelated projects or credentials. Change host configuration only when this task explicitly authorizes that change. Report actual changed source files and test results.':'Use only read/write/edit in this directory, always with absolute file_path values. Do not change working directories. Worker 完整权限未开启：当前 fullAccess: false。Shell and external CLI tools are unavailable in files mode; report this limitation, never ask for a tool channel. To enable them, set fullAccess: true in the Super Bot config of the active profile cordis.patch.yml and reload when idle.'}\nUse super_bot_report(progress) at meaningful checkpoints, such as written changes or a focused failing or passing test. State what was actually observed. For reloads, report a matching host receipt when available. Use waiting to ask a necessary question. For ready provide files and checks explaining every acceptance criterion. Never claim the task is accepted; the user decides.`}]});
+      const message=createUserMessage({source:{kind:'super-bot',taskId,runId:run.id,inputId:run.inputId,taskRevision:run.taskRevision,generation:run.generation},content:[{type:'text',text:`You are executing a NEW attempt of one Super Bot task.\nCurrent run: ${run.id}. Reports from previous attempts do not complete this run. Re-check current facts and perform the authorized work; do not merely repeat an earlier conclusion. Submit a fresh super_bot_report for this run.\nBot configuration revision: ${task.botConfigRevision}\nBot responsibility: ${botContext.instructions}${materialPrompt(botContext.materials)}${conventionPrompt}\nGoal: ${task.goal}\nAuthorized scope: ${task.scope}\nAcceptance criteria: ${task.acceptance}\nWorking directory: ${workdirSummary(b.cwd,b.workdir)}. Work only inside it; do not change other checkouts or directories.${supplement}\n${fullAccessEnabled(this.options)?'This Worker uses the native Full Access preset. Use native tools including shell to implement and test the requested work. Keep work scoped to this task. Do not modify unrelated projects or credentials. Change host configuration only when this task explicitly authorizes that change. Report actual changed source files and test results.':'Use only read/write/edit in this directory, always with absolute file_path values. Do not change working directories. Worker 完整权限未开启：当前 fullAccess: false。Shell and external CLI tools are unavailable in files mode; report this limitation, never ask for a tool channel. To enable them, set fullAccess: true in the Super Bot config of the active profile cordis.patch.yml and reload when idle.'}\n${CODE_DELIVERY}\nUse super_bot_report(progress) at meaningful checkpoints, such as written changes or a focused failing or passing test. State what was actually observed. For reloads, report a matching host receipt when available. Use waiting to ask a necessary question. For ready provide files and checks explaining every acceptance criterion. Never claim the task is accepted; the user decides.`}]});
       input=this.store.saveRunMessage(run.id,message.id,JSON.stringify(message));
     }
     const releaseMask=fullAccessEnabled(this.options)?()=>{}:agent.ctx.tools.restrict({allow:['read','write','edit','super_bot_report']});
@@ -673,14 +682,12 @@ export class DshExecution {
     const timeout=setTimeout(()=>{if(!this.disposed&&this.store.getRun(receipt.runId).finishedAt===null)this.store.runRecovery(receipt.runId,'停止已请求，但 10 秒内未确认收敛。请核对原生会话与后台工作。');},10000);timeout.unref();
     void active.done.finally(()=>clearTimeout(timeout));return receipt;
   }
-  async modelPreview(botId:string,taskId?:string,managerAgent?:Agent,readLog=(id:string)=>readModelLog(this.ctx,id)) {
+  async modelPreview(botId:string,taskId?:string,managerAgent?:Agent):Promise<WorkerModelPreview> {
     const binding=taskId?this.store.activeBinding(taskId):null;
     const workerId=binding?.state==='ready'?binding.sessionId:null;
-    const observe=async(id:string,active?:Agent)=>{
+    const observe=(id:string,active?:Agent)=>{
       const agent=active?.id===id&&active.session?active:this.ctx.agents.get?.(SessionId(id));
-      if(!agent)return (await readLog(id))?.selection??null;
-      const chosen=selectedModel(this.ctx,agent);
-      return chosen?modelRoute(chosen):null;
+      return observeNativeModel(this.ctx,id,agent?.session);
     };
     const current=workerId?await observe(workerId):null;
     const manager=this.store.activeManager(botId);
@@ -691,18 +698,17 @@ export class DshExecution {
     return {current,expected:workerModelPlan(current,this.options.workerModel,inherited)};
   }
 
-  async modelDetail(task:Task):Promise<TaskModels> {
-    const evidence=this.store.taskRuns(task.id).map(run=>({run,input:this.store.getRunInput(run.id),
-      proof:this.store.runTurn(run.id),expected:this.store.runModelPlan(run.id)}));
+  async modelHistory(taskId:string):Promise<RunModels[]> {
     const logs=new Map<string,ReturnType<typeof readModelLog>>();
     const readLog=(id:string)=>{
       const previous=logs.get(id);if(previous)return previous;
       const next=readModelLog(this.ctx,id);logs.set(id,next);return next;
     };
-    const [preview,runs]=await Promise.all([this.modelPreview(task.botId,task.id,undefined,readLog),
-      Promise.all(evidence.map(async({run,input,proof,expected})=>({runId:run.id,sessionId:run.sessionId,createdAt:run.createdAt,expected,
-        actual:input.messageId?actualModelRequests(await readLog(run.sessionId),run,input,proof):[]})))]);
-    return {...preview,runs};
+    return Promise.all(this.store.taskRuns(taskId).map(async run=>{
+      const input=this.store.getRunInput(run.id),proof=this.store.runTurn(run.id),expected=this.store.runModelPlan(run.id);
+      return {runId:run.id,sessionId:run.sessionId,createdAt:run.createdAt,expected,
+        actual:input.messageId?actualModelRequests(await readLog(run.sessionId),run,input,proof):[]};
+    }));
   }
 
   recoveryDetail(detail:ReturnType<Store['taskDetail']>):RecoveryDetail|null {

@@ -10,9 +10,9 @@ import type {} from '@deepseek-ai/dsh-client-ui-conversation/client';
 import type {} from '@deepseek-ai/dsh-client-ui-session/client';
 import type { UseSidebarRightTabInfo } from '@deepseek-ai/dsh-client-ui-sidebar-right/client';
 import { WorkButton, SessionOriginHint, SessionWork } from './ui/SessionWork.tsx';
-import { WORK_TAB, openBotConversation, openWorkLink, workLinkForUrl } from './ui/work-navigation.ts';
+import { WORK_TAB, chatDeliveryLink, openBotConversation, openWorkLink, sameWorkHost, workLinkForUrl } from './ui/work-navigation.ts';
 import { BotHome } from './ui/BotHome.tsx';
-import { parseWorkLink } from './work-links.ts';
+import { parseWorkLink, RESULT_FILE_PATH, resultFileUrl, workUrl } from './work-links.ts';
 
 export const inject = ['slots', 'uiWorkspace', 'connection', 'layout', 'sidebarRight', 'sidebarRightTabs'];
 type ClientContext = Omit<Context, 'connection'> & { connection: ConnectionHandle };
@@ -45,7 +45,8 @@ export function apply(context: Context): void {
     let intent: AbortController | undefined, nativeHash: string | undefined;
     const replaceHash = (hash: string) => history.replaceState(history.state, '', location.pathname + location.search + hash);
     const select = () => {
-      if (workLinkForUrl(new URL(location.href), location.origin) && ctx.layout.panelInfo.getSnapshot().activePanelId !== panel) {
+      const current = new URL(location.href);
+      if (workLinkForUrl(current, current) && ctx.layout.panelInfo.getSnapshot().activePanelId !== panel) {
         ctx.layout.selectPanel(panel);
       }
     };
@@ -58,28 +59,48 @@ export function apply(context: Context): void {
     const click = (event: MouseEvent) => {
       const link = event.target instanceof Element ? event.target.closest('a') : null;
       if (!link?.href) return;
-      const url = new URL(link.href, location.href);
-      if (url.origin === location.origin && url.pathname === '/api/super-bot-file') {
-        event.stopPropagation(); link.setAttribute('download', ''); return;
+      const current = new URL(location.href), url = new URL(link.href, current);
+      const delivery = link.closest('[data-slot="conversation.chat.flow"]') ? chatDeliveryLink(url, current) : undefined;
+      const primary = event.type === 'click' && event.button === 0 && !event.defaultPrevented
+        && !event.metaKey && !event.ctrlKey && !event.altKey && !event.shiftKey;
+      if (delivery) {
+        // Cancel native browser/sidebar navigation before any asynchronous ownership lookup.
+        event.preventDefault(); event.stopPropagation();
+        if (!primary || delivery === 'blocked') return;
+        if (delivery.kind === 'file') {
+          const sessionId = ctx.sidebarRight.mounted.getSnapshot();
+          if (!sessionId) return;
+          const download = document.createElement('a');
+          download.href = new URL(resultFileUrl(delivery.resultId, delivery.index, sessionId), current).href;
+          // The server's Content-Disposition downloads success; an error shows recovery instructions.
+          download.click();
+          return;
+        }
+      } else if (event.type === 'click' && sameWorkHost(url, current) && url.pathname === RESULT_FILE_PATH) {
+        event.stopPropagation(); return;
       }
-      const work = workLinkForUrl(url, location.origin);
-      if (!work || event.defaultPrevented || event.button !== 0 || event.metaKey || event.ctrlKey || event.altKey || event.shiftKey) return;
+      const work = delivery ?? workLinkForUrl(url, current);
+      if (!work || !primary) return;
       event.preventDefault(); event.stopPropagation();
       intent?.abort(); intent = new AbortController();
       const { signal } = intent;
-      void openWorkLink(api, ctx.sidebarRight, work, signal).then(destination => {
+      void openWorkLink(api, ctx.sidebarRight, work, signal, !!delivery).then(destination => {
         if (signal.aborted || !destination) return;
-        nativeHash = destination === 'sidebar' ? url.hash : undefined;
-        replaceHash(url.hash);
+        const hash = workUrl(work).slice(1);
+        nativeHash = destination === 'sidebar' ? hash : undefined;
+        replaceHash(hash);
         if (destination === 'work') window.dispatchEvent(new Event('hashchange'));
       });
     };
     let disposed = false;
     queueMicrotask(() => { if (!disposed) select(); });
-    document.addEventListener('click', click, true); window.addEventListener('hashchange', hashChanged);
+    const mouseEvents = ['click', 'auxclick', 'contextmenu'] as const;
+    for (const name of mouseEvents) document.addEventListener(name, click, true);
+    window.addEventListener('hashchange', hashChanged);
     return () => {
       disposed = true; intent?.abort(); unsubscribe();
-      document.removeEventListener('click', click, true); window.removeEventListener('hashchange', hashChanged);
+      for (const name of mouseEvents) document.removeEventListener(name, click, true);
+      window.removeEventListener('hashchange', hashChanged);
     };
   });
   const guide={id:'work',order:20,title:()=> '当前 Bot 的工作',description:()=> '进展、需要你处理的事与成果',icon:Icon};

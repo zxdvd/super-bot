@@ -2,7 +2,8 @@
  * Only the native host boundary is synthetic; no running host or user data is touched. */
 import {test,type TestContext} from 'node:test';
 import assert from 'node:assert/strict';
-import {existsSync,mkdirSync,mkdtempSync,realpathSync,rmSync,writeFileSync,unlinkSync} from 'node:fs';
+import {execFileSync,spawnSync} from 'node:child_process';
+import {existsSync,mkdirSync,mkdtempSync,readFileSync,realpathSync,rmSync,writeFileSync,unlinkSync} from 'node:fs';
 import {join} from 'node:path';
 import {Context} from '@deepseek-ai/cordis';
 import {ToolsService} from '@deepseek-ai/dsh-tools';
@@ -85,10 +86,10 @@ function fixture(t:TestContext,workspace=false,extra:(directory:string)=>Record<
     schemas:()=>registry.schemas(),
     nativeCall:async(callId:string,args:Record<string,unknown>)=>{const result=await nativeResult(callId,args);assert.ok(!result.isError,JSON.stringify(result.error));return result.value as any;},
     delivered:()=>delivered,
-    finish:async(taskId:string,files:string[],kind:'ready'|'waiting'='ready')=>{
+    finish:async(taskId:string,files:string[],kind:'ready'|'waiting'='ready',text?:{summary:string;checks:string})=>{
       const run=store.latestRun(taskId)!,agent=agents.get(run.sessionId);
       await emit({type:'user/message',seq:1,data:agent.messages.at(-1)},run.sessionId);
-      const report=await tools.get('super_bot_report').execute({kind,summary:kind==='ready'?'合成成果':'请补充语言',checks:'逐项回读',files},{agent:agents.get(run.sessionId),callId:'ready',signal:new AbortController().signal,concludeTurn:()=>{}});
+      const report=await tools.get('super_bot_report').execute({kind,summary:kind==='ready'?'合成成果':'请补充语言',checks:'逐项回读',...text,files},{agent:agents.get(run.sessionId),callId:'ready',signal:new AbortController().signal,concludeTurn:()=>{}});
       agents.get(run.sessionId).finish();await new Promise<void>(resolve=>setImmediate(resolve));return report;
     },
     call:(callId:string,args:Record<string,unknown>,signal=new AbortController().signal)=>tools.get('super_bot_manage').execute(args,{agent:{id:manager.requestedSessionId},callId,signal}),
@@ -662,6 +663,98 @@ test('Bot-chosen existing directories are exclusive: the second task waits in FI
     assert.equal(f.store.activeBinding(isolated.task.id)?.cwd,join(f.directory,'work','.super-bot-workspaces',`research-${isolated.task.id.slice(0,8)}`));
     assert.throws(()=>f.store.reserveRun('late',second.task.id,f.store.getTask(second.task.id).rowVersion),{code:'resource-conflict'});
   }finally{await f.close();}
+});
+
+test('code delivery from native chat preserves a dirty Git baseline and reports only attributable work', async t => {
+  const f = fixture(t, true, directory => ({ allowedRoots: [work(directory)] }));
+  t.after(f.close);
+  const repo = join(f.directory, 'work', 'repo');
+  mkdirSync(repo);
+  const git = (...args: string[]) => execFileSync('git', args, { cwd: repo, encoding: 'utf8', timeout: 5_000 });
+  const app = join(repo, 'app.mjs'), notes = join(repo, 'review.md'), overlap = join(repo, 'overlap.mjs');
+  const initial = 'export const staged = 0;\nexport const local = 0;\nexport const feature = false;\n';
+  const staged = initial.replace('staged = 0', 'staged = 1');
+  const dirty = staged.replace('local = 0', 'local = 1');
+  git('init', '--quiet', '--template=');
+  writeFileSync(app, initial);
+  writeFileSync(overlap, 'export const value = 0;\n');
+  git('add', 'app.mjs', 'overlap.mjs');
+  git('-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.invalid', '-c', 'commit.gpgsign=false',
+    '-c', 'core.hooksPath=/dev/null', 'commit', '--quiet', '-m', 'Synthetic starting point');
+  writeFileSync(app, staged);
+  git('add', 'app.mjs');
+  writeFileSync(app, dirty);
+  writeFileSync(notes, 'Existing untracked review\n');
+  writeFileSync(overlap, 'export const value = 1;\n');
+  const head = git('rev-parse', 'HEAD').trim();
+  const openingStatus = git('status', '--short', '--', 'app.mjs', 'overlap.mjs', 'review.md');
+  assert.equal(openingStatus, 'MM app.mjs\n M overlap.mjs\n?? review.md\n');
+  const openingApp = readFileSync(app, 'utf8');
+  const openingCopy = join(f.directory, 'app-before.mjs');
+  writeFileSync(openingCopy, openingApp);
+  const indexBefore = git('diff', '--cached', '--binary');
+
+  await f.native('request-code', 1, '只修改 app.mjs 中的 feature，保留已有编辑并报告验证结果。');
+  const { task, run } = await f.nativeCall('create-code', {
+    action: 'create', goal: 'Enable the app feature', workdir: { mode: 'existing', path: repo },
+  });
+  assert.ok(run);
+  const prompt = f.delivered().content[0].text;
+  assert.match(prompt, /For code work, .*before editing, record the opening Git HEAD and relevant staged, unstaged, and untracked changes/);
+  assert.match(prompt, /Compare with the opening state/);
+  assert.match(prompt, /If you cannot attribute a change, say so/);
+  assert.match(prompt, /commands actually run, their outcomes, and what remains unverified/);
+  assert.match(prompt, /matching native load receipt for this result and build/);
+  assert.match(prompt, /For ordinary non-code work, keep the report brief/);
+  assert.match(f.schemas().find(tool => tool.name === 'super_bot_manage')!.description!, /matching native receipt in detail\.progress\.reload/);
+
+  const modifiedApp = openingApp.replace('feature = false', 'feature = true');
+  writeFileSync(app, modifiedApp);
+  // Simulate an unobserved editor's overlapping change. The report leaves attribution open.
+  writeFileSync(overlap, 'export const value = 2;\n');
+  execFileSync(process.execPath, ['--check', 'app.mjs'], { cwd: repo, timeout: 5_000 });
+  git('diff', '--check');
+  const delta = spawnSync('git', ['diff', '--no-index', '--', openingCopy, app], { cwd: repo, encoding: 'utf8', timeout: 5_000 });
+  assert.equal(delta.status, 1, delta.stderr);
+  const taskDiff = delta.stdout.split('\n').filter(line => /^[+-]export /.test(line)).join('\n');
+  assert.equal(taskDiff, '-export const feature = false;\n+export const feature = true;');
+  const fact = [
+    `Opening Git HEAD ${head}`,
+    `Existing related changes\n${openingStatus.trimEnd()}`,
+    `Task diff against the opening file\n${taskDiff}`,
+    'The later edit to overlap.mjs cannot be attributed using the recorded evidence.',
+  ].join('\n\n');
+  const proof = join(repo, 'facts.md');
+  writeFileSync(proof, fact);
+  const summary = 'Enabled feature in app.mjs. See facts.md for the opening HEAD and scoped delta.';
+  const checks = 'Ran node --check app.mjs and git diff --check. Both exited 0.\nWeb and Desktop loading unverified.';
+  const report = await f.finish(task.id, [proof, app], 'ready', { summary, checks });
+  const detail = await f.nativeCall('detail-code', { action: 'detail', taskId: task.id });
+  assert.equal(detail.result.id, report.resultId);
+  assert.equal(detail.result.summary, summary);
+  assert.equal(detail.result.checks, checks);
+  assert.equal(detail.progress.reload, null);
+  assert.equal(detail.evidenceValidation.status, 'verified');
+  assert.deepEqual(detail.files.map((file: { path: string; text: string }) => [file.path, file.text]), [[proof, fact], [app, modifiedApp]]);
+  assert.deepEqual(detail.files[0].text.split('\n\n').slice(2), [
+    `Task diff against the opening file\n${taskDiff}`, 'The later edit to overlap.mjs cannot be attributed using the recorded evidence.',
+  ]);
+  const headDiff = git('diff', 'HEAD', '--', 'app.mjs');
+  assert.match(headDiff, /\+export const staged = 1;/);
+  assert.match(headDiff, /\+export const local = 1;/);
+  assert.equal(readFileSync(app, 'utf8').replace('feature = true', 'feature = false'), openingApp);
+  assert.equal(readFileSync(notes, 'utf8'), 'Existing untracked review\n');
+  assert.equal(git('diff', '--cached', '--binary'), indexBefore);
+  assert.equal(git('rev-parse', 'HEAD').trim(), head);
+
+  const { delivery } = await f.nativeCall('deliver-code', {
+    action: 'deliver', taskId: task.id, resultId: report.resultId, text: `${summary}\n${checks}`,
+  });
+  assert.match(delivery.markdown, /Web and Desktop loading unverified/);
+  assert.ok(delivery.markdown.includes(`resultId=${report.resultId}`));
+  assert.match(delivery.markdown, /\[facts\.md\].*\[app\.mjs\]/s);
+  assert.equal(detail.task.lifecycle, 'review');
+  assert.equal(detail.result.humanAcceptedAt, null);
 });
 
 test('workdir requests outside allowedRoots are rejected with a stable code and no session',async t=>{

@@ -3,7 +3,8 @@ import type { ISidebarRight } from '@deepseek-ai/dsh-client-ui-sidebar-right/cli
 import type { Bot, ManagerBinding, Task } from '../model.ts';
 import { managedSessionId, type SessionOrigin } from '../mirror.ts';
 import type { WorkspaceApi } from './Workspace.tsx';
-import { parseWorkLink, workUrl, type WorkLink } from '../work-links.ts';
+import { parseResultFileLink, parseWorkLink, RESULT_FILE_PATH, workUrl, type WorkLink } from '../work-links.ts';
+import type { Detail } from './work/types.ts';
 
 export const WORK_TAB = 'super-bot-work';
 
@@ -13,26 +14,60 @@ declare module '@deepseek-ai/dsh-client-ui-sidebar-right/client' {
   }
 }
 
-export function workLinkForUrl(url: URL, origin: string): WorkLink | undefined {
-  if (url.origin === origin && url.pathname === '/' && !url.searchParams.has('resultId') && !url.searchParams.has('attentionId')) {
+function isDesktopDocument(url: URL): boolean {
+  return url.protocol === 'dsh-app:' && url.host === 'app' && !url.username && !url.password;
+}
+
+export function sameWorkHost(url: URL, current: URL): boolean {
+  return isDesktopDocument(current) ? isDesktopDocument(url)
+    : (current.protocol === 'http:' || current.protocol === 'https:') && url.origin === current.origin;
+}
+
+export function workLinkForUrl(url: URL, current: URL): WorkLink | undefined {
+  if (sameWorkHost(url, current) && url.pathname === '/' && !url.searchParams.has('resultId') && !url.searchParams.has('attentionId')) {
     return parseWorkLink(url.hash);
   }
 }
 
+type ChatDeliveryLink = Extract<WorkLink, { kind: 'result' }>
+  | ({ kind: 'file' } & NonNullable<ReturnType<typeof parseResultFileLink>>);
+
+/** Only the exact delivery namespace is reserved in native chat. Arbitrary HTTP links keep DSH's handler. */
+export function chatDeliveryLink(url: URL, current: URL): ChatDeliveryLink | 'blocked' | undefined {
+  const isFile = url.pathname === RESULT_FILE_PATH;
+  const hash = new URLSearchParams(url.hash.slice(1));
+  if (!isFile && !(url.pathname === '/' && hash.has('super-bot-task') && hash.has('resultId'))) return;
+  const loopback = (value: URL) => value.protocol === 'http:' && value.hostname === '127.0.0.1' && !!value.port;
+  const localCarrier = loopback(url) && (isDesktopDocument(current) || loopback(current));
+  if (url.username || url.password || (!sameWorkHost(url, current) && !localCarrier)) return 'blocked';
+  if (isFile) {
+    const file = parseResultFileLink(url);
+    return file ? { kind: 'file', ...file } : 'blocked';
+  }
+  const work = parseWorkLink(url.hash);
+  return !url.search && work?.kind === 'result' ? work : 'blocked';
+}
+
 export async function openWorkLink(
   api: WorkspaceApi, sidebar: Pick<Context['sidebarRight'], 'mounted' | 'active' | 'openTab' | 'tabsIn'>, link: WorkLink,
-  signal: AbortSignal,
+  signal: AbortSignal, chatOnly = false,
 ): Promise<'sidebar' | 'work' | undefined> {
   if (signal.aborted) return;
+  const fallback = chatOnly ? undefined : 'work';
   const sessionId = sidebar.mounted.getSnapshot();
-  if (!sessionId || link.kind === 'task') return 'work';
+  if (!sessionId || link.kind === 'task') return fallback;
   const navigation = api.beginNavigation(), request = new AbortController();
   const unsubscribe = sidebar.mounted.subscribe(() => request.abort());
   const current = AbortSignal.any([signal, navigation, request.signal]);
   try {
     const bot = await readSessionBot(api, sessionId, current, () => sidebar.mounted.getSnapshot());
     if (current.aborted || bot === undefined) return;
-    if (!bot) return 'work';
+    if (!bot) return fallback;
+    if (chatOnly && link.kind === 'result') {
+      const detail = await api.call<Detail>('task.detail', { id: link.taskId, resultId: link.resultId, sessionId }, current);
+      if (current.aborted || detail.task.id !== link.taskId || detail.task.botId !== bot.id
+        || detail.linkedResult?.id !== link.resultId || detail.linkedResult.taskId !== link.taskId) return;
+    }
     const active = sidebar.active();
     const existing = active?.kind === WORK_TAB ? active : sidebar.tabsIn(sessionId).find(tab => tab.kind === WORK_TAB);
     sidebar.openTab(WORK_TAB, {
@@ -41,7 +76,7 @@ export async function openWorkLink(
     });
     return 'sidebar';
   } catch {
-    if (!current.aborted && sidebar.mounted.getSnapshot() === sessionId) return 'work';
+    if (!current.aborted && sidebar.mounted.getSnapshot() === sessionId) return fallback;
   } finally { unsubscribe(); }
 }
 

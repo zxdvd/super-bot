@@ -7,6 +7,7 @@ import type {} from '@deepseek-ai/dsh-host-webserver';
 import type {} from '@deepseek-ai/dsh-app-boot';
 import type {} from '@deepseek-ai/dsh-hmr';
 import type {} from '@deepseek-ai/dsh-cmdline';
+import { createHash } from 'node:crypto';
 import { createRequire } from 'node:module';
 import { realpathSync } from 'node:fs';
 import { homedir } from 'node:os';
@@ -16,6 +17,7 @@ import { startReloadHost } from './dev-reload-host.ts';
 import { ReloadAdmission } from './reload-admission.ts';
 import { readEvidence } from './evidence.ts';
 import { Store } from './store.ts';
+import { BotMemory } from './bot-memory.ts';
 import { DshExecution } from './dsh.ts';
 import {runtimeLimits,type RuntimeOptions} from './runtime.ts';
 import { Managers } from './manager.ts';
@@ -23,6 +25,7 @@ import { NativeSidebar } from './sidebar.ts';
 import { createLedgerBackup } from './backups.ts';
 import { bindMirror, parseMirrorQuery, startMirror } from './mirror-host.ts';
 import { readLocalMirror } from './mirror-queries.ts';
+import { RESULT_FILE_PATH } from './work-links.ts';
 import { managedSessionId, oppositeOwner, type BotOwner, type MirrorBot, type MirrorCatalog, type SessionOrigin } from './mirror.ts';
 import { AppError, requiredText, optionalText,type WorkspaceStatus, type NewBot, type NewTask, type ControlMode } from './model.ts';
 
@@ -54,7 +57,8 @@ export async function apply(ctx: Context, config: RuntimeOptions & { dataDir?: s
   const profile = ctx.get?.('profileContext');
   const owner: BotOwner = (profile?.name ?? process.env.DSH_PROFILE) === 'desktop' ? 'desktop' : 'web';
   const peer = oppositeOwner(owner), binding = bindMirror(dataDir, owner, profile, config.mirrorDir);
-  const store = new Store(join(dataDir, 'ledger.sqlite'));store.maxRunningTasks=runtimeLimits(config).maxRunningTasks;
+  const store = new Store(join(dataDir, 'ledger.sqlite'), new BotMemory(dataDir));
+  store.maxRunningTasks=runtimeLimits(config).maxRunningTasks;
   let pairingIssue = binding.issue;
   const mirrorReady = binding.pair && startMirror(binding.pair, query => readLocalMirror(store, query)).catch(() => {
     pairingIssue = '无法启动本端只读镜像监听。';
@@ -125,7 +129,15 @@ export async function apply(ctx: Context, config: RuntimeOptions & { dataDir?: s
         return { ok: true, value: await mirror.read(query) };
       }
       if ('owner' in payload) throw new AppError('invalid-input', '此入口只操作本机原账本。');
-      if(endpoint==='manager.notification.resolve'){managers.resolveNotification(requiredText(payload.requestId,'请求标识',200),requiredText(payload.botId,'Bot 标识',200),requiredText(payload.eventId,'通知标识',300),payload.resolution as 'handled'|'retry-unsent',payload.acknowledged);return {ok:true,value:store.managerInfo(String(payload.botId))};}
+      if (endpoint === 'manager.notification.resolve') {
+        const botId = requiredText(payload.botId, 'Bot 标识', 200);
+        if (payload.sessionId !== undefined && store.botForSession(requiredText(payload.sessionId, '会话标识', 200))?.id !== botId) {
+          throw new AppError('not-found', '通知不属于当前 Bot 对话或已不可用。');
+        }
+        managers.resolveNotification(requiredText(payload.requestId, '请求标识', 200), botId,
+          requiredText(payload.eventId, '通知标识', 300), payload.resolution as 'handled' | 'retry-unsent', payload.acknowledged);
+        return { ok: true, value: store.managerInfo(botId) };
+      }
       if (endpoint === 'status') return { ok: true, value: status() };
       if (endpoint === 'backup.create') return {ok:true,value:await createLedgerBackup(store,dataDir,requiredText(payload.requestId,'请求标识',200))};
       if (endpoint === 'bot.list') return { ok: true, value: store.listBots() };
@@ -150,13 +162,24 @@ export async function apply(ctx: Context, config: RuntimeOptions & { dataDir?: s
         const task = taskInScope(payload), snapshot = store.taskDetail(task.id);
         const recovery = execution.recoveryDetail(snapshot);
         const childWaits = execution.childWaitDetails(task.id);
-        const model = await execution.modelDetail(task);
+        const model = await execution.modelPreview(task.botId, task.id);
         taskInScope(payload);
         const detail = { ...snapshot, recovery, model, childWaits,
           reloadEligible: snapshot.binding?.cwd === realpathSync(checkout) };
         if (payload.resultId === undefined) return { ok: true, value: detail };
         const result = store.resultById(requiredText(payload.resultId, '成果标识', 200));
-        return { ok: true, value: { ...detail, linkedResultBelongs: result?.taskId === task.id } };
+        const linkedResult = result?.taskId === task.id ? result : null;
+        const linkedChatDelivery = linkedResult?.id === detail.result?.id ? detail.chatDelivery : store.chatDeliveryStatus(task, linkedResult, true);
+        return { ok: true, value: { ...detail, linkedResult, linkedChatDelivery, linkedResultBelongs: linkedResult !== null } };
+      }
+      if (endpoint === 'task.model-history') {
+        if (Object.keys(payload).some(key => !['action', 'id', 'sessionId'].includes(key))) {
+          throw new AppError('invalid-input', '请仅提供本端任务与当前 Bot 会话标识。');
+        }
+        const task = taskInScope(payload);
+        const runs = await execution.modelHistory(task.id);
+        taskInScope(payload);
+        return { ok: true, value: { taskId: task.id, runs } };
       }
       if (endpoint === 'task.dispatch') {
         const { id } = taskInScope(payload);
@@ -211,13 +234,23 @@ export async function apply(ctx: Context, config: RuntimeOptions & { dataDir?: s
     }
   }
   // Read-only artifact links work in native chat. Never accept a caller-supplied path.
-  ctx.effect(()=>ctx.connection.fetch.register({path:'/api/super-bot-file',methods:['GET'],requestBody:'buffered',fetch:async request=>{
+  ctx.effect(()=>ctx.connection.fetch.register({path:RESULT_FILE_PATH,methods:['GET'],requestBody:'buffered',fetch:async request=>{
     try {
       const params=new URL(request.url).searchParams,resultId=params.get('resultId')??'',index=Number(params.get('index'));
       const result=store.resultById(resultId);
-      if(!result||!params.has('index')||!Number.isSafeInteger(index)||index<0||!result.evidence[index])return new Response('找不到成果文件。',{status:404});
-      const run=store.getRun(result.runId),binding=store.getBinding(run.bindingId),evidence=result.evidence[index];
-      const bytes=await readEvidence(binding.cwd,evidence);
+      const sessions=params.getAll('sessionId');
+      if(!result||!params.has('index')||!Number.isSafeInteger(index)||index<0||!result.evidence[index]
+        ||(sessions.length>0&&(sessions.length!==1||store.botForSession(sessions[0])?.id!==store.getTask(result.taskId).botId))) {
+        return new Response('找不到成果文件。',{status:404});
+      }
+      const evidence = result.evidence[index];
+      let bytes = store.resultAttachment(result.id, index);
+      if (bytes === undefined) {
+        const run = store.getRun(result.runId), binding = store.getBinding(run.bindingId);
+        bytes = await readEvidence(binding.cwd, evidence);
+      } else if (bytes.length !== evidence.bytes || createHash('sha256').update(bytes).digest('hex') !== evidence.sha256) {
+        throw new AppError('attachment-invalid','保存的附件副本无法通过校验。请从有效的账本备份恢复，或请 Bot 重新提交成果。');
+      }
       return new Response(new Uint8Array(bytes),{headers:{'Content-Type':'application/octet-stream','Content-Disposition':`attachment; filename*=UTF-8''${encodeURIComponent(basename(evidence.path))}`,'Cache-Control':'no-store','X-Content-Type-Options':'nosniff'}});
     }catch(error){return new Response(error instanceof AppError?error.message:'无法读取成果文件。',{status:409,headers:{'Cache-Control':'no-store'}});}
   }}));

@@ -5,21 +5,32 @@ import { createHash, randomUUID } from 'node:crypto';
 import schemaVersion from '../schema-version.json' with {type:'json'};
 import { AppError, requiredText, optionalText, taskStatus, type ChatSource, type Bot, type Task, type NewBot, type NewTask, type TaskPage, type ControlMode, type Attention, type Binding, type Run, type RunInput, type WorkReport, type Result,type ManagerBinding,type ManagerEvent,type ExistingSessionGrant,type ReferenceMaterial,type TaskBotContext,type DispatchWait,type WorkdirInfo,type RunTurn,botDraft } from './model.ts';
 import { RESULT_FRESH_MS, type ChatDeliveryStatus, type RecoveryContinuation, type ReloadReceipt, type RunChildWait,
-  type TaskProgress, type WorkerModelPlan } from './model.ts';
+  type TaskProgress, type UncertainDelivery, type WorkerModelPlan } from './model.ts';
 import {parseWorkdirRequest} from './workdir.ts';
+import type { CapturedEvidence } from './evidence.ts';
+import type { BotMemory } from './bot-memory.ts';
 import type { MirrorRecords, ResultRecord, ReviewRecord } from './mirror.ts';
 
 const BLOCKING_ATTENTIONS="state='open' AND kind IN ('input','approval','recovery')";
 const DELIVERY_ATTEMPT_LIMIT=3;
 const DELIVERY_RETRY_DELAY_MS=30000;
 const RESULT_DELIVERY_REASON='成果仍待在原对话交付。请确认当前版本，并在最终可见回复中附上完整的成果链接。';
+const DELIVERY_RETRIES_EXHAUSTED='成果补交付已达到 3 次上限，已停止自动唤醒。请在 Bot 对话或工作面板核对成果；未重新执行 Worker。';
+type ManagerProblem = { message: string; at: number; eventId?: string };
+function deliveryUncertainReason(payload:{deliveryUncertainReason?:string;deliveryRetryExhausted?:boolean;
+  legacyDelivery?:{explicit?:boolean};reconcileNote?:string}, diagnostic?:string):string {
+  return payload.deliveryUncertainReason??diagnostic
+    ??(payload.deliveryRetryExhausted?DELIVERY_RETRIES_EXHAUSTED:undefined)
+    ??(payload.legacyDelivery?.explicit?'历史交付工具有回包，尚缺原聊天中的可核对回复。':undefined)
+    ??payload.reconcileNote??'账本未能确认这份成果已在原聊天交付。';
+}
 
 /** One local database. Business transactions will live here, not in the UI/adapter. */
 export class Store {
   readonly db: DatabaseSync;
   /** Global execution slots; set from config by the plugin entry. */
   maxRunningTasks=2;
-  constructor(path: string) {
+  constructor(path: string, readonly memory?: BotMemory) {
     if (path !== ':memory:') mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
     this.db = new DatabaseSync(path);
     try {
@@ -71,6 +82,12 @@ export class Store {
         CREATE TABLE IF NOT EXISTS resources (runId TEXT PRIMARY KEY REFERENCES runs(id),cwd TEXT NOT NULL UNIQUE);
         CREATE TABLE IF NOT EXISTS reports (id TEXT PRIMARY KEY,runId TEXT NOT NULL REFERENCES runs(id),kind TEXT NOT NULL,data TEXT NOT NULL,createdAt INTEGER NOT NULL);
         CREATE TABLE IF NOT EXISTS results (id TEXT PRIMARY KEY,runId TEXT NOT NULL UNIQUE REFERENCES runs(id),taskId TEXT NOT NULL REFERENCES tasks(id),taskRevision INTEGER NOT NULL,summary TEXT NOT NULL,checks TEXT NOT NULL,evidence TEXT NOT NULL,createdAt INTEGER NOT NULL,humanAcceptedAt INTEGER);
+        CREATE TABLE IF NOT EXISTS result_attachments (
+          resultId TEXT NOT NULL REFERENCES results(id) ON DELETE CASCADE,
+          fileIndex INTEGER NOT NULL CHECK(fileIndex BETWEEN 0 AND 9),
+          data BLOB NOT NULL,
+          PRIMARY KEY(resultId,fileIndex)
+        ) STRICT;
         CREATE TABLE IF NOT EXISTS reviews (id TEXT PRIMARY KEY,resultId TEXT NOT NULL REFERENCES results(id),actor TEXT NOT NULL,verdict TEXT NOT NULL,note TEXT NOT NULL,createdAt INTEGER NOT NULL);
         CREATE TABLE IF NOT EXISTS managers (id TEXT PRIMARY KEY,botId TEXT NOT NULL REFERENCES bots(id),generation INTEGER NOT NULL,configRevision INTEGER NOT NULL,requestedSessionId TEXT NOT NULL UNIQUE,sessionId TEXT UNIQUE,cwd TEXT NOT NULL,state TEXT NOT NULL,createdAt INTEGER NOT NULL,UNIQUE(botId,generation));
         CREATE UNIQUE INDEX IF NOT EXISTS managers_active ON managers(botId) WHERE state!='released';
@@ -293,14 +310,20 @@ export class Store {
     this.command(requestId,'manager.notification.resolve',{botId,id,action,acknowledged:true},()=>{
       const row=this.db.prepare("SELECT state,payload,taskId,attempts FROM outbox WHERE id=? AND kind='manager.notify' AND json_extract(payload,'$.botId')=?").get(id,botId);
       if(!row)throw new AppError('not-found','通知不存在。');
+      const payload=JSON.parse(String(row.payload));
+      const problem=JSON.parse(this.get(`managerProblem:${botId}`)??'null') as ManagerProblem|null;
+      const diagnostic=problem?.eventId===id?problem.message:undefined;
       if(action==='retry-unsent') {
-        if(row.state!=='blocked'||Number(row.attempts)!==0||JSON.parse(String(row.payload)).messageId!=null)throw new AppError('notification-uncertain','只有未入队且已停止重试的通知可以重试；未知投递须人工核对，不能重发。');
+        if(row.state!=='blocked'||Number(row.attempts)!==0||payload.messageId!=null)throw new AppError('notification-uncertain','只有未入队且已停止重试的通知可以重试；未知投递须人工核对，不能重发。');
         this.db.prepare("UPDATE outbox SET state='pending',payload=json_set(payload,'$.preflightFailures',0,'$.nextAttemptAt',0,'$.deferReason','用户确认重试未入队通知') WHERE id=?").run(id);
       }else {
         if(!['unknown','blocked'].includes(String(row.state)))throw new AppError('notification-active','通知仍在处理或已经结束。');
-        this.db.prepare("UPDATE outbox SET state='handled' WHERE id=?").run(id);
+        if(row.state==='unknown'&&payload.deliveryOnly===true) {
+          this.db.prepare("UPDATE outbox SET state='handled',payload=json_set(payload,'$.deliveryUncertainReason',?) WHERE id=?")
+            .run(deliveryUncertainReason(payload,diagnostic),id);
+        }else this.db.prepare("UPDATE outbox SET state='handled' WHERE id=?").run(id);
       }
-      if(JSON.parse(this.get(`managerProblem:${botId}`)??'null')?.eventId===id)this.managerProblem(botId,'');
+      if(problem?.eventId===id)this.managerProblem(botId,'');
       this.event('manager.notification-resolved',(row.taskId??null) as string|null,{botId,eventId:id,action,actor:'user'});return {};
     });
   }
@@ -335,7 +358,7 @@ export class Store {
   }
   private stopManagerDeliveryRetries(id:string,botId:string):void {
     const changed=this.db.prepare("UPDATE outbox SET state='unknown',payload=json_set(payload,'$.deliveryRetryExhausted',json('true')) WHERE id=? AND coalesce(json_extract(payload,'$.deliveryRetryExhausted'),0)=0").run(id).changes;
-    if(changed)this.managerProblem(botId,'成果补交付已达到 3 次上限，已停止自动唤醒。请在 Bot 对话或工作面板核对成果；未重新执行 Worker。',id);
+    if(changed)this.managerProblem(botId,DELIVERY_RETRIES_EXHAUSTED,id);
   }
   managerDeliveryAttemptEnded(id:string,messageId:string,proof:{sessionId:string;turn:number;endSeq:number}):void {
     this.db.exec('BEGIN IMMEDIATE');
@@ -389,7 +412,7 @@ export class Store {
     return this.db.prepare("SELECT id,taskId,payload,state,createdAt FROM outbox WHERE kind='manager.notify' AND state NOT IN ('done','superseded','handled') AND json_extract(payload,'$.botId')=? ORDER BY createdAt DESC,id LIMIT ?").all(botId,limit) as unknown as ManagerEvent[];
   }
   supersedeManagerDelivery(id:string):void {
-    this.db.prepare("UPDATE outbox SET state='superseded' WHERE id=? AND kind='manager.notify' AND json_extract(payload,'$.deliveryOnly')=1 AND state!='done'").run(id);
+    this.db.prepare("UPDATE outbox SET state='superseded' WHERE id=? AND kind='manager.notify' AND json_extract(payload,'$.deliveryOnly')=1 AND state NOT IN ('done','handled')").run(id);
   }
   managerDeliveryUncertain(id:string):boolean {
     return this.db.prepare("UPDATE outbox SET state='unknown' WHERE id=? AND kind='manager.notify' AND json_extract(payload,'$.deliveryOnly')=1 AND state IN ('pending','sending','entered')").run(id).changes===1;
@@ -426,10 +449,57 @@ export class Store {
   managerProblem(botId:string,message:string,eventId?:string):void {
     const key=`managerProblem:${botId}`;const prior=this.get(key);
     if(!message){this.db.prepare('DELETE FROM metadata WHERE key=?').run(key);return;}
+    if(eventId?.startsWith('manager-event:delivery:')) {
+      const delivery=this.db.prepare(`SELECT state FROM outbox WHERE id=? AND kind='manager.notify'
+        AND json_extract(payload,'$.deliveryOnly')=1 AND json_extract(payload,'$.botId')=?`).get(eventId,botId);
+      if(delivery?.state==='handled')return; // A late native check must not reopen the owner's issue.
+      // Keep an exact delivery's diagnostic when subsequent wakes clear or replace the Bot-wide problem.
+      if(delivery?.state==='unknown')this.db.prepare(`UPDATE outbox SET payload=json_set(payload,'$.deliveryUncertainReason',?)
+        WHERE id=? AND json_extract(payload,'$.deliveryUncertainReason') IS NOT ?`).run(message,eventId,message);
+    }
     if(prior&&JSON.parse(prior).message===message&&JSON.parse(prior).eventId===eventId)return;
     this.set(key,JSON.stringify({message,at:Date.now(),...(eventId?{eventId}:{})}));
   }
-  managerInfo(botId:string) {return {binding:this.activeManager(botId),notifications:this.db.prepare("SELECT id,state,attempts,json_extract(payload,'$.deferReason') deferReason,json_extract(payload,'$.nextAttemptAt') nextAttemptAt,json_extract(payload,'$.reconcileAttempts') reconcileAttempts,json_extract(payload,'$.reconcileNote') reconcileNote FROM outbox WHERE kind='manager.notify' AND state NOT IN ('done','superseded','handled') AND json_extract(payload,'$.botId')=? ORDER BY createdAt,id LIMIT 20").all(botId),pending:Number(this.db.prepare("SELECT count(*) AS n FROM outbox WHERE kind='manager.notify' AND state='pending' AND json_extract(payload,'$.botId')=?").get(botId)?.n),uncertain:Number(this.db.prepare("SELECT count(*) AS n FROM outbox WHERE kind='manager.notify' AND state='unknown' AND json_extract(payload,'$.botId')=?").get(botId)?.n),hourlyWakes:this.managerWakeCount(botId,Date.now()-3600000),problem:JSON.parse(this.get(`managerProblem:${botId}`)??'null') as {message:string;at:number}|null};}
+  private uncertainDeliveries(botId:string,problem:ManagerProblem|null):UncertainDelivery[] {
+    const rows=this.db.prepare(`SELECT o.id,t.id AS taskId,t.goal AS taskGoal,r.id AS resultId,o.createdAt,o.payload
+      FROM outbox o JOIN tasks t ON t.id=o.taskId
+      JOIN results r ON r.taskId=t.id AND r.id=json_extract(o.payload,'$.resultId')
+        AND r.taskRevision=json_extract(o.payload,'$.taskRevision') AND o.id='manager-event:delivery:' || r.id
+      WHERE o.kind='manager.notify' AND o.state='unknown' AND json_extract(o.payload,'$.deliveryOnly')=1
+        AND t.botId=? AND json_extract(o.payload,'$.botId')=t.botId ORDER BY o.createdAt,o.id`).all(botId);
+    if(!rows.length)return [];
+    const chats=this.db.prepare('SELECT id,sessionId FROM managers WHERE botId=? AND sessionId IS NOT NULL').all(botId);
+    return rows.map(row=>{
+      const id=String(row.id),payload=JSON.parse(String(row.payload));
+      const ended=payload.deliveryAttemptEnd;
+      const input=typeof payload.messageJson==='string'?this.decodeManagerMessage(payload.messageJson):null;
+      const source=input?.source;
+      const claimed=source?.kind==='super-bot-manager'&&source.botId===botId&&source.eventId===id
+        &&typeof payload.messageId==='string'&&input?.id===payload.messageId;
+      const attemptChat=claimed?chats.find(chat=>chat.id===source.managerId)?.sessionId:undefined;
+      const hasEnd=ended?.messageId&&ended.messageId===payload.messageId;
+      const session=attemptChat??[hasEnd&&ended.sessionId,payload.reviewSessionId,payload.deliverSessionId,payload.legacyDelivery?.sessionId]
+        .find(candidate=>candidate&&chats.some(chat=>chat.sessionId===candidate));
+      const reason=deliveryUncertainReason(payload,problem?.eventId===id?problem.message:undefined);
+      return {id,taskId:String(row.taskId),taskGoal:String(row.taskGoal),resultId:String(row.resultId),reason,
+        sessionId:typeof session==='string'?session:null,at:Number(payload.deliveredAt??row.createdAt),
+        ...(hasEnd&&ended.sessionId===session&&Number.isSafeInteger(ended.turn)?{turn:Number(ended.turn)}:{})};
+    });
+  }
+  private decodeManagerMessage(json:string) {
+    try {return JSON.parse(json) as {id?:string;source?:{kind?:string;botId?:string;eventId?:string;managerId?:string}}|null;}
+    catch {return null;}
+  }
+  managerInfo(botId:string) {
+    const problem=JSON.parse(this.get(`managerProblem:${botId}`)??'null') as ManagerProblem|null;
+    return {binding:this.activeManager(botId),notifications:this.db.prepare(`SELECT id,state,attempts,json_extract(payload,'$.deferReason') deferReason,
+        json_extract(payload,'$.nextAttemptAt') nextAttemptAt,json_extract(payload,'$.reconcileAttempts') reconcileAttempts,
+        json_extract(payload,'$.reconcileNote') reconcileNote FROM outbox WHERE kind='manager.notify'
+        AND state NOT IN ('done','superseded','handled') AND json_extract(payload,'$.botId')=? ORDER BY createdAt,id LIMIT 20`).all(botId),
+      pending:Number(this.db.prepare("SELECT count(*) AS n FROM outbox WHERE kind='manager.notify' AND state='pending' AND json_extract(payload,'$.botId')=?").get(botId)?.n),
+      uncertain:Number(this.db.prepare("SELECT count(*) AS n FROM outbox WHERE kind='manager.notify' AND state='unknown' AND json_extract(payload,'$.botId')=?").get(botId)?.n),
+      uncertainDeliveries:this.uncertainDeliveries(botId,problem),hourlyWakes:this.managerWakeCount(botId,Date.now()-3600000),problem};
+  }
   releaseManager(requestId:string,botId:string,expectedGeneration:number):ManagerBinding {
     return this.command(requestId,'manager.replace',{botId,expectedGeneration},()=>{
       const manager=this.activeManager(botId);if(!manager||manager.generation!==expectedGeneration)throw new AppError('manager-stale','管理会话已经改变，请刷新。');
@@ -439,7 +509,7 @@ export class Store {
       this.event('manager.replaced',null,{botId,oldSessionId:manager.sessionId});return manager;
     });
   }
-  createTask(requestId: string, input: NewTask, source?:ChatSource): Task {
+  createTask(requestId: string, input: NewTask, source?: ChatSource, conventionOverride?: string): Task {
     if(input.startPaused!==undefined&&typeof input.startPaused!=='boolean')throw new AppError('invalid-input','初始暂停状态必须是布尔值。');
     const payload: NewTask = { botId: requiredText(input.botId, 'Bot 标识', 200), goal: requiredText(input.goal, '任务目标'),
       scope: optionalText(input.scope, '任务范围'), acceptance: optionalText(input.acceptance, '验收条件'), reviewPolicy: input.reviewPolicy,...(input.startPaused?{startPaused:true}:{}) };
@@ -447,12 +517,17 @@ export class Store {
     if (!['human', 'bot'].includes(payload.reviewPolicy)) throw new AppError('invalid-input', '请选择有效的验收方式。');
     // Native provenance, not a model-provided call ID, identifies one human request.
     // Keep the normal call receipt too: reusing a call ID with changed content must still fail.
-    const intentHash=source?createHash('sha256').update(JSON.stringify({action:'task.create-intent',payload,source:{sessionId:source.sessionId,messages:(source.messages??[source]).map(({messageId,seq})=>({messageId,seq})).sort((a,b)=>a.seq-b.seq)}})).digest('hex'):undefined;
+    const intent = conventionOverride === undefined ? payload : { ...payload, conventionOverride };
+    const intentHash=source?createHash('sha256').update(JSON.stringify({action:'task.create-intent',payload:intent,source:{sessionId:source.sessionId,messages:(source.messages??[source]).map(({messageId,seq})=>({messageId,seq})).sort((a,b)=>a.seq-b.seq)}})).digest('hex'):undefined;
     const intentId=intentHash?`task-intent:${intentHash}`:undefined;
-    return this.command(requestId, 'task.create', {...payload,...(source?{source}:{})}, () => {
+    return this.command(requestId, 'task.create', {...intent,...(source?{source}:{})}, () => {
       const prior=intentId?this.db.prepare('SELECT result FROM requests WHERE id=?').get(intentId):undefined;
       if(prior)return JSON.parse(String(prior.result)) as Task;
       const bot=this.getBot(payload.botId),context=this.currentBotContext(payload.botId);
+      const convention = conventionOverride ?? this.memory?.defaultConvention(bot.id);
+      if (convention !== undefined) context.workConvention = {
+        text: convention, source: conventionOverride === undefined ? 'default' : 'override',
+      };
       const id = randomUUID(), now = Date.now();
       this.db.prepare('INSERT INTO tasks(id,botId,goal,scope,acceptance,reviewPolicy,controlMode,createdAt,updatedAt,botConfigRevision,botContext,workdirRequest) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)')
         .run(id, payload.botId, payload.goal, payload.scope, payload.acceptance, payload.reviewPolicy,payload.startPaused?'paused':'auto',now,now,bot.configRevision,JSON.stringify(context),payload.workdir?JSON.stringify(payload.workdir):null);
@@ -506,20 +581,21 @@ export class Store {
       ORDER BY e.id DESC LIMIT 1`).get(run.id);
     return typeof receipt?.createdAt==='number' ? {...task,deliveredAt:receipt.createdAt} : task;
   }
-  private chatDeliveryStatus(task:Task,result:Result|null):ChatDeliveryStatus|null {
-    if(!result||!['review','completed'].includes(task.lifecycle))return null;
+  chatDeliveryStatus(task:Task,result:Result|null,historical=false):ChatDeliveryStatus|null {
+    if(!result||result.taskId!==task.id||(!historical&&!['review','completed'].includes(task.lifecycle)))return null;
+    const eventId=`manager-event:delivery:${result.id}`;
     const row=this.db.prepare(`SELECT state,payload FROM outbox WHERE id=? AND kind='manager.notify' AND taskId=?
       AND json_extract(payload,'$.botId')=? AND json_extract(payload,'$.taskRevision')=?`)
-      .get(`manager-event:delivery:${result.id}`,task.id,task.botId,task.taskRevision);
-    if(!row)return {state:task.lifecycle==='review'&&!task.managerReviewed?'awaiting-review':'uncertain'};
+      .get(eventId,task.id,task.botId,historical?result.taskRevision:task.taskRevision);
+    if(!row)return historical?null:{state:task.lifecycle==='review'&&!task.managerReviewed?'awaiting-review':'uncertain'};
     const payload=JSON.parse(String(row.payload));
     if(row.state==='done'&&payload.chatDelivery?.messageId)return {state:'delivered'};
-    if(row.state==='handled')return {state:'handled'};
-    const problem=JSON.parse(this.get(`managerProblem:${task.botId}`)??'null') as {eventId?:string;message:string}|null;
+    const problem=JSON.parse(this.get(`managerProblem:${task.botId}`)??'null') as ManagerProblem|null;
     const pending=['pending','sending','entered'].includes(String(row.state));
-    const diagnostic=problem?.eventId===`manager-event:delivery:${result.id}`?problem.message:undefined;
-    const reason=pending?(payload.deferReason??diagnostic):(diagnostic??payload.reconcileNote??payload.deferReason);
-    return {state:pending?'pending':'uncertain',...(reason?{reason}:{})};
+    const diagnostic=problem?.eventId===eventId?problem.message:undefined;
+    const reason=row.state==='unknown'||row.state==='handled'?deliveryUncertainReason(payload,diagnostic)
+      :pending?(payload.deferReason??diagnostic):(diagnostic??payload.reconcileNote??payload.deferReason);
+    return {state:row.state==='handled'?'handled':pending?'pending':'uncertain',...(reason?{reason}:{})};
   }
   taskDetail(id: string) {
     const task=this.withDelivery(this.getTask(id)),binding=this.activeBinding(id),run=this.latestRun(id);
@@ -954,16 +1030,24 @@ export class Store {
     const row=this.db.prepare('SELECT * FROM results WHERE id=?').get(id) as unknown as (Omit<Result,'evidence'>&{evidence:string})|undefined;
     return row?{...row,evidence:JSON.parse(row.evidence)}:null;
   }
+  resultAttachment(resultId: string, fileIndex: number): Uint8Array | undefined {
+    const row = this.db.prepare('SELECT data FROM result_attachments WHERE resultId=? AND fileIndex=?')
+      .get(resultId, fileIndex) as { data: Uint8Array } | undefined;
+    return row?.data;
+  }
   workerReportReceipt(runId:string,callId:string,report:WorkReport):{accepted:true;resultId?:string}|undefined {
     const row=this.db.prepare('SELECT data FROM reports WHERE id=?').get(`${runId}:${callId}`) as {data:string}|undefined;if(!row)return;
     const saved=JSON.parse(row.data) as {evidence:WorkReport['evidence']};
     return this.commandReceipt(`report:${runId}:${callId}`,'worker.report',{runId,callId,kind:report.kind,summary:requiredText(report.summary,'报告内容'),checks:optionalText(report.checks,'验收说明'),evidence:saved.evidence??[],...(report.requestedFiles?{requestedFiles:report.requestedFiles}:{})});
   }
-  workerReport(runId:string,callId:string,report:WorkReport):{accepted:true;resultId?:string} {
+  workerReport(runId:string,callId:string,report:WorkReport,captured?:readonly CapturedEvidence[]):{accepted:true;resultId?:string} {
     const summary=requiredText(report.summary,'报告内容');
     if(!['progress','waiting','ready','blocked','failed'].includes(report.kind))throw new AppError('invalid-report','报告类型无效。');
-    const payload={runId,callId,kind:report.kind,summary,checks:optionalText(report.checks,'验收说明'),evidence:report.evidence??[],...(report.requestedFiles?{requestedFiles:report.requestedFiles}:{})};
-    if(report.kind==='ready'&&(!payload.checks||payload.evidence.length===0))throw new AppError('evidence-required','提交成果必须有验收说明和文件证据。');
+    const evidence = captured?.map(({file})=>file) ?? report.evidence ?? [];
+    const payload={runId,callId,kind:report.kind,summary,checks:optionalText(report.checks,'验收说明'),evidence,...(report.requestedFiles?{requestedFiles:report.requestedFiles}:{})};
+    if(report.kind==='ready'&&(!payload.checks||payload.evidence.length===0||(report.requestedFiles&&!captured))) {
+      throw new AppError('evidence-required','提交成果必须有验收说明和文件证据。');
+    }
     const outcome=this.command(`report:${runId}:${callId}`,'worker.report',payload,()=>{
       const run=this.getRun(runId);const task=this.getTask(run.taskId);const b=this.activeBinding(task.id);
       if(run.finishedAt!==null||run.state==='cancelling'||task.taskRevision!==run.taskRevision||b?.id!==run.bindingId||task.controlMode==='manual') {
@@ -977,6 +1061,10 @@ export class Store {
       if(report.kind!=='ready')return {accepted:true as const};
       const resultId=randomUUID();
       this.db.prepare('INSERT INTO results VALUES (?,?,?,?,?,?,?,?,NULL)').run(resultId,runId,task.id,run.taskRevision,summary,payload.checks,JSON.stringify(payload.evidence),Date.now());
+      if (captured) {
+        const insert = this.db.prepare('INSERT INTO result_attachments(resultId,fileIndex,data) VALUES (?,?,?)');
+        captured.forEach(({data}, index) => insert.run(resultId, index, data));
+      }
       return {accepted:true as const,resultId};
     });
     if(!outcome.accepted)throw new AppError('report-stale','当前执行或目标已改变，报告未成为当前成果。');

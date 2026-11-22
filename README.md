@@ -4,9 +4,11 @@
 
 **聊天表达意图；面板展示事实；程序维护状态；模型负责判断。**
 
-当前为本地开发预览。与 Bot 聊天，由它创建任务、委派普通 Full Access Worker、检查成果并回到原对话交付。支持补充需求、同任务返工、停止和人工验收。首个交付形态是 DSH Web 插件，常规回归固定使用 `0.2.2-rc.1`，插件也可在 `0.2.2-rc.5` 运行。Web 与 macOS Desktop 可选启用同机只读镜像，隔离原生宿主已验证，日常界面待体验验收。Super Bot 是独立产品，不属于 `dsh-plugins` 搜索插件集合。
+当前为本地开发预览，通过 DSH Web 安装。与 Bot 聊天即可安排普通 Full Access Worker 执行，原对话接收交付并继续补充或返工。另一台机器试用只需一个 Web profile。macOS 同机只读镜像是可选功能。
 
-**2026-11-16 状态：** 已完成四轮真实 Bot/Worker dogfooding，覆盖代码修复、补充需求、交付、返工、聊天旁工作视图和侧栏整理；最新源码检查 266 项测试及 typecheck/build 通过，另有隔离宿主的 Worker 崩溃恢复与 Manager 通知验证。真实用户的最终接受、多任务歧义体验和精确费用评估仍待完成。新会话先读 [接手说明](docs/handoff.md)，验收范围见 [任务清单](specs/changes/2026-11-super-bot-mvp/tasks.md)。
+- **自动验证。** Node `24.22.1` 的完整检查通过，含 87 项账本测试、281 项适配测试、行数检查、类型检查及 Host/Client 构建。隔离 DSH 原生 Host 使用确定性模型验证聊天交付、版本附件与 Markdown 记忆等契约。
+- **真实使用记录。** 日常 Web 已实际从原聊天派发普通 Worker、交错回答两个任务的问题、收取并打开精确成果、返工和核对恢复。隔离浏览器曾由开发者点击接受新版，账本记录了该测试的人工接受。各项范围见 [实施路线](ROADMAP.md)。
+- **待用户验证。** 全新克隆后用自己的模型完成个人首版试用及最终接受，核对真实模型处理歧义与成果质量。日常 Web 和 macOS Desktop 的同机配对体验、精确费用归因也待核对。试用步骤见 [第一次真实模型试用](docs/first-trial.md)。
 
 ## 产品边界
 
@@ -32,7 +34,9 @@
 
 ## 安装本地预览包
 
-此预览包支持 DSH Web `0.2.2-rc.1`、`0.2.2-rc.5` 和 Node `>=24.9`。已有兼容 DSH 的用户可直接使用收到的 tgz。尚未安装 DSH 时可运行 `npm install -g @deepseek-ai/dsh@0.2.2-rc.1`。macOS Desktop `0.2.2-rc.5` 的隔离原生 Host 已通过同机配对验证，启用步骤见下文。开发者先在源码仓库构建并打包。
+先确认 `node --version` 至少为 `24.9.0`，构建命令和启动 DSH 的终端都要满足此要求。源码完整检查使用 Node `24.22.1`，隔离 macOS Desktop `0.2.2-rc.5` Host 自带 Node `24.21.0`。插件声明支持 DSH Web `0.2.2-rc.1` 和 `0.2.2-rc.5`，两版都有原生宿主验证，仓库的 SDK 与 CLI 锁定 `rc.1`。已有兼容 DSH 可直接使用。没有 CLI 时可运行 `npm install -g @deepseek-ai/dsh@0.2.2-rc.5`。CLI 的 `plugin add` 需要 PATH 上有 `pnpm`，先用 `pnpm --version` 核对。
+
+从新克隆的源码目录构建并打包。`check` 的最后一步会生成 `lib/`，`npm pack` 读取该目录。已有 tgz 可从下一段开始。
 
 ```sh
 npm ci
@@ -40,49 +44,49 @@ npm run check
 npm pack
 ```
 
-用独立数据目录和 profile 安装生成的 `zxdvd-super-bot-0.1.3.tgz`：
+为试用选一个独立的 DSH home 和新 profile。替换下面的绝对路径，tgz 文件名以 `npm pack` 的输出为准。
 
 ```sh
-DSH_HOME=/absolute/path/super-bot-home dsh --profile super-bot --from-default-profile web --dump-config > /dev/null
-DSH_HOME=/absolute/path/super-bot-home dsh plugin --profile super-bot add /absolute/path/zxdvd-super-bot-0.1.3.tgz
-DSH_HOME=/absolute/path/super-bot-home dsh --profile super-bot --no-open --port 3081
+export DSH_HOME=/absolute/path/super-bot-trial-home
+# 仅首次创建该 profile 时执行
+dsh --profile super-bot-trial --from-default-profile web --dump-config > /dev/null
+dsh plugin --profile super-bot-trial add /absolute/path/zxdvd-super-bot-0.1.3.tgz
+dsh --profile super-bot-trial --host 127.0.0.1 --no-open --port 3081
 ```
 
-上面的 `--from-default-profile web` **仅用于全新 profile 的首次初始化**；更新现有 profile 时只运行 plugin add 和启动命令，不要重复初始化。
+`--from-default-profile web` 会用模板替换目标 profile。更新已有 profile 时，先备份并停止对应宿主，再使用同一个 `DSH_HOME` 和 profile 运行 `plugin add` 和启动命令。每份账本由一个宿主打开。
 
-首次运行保留终端打印的登录链接，打开后进入左侧 Super Bot。独立 home 不继承日常模型账号；在原生会话明确选择并配置你自己的模型。DSH 默认路由不算该会话已选择；未选择时任务不创建 Run，Manager 保留通知且不自动调用。显式选择并不保证账号可用，缺登录/API Key 或额度错误会在工作台提示，再到原生设置处理。产品安装包不包含测试模型。升级前先备份、停止该宿主，再安装新包并启动；不要同时打开同一账本。下方的构建、测试命令只适用于源码仓库，不在已安装的插件目录运行。
+打开启动终端打印的完整登录链接，在 Web 的「设置 → 模型」配置试用账号，再从左侧进入 Super Bot，创建并打开 Bot 对话，在原生模型选择器里明确选择模型。模型目录、提供方及认证由 DSH 管理。新 home 使用自己的存储及账号配置；提供方仍可能读取启动环境里的认证变量。Super Bot 角色覆盖可引用当前 profile 已有的模型，见 [角色模型与 Worker](#使用完整原生-worker)。未明确选择且无适用覆盖时，未配置模型的派发不会创建 Run，Manager 待发通知继续保留。登录、密钥及额度错误在工作台提示，可回原生设置处理。试用流程见 [第一次真实模型试用](docs/first-trial.md)。
+
+如果在另一台机器运行，把 Web 绑定到 `127.0.0.1:3081`。在浏览器所在机器执行 `ssh -N -L 127.0.0.1:3081:127.0.0.1:3081 user@trial-host`，保持隧道连接，再打开远端终端打印的完整登录链接。本地和远端使用相同端口，生成的交付链接也能沿该隧道打开。单独使用 Web 即可试用，macOS 用户可按需配置 [同机只读镜像](#同机-web-与-desktop-只读镜像)。
 
 ## 本地开发预览
 
-开发迭代不需要修改版本号或打 tgz。DSH Web 自带 Host HMR 和 Client HMR，源码以本地 `link:` 安装即可使用；[机制与实际验证](docs/development-hmr.md)。
-
-日常开发使用已启用保护、以本仓库 `link:` 安装的 DSH Web profile。宿主需要原生 HMR，使用 Web 默认的 `root: []`。命令优先使用 `SUPER_BOT_PROFILE`，其次使用当前 DSH 会话提供的 `DSH_PROFILE`，外部终端默认 `web`。`DSH_HOME` 默认为 `~/.dsh`。
+开发时可用 `link:` 加载当前源码目录的构建产物。沿用前面的独立 `DSH_HOME` 和 `super-bot-trial` profile，首次创建 profile 时先执行上面的初始化命令。已有宿主链接到同一工作目录时，等 Bot、Worker 和后台活动空闲并停止对应宿主，再构建、首次链接或由 tgz 切换到链接。从源码根目录运行：
 
 ```sh
-fnm exec --using=24.21.0 npm run dev:reload
-# 可选，最多等待 30 秒取得许可
-fnm exec --using=24.21.0 npm run dev:reload -- --wait 30
+npm ci
+npm run build
+dsh plugin --profile super-bot-trial add "link:$PWD"
+dsh --profile super-bot-trial --host 127.0.0.1 --no-open --port 3081
 ```
 
-默认忙碌即拒绝并打印阻塞项。`--wait 1–120` 只在同一活实例上有界重试，等待期间正常接活。授予许可后，同一道门槛暂停 Worker 新派发、会话准备和 Manager 自动唤醒。命令先在 `.runtime` 构建，再由授权实例用私有触发文件把发布和重组交给 DSH 原生 HMR 队列。profile 的 manifest 和 patch 无须改写。终端显示 `Applied` 表示同一宿主内的新插件实例报告了这一批构建。Ctrl-C 可以取消等待或尚未发布的许可。触发未被处理时，许可到期后恢复接活。发布后如果失联或没有匹配回执，检查原生 HMR 日志和 Plugins 状态再重试。
+已链接当前仓库并加载支持许可的版本后，保留 Web 原生 HMR 及默认 `root: []`，在沿用同一 `DSH_HOME` 的源码终端运行：
 
-首次安装或从旧版启用保护时，等 Bot、Worker 和后台活动空闲并正常停止该宿主，再于本仓库运行 `npm run build`。已链接到本仓库的 profile 可用原命令启动。首次链接或从 tgz 切换时，按既有安装流程运行 `dsh plugin --profile web add "link:$PWD"`，再用同一 profile 启动。首次创建 profile 和 tgz 安装见上文。旧版活实例还没有许可入口，`dev:reload` 会安全退出。
+```sh
+SUPER_BOT_PROFILE=super-bot-trial npm run dev:reload
+SUPER_BOT_PROFILE=super-bot-trial npm run dev:reload -- --wait 30
+```
+
+`dev:reload` 依次使用 `SUPER_BOT_PROFILE`、当前 DSH 会话提供的 `DSH_PROFILE`、默认 `web`，`DSH_HOME` 默认 `~/.dsh`。默认忙碌即打印阻塞项并退出，`--wait` 接受 1～120 秒。授予许可后暂时关闭新派发、会话准备和 Manager 自动唤醒，在 `.runtime` 构建，再通过 DSH 原生 HMR 发布。`Applied` 代表同一宿主的新实例回报了本批构建。Ctrl-C 可取消等待或尚未发布的许可，未触发的许可会自动到期。发布后缺匹配回执时，以原生日志和 Plugins 状态为准。旧版缺许可入口时，先按上面的停机步骤构建并启动。机制与复验见 [开发热加载说明](docs/development-hmr.md)。
 
 宿主已加载支持成果回执的版本后，可用 `npm run dev:reload -- --result <成果ID>` 把一次开发重载关联到当前仓库的已收敛成果。任务详情显示成果 ID。宿主核对暂存构建中包含的成果源码和同进程接棒，成功后登记构建号及时间供任务详情查询。普通重载命令也可照常使用。
 
 保护适用于上述 `dev:reload`。普通构建、源码监听、手工改配置和 DSH 自行重组仍可触发各自的热加载。日常宿主运行期间，可用 `SUPER_BOT_BUILD_OUTDIR=.runtime/check npm run check` 验证源码而不发布到共享 `lib`。DSH Client HMR 刷新前端时，页面局部状态可能重置。需要自动监听源码时，使用下面的独立开发宿主：
 
-需要 Node `>=24.9`，当前验证 Node `24.21.0`。在仓库中运行：
+在没有其他宿主使用该工作目录 `lib/` 的情况下，可运行 `npm ci`、`npm run dev`。`dev` 从仓库锁定的 DSH CLI 启动，使用 `.runtime/dsh-dev` 下的独立 home 和 `super-bot-dev` profile，默认监听 `127.0.0.1:3081`，可用 `SUPER_BOT_PORT` 改端口。自动构建监听 `src`，Host HMR 监听 `lib/index.js`，Client HMR 刷新 `lib/client.js`。进程使用自己的 DSH 存储，也会继承启动环境变量。用终端的登录链接进入，Ctrl-C 退出。再次运行保留任务数据，默认账本位于该 home 的 `super-bot/ledger.sqlite`。
 
-```sh
-npm ci
-npm run check
-npm run dev
-```
-
-`dev` 使用仓库 `.runtime/dsh-dev` 下的独立 home 和 `super-bot-dev` profile，监听 `127.0.0.1:3081`（可设 `SUPER_BOT_PORT`）。自动构建监听 `src`，Host HMR 监听 `lib/index.js`，Client HMR 刷新 `lib/client.js`；不需要重复打包、安装或重启宿主。从终端启动链接进入后点击左侧 Super Bot。该隔离环境不复用日常会话或模型凭证；有模型的日常入口仍是 web profile。退出用 Ctrl-C；再次运行保留任务数据。数据库默认在 `$DSH_HOME/super-bot/ledger.sqlite`，不要同时用多个宿主打开同一数据库。
-
-- `npm run check`：类型检查、核心账本测试、DSH 适配层测试、Host/Client 构建。`npm test` 单独运行不依赖 DSH 的账本测试。
+- `npm run check` 包含行数检查、类型检查、核心账本测试、DSH 适配层测试和 Host/Client 构建。`npm test` 单独运行账本测试。
 - `npm run smoke:notifications`：自建全新隔离 home/profile/账本与确定性提供方，验证 Manager 未就绪、额度恢复、通知回执崩溃及重复重启；无真实模型费用、无生产连接。
 - `npm run smoke:chat`：在专用探针宿主上验证聊天接单、同对话交付、文件下载、提问回答、返工、Bot 直接 Shell 查询/noWait 拒绝与 Worker 原生 Shell 文件任务；仅确定性模型，不依赖外部服务。可传专用宿主日志：`npm run smoke:chat -- .runtime/permissions-host.log`。
 - `node scripts/smoke-delivery-receipt.mjs <隔离宿主日志>`：使用确定性探针和每小时一次的唤醒限额，验证工具回包、原聊天链接回执、版本下载及人工验收状态。运行条件与证据见 [DF-14](specs/changes/2026-11-super-bot-mvp/evidence.md#2026-11-21-df-14--原聊天成果回执)。
@@ -96,7 +100,7 @@ Node 用 fnm 管理时，可用 `fnm exec --using=24.21.0 npm run dev`，无需�
 
 ## 使用完整原生 Worker
 
-在所用 profile 的 `cordis.patch.yml` 为本插件配置角色模型和项目目录，provider/model 填该 profile 中已有的标识：
+角色模型和项目目录可在所用 profile 的 `cordis.patch.yml` 中配置。Super Bot 准备管理会话时会应用 `managerModel`，省略时沿用原生选择。Bot 派发时，Worker 优先使用 `workerModel`，其次使用 Worker 会话已记录的原生选择，再继承当前 Bot 对话已记录的选择。手动开始和核对后继续使用 Worker 角色覆盖或 Worker 原生选择。以下 provider、model 和推理档位均为占位示例，请换成当前 profile 已配置并受提供方支持的值。
 
 ```yaml
 - id: super-bot
@@ -105,11 +109,11 @@ Node 用 fnm 管理时，可用 `fnm exec --using=24.21.0 npm run dev`，无需�
     allowedRoots: [/absolute/path/projects]  # 任务目录只能落在这些根之下
     managerModel:
       provider: your-provider
-      model: gpt-6.1-sol
+      model: your-model
       reasoningEffort: medium
     workerModel:
       provider: your-provider
-      model: gpt-6.1-sol
+      model: your-model
       reasoningEffort: xhigh
 ```
 
@@ -135,7 +139,7 @@ Node 用 fnm 管理时，可用 `fnm exec --using=24.21.0 npm run dev`，无需�
 
 在 DSH 原生聊天打开当前由 Super Bot 创建和管理的 Manager 或 Worker，会话头部显示创建端。对端显示「请在创建端继续」，原生会话列表沿用 DSH 规则。日常 Web 和 Desktop 的界面验收由用户完成。
 
-隔离复验可运行 `node scripts/smoke-mirror.mjs`，需要 Node `>=24.9`、`lsof` 和已安装的 macOS DeepSeek Harness。脚本使用两个真实 Host、独立 profile/账本和确定性测试模型；运行证据保存在 `.runtime`。验证连接和客户端资源的发布，日常渲染与点击需要在实机验收。
+隔离复验可运行 `node scripts/smoke-mirror.mjs`，需要 Node `>=24.9`、`lsof` 和已安装的 macOS DeepSeek Harness。脚本使用两个真实 Host、独立 profile/账本和确定性测试模型，运行证据保存在 `.runtime`。验证换端口后从原聊天打开成果时，设置 `SUPER_BOT_TEST_CHAT_LINKS=1`、`SUPER_BOT_TEST_PLAYWRIGHT`（Playwright 模块绝对路径）和 `SUPER_BOT_TEST_BROWSER`（Chromium 可执行文件绝对路径），再运行同一命令。浏览器连接隔离 Desktop Host 的 HTTP 载体。日常原生 Desktop 窗口留待实机验收。
 
 ## 任务工作目录
 
@@ -150,7 +154,7 @@ Bot 在 `super_bot_manage` 的 `create`/`dispatch` 中可传 `workdir`，按任�
 
 所有路径解析 realpath 后必须位于 `allowedRoots` 内，且不能是 HOME、`/`、Super Bot 数据目录、`deniedPaths` 或 `.ssh`/`.aws`/`.env`/`*.pem` 等敏感位置；违反时返回 `workdir-rejected`，Bot 应换目录或询问用户。hook 的变量只通过环境变量传入（`SB_NAME`、`SB_TASK_ID`、`SB_WORKDIR`、`SB_ARG_<KEY>`，命令里的 `{name}`/`{args.x}` 会被替换为带引号的变量引用），参数名须在 `argNames` 中，值只允许字母数字和 `._/ -`；失败或超时（默认 300 秒，应小于 `managerTurnMinutes`）不重试，返回 `workdir-hook-failed` 并清理 hook 留下的空目录。同一请求重试不会重复运行 hook。
 
-清理默认手动（`workdirCleanup: manual`）：任务结束后可在任务详情的“工作目录”卡片点“清理”；`existing` 目录永不删除，worktree 有未提交改动时不强删，hook 需配置 `remove`。`on-complete` 会在接受或取消后自动清理，但之后成果文件下载会失效。
+清理默认手动（`workdirCleanup: manual`），任务结束后可在任务详情的“工作目录”卡片点“清理”。`existing` 目录由用户维护，含未提交改动的 worktree 会保留，hook 清理需配置 `remove`。`on-complete` 会在接受或取消后自动清理。已保存的成果附件仍可下载，旧成果若只有原路径，清理后需先恢复原文件。
 
 旧配置 `workspace: <dir>` 仍可用：等价于 `allowedRoots: [<dir>]`，Git 根目录默认 worktree，并在状态里提示改用新键。`allowedRoots`/`workspace` 指向 HOME 或 `/` 时会被忽略并提示，任务回退到数据目录下的独立目录。
 
@@ -159,14 +163,14 @@ Bot 在 `super_bot_manage` 的 `create`/`dispatch` 中可传 `workdir`，按任�
 ```yaml
 - id: super-bot
   config:
-    allowedRoots: [/Users/me/work]
+    allowedRoots: [/absolute/path/projects]
     defaultWorkdir: isolated          # isolated | worktree | hook | none
     defaultIsolatedDir: .super-bot-workspaces
-    deniedPaths: [/Users/me/work/secrets]
+    deniedPaths: [/absolute/path/projects/secrets]
     workdirCleanup: manual            # manual | on-complete
     workdirHook:
       description: 用 team-workspace 创建包含多个仓库的工作区
-      cwd: /Users/me/work/workspaces
+      cwd: /absolute/path/projects/workspaces
       create: tw ws create {name} --repos {args.repos}   # 未输出 SB_WORKDIR 时使用 <cwd>/<name>
       remove: tw ws rm {name}
       argNames: [repos]
@@ -187,7 +191,9 @@ Bot 在 `super_bot_manage` 的 `create`/`dispatch` 中可传 `workdir`，按任�
 4. 需要修改就继续说；Bot 将实际用户消息交给对应任务返工。完成后点交付中的“查看成果并确认”，直接进入该成果详情，检查后点击“接受成果”。Bot 不能代替人点击接受。
 5. “工作”用于按需查看进度、验收、停止或处理异常；Bot 设置、参考材料和账本维护在工作视图右上角“⋯”里。正常接单不需要任务表单、Session ID 或手动开始。
 
-Bot 检查成果后调用 `super_bot_manage` 的 `deliver`（taskId、resultId、text）交付：插件在同一事务里记录交付并关闭补交付通知，自己渲染相对路径的文件与任务链接（`/api/super-bot-file?…`、`/#super-bot-task=…`），与 Web/Desktop 端口无关。按回复文本识别链接只作为旧行为兜底。聊天接单与反馈会记录真实原生用户消息来源；自动通知不能充当用户请求。文件链接只读取已报告的任务成果，拒绝 `.ssh`、`.aws`、`credentials`、`*.pem` 和 `.env`（含变体与符号链接别名），下载时重新验证哈希；文件改变后需要重新提交。默认人工最终确认。Full Access 下可用能力跟随宿主及其插件，具体外部服务仍需对应配置与任务授权。
+Bot 检查成果后调用 `super_bot_manage` 的 `deliver`（taskId、resultId、text）生成交付链接。插件核对原生聊天中持久保存的最终回复、正常轮次结束和精确的成果及文件链接之后，才登记回执并结清补交付通知。聊天接单与反馈记录真实原生用户消息来源。自动通知不能充当用户请求。
+
+原生 Markdown 会把根相对地址显示为文件控件，交付消息因此使用生成时的宿主 HTTP 地址。同一创建端 Desktop 换端口后，可从原 Bot 聊天继续打开原 Task 和 Result，附件由当前宿主校验并下载。被替代的版本保留原摘要、检查和附件入口，当前版本沿用人工验收。Worker 通过 `ready` 明确提交的附件与成果一并入账，每份成果最多 10 个文件，单个最多 10 MiB，合计最多 20 MiB。创建端下载按成果版本核对附件副本的大小和 SHA-256。升级前未保存副本的附件继续按原路径、大小和 SHA-256 核对。若原文件已丢失或变化，请把提交时的文件恢复到原路径，或请 Bot 重新提交成果。Full Access 下可用能力跟随宿主及其插件，外部服务仍需对应配置与任务授权。
 
 确定性测试只证明流程与约束，不能代替真实模型质量验收。测试模型只存在于单独的契约测试插件中，不随产品包交付。
 
@@ -207,7 +213,7 @@ DF-06 工作入口复用原生 Bot 对话和右侧栏：有聊天记录时在对
 - 在正在执行的 Worker 会话里插话或排队下一条，不会中断当前自动轮次。自动轮次按自身的 `turn/end`、最终报告和后台作业/子 Agent 状态结算，不等待整个会话空闲；因此排队的人工下一轮不会把已正常结束的 Run 误标为中断。新人工轮次会把尚未完成的任务转人工管理，但不会取消该轮，也不会篡改旧 Run 已结算的事实。
 - Bot 设置、管理对话、侧栏整理与账本维护移到右上角“⋯”设置页，不再占首屏。成果文件链接继续走原有认证与哈希校验；下载不代表接受。
 - 入口按原生 Session 查询当前有效 Bot，不使用浏览器最后选择的 Bot。普通会话、Worker 和旧 Bot 对话不会借用别的 Bot 的任务；导航或会话变化会使旧查询失效。
-- 任务详情显示 Worker 的原生选择、下次 Bot 派发预计模型及来源。角色覆盖优先，其次是 Worker 会话选择。Bot 可从自己的原生会话继承已记录的选择，手动开始与恢复继续使用 Worker 自己的选择或角色覆盖。执行模型区可展开历史 Run、轮中切换和原生证据。档位和调用证据不足时显示「未知」。详见 [DF-11 验证记录](specs/changes/2026-11-super-bot-mvp/evidence.md#2026-11-21-df-11--显示实际模型与来源)。
+- 任务详情显示 Worker 的原生选择、下次 Bot 派发预计模型及来源。角色覆盖优先，其次是 Worker 会话选择。Bot 可从自己的原生会话继承已记录的选择，手动开始与恢复继续使用 Worker 自己的选择或角色覆盖。在创建端展开「执行模型」才会读取各 Run 的实际请求、原生证据和派发时预计模型。收起后再次展开可刷新；无法确认的字段显示「未知」。详见 [DF-11 验证记录](specs/changes/2026-11-super-bot-mvp/evidence.md#2026-11-21-df-11--显示实际模型与来源)。
 
 定向回归命令（合成原生边界 + 实际产品账本/客户端逻辑，不代替浏览器验收）：
 
@@ -244,6 +250,37 @@ Worker 完成源码验证后，外层已在空闲时加载，核对真实侧栏�
 
 任务保留创建时的 Bot 配置版本；修改 Bot 只影响以后创建的任务。旧任务仍使用原职责与原参考内容，防止执行中悄悄改变约定。配置确有变化时，旧管理对话保留为历史并失去管理权限，回首页点 Bot 会准备新的对话，需要重新选择模型。管理对话正在工作时不能修改配置；未改变内容的保存不会更换对话。
 
+## Bot 的 Markdown 记忆
+
+在 Bot 原聊天明确要求保存默认工作约定，例如「请把『交付前回读文件』保存为以后的默认工作约定」。之后一句清楚的委派即可采用默认约定。在委派中说「这一次请在交付前检查标题，覆盖默认约定」，该任务会保存并采用当次要求。可以在原聊天按任务询问实际采用的约定。以后更新默认值时，已有任务和同任务续跑继续从原任务快照读取。
+
+记忆保存在创建端的 `<dataDir>/memory/<Bot ID>/`。`dataDir` 依次取插件配置 `dataDir`、`SUPER_BOT_DATA_DIR`、`$DSH_HOME/super-bot`，未指定 DSH home 时为 `~/.dsh/super-bot`。按完整 Bot ID 定位目录，同名 Bot 分别保存，更换管理对话继续使用同一目录。新 Bot 创建 `index.md`，旧 Bot 第一次查索引或保存约定时创建。请在原聊天更新默认约定，程序负责维护 `work-convention.md` 的正文和来源顺序。
+
+手工维护决策时，在该 Bot 目录创建 `decisions/`。用 UTF-8 保存独立普通文件，每个文件最多 16 KiB，索引也遵循此限制。文件名以小写字母或数字开头，主文件名最长 80 字符，只用小写字母、数字和连字符，扩展名为 `.md`。例如保存 `decisions/release-checks.md`，然后在现有 `index.md` 追加一行索引，保留其他条目。
+
+```markdown
+- [发布检查范围](decisions/release-checks.md)
+```
+
+决策文件第一行使用 `[来源]` 链接，空一行再写非空正文。示例里的 UUID 须换成创建端同一个 Bot 的实际 Task ID 和所属 Result ID。也可省略 `&resultId=…` 引用任务本身。可从原聊天的「查看成果并确认」链接取 `/#super-bot-task=…` 路径和片段，去掉协议、主机和端口。请使用仍保存在账本中的任务或成果，问题链接、附件 URL 和外站链接不符合来源格式。
+
+```markdown
+[来源](/#super-bot-task=11111111-1111-4111-8111-111111111111&resultId=22222222-2222-4222-8222-222222222222)
+
+发布前检查安装包清单，并在隔离 Web Host 验证登录和成果下载。
+```
+
+回到该 Bot 原聊天询问这项决策，确认它引用同一个任务或成果。Bot 会先读索引，再按需读取相关条目并引用程序核验后的来源。只保存需要长期引用的决策与理由，避免把账号凭证、原始聊天和临时工作日志写进会提供给模型的内容。当前聊天保存入口只处理默认工作约定，决策文件和索引由创建端手工维护，镜像只提供只读任务投影。
+
+SQLite 在每项任务创建时保存当时采用的默认约定或本次覆盖及其来源，同任务续跑读该快照。账本备份包含这些任务快照。当前默认约定、决策正文及索引保留在独立 Markdown 目录，按下文 [备份、恢复与卸载](#备份恢复与卸载) 一并保管。
+
+定向回归使用 `node --import tsx --test test/adapter/bot-memory.test.ts`。隔离原生烟测可复用双端载体，使用 `.runtime` 内的构建和全新数据目录：
+
+```sh
+SUPER_BOT_BUILD_OUTDIR=.runtime/memory-build npm run build
+SUPER_BOT_TEST_BOT_MEMORY=1 SUPER_BOT_TEST_BUILD_DIR="$PWD/.runtime/memory-build" node scripts/smoke-mirror.mjs
+```
+
 ## 持久 Manager
 
 创建或打开 Bot 时自动准备当前对话；在原生界面选择模型。它可以通过聊天创建任务，也会接收新任务、回答、返工和执行结束的重要事件。仅完整且处于自动管理状态的任务可派发；默认由人最终验收。创建任务时明确授权的低风险任务可由 Bot 验收，记录不会伪装成人工接受。
@@ -268,7 +305,7 @@ Bot 之间轮流获得自动管理机会；同一 Bot 的用户回答、人工�
 
 设置页（“⋯”）的“备份账本”使用 SQLite 一致性快照，并返回备份路径和清单。它可以在宿主运行时执行；同一请求重复到达保留首次已发布的快照，即使清单写入时中断也不会替换它。原快照被删除或损坏时会报错，需要重新点击备份创建新快照。文件位于数据目录的 `backups/`，权限为仅当前用户可读写。
 
-**账本备份不包含成果文件、DSH 会话或模型凭证。** 清单列出需要另行保留的会话 ID 和工作目录。不要只复制一个正在使用的 `ledger.sqlite` 而遗漏 WAL；应使用面板的备份操作。
+请用面板的备份操作取得包含 WAL 中已提交数据的一致性快照。SQLite 备份包含任务约定快照和已保存的成果附件。请另行备份创建端数据目录下的 `memory/`，保留完整 Bot ID 目录结构、默认约定、索引和决策文件。按清单另行保留 DSH 会话和未保存副本的原成果文件，模型凭证单独保管。
 
 先停止使用该账本的宿主，再恢复到一个尚不存在的新目录：
 
@@ -278,15 +315,15 @@ npm run restore:ledger -- /absolute/path/backup.sqlite /absolute/path/new-super-
 
 如果只有 tgz，先解包，然后用 `node /absolute/path/package/scripts/restore-ledger.mjs /absolute/path/backup.sqlite /absolute/path/new-super-bot-data` 调用包内脚本。
 
-恢复脚本检查完整性和 schema，拒绝覆盖现有目录。恢复后的未完成任务全部暂停并产生待核对事项，旧管理通知不自动重放；备份之后真实文件或会话可能已经变化，需要逐项核对。原账本与备份不会被修改。当前 schema 为 9，恢复脚本接受 schema 6～9 的备份；旧账本在新宿主首次打开时事务升级。schema 9 新增 Run 的原进程轮次/事件坐标与后台收敛证据；旧 Run 不补造证据，未完成且证据不足时仍保留资源待核对。其他版本会拒绝，需先使用对应版本处理。升级前应先备份；旧插件不能打开已升级账本。回退时停止宿主，使用旧版插件、对应旧版恢复脚本和升级前的备份恢复到新目录，不能覆盖或降级当前数据库。
+恢复脚本检查完整性和 schema，拒绝覆盖现有目录。恢复后的未完成任务全部暂停并产生待核对事项，旧管理通知不自动重放；备份之后真实文件或会话可能已经变化，需要逐项核对。原账本与备份不会被修改。当前 schema 为 10，恢复脚本接受 schema 6～10 的备份。旧账本在新宿主首次打开时事务升级。schema 10 增加按成果版本保存的附件副本，历史成果继续以原记录为准。schema 9 新增 Run 的原进程轮次/事件坐标与后台收敛证据；旧 Run 不补造证据，未完成且证据不足时仍保留资源待核对。其他版本会拒绝，需先使用对应版本处理。升级前应先备份；旧插件不能打开已升级账本。回退时停止宿主，使用旧版插件、对应旧版恢复脚本和升级前的备份恢复到新目录，不能覆盖或降级当前数据库。
 
-启动宿主时设置 `SUPER_BOT_DATA_DIR=/absolute/path/new-super-bot-data`，或在插件配置中设置 `dataDir`（配置优先）。继续使用原 DSH home，或先恢复对应会话与成果目录；仅修改数据目录不会搬迁那些文件。切回原账本时，停止宿主并撤销该设置。不要同时运行两个宿主操作同一组会话/成果。
+脚本完成后、启动前，将对应备份的 `memory/` 放入新数据目录，保留各 Bot ID 和原有私有权限。SQLite 恢复会带回历史任务约定快照及已保存的附件，但不会从快照重建 Markdown 默认约定和决策笔记。启动时设置 `SUPER_BOT_DATA_DIR=/absolute/path/new-super-bot-data`，或设置优先级更高的插件 `dataDir`。继续使用原 DSH home，或先恢复对应会话与旧成果所需的原文件。切回原账本时，停止宿主并撤销该设置。每组会话和成果由一个宿主运行。
 
-在隔离 profile 中卸载、重装的命令为：
+沿用安装时的 `DSH_HOME` 和 profile，可在停机后卸载并按需重装同一 tgz。
 
 ```sh
-DSH_HOME=/absolute/path/dsh-home dsh plugin --profile profile-name remove @zxdvd/super-bot
-DSH_HOME=/absolute/path/dsh-home dsh plugin --profile profile-name add /absolute/path/super-bot
+dsh plugin --profile super-bot-trial remove @zxdvd/super-bot
+dsh plugin --profile super-bot-trial add /absolute/path/zxdvd-super-bot-0.1.3.tgz
 ```
 
 执行前停止该宿主，之后重新启动。卸载会移除产品入口/API/工具，不删除账本、原生会话或成果。此流程已在测试 profile 验证；运行中热卸载尚未验证。

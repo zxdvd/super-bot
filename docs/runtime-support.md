@@ -1,8 +1,6 @@
 # 当前运行能力与降级
 
-截至 2026-11-09，聊天主入口与四轮真实 Bot/Worker dogfooding 已落地。下表区分既有 files 模式的底层证据与 Full Access 增量；局部实测不代表首版全部验收。最新状态见[接手说明](handoff.md)。
-
-验证目标：DSH Web `0.2.2-rc.1`、Node `24.21.0`、SQLite `3.53.4`。独立 home/profile 使用无网络确定性模型，调用真实 DSH API、文件工具、原生审批和会话运行时。这里的“已验证”不代表真实模型的工作质量。
+当前支持 DSH Web `0.2.2-rc.1`、`0.2.2-rc.5`，Node 最低 `24.9.0`。仓库 SDK 锁定 Web `rc.1`，当前完整检查使用 Node `24.22.1`。隔离 Web `rc.5` 及 macOS Desktop `rc.5` 原生 Host 分别在 Node `24.22.1` 和 Desktop 内置 `24.21.0` 上运行。下表包含既有 files 与 Full Access 的分阶段验证记录。独立探针用确定性模型验证宿主契约，真实模型试用与个人验收状态见 [README](../README.md)。
 
 | 能力 | 当前结果 | 产品行为与证据 |
 | --- | --- | --- |
@@ -31,7 +29,7 @@
 | Dashboard 离线 | 已验证 | 仅保留快照并禁用变更；重连不重放操作，恢复筛选和位置。100 项分页通过；恢复旧备份时清除失效任务/Bot 选择并钳制页码，同页任务消失路径 UI 通过 |
 | 运行中热卸载/热替换 | 空闲插件原生 HMR 已实测 | 独立宿主验证 link 源码监听及 tgz→link 配置重组：同 PID、同版本换成新模块。真实 Super Bot 后端重挂载、前端 rebuilt SSE 通过。`dev:reload` 用于日常空闲重载，`dev` 用于隔离自动监听；活动执行期间不热替换 |
 | 同机 Web 与 macOS Desktop | 真实原生 Host 已验证，日常界面待验收 | Web rc.1、rc.5 与实际 Desktop rc.5 Host。各自原账本、原生聊天和验收可用，对端只读查阅。Desktop 动态端口、两端热载与断线重连通过。[启用说明](../README.md#同机-web-与-desktop-只读镜像) |
-| 真实模型质量、Token/费用 | 四轮 dogfooding 已完成；无精确费用归因 | Sol medium Bot 委派 Sol xhigh Full Access Worker，实际 Shell/子 Agent/测试、补充需求、原对话交付及同任务返工通过；多任务歧义、用户最终接受和费用评估仍待验证。自动审查超时等异常见接手说明 |
+| 真实模型质量、Token/费用 | 已有真实模型试用记录 | 日常 Web 已用真实模型委派 Full Access Worker 执行 Shell、子 Agent、测试，且验证了补充需求、原对话交付和同任务返工。真正有歧义时的澄清、个人首版验收及精确费用归因待用户试用 |
 
 Bot 默认（省略 `fullAccess` 或 true）开放 `skill`、`bash`、`read`、`read_image`、`job_output`、`job_list`、`job_kill` 与 `super_bot_manage`。工具列表和执行 guard 双重约束，无 write/edit 或原生 Worker/subagent 工具。轻量只读/状态查询、lark-cli 查询及 Shell skill 可在 Bot 直接执行；代码/文件修改、多步骤和长任务仍委派 Worker。Shell 不构成只读沙箱，程序不声称能识别任意命令的副作用，意图分工由指令引导。
 
@@ -41,7 +39,7 @@ noWait 拒绝常见 sleep 调用；所有 preset 的 Bot bash 都须显式正数
 
 复跑旧目录、scoped-tools、预算等 files 隔离 smoke 时，须在专用测试 profile 显式设置 `fullAccess: false`；`smoke:chat` 使用默认 Full Access，核对 Bot 精确八项工具列表、直接 Bash 查询零 Task、真实 noWait 拒绝及 Worker Shell 文件任务。
 
-仅补交付通知每成果最多 3 次自动唤醒，后两次退避 30/60 秒；次数、结束输入与期限落在原 outbox payload，重启不重置。到限 unknown 并停止唤醒；未知发送、缺失结束记录及补交付轮次用户中断不自动重放。链接按路径与 resultId/index/taskId 识别，允许相对地址、参数换序与不同端口；仍以原生持久化最终回复和成功 turn/end 为准。识别历史交付不承诺旧端口的下载地址在重启后仍可打开，可从当前工作面板查看成果。
+仅补交付通知每成果最多 3 次自动唤醒，后两次退避 30/60 秒；次数、结束输入与期限落在原 outbox payload，重启不重置。到限 unknown 并停止唤醒；未知发送、缺失结束记录及补交付轮次用户中断不自动重放。回执核对同宿主的精确链接、归属匹配的原生持久最终回复和正常 turn/end。已用隔离 Desktop HTTP 载体验证换端口后从原聊天打开精确成果，附件由当前创建端校验并返回。成果或链接无法打开时，可从当前「工作」查看任务详情。日常原生 Desktop 窗口待实机验收。
 
 files 模式目录限制是应用层约束，不是操作系统沙箱。Full Access 不附加该目录限制，也不把不同 Bot 作为安全租户。既有原生会话的历史、插件和用户手动操作仍属于当前单用户宿主。
 

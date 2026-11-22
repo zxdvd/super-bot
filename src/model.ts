@@ -27,7 +27,11 @@ export interface Bot {
 }
 export interface ReferenceInfo {path:string;sha256:string;bytes:number}
 export interface ReferenceMaterial extends ReferenceInfo {text:string}
-export interface TaskBotContext {instructions:string;materials:ReferenceMaterial[]}
+export interface TaskBotContext {
+  instructions: string;
+  materials: ReferenceMaterial[];
+  workConvention?: { source: 'default' | 'override'; text: string };
+}
 export type Lifecycle = 'open' | 'review' | 'completed' | 'cancelled';
 export type ControlMode = 'auto' | 'paused' | 'manual';
 export interface Task {
@@ -86,6 +90,10 @@ export interface ExistingSessionPreview {sessionId:string;cwd:string;quiet:boole
 export interface ManagerBinding {id:string;botId:string;generation:number;configRevision:number;requestedSessionId:string;sessionId:string|null;cwd:string;state:'creating'|'ready'|'recovery'|'released';createdAt:number}
 export interface ManagerEvent {id:string;taskId:string|null;payload:string;state:string;createdAt:number}
 export type ChatDeliveryStatus = { state: 'awaiting-review' | 'pending' | 'uncertain' | 'delivered' | 'handled'; reason?: string };
+export type UncertainDelivery = {
+  id: string; taskId: string; taskGoal: string; resultId: string;
+  reason: string; sessionId: string | null; at: number; turn?: number;
+};
 export type ReloadReceipt = { resultId: string; build: string; from: string; to: string; pid: number; at: number };
 export type TaskProgress = {
   worker: { runId: string; summary: string; at: number } | null;
@@ -124,9 +132,12 @@ export interface RunModels {
   expected: WorkerModelPlan | null;
   actual: ActualModelRequest[];
 }
-export interface TaskModels {
+export interface WorkerModelPreview {
   current: ModelRoute | null;
   expected: WorkerModelPlan | null;
+}
+export interface TaskModelHistory {
+  taskId: string;
   runs: RunModels[];
 }
 export interface ChildWaitMember {

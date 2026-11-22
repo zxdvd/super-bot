@@ -28,13 +28,13 @@ export function TestTasks({ w, tasks, nested = false }: { w: WorkspaceState; tas
   </details>;
 }
 
-export function Inbox({ w }: { w: WorkspaceState }) {
+export function Inbox({ w, onReturn }: { w: WorkspaceState; onReturn?: () => void }) {
   const items = w.page?.items;
   if (!items) return <div className="card"><div className="skeleton"/><div className="skeleton"/><div className="skeleton"/></div>;
   const groups = inboxGroups(items, w.seen, w.now);
   const clear = groups.fresh.length > 0 && <button className="small" onClick={() => w.markAllSeen(groups.fresh)}>标为已读</button>;
   return <div className="inbox">
-    <SystemIssues w={w}/>
+    <SystemIssues w={w} onReturn={onReturn}/>
     {items.length === 0 ? <div className="card empty">
       <h2>还没有任务</h2>
       <p>在聊天里把事情交给 Bot，例如“调研某个方案并写对比表”或“修复某个页面的样式问题”。它会在这里出现。</p>
