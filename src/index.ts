@@ -4,9 +4,16 @@ import type {} from '@deepseek-ai/dsh-client-connection';
 import type {} from '@deepseek-ai/dsh-api-session-controller';
 import type {} from '@deepseek-ai/dsh-workspace';
 import type {} from '@deepseek-ai/dsh-host-webserver';
+import type {} from '@deepseek-ai/dsh-app-boot';
+import type {} from '@deepseek-ai/dsh-hmr';
+import type {} from '@deepseek-ai/dsh-cmdline';
 import { createRequire } from 'node:module';
+import { realpathSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { basename,join,resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { startReloadHost } from './dev-reload-host.ts';
+import { ReloadAdmission } from './reload-admission.ts';
 import { readEvidence } from './evidence.ts';
 import { Store } from './store.ts';
 import { DshExecution } from './dsh.ts';
@@ -14,6 +21,9 @@ import {runtimeLimits,type RuntimeOptions} from './runtime.ts';
 import { Managers } from './manager.ts';
 import { NativeSidebar } from './sidebar.ts';
 import { createLedgerBackup } from './backups.ts';
+import { bindMirror, parseMirrorQuery, startMirror } from './mirror-host.ts';
+import { readLocalMirror } from './mirror-queries.ts';
+import { managedSessionId, oppositeOwner, type BotOwner, type MirrorBot, type MirrorCatalog, type SessionOrigin } from './mirror.ts';
 import { AppError, requiredText, optionalText,type WorkspaceStatus, type NewBot, type NewTask, type ControlMode } from './model.ts';
 
 export const name = 'super-bot';
@@ -35,25 +45,86 @@ export const Config = Schema.object({ dataDir: Schema.string().description('Supe
   workdirHook:Schema.union([Schema.const(undefined),workdirHook]),
   workdirCleanup:Schema.union([Schema.const('manual'),Schema.const('on-complete')]).default('manual').description('任务完成或取消后是否自动清理隔离目录 / worktree / hook 目录；已有目录从不清理'),
   workspace:Schema.string().description('已弃用：等同 allowedRoots: [workspace]'),
+  mirrorDir: Schema.string().description('可选。同机 Web 与 Desktop 只读镜像的私有配对目录，含 pair.json。'),
   maxRunningTasks:Schema.natural().min(1).default(2).description('全局同时执行的 Worker 任务数'),managerWakesPerHour:Schema.natural().min(1).default(20).description('每个 Bot 每小时自动唤醒上限；达到后记录问题并暂停自动唤醒'),managerConcurrentWakes:Schema.natural().min(1).default(2).description('同时自动唤醒的 Bot 数'),managerTurnMinutes:Schema.natural().min(1).default(5).description('单次自动 Bot 轮次上限（分钟）'),managerModel:roleModel,workerModel:roleModel });
 
-export function apply(ctx: Context, config: RuntimeOptions & { dataDir?: string } = {}): void {
+export async function apply(ctx: Context, config: RuntimeOptions & { dataDir?: string; mirrorDir?: string } = {}): Promise<void> {
+  const checkout = fileURLToPath(new URL('..', import.meta.url));
   const dataDir = resolve(config.dataDir ?? process.env.SUPER_BOT_DATA_DIR ?? join(process.env.DSH_HOME ?? join(homedir(), '.dsh'), 'super-bot'));
+  const profile = ctx.get?.('profileContext');
+  const owner: BotOwner = (profile?.name ?? process.env.DSH_PROFILE) === 'desktop' ? 'desktop' : 'web';
+  const peer = oppositeOwner(owner), binding = bindMirror(dataDir, owner, profile, config.mirrorDir);
   const store = new Store(join(dataDir, 'ledger.sqlite'));store.maxRunningTasks=runtimeLimits(config).maxRunningTasks;
-  const execution=new DshExecution(ctx,store,dataDir,config);
-  const managers=new Managers(ctx,store,execution,dataDir,()=>ctx.webServer.getOrigin(),config);
+  let pairingIssue = binding.issue;
+  const mirrorReady = binding.pair && startMirror(binding.pair, query => readLocalMirror(store, query)).catch(() => {
+    pairingIssue = '无法启动本端只读镜像监听。';
+    ctx.logger.warn(`[super-bot] ${pairingIssue}`);
+  });
+  const reloadAdmission=new ReloadAdmission();
+  const execution=new DshExecution(ctx,store,dataDir,config,reloadAdmission);
+  const managers=new Managers(ctx,store,execution,dataDir,()=>ctx.webServer.getOrigin(),config,reloadAdmission);
   const sidebar=new NativeSidebar(ctx,store);
-  ctx.effect(() => async () => {await managers.dispose();await execution.dispose();store.close();});
+  let reloadHost: ReturnType<typeof startReloadHost>;
+  ctx.effect(() => async () => {
+    reloadHost?.close();
+    await (await mirrorReady)?.close();
+    await managers.dispose();await execution.dispose();store.close();
+    reloadHost?.retired();
+  });
+  const mirror = await mirrorReady;
   execution.install();
   managers.install();
   const require = createRequire(import.meta.url);
   const runtime = require('@deepseek-ai/dsh-agent/package.json').version as string;
   const startedAt = Date.now();
   const status = (): WorkspaceStatus => ({ product: 'Super Bot', version: require('../package.json').version as string, runtime,
-    ...store.sqliteInfo(), startedAt, configWarnings:execution.policy.warnings });
+    ...store.sqliteInfo(), startedAt, configWarnings:execution.policy.warnings, mirrorIssue: pairingIssue ?? mirror?.configurationIssue() });
+
+  function taskInScope(payload: Record<string, unknown>) {
+    const task = store.getTask(requiredText(payload.id, '任务标识', 200));
+    if (payload.sessionId !== undefined && store.botForSession(requiredText(payload.sessionId, '会话标识', 200))?.id !== task.botId) {
+      throw new AppError('not-found', '链接中的任务不属于当前 Bot 对话或已不可用。');
+    }
+    return task;
+  }
+
+  async function mirrorCatalog(): Promise<MirrorCatalog> {
+    if (!mirror) return { owner, peer, state: pairingIssue ? 'unverified' : 'disabled', reason: pairingIssue, bots: [] };
+    try {
+      const bots = await mirror.read({ op: 'catalog' }) as MirrorBot[];
+      return { owner, peer, state: 'online', bots };
+    } catch (cause) {
+      if (cause instanceof AppError && cause.code === 'mirror-offline') return { owner, peer, state: 'offline', bots: [] };
+      return { owner, peer, state: 'unverified', reason: cause instanceof AppError ? cause.message : '镜像暂不可用。', bots: [] };
+    }
+  }
+
+  async function sessionOrigin(payload: Record<string, unknown>): Promise<SessionOrigin | null> {
+    const { sessionId } = payload;
+    if (Object.keys(payload).some(key => key !== 'action' && key !== 'sessionId') || typeof sessionId !== 'string') {
+      throw new AppError('invalid-input', '请仅提供当前原生会话标识。');
+    }
+    if (!managedSessionId.test(sessionId)) return null;
+    if (store.ownsManagedSession(sessionId)) return { owner, local: true };
+    try {
+      const owned = await mirror?.read({ op: 'session-origin', sessionId });
+      if (store.ownsManagedSession(sessionId)) return { owner, local: true };
+      return owned === true ? { owner: peer, local: false } : null;
+    } catch { return null; }
+  }
 
   async function invoke(endpoint: string, payload: Record<string, unknown>) {
     try {
+      if (endpoint === 'session.origin') return { ok: true, value: await sessionOrigin(payload) };
+      if (endpoint === 'mirror.catalog' && Object.keys(payload).length === 1) return { ok: true, value: await mirrorCatalog() };
+      if (endpoint === 'mirror.tasks' || endpoint === 'mirror.detail') {
+        const { action: _action, owner: requestedOwner, ...fields } = payload;
+        if (requestedOwner !== peer || 'op' in fields) throw new AppError('invalid-input', '镜像来源不匹配。');
+        const query = parseMirrorQuery({ ...fields, op: endpoint === 'mirror.tasks' ? 'tasks' : 'detail' });
+        if (!mirror) throw new AppError('mirror-unverified', pairingIssue ?? '尚未启用配对镜像。');
+        return { ok: true, value: await mirror.read(query) };
+      }
+      if ('owner' in payload) throw new AppError('invalid-input', '此入口只操作本机原账本。');
       if(endpoint==='manager.notification.resolve'){managers.resolveNotification(requiredText(payload.requestId,'请求标识',200),requiredText(payload.botId,'Bot 标识',200),requiredText(payload.eventId,'通知标识',300),payload.resolution as 'handled'|'retry-unsent',payload.acknowledged);return {ok:true,value:store.managerInfo(String(payload.botId))};}
       if (endpoint === 'status') return { ok: true, value: status() };
       if (endpoint === 'backup.create') return {ok:true,value:await createLedgerBackup(store,dataDir,requiredText(payload.requestId,'请求标识',200))};
@@ -70,18 +141,61 @@ export function apply(ctx: Context, config: RuntimeOptions & { dataDir?: string 
       if (endpoint === 'bot.create') return {ok:true,value:await managers.createBot(requiredText(payload.requestId,'请求标识',200),payload as unknown as NewBot)};
       if (endpoint === 'bot.update') return {ok:true,value:await managers.updateBot(requiredText(payload.requestId,'请求标识',200),requiredText(payload.id,'Bot 标识',200),payload.expectedRevision as number,payload as unknown as NewBot)};
       if (endpoint === 'task.create') return { ok: true, value: store.createTask(requiredText(payload.requestId,'请求标识',200),payload as unknown as NewTask) };
+      if (endpoint === 'task.inbox') return { ok: true, value: store.taskInbox(requiredText(payload.botId,'Bot 标识',200)) };
       if (endpoint === 'task.list') return { ok: true, value: store.listTasks({
         botId: requiredText(payload.botId,'Bot 标识',200), q: optionalText(payload.q,'搜索',200),
         lifecycle: optionalText(payload.lifecycle,'状态',30), limit: payload.limit as number | undefined, offset: payload.offset as number | undefined,
       }) };
-      if (endpoint === 'task.detail') return { ok: true, value: store.taskDetail(requiredText(payload.id,'任务标识',200)) };
-      if (endpoint === 'task.dispatch') return {ok:true,value:await execution.dispatch(requiredText(payload.requestId,'请求标识',200),requiredText(payload.id,'任务标识',200),payload.expectedRowVersion as number)};
+      if (endpoint === 'task.detail') {
+        const task = taskInScope(payload), snapshot = store.taskDetail(task.id);
+        const recovery = execution.recoveryDetail(snapshot);
+        const childWaits = execution.childWaitDetails(task.id);
+        const model = await execution.modelDetail(task);
+        taskInScope(payload);
+        const detail = { ...snapshot, recovery, model, childWaits,
+          reloadEligible: snapshot.binding?.cwd === realpathSync(checkout) };
+        if (payload.resultId === undefined) return { ok: true, value: detail };
+        const result = store.resultById(requiredText(payload.resultId, '成果标识', 200));
+        return { ok: true, value: { ...detail, linkedResultBelongs: result?.taskId === task.id } };
+      }
+      if (endpoint === 'task.dispatch') {
+        const { id } = taskInScope(payload);
+        return {ok:true,value:await execution.dispatch(requiredText(payload.requestId,'请求标识',200),id,
+          payload.expectedRowVersion as number,()=>{taskInScope(payload);})};
+      }
       if (endpoint === 'task.stop') return {ok:true,value:await execution.stop(requiredText(payload.requestId,'请求标识',200),requiredText(payload.id,'任务标识',200),payload.expectedRowVersion as number)};
       if (endpoint === 'task.cancel'||endpoint==='session.detach') return {ok:true,value:await execution.endTaskLink(endpoint,requiredText(payload.requestId,'请求标识',200),requiredText(payload.id,'任务标识',200),payload.expectedRowVersion as number)};
-      if (endpoint === 'run.recover') return {ok:true,value:await execution.recover(requiredText(payload.requestId,'请求标识',200),requiredText(payload.id,'任务标识',200),payload.expectedRowVersion as number,payload.acknowledged)};
-      if (endpoint === 'result.accept') return {ok:true,value:await execution.accept(requiredText(payload.requestId,'请求标识',200),requiredText(payload.id,'任务标识',200),payload.expectedRowVersion as number,requiredText(payload.resultId,'成果标识',200))};
-      if (endpoint === 'result.reject') return {ok:true,value:store.rejectResult(requiredText(payload.requestId,'请求标识',200),requiredText(payload.id,'任务标识',200),payload.expectedRowVersion as number,requiredText(payload.resultId,'成果标识',200),requiredText(payload.text,'返工要求'))};
-      if (endpoint === 'attention.respond') return {ok:true,value:store.respondAttention(requiredText(payload.requestId,'请求标识',200),requiredText(payload.attentionId,'待办标识',200),payload.expectedRowVersion as number,requiredText(payload.text,'回答'))};
+      if (endpoint === 'run.recover' || endpoint === 'run.recover-and-continue') {
+        const { id } = taskInScope(payload);
+        const continuation = endpoint === 'run.recover-and-continue' ? {
+          attentionId: requiredText(payload.attentionId, '恢复事项标识', 200),
+          bindingId: requiredText(payload.bindingId, '会话关联标识', 200),
+          expectedBindingGeneration: payload.expectedBindingGeneration as number,
+        } : undefined;
+        if (continuation && (!Number.isSafeInteger(continuation.expectedBindingGeneration) || continuation.expectedBindingGeneration < 1)) {
+          throw new AppError('invalid-input', '请刷新后使用当前会话关联版本核对。');
+        }
+        return {ok:true,value:await execution.recover(requiredText(payload.requestId,'请求标识',200),id,
+          payload.expectedRowVersion as number,payload.acknowledged,continuation,()=>{taskInScope(payload);})};
+      }
+      if (endpoint === 'result.accept' || endpoint === 'result.reject') {
+        const args = [requiredText(payload.requestId,'请求标识',200), taskInScope(payload).id,
+          payload.expectedRowVersion as number, requiredText(payload.resultId,'成果标识',200)] as const;
+        const authorize = payload.sessionId === undefined ? undefined : () => { taskInScope(payload); };
+        return {ok:true,value:endpoint === 'result.accept' ? await execution.accept(...args,authorize)
+          : store.rejectResult(...args,requiredText(payload.text,'返工要求'))};
+      }
+      if (endpoint === 'attention.respond') {
+        const attentionId = requiredText(payload.attentionId,'待办标识',200);
+        if (payload.id !== undefined || payload.sessionId !== undefined) {
+          const task = taskInScope(payload);
+          if (!store.taskDetail(task.id).attentions.some(attention => attention.id === attentionId)) {
+            throw new AppError('not-found', '问题不属于当前任务。');
+          }
+        }
+        return {ok:true,value:store.respondAttention(requiredText(payload.requestId,'请求标识',200),attentionId,
+          payload.expectedRowVersion as number,requiredText(payload.text,'回答'))};
+      }
       if (endpoint === 'session.prepare') return {ok:true,value:await execution.prepareSession(requiredText(payload.requestId,'请求标识',200),requiredText(payload.id,'任务标识',200),payload.expectedRowVersion as number)};
       if (endpoint === 'session.inspect') return {ok:true,value:await execution.inspectExistingSession(requiredText(payload.id,'任务标识',200),requiredText(payload.sessionId,'会话标识',200))};
       if (endpoint === 'session.attach') return {ok:true,value:await execution.attachExistingSession(requiredText(payload.requestId,'请求标识',200),{taskId:requiredText(payload.id,'任务标识',200),expectedRowVersion:payload.expectedRowVersion as number,sessionId:requiredText(payload.sessionId,'会话标识',200),cwd:requiredText(payload.cwd,'工作目录'),fullHistoryApproved:payload.fullHistoryApproved===true,directoryApproved:payload.directoryApproved===true})};
@@ -120,7 +234,29 @@ export function apply(ctx: Context, config: RuntimeOptions & { dataDir?: string 
         return new Response('Invalid command envelope', { status: 400 });
       }
       return Response.json({ type: 'server-response', rpcId: envelope.rpcId,
-        result: await invoke(envelope.payload.action, envelope.payload) });
+        result: await invoke(envelope.payload.action, envelope.payload) }, { headers: { 'Cache-Control': 'no-store' } });
     },
   }));
+
+  // HMR is optional for the product. Register its development control only once the launcher is ready.
+  await ctx.inject(['profileContext','hmr','appReady'],scope=>{
+    const {profileContext:profile,hmr,appReady}=scope;
+    if(typeof hmr.watchConfig!=='function'||typeof hmr.reconcileProfile!=='function'||!appReady)return;
+    scope.effect(()=>{
+      let host: ReturnType<typeof startReloadHost>;
+      const log=(message:string)=>ctx.logger.warn(`[super-bot] ${message}`);
+      const unsubscribe=appReady.onReady(()=>{
+        try {
+          const root=realpathSync(checkout);
+          host=reloadHost=startReloadHost({profile,hmr,root,
+            build:typeof __SUPER_BOT_RELOAD_BUILD__==='string'?__SUPER_BOT_RELOAD_BUILD__:'',admission:reloadAdmission,
+            reloadResult:{evidence:id=>store.devReloadResult(id,root).result.evidence,record:receipt=>store.recordDevReload(root,receipt)},
+            blockers:()=>[...execution.reloadBlockers(),...managers.reloadBlockers()],log});
+        } catch(error) { log(`Development reload unavailable: ${error instanceof Error?error.message:'unknown failure'}`); }
+      });
+      return ()=>{unsubscribe();host?.close();};
+    });
+  });
 }
+
+declare const __SUPER_BOT_RELOAD_BUILD__: string;

@@ -28,7 +28,7 @@ export function forgetView(): void {
   try { sessionStorage.removeItem(VIEW_KEY); } catch { /* Optional view memory. */ }
 }
 
-/** Which finished results the user has opened, keyed by task ID with the update time seen. */
+/** Which original-chat deliveries the user has opened, keyed by task ID and receipt time. */
 export function seenResults(): Record<string, number> {
   try {
     const value = JSON.parse(localStorage.getItem(SEEN_KEY) ?? '{}') as unknown;

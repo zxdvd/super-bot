@@ -93,6 +93,8 @@ class ProbeAdapter extends LlmAdapter {
         const foreign=text.match(/CROSS_BOT:([^\s]+)/)?.[1];
         if(foreign)plan={action:'detail',taskId:foreign};
         else if(trigger?.source?.kind==='user'&&text==='请用 Shell 运行本机命令，把合成检查结果保存成文件。')plan={action:'create',goal:'LOCAL_CLI_PROBE',scope:'只在任务目录运行合成 Shell 命令，不访问外部服务',acceptance:'result.md 内容为 LOCAL_CLI_OK'};
+        else if(trigger?.source?.kind==='user'&&['DF14_RECEIPT_PROBE','MIRROR_PROGRESS_PROBE'].includes(text))plan={action:'create',goal:text,scope:'专用任务目录，不访问网络',acceptance:'result.md 包含两项合成事实并已回读'};
+        else if(trigger?.source?.kind==='user'&&text.startsWith('DF14_SHOW_RESULT:'))plan={action:'detail',taskId:text.slice('DF14_SHOW_RESULT:'.length)};
         else if(trigger?.source?.kind==='user'&&(text.includes('MANAGER_PROBE')||text==='请写一份简短的说明，包含两项事实，完成后给我文件。'||text==='请写一份说明，先确认读者。'))plan={action:'create',goal:text.includes('先确认读者')?'ASK_PROBE':'Manager 生成合成说明',scope:'专用任务目录，不访问网络',acceptance:'result.md 包含两项事实并已回读'};
         else if(trigger?.source?.kind==='user'&&(text==='读者是新同事，保持简短。'||text==='再加一句结论。'))plan={action:'list'};
         else if(trigger?.source?.kind==='super-bot-manager'){const target=text.match(/\nTask: ([a-f0-9-]{36})\n/)?.[1];plan=target?{action:'detail',taskId:target}:{action:'list'};}
@@ -106,11 +108,14 @@ class ProbeAdapter extends LlmAdapter {
       }else if((['create','respond','rework'].includes(String(prior.action))||value?.prepared)&&value?.task&&!value?.run&&!value?.deferred)plan={action:'dispatch',taskId:value.task.id,expectedRowVersion:value.task.rowVersion};
       else if(prior.action==='detail'&&value?.task?.controlMode==='auto') {
         if(trigger?.source?.kind==='user'&&text==='再加一句结论。'&&value.result)plan={action:'rework',taskId:value.task.id,expectedRowVersion:value.task.rowVersion,resultId:value.result.id};
-        else if(trigger?.source?.kind==='user'&&text==='读者是新同事，保持简短。'&&value.attentions?.some((a:any)=>a.kind==='input'&&a.state==='open'))plan={action:'respond',taskId:value.task.id,expectedRowVersion:value.task.rowVersion,attentionId:value.attentions.find((a:any)=>a.kind==='input'&&a.state==='open').id};
+        else if(trigger?.source?.kind==='user'&&text==='读者是新同事，保持简短。'&&value.pendingQuestions?.[0])plan={action:'respond',taskId:value.task.id,expectedRowVersion:value.task.rowVersion,attentionId:value.pendingQuestions[0].id};
         else if(value.result&&value.task.lifecycle==='review'&&!value.task.managerReviewed) {
           const rework=String(value.task.goal).includes('MANAGER_REWORK_LOOP')||(String(value.task.goal).includes('MANAGER_REWORK_PROBE')&&!JSON.stringify(value.files).includes('修订'));
           plan={action:'review',taskId:value.task.id,expectedRowVersion:value.task.rowVersion,resultId:value.result.id,verdict:rework?'rework':'accept',note:rework?'请补充修订说明后重新提交。':'已通过 detail 读取文件内容：含标题、两项事实，并有回读记录。默认提交用户最终验收。'};
         }else if(value.task.status==='unscheduled')plan={action:'dispatch',taskId:value.task.id,expectedRowVersion:value.task.rowVersion};
+      }
+      if(prior?.action==='review'&&value?.task?.goal==='DF14_RECEIPT_PROBE') {
+        plan={action:'deliver',taskId:prior.taskId,resultId:prior.resultId,text:'已写入并回读合成事实，待你确认。'};
       }
       if(plan) {
         if(options.sessionId){const attempts=this.managerAttempts.get(options.sessionId)??[];attempts.push(plan);this.managerAttempts.set(options.sessionId,attempts);}
@@ -119,8 +124,16 @@ class ProbeAdapter extends LlmAdapter {
         yield {type:'block-end',index:0,block:{type:'tool-call',id,name:'super_bot_manage',arguments:args}};yield {type:'finish',reason:{kind:'tool-calls'}};return;
       }
       const detail=later.filter(m=>m.role==='tool').flatMap(m=>m.content.filter(b=>b.type==='text').map(b=>{try{return JSON.parse(b.text);}catch{return null;}})).findLast(v=>v?.delivery);
-      const question=value?.attentions?.find((a:any)=>a.kind==='input'&&a.state==='open');
-      const reply=prior?.action==='review'&&detail?.delivery?`已完成：${detail.delivery.summary}\n${detail.delivery.files.map((f:any)=>`[${f.name}](${f.url})`).join('\n')}\n检查：${detail.delivery.checks}\n等待你确认。[查看成果并确认](${detail.delivery.workUrl})`:question?question.question:(prior?.action==='dispatch'||(prior?.action==='create'&&(value?.run||value?.deferred)))?'已经开始处理，完成后我会回到这里交付。':trigger?.source?.kind==='user'?'你好，我可以帮你安排文档工作。':'已核对当前状态。';
+      const workerQuestion=value?.pendingQuestions?.[0];
+      const clarification=value?.attentions?.find((a:any)=>a.kind==='input'&&a.state==='open'&&!a.id.startsWith('run:'));
+      let reply='已核对当前状态。';
+      if(prior?.action==='deliver')reply='请查看上面的交付卡片。';
+      else if(detail?.delivery&&(prior?.action==='review'||text.startsWith('DF14_SHOW_RESULT:'))) {
+        reply=`等待你确认。\n${detail.delivery.chatMarkdown}`;
+      }else if(workerQuestion)reply=`${workerQuestion.question}\n${workerQuestion.markdown}`;
+      else if(clarification)reply=clarification.question;
+      else if(prior?.action==='dispatch'||(prior?.action==='create'&&(value?.run||value?.deferred)))reply='已经开始处理，完成后我会回到这里交付。';
+      else if(trigger?.source?.kind==='user')reply='你好，我可以帮你安排文档工作。';
       yield {type:'block-start',index:0,blockType:'text'};yield {type:'text-delta',index:0,text:reply};
       yield {type:'block-end',index:0,block:{type:'text',text:reply}};yield {type:'finish',reason:{kind:'stop'}};return;
     }
@@ -164,11 +177,14 @@ class ProbeAdapter extends LlmAdapter {
       const hasAnswer=options.messages.some(m=>m.content.some(b=>b.type==='text'&&b.text.includes('Additional user input (answer):')));
       const needsAnswer=body.includes('Goal: ASK_PROBE')&&!hasAnswer;
       const localCli=body.includes('Goal: LOCAL_CLI_PROBE');
-      const planned=localCli&&!calls.includes('bash')?{name:'bash',args:{description:"生成本机 Shell 合成检查结果",command:"printf 'LOCAL_CLI_OK\\n' > result.md"}}:body.includes('Goal: STEP_BUDGET_PROBE')?{name:'read',args:{file_path:join(cwd,'missing-budget-probe.txt')}}:approvalProbe&&calls.includes('write')&&!existsSync(file)&&!calls.includes('super_bot_report')?{name:'super_bot_report',args:{kind:'failed',summary:'审批路径结束，写入没有生成文件；请核对原生审批结果。'}}:
+      const progressProbe=body.includes('Goal: MIRROR_PROGRESS_PROBE');
+      const reports=progressProbe?later.flatMap(m=>m.content.flatMap(b=>b.type==='tool-call'&&b.name==='super_bot_report'?[JSON.parse(b.arguments).kind]:[])):[];
+      const planned=progressProbe&&!reports.includes('progress')?{name:'super_bot_report',args:{kind:'progress',summary:'MIRROR_NATIVE_PROGRESS'}}:
+        localCli&&!calls.includes('bash')?{name:'bash',args:{description:"生成本机 Shell 合成检查结果",command:"printf 'LOCAL_CLI_OK\\n' > result.md"}}:body.includes('Goal: STEP_BUDGET_PROBE')?{name:'read',args:{file_path:join(cwd,'missing-budget-probe.txt')}}:approvalProbe&&calls.includes('write')&&!existsSync(file)&&!calls.includes('super_bot_report')?{name:'super_bot_report',args:{kind:'failed',summary:'审批路径结束，写入没有生成文件；请核对原生审批结果。'}}:
         needsAnswer&&!calls.includes('super_bot_report')?{name:'super_bot_report',args:{kind:'waiting',summary:'请说明文档面向谁？'}}:
         !localCli&&!calls.includes('write')?{name:'write',args:{file_path:body.includes('Goal: RELATIVE_PATH_PROBE')?'result.md':file,content:'# 合成成果\n\n事实一：这份文档由隔离测试模型生成。\n事实二：测试没有访问网络或使用模型凭证。\n'+(body.includes('Additional user input (rework):')?'\n修订：已按返工要求补充说明。\n':'')+(body.includes('Goal: LARGE_RESULT_PROBE')?'\n'+'x'.repeat(16000):'')}}:
         !calls.includes('read')?{name:'read',args:{file_path:file}}:
-        !calls.includes('super_bot_report')?{name:'super_bot_report',args:{kind:'ready',summary:localCli?'已执行本机 Shell 并生成合成结果。':'已生成并回读两项事实的说明文件。',checks:localCli?'原生 bash 执行后已 read 回读 LOCAL_CLI_OK。':'result.md 包含标题和两项事实；已用原生 read 工具回读核对。',files:[file]}}:null;
+        (progressProbe?!reports.includes('ready'):!calls.includes('super_bot_report'))?{name:'super_bot_report',args:{kind:'ready',summary:localCli?'已执行本机 Shell 并生成合成结果。':'已生成并回读两项事实的说明文件。',checks:localCli?'原生 bash 执行后已 read 回读 LOCAL_CLI_OK。':'result.md 包含标题和两项事实；已用原生 read 工具回读核对。',files:[file]}}:null;
       if(planned) {
         const id=ToolCallId(randomUUID()),args=JSON.stringify(planned.args);
         yield {type:'block-start',index:0,blockType:'tool-call'};

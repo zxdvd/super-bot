@@ -5,10 +5,18 @@ import type { Context } from '@deepseek-ai/cordis';
 import type { ISidebarRight } from '@deepseek-ai/dsh-client-ui-sidebar-right/client';
 import type { Bot, ManagerBinding, Task } from '../../src/model.ts';
 import { Store } from '../../src/store.ts';
+import { parseWorkLink, workUrl, type WorkLink } from '../../src/work-links.ts';
+import { LinkedTaskContent, TaskDetailHeader } from '../../src/ui/work/TaskDetail.tsx';
+import { SessionControls } from '../../src/ui/work/SessionControls.tsx';
+import { ReplyForm } from '../../src/ui/work/forms.tsx';
+import type { WorkspaceState } from '../../src/ui/work/useWorkspace.ts';
 import { apply as applyClient, inject } from '../../src/client.tsx';
-import { SessionWork, WorkButton } from '../../src/ui/SessionWork.tsx';
+import { SessionOriginHint, SessionWork, WorkButton } from '../../src/ui/SessionWork.tsx';
+import { parseMirrorQuery } from '../../src/mirror-host.ts';
+import { readLocalMirror } from '../../src/mirror-queries.ts';
+import type { SessionOrigin } from '../../src/mirror.ts';
 import { resultHeading, workGroup, type WorkspaceApi } from '../../src/ui/Workspace.tsx';
-import { WORK_TAB, openBotConversation, readSessionBot, readTaskLink, toggleSessionWork, watchSessionBot, type SessionBotState } from '../../src/ui/work-navigation.ts';
+import { WORK_TAB, openBotConversation, openWorkLink, readSessionBot, readTaskLink, toggleSessionWork, watchSessionBot, watchSessionOrigin, workLinkForUrl, type SessionBotState } from '../../src/ui/work-navigation.ts';
 
 function fixture() {
   const store = new Store(':memory:');
@@ -59,6 +67,53 @@ test('work ownership is read-only and follows only current ready native Bot conv
     assert.equal(f.store.botForSession(next.requestedSessionId), null, 'config revision invalidates old conversation');
     assert.equal(f.store.botForSession(f.mb.requestedSessionId)?.id, f.b.id);
   } finally { f.store.close(); }
+});
+
+test('mirror origin lookup is exact and read-only for confirmed plugin-created sessions', () => {
+  const f = fixture();
+  try {
+    const pending = f.store.beginBinding('worker', f.ta.id, f.ta.rowVersion, '/synthetic/a');
+    const read = (sessionId: string) => readLocalMirror(f.store, parseMirrorQuery({ op: 'session-origin', sessionId }));
+    assert.equal(read(pending.requestedSessionId), false);
+    f.store.confirmBinding(pending.id, pending.requestedSessionId);
+    const external = 'session-12345678-aaaa-4bbb-8ccc-1234567890ab';
+    f.store.attachExistingSession('attach', { taskId: f.tb.id, expectedRowVersion: f.tb.rowVersion, sessionId: external,
+      cwd: '/synthetic/b', fullHistoryApproved: true, directoryApproved: true });
+    const before = f.store.db.prepare('SELECT max(id) AS n FROM events').get();
+    assert.equal(read(f.ma.requestedSessionId), true);
+    assert.equal(read(pending.requestedSessionId), true);
+    assert.equal(read(external), false);
+    for (const input of [{ op: 'session-origin', sessionId: '../arbitrary' },
+      { op: 'session-origin', sessionId: f.ma.requestedSessionId, taskId: f.ta.id }]) {
+      assert.throws(() => parseMirrorQuery(input), { code: 'invalid-input' });
+    }
+    assert.deepEqual(f.store.db.prepare('SELECT max(id) AS n FROM events').get(), before);
+    f.store.releaseManager('replace', f.a.id, f.ma.generation);
+    assert.equal(read(f.ma.requestedSessionId), false);
+  } finally { f.store.close(); }
+});
+
+test('origin hint lookup is one read per visit and ignores responses for departing native sessions', async () => {
+  const f = fixture(), current = source(f.ma.requestedSessionId);
+  const requests: ReturnType<typeof deferred<SessionOrigin | null>>[] = [];
+  const states: (SessionOrigin | undefined)[] = [];
+  const api = apiWith(async <T>(action: string, payload?: Record<string, unknown>) => {
+    assert.equal(action, 'session.origin');
+    assert.deepEqual(payload, { sessionId: f.ma.requestedSessionId });
+    const read = deferred<SessionOrigin | null>(); requests.push(read); return read.promise as Promise<T>;
+  });
+  const stop = watchSessionOrigin(api, f.ma.requestedSessionId, current, value => states.push(value));
+  try {
+    current.select(f.mb.requestedSessionId); current.select(f.ma.requestedSessionId);
+    assert.equal(requests.length, 2);
+    requests[0]!.resolve({ owner: 'web', local: true }); await flush();
+    assert.equal(states.at(-1), undefined);
+    requests[1]!.resolve({ owner: 'desktop', local: false }); await flush();
+    assert.deepEqual(states.at(-1), { owner: 'desktop', local: false });
+    current.select(undefined);
+    assert.equal(states.at(-1), undefined);
+  } finally { stop(); f.store.close(); }
+  assert.equal(current.listeners.size, 0);
 });
 
 test('session lookup uses native identity, rejects mismatched responses and isolates the task page', async () => {
@@ -175,18 +230,94 @@ test('native work toggle and return only target their on-screen session, never c
 
 test('real client registration is additive, session-scoped, and ignores forged tab owner parameters', () => {
   const entries: { options: any; render: Function }[] = [], effects: Function[] = [], definitions: any[] = [];
-  const ctx = { effect: (fn: Function) => { effects.push(fn); }, slots: { inject: (_name: string, fn: Function) => fn(), register: (options: any, render: Function) => { entries.push({ options, render }); } }, sidebarRightTabs: { register: (definition: unknown) => { definitions.push(definition); return () => {}; } }, sidebarRight: {}, layout: {}, connection: {}, uiWorkspace: {} } as unknown as Context;
+  const opened: unknown[] = [];
+  const ctx = { effect: (fn: Function) => { effects.push(fn); }, slots: { inject: (_name: string, fn: Function) => fn(), register: (options: any, render: Function) => { entries.push({ options, render }); } }, sidebarRightTabs: { register: (definition: unknown) => { definitions.push(definition); return () => {}; } }, sidebarRight: {}, layout: {}, connection: {}, uiWorkspace: { openSession: (target: unknown) => opened.push(target) } } as unknown as Context;
   applyClient(ctx); effects[1]!();
   assert.ok(inject.includes('sidebarRight')); assert.ok(inject.includes('sidebarRightTabs'));
   const header = entries.find(entry => entry.options.name === 'conversation.session.header.actions')!;
   const hero = entries.find(entry => entry.options.name === 'conversation.hero.options')!;
   for (const entry of [header, hero]) { const element = entry.render({ sessionId: 'native-a' }); assert.equal(element.type, WorkButton); assert.equal(element.props.sessionId, 'native-a'); }
+  const origin = entries.filter(entry => entry.options.id === 'super-bot-session-origin');
+  assert.deepEqual(origin.map(entry => entry.options.name), ['conversation.session.header.actions', 'conversation.hero.options']);
+  for (const entry of origin) {
+    const element = entry.render({ sessionId: 'native-a' });
+    assert.equal(element.type, SessionOriginHint); assert.equal(element.props.sessionId, 'native-a');
+  }
+  assert.ok(entries.every(entry => !entry.options.name.includes('composer')));
   const body = entries.find(entry => entry.options.name === 'sidebar.right.pane.tab')!;
   assert.equal(body.options.key, definitions[0].id); assert.equal(definitions[0].kind, WORK_TAB); assert.equal(definitions[0].keepMounted, undefined);
   const props = { sessionId: 'native-a', useTabInfo: () => ({ tab: { id: 'tab-a', visible: true, navigation: { params: { botId: 'forged-b' } } } }) };
   const element = body.render(props); assert.equal(element.type, SessionWork); assert.equal(element.props.sessionId, 'native-a'); assert.equal(element.props.tabId, 'tab-a'); assert.equal(element.props.botId, undefined);
-  assert.equal(body.render({ ...props, useTabInfo: () => ({ tab: { visible: false } }) }), null);
+  assert.equal(element.props.linkedWork, undefined);
+  element.props.api.openChildSession('native-parent', 'native-child');
+  assert.deepEqual(opened, [{ parentSessionId: 'native-parent', childSessionId: 'native-child', mode: 'unknown' }]);
+  const link = { kind: 'result', taskId: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', resultId: 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb' } as const;
+  const nativeLink = (sessionId: string, revision: number) => body.render({ ...props, useTabInfo: () => ({
+    tab: { id: 'tab-a', visible: true, navigation: { revision, params: { sessionId, botId: 'a', href: workUrl(link) } } },
+  }) }).props.linkedWork;
+  assert.deepEqual(nativeLink('native-a', 1), { link, botId: 'a', revision: 1 });
+  assert.deepEqual(nativeLink('native-a', 2), { link, botId: 'a', revision: 2 });
+  assert.equal(nativeLink('native-b', 1), undefined);
+  assert.equal(body.render({ ...props, useTabInfo: () => ({ tab: { visible: false, navigation: {} } }) }), null);
   assert.ok(entries.every(entry => !['root', 'rightbar', 'conversation.session.header.corner'].includes(entry.options.name)));
+});
+
+test('native work links use the current Bot tab, deduplicate repeated clicks, and discard late navigation', async () => {
+  const f = fixture(), current = source(f.ma.requestedSessionId);
+  const openings: unknown[] = [];
+  const pending = deferred<Bot | null>();
+  let asyncRead = false;
+  let nav = new AbortController();
+  const api = {
+    ...apiWith(async <T>(_action: string, payload?: Record<string, unknown>) => {
+      return asyncRead ? pending.promise as Promise<T> : f.store.botForSession(String(payload?.sessionId)) as T;
+    }),
+    beginNavigation: () => { nav.abort(); nav = new AbortController(); return nav.signal; },
+  };
+  const tab = { id: 'existing', kind: WORK_TAB };
+  const sidebar = { mounted: current, active: () => openings.length === 2 ? tab : undefined,
+    tabsIn: () => openings.length ? [tab] : [],
+    openTab: (...args: unknown[]) => { openings.push(args); } } as unknown as Context['sidebarRight'];
+  const question: WorkLink = { kind: 'question', taskId: f.ta.id, attentionId: `run:${f.tb.id}` };
+  const result: WorkLink = { kind: 'result', taskId: f.ta.id, resultId: f.tb.id };
+  const active = new AbortController().signal;
+  try {
+    assert.equal(await openWorkLink(api, sidebar, question, active), 'sidebar');
+    assert.equal(await openWorkLink(api, sidebar, result, active), 'sidebar');
+    assert.equal(await openWorkLink(api, sidebar, result, active), 'sidebar');
+    assert.deepEqual(openings, [question, result, result].map((link, index) => [WORK_TAB,
+      { params: { sessionId: f.ma.requestedSessionId, botId: f.a.id, href: workUrl(link) }, ...(index ? { replaceTab: 'existing' } : {}) }]));
+    assert.equal(await openWorkLink(api, sidebar, { kind: 'task', taskId: f.ta.id }, active), 'work');
+    current.select('ordinary');
+    assert.equal(await openWorkLink(api, sidebar, result, active), 'work');
+    current.select(f.ma.requestedSessionId); asyncRead = true;
+    const late = openWorkLink(api, sidebar, question, active);
+    current.select(f.mb.requestedSessionId); current.select(f.ma.requestedSessionId);
+    pending.resolve(f.a);
+    assert.equal(await late, undefined);
+    const cancelled = openWorkLink(api, sidebar, question, active);
+    api.beginNavigation();
+    assert.equal(await cancelled, undefined);
+    assert.equal(openings.length, 3);
+    assert.equal(current.listeners.size, 0);
+  } finally { f.store.close(); }
+});
+
+test('work link parser preserves explicit identity and allows only same-origin root work URLs', () => {
+  const taskId = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', resultId = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb';
+  const question: WorkLink = { kind: 'question', taskId, attentionId: `run:${resultId}` };
+  const result: WorkLink = { kind: 'result', taskId, resultId }, origin = 'https://host.example';
+  for (const link of [question, result, { kind: 'task', taskId }] as const) {
+    assert.deepEqual(parseWorkLink(workUrl(link).slice(1)), link);
+    assert.deepEqual(workLinkForUrl(new URL(workUrl(link), origin), origin), link);
+  }
+  for (const hash of [`#super-bot-task=${taskId}&resultId=`, `#super-bot-task=${taskId}&resultId=invalid`,
+    `${workUrl(result).slice(1)}&resultId=${resultId}`, `${workUrl(result).slice(1)}&attentionId=run%3A${resultId}`]) {
+    assert.equal(parseWorkLink(hash), undefined);
+  }
+  assert.equal(workLinkForUrl(new URL(`https://other.example${workUrl(result)}`), origin), undefined);
+  assert.equal(workLinkForUrl(new URL(`/other${workUrl(result).slice(1)}`, origin), origin), undefined);
+  assert.equal(workLinkForUrl(new URL(`/?resultId=${resultId}#super-bot-task=${taskId}`, origin), origin), undefined);
 });
 
 test('work grouping preserves human review and does not relabel a report as completed', () => {
@@ -233,5 +364,111 @@ test('real ready, settlement, pause, rework and cancellation facts project disti
     assert.equal(resultHeading(f.store.getTask(f.tb.id)), '候选报告 · 当前不可验收');
     assert.equal(workGroup(f.store.getTask(f.tb.id)), 'needs-you');
     assert.equal(resultHeading({ ...f.ta, lifecycle: 'completed', status: 'completed' }), '成果 · 已接受');
+  } finally { f.store.close(); }
+});
+
+for (const reason of ['directory', 'capacity'] as const) test(`DF-13 task detail explains ${reason} waits and offers consistent actions`, () => {
+  const f = fixture();
+  const w = { locked: false } as WorkspaceState;
+  try {
+    f.store.maxRunningTasks = 1;
+    const occupied = '/synthetic/occupied';
+    for (const [task, path] of [[f.ta, occupied], [f.tb, reason === 'directory' ? occupied : '/synthetic/other']] as const) {
+      const binding = f.store.beginBinding(`binding-${task.id}`, task.id, task.rowVersion, path);
+      f.store.confirmBinding(binding.id, binding.requestedSessionId);
+    }
+    const holder = f.store.reserveRun('holder', f.ta.id, f.store.getTask(f.ta.id).rowVersion);
+    const show = () => {
+      const detail = f.store.taskDetail(f.tb.id);
+      const head: any[] = TaskDetailHeader({ w, detail, close: () => {} }).props.children;
+      const [primary] = head.at(-1).props.children;
+      const advanced: any = SessionControls({ w, detail }).props.children[1];
+      const start = (node: any): boolean => Array.isArray(node) ? node.some(start) :
+        node?.props?.children === '开始执行' || !!node?.props && start(node.props.children);
+      const text = (node: any): string => Array.isArray(node) ? node.map(text).join('') :
+        typeof node === 'string' ? node : node?.props ? text(node.props.children) : '';
+      return { detail, status: text(head.at(-2)), starts: [start(primary.type(primary.props)), start(advanced.type(advanced.props))] };
+    };
+    const rowVersion = f.store.getTask(f.tb.id).rowVersion;
+    assert.throws(() => f.store.reserveRun('blocked', f.tb.id, rowVersion), { code: reason === 'directory' ? 'resource-conflict' : 'capacity' });
+    f.store.recordWait(f.tb.id);
+    f.store.enqueueManager(f.b.id, `capacity:${f.tb.id}:${rowVersion}`, 'Synthetic wait', f.tb.id);
+    const blocked = show();
+    assert.deepEqual(blocked.starts, [false, false]);
+    assert.match(blocked.status, reason === 'directory' ? /工作目录被占用，排在「A+」之后/ : /等待执行名额/);
+    assert.match(blocked.status, /Bot 会继续安排/);
+    f.store.saveRunMessage(holder.id, 'holder-input', '{}');
+    f.store.claimDispatch(holder.id);f.store.inputEntered(holder.id, 'holder-input', 1);
+    f.store.workerReport(holder.id, 'done', { kind: 'waiting', summary: 'Holder released the resource' });
+    f.store.settleRun(holder.id);
+    const ready = show();
+    assert.equal(ready.detail.wait, null);
+    assert.match(ready.status, /资源已就绪，等管理会话可用后由 Bot 继续安排/);
+    assert.deepEqual(ready.starts, [false, false]);
+    f.store.releaseManager('disable-B', f.b.id, f.mb.generation);
+    const manual = show();
+    assert.equal(manual.status, '');
+    assert.deepEqual(manual.starts, [true, true]);
+  } finally { f.store.close(); }
+});
+
+test('the linked task drawer offers only the exact answer or explicitly selected result', async () => {
+  const f = fixture();
+  const mutations: unknown[] = [];
+  const w = { locked: false, mutate: async (...args: unknown[]) => { mutations.push(args); return true; } } as unknown as WorkspaceState;
+  const close = () => {};
+  const inTask = (taskId: string, key: string) => {
+    const run = f.store.reserveRun(key, taskId, f.store.getTask(taskId).rowVersion);
+    f.store.saveRunMessage(run.id, `msg-${key}`, '{}'); f.store.claimDispatch(run.id); f.store.inputEntered(run.id, `msg-${key}`, 1);
+    return run;
+  };
+  const drawer = (link: Exclude<WorkLink, { kind: 'task' }>, resultBelongs = false): any[] => LinkedTaskContent({ w, close, link,
+    detail: { ...f.store.taskDetail(f.ta.id), linkedResultBelongs: resultBelongs } }).props.children;
+  try {
+    for (const task of [f.ta, f.tb]) {
+      const binding = f.store.beginBinding(`binding-${task.id}`, task.id, task.rowVersion, `/synthetic/${task.id}`);
+      f.store.confirmBinding(binding.id, binding.requestedSessionId);
+    }
+    const one = inTask(f.ta.id, 'question-a'), two = inTask(f.tb.id, 'question-b');
+    for (const [run, key] of [[one, 'one'], [two, 'two']] as const) {
+      f.store.workerReport(run.id, key, { kind: 'waiting', summary: `Question ${key}` }); f.store.settleRun(run.id);
+    }
+    const question = { kind: 'question', taskId: f.ta.id, attentionId: `run:${one.id}` } as const;
+    const [head, questionBox] = drawer(question);
+    assert.equal(head.props.controls, false);
+    assert.equal(questionBox.props.attention.id, question.attentionId);
+    const answerForm = questionBox.type(questionBox.props).props.children.find((node: any) => node?.type === ReplyForm);
+    await answerForm.props.submit('合成回答', 'answer');
+    assert.deepEqual(mutations, [['attention.respond', { requestId: 'answer', id: question.taskId, attentionId: question.attentionId,
+      expectedRowVersion: f.store.getTask(f.ta.id).rowVersion, text: '合成回答' }]]);
+    assert.match(drawer({ ...question, attentionId: `run:${two.id}` })[1].props.children, /不属于此任务/);
+    const answer = f.store.respondAttention('answer', question.attentionId, f.store.getTask(f.ta.id).rowVersion, '合成回答');
+    assert.equal(answer.attentionId, question.attentionId);
+    const responding = drawer(question)[1];
+    assert.ok(!responding.type(responding.props).props.children.some((node: any) => node?.type === ReplyForm));
+    const ready = (key: string) => {
+      const run = inTask(f.ta.id, key);
+      const { resultId } = f.store.workerReport(run.id, key, { kind: 'ready', summary: key, checks: 'Verified',
+        evidence: [{ path: '/synthetic/result.md', sha256: key, bytes: 1 }] });
+      f.store.settleRun(run.id); return { kind: 'result', taskId: f.ta.id, resultId: resultId! } as const;
+    };
+    const old = ready('old');
+    assert.match(drawer(question)[1].props.children, /已回答/);
+    assert.equal(drawer(old, true)[0].props.controls, true);
+    f.store.rejectResult('rework', f.ta.id, f.store.getTask(f.ta.id).rowVersion, old.resultId, '再修一版');
+    assert.equal(drawer(old, true)[0].props.controls, false);
+    const latest = ready('latest');
+    const [oldHead, oldNotice] = drawer(old, true);
+    assert.equal(oldHead.props.controls, false);
+    assert.match(oldNotice.props.children[0].props.children, /已被新版替代/);
+    assert.equal(oldNotice.props.children[1].props.href, workUrl(latest));
+    const [newHead, newCard] = drawer(latest, true);
+    assert.equal(newHead.props.controls, true);
+    assert.equal(newCard.props.detail.result.id, latest.resultId);
+    const [foreignHead, foreignNotice] = drawer({ ...old, resultId: f.tb.id });
+    assert.equal(foreignHead.props.controls, false);
+    assert.match(foreignNotice.props.children, /无效或不属于此任务/);
+    assert.throws(() => f.store.acceptResult('old-accept', old.taskId, f.store.getTask(f.ta.id).rowVersion, old.resultId), { code: 'result-stale' });
+    assert.equal(f.store.resultById(latest.resultId)?.humanAcceptedAt, null);
   } finally { f.store.close(); }
 });

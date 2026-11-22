@@ -4,10 +4,15 @@ import { dirname,relative,isAbsolute,sep } from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
 import schemaVersion from '../schema-version.json' with {type:'json'};
 import { AppError, requiredText, optionalText, taskStatus, type ChatSource, type Bot, type Task, type NewBot, type NewTask, type TaskPage, type ControlMode, type Attention, type Binding, type Run, type RunInput, type WorkReport, type Result,type ManagerBinding,type ManagerEvent,type ExistingSessionGrant,type ReferenceMaterial,type TaskBotContext,type DispatchWait,type WorkdirInfo,type RunTurn,botDraft } from './model.ts';
+import { RESULT_FRESH_MS, type ChatDeliveryStatus, type RecoveryContinuation, type ReloadReceipt, type RunChildWait,
+  type TaskProgress, type WorkerModelPlan } from './model.ts';
 import {parseWorkdirRequest} from './workdir.ts';
+import type { MirrorRecords, ResultRecord, ReviewRecord } from './mirror.ts';
 
+const BLOCKING_ATTENTIONS="state='open' AND kind IN ('input','approval','recovery')";
 const DELIVERY_ATTEMPT_LIMIT=3;
 const DELIVERY_RETRY_DELAY_MS=30000;
+const RESULT_DELIVERY_REASON='成果仍待在原对话交付。请确认当前版本，并在最终可见回复中附上完整的成果链接。';
 
 /** One local database. Business transactions will live here, not in the UI/adapter. */
 export class Store {
@@ -41,6 +46,7 @@ export class Store {
         CREATE UNIQUE INDEX IF NOT EXISTS tasks_session ON tasks(sessionId) WHERE sessionId IS NOT NULL AND lifecycle IN ('open','review');
         CREATE TABLE IF NOT EXISTS requests (id TEXT PRIMARY KEY, hash TEXT NOT NULL, result TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS events (id INTEGER PRIMARY KEY AUTOINCREMENT, taskId TEXT, kind TEXT NOT NULL, data TEXT NOT NULL, createdAt INTEGER NOT NULL);
+        CREATE INDEX IF NOT EXISTS events_child_wait_task ON events(taskId,id) WHERE kind GLOB 'child-wait.*';
         CREATE TABLE IF NOT EXISTS inputs (id TEXT PRIMARY KEY, taskId TEXT NOT NULL REFERENCES tasks(id), kind TEXT NOT NULL, content TEXT NOT NULL, state TEXT NOT NULL DEFAULT 'accepted', createdAt INTEGER NOT NULL);
         CREATE TABLE IF NOT EXISTS attentions (id TEXT PRIMARY KEY, taskId TEXT NOT NULL REFERENCES tasks(id), kind TEXT NOT NULL, question TEXT NOT NULL, taskRevision INTEGER NOT NULL, state TEXT NOT NULL DEFAULT 'open', createdAt INTEGER NOT NULL);
         CREATE INDEX IF NOT EXISTS attentions_task_state ON attentions(taskId,state);
@@ -119,6 +125,18 @@ export class Store {
       this.db.exec('COMMIT'); return result;
     } catch (error) { this.db.exec('ROLLBACK'); throw error; }
   }
+  recordChildWait(taskId:string,edge:'started'|'updated'|'ended',wait:RunChildWait):void {
+    this.event(`child-wait.${edge}`,taskId,wait);
+  }
+  taskChildWaits(taskId:string):RunChildWait[] {
+    const waits=new Map<string,RunChildWait>();
+    const rows=this.db.prepare("SELECT data FROM events WHERE taskId=? AND kind GLOB 'child-wait.*' ORDER BY id").iterate(taskId);
+    for(const {data} of rows) {
+      const wait=JSON.parse(String(data)) as RunChildWait;
+      waits.set(wait.id,wait);
+    }
+    return [...waits.values()].reverse();
+  }
   /** Audit-only fact recorded by an adapter (no state change). */
   note(kind:string,taskId:string|null,data:unknown):void {this.event(kind,taskId,data);}
   private event(kind: string, taskId: string | null, data: unknown): void {
@@ -188,6 +206,13 @@ export class Store {
     const bot=this.getBot(manager.botId);
     return bot.managerSessionId===sessionId&&bot.configRevision===manager.configRevision&&this.activeManager(bot.id)?.id===manager.id?bot:null;
   }
+  ownsManagedSession(sessionId: string): boolean {
+    if (this.botForSession(sessionId)) return true;
+    return !!this.db.prepare(`SELECT 1 FROM bindings b JOIN tasks t ON t.id=b.taskId
+      WHERE b.requestedSessionId=? AND b.sessionId=b.requestedSessionId AND b.state='ready'
+        AND t.sessionId=b.sessionId AND b.taskRevision=t.taskRevision AND EXISTS (
+          SELECT 1 FROM outbox WHERE id='binding:' || b.id AND kind='session.create' AND state='done')`).get(sessionId);
+  }
   beginManager(requestId:string,botId:string,cwd:string):ManagerBinding {
     return this.command(requestId,'manager.prepare',{botId,cwd},()=>{
       const bot=this.getBot(botId),existing=this.activeManager(botId);if(existing)return existing;
@@ -214,12 +239,31 @@ export class Store {
       this.event('manager.ready',null,{botId:manager.botId,sessionId});return this.activeManager(manager.botId)!;
     });
   }
-  enqueueManager(botId:string,key:string,reason:string,taskId:string|null,priority=0,delivery?:{resultId:string;taskRevision:number;reviewSessionId?:string;reviewCallId?:string}):void {
+  enqueueManager(botId:string,key:string,reason:string,taskId:string|null,priority=0,delivery?:{
+    resultId:string;taskRevision:number;reviewSessionId?:string;reviewCallId?:string;deliverSessionId?:string;deliverCallId?:string;
+  }):void {
     this.getBot(botId); // Readiness is a delivery gate, never permission to lose a durable notification.
-    this.db.prepare('INSERT OR IGNORE INTO outbox(id,kind,taskId,payload,createdAt) VALUES (?,?,?,?,?)').run(`manager-event:${key}`,'manager.notify',taskId,JSON.stringify({botId,reason,taskId,priority,notifyWhilePaused:/^(budget-stopped:|recovery:|approval:|settled:|delivery:)/.test(key),...(delivery?{deliveryOnly:true,...delivery}:{})}),Date.now());
+    this.db.prepare('INSERT OR IGNORE INTO outbox(id,kind,taskId,payload,createdAt) VALUES (?,?,?,?,?)').run(`manager-event:${key}`,'manager.notify',taskId,JSON.stringify({botId,reason,taskId,priority,notifyWhilePaused:/^(budget-stopped:|recovery:|approval:|settled:|delivery:)/.test(key),...(delivery?{deliveryOnly:true,exactResultLink:true,...delivery}:{})}),Date.now());
   }
-  pendingManagerEvents(botId:string):ManagerEvent[] {
-    return this.db.prepare("SELECT id,taskId,payload,state,createdAt FROM outbox WHERE kind='manager.notify' AND state='pending' AND (taskId IS NULL OR json_extract(payload,'$.notifyWhilePaused')=1 OR EXISTS (SELECT 1 FROM tasks WHERE tasks.id=outbox.taskId AND controlMode='auto')) AND json_extract(payload,'$.botId')=? AND coalesce(json_extract(payload,'$.nextAttemptAt'),0)<=? ORDER BY coalesce(json_extract(payload,'$.priority'),0) DESC,createdAt,id LIMIT 10").all(botId,Date.now()) as unknown as ManagerEvent[];
+  private dueManagerEvents(botId:string,limit:number):Iterable<ManagerEvent> {
+    return this.db.prepare(`SELECT id,taskId,payload,state,createdAt FROM outbox
+      WHERE kind='manager.notify' AND state='pending' AND json_extract(payload,'$.botId')=?
+        AND (taskId IS NULL OR EXISTS (SELECT 1 FROM tasks WHERE tasks.id=outbox.taskId AND tasks.botId=?
+          AND (tasks.controlMode='auto' OR json_extract(outbox.payload,'$.notifyWhilePaused')=1)))
+        AND coalesce(json_extract(payload,'$.nextAttemptAt'),0)<=?
+      ORDER BY coalesce(json_extract(payload,'$.priority'),0) DESC,createdAt,id LIMIT ?`)
+      .iterate(botId,botId,Date.now(),limit) as unknown as Iterable<ManagerEvent>;
+  }
+  pendingManagerEvents(botId:string):ManagerEvent[] {return [...this.dueManagerEvents(botId,10)];}
+  nextManagerEvent(botId:string):ManagerEvent|undefined {
+    const blocked=new Set<string>();
+    for(const event of this.dueManagerEvents(botId,-1)) {
+      if(!event.id.startsWith('manager-event:capacity:'))return event;
+      const id=event.taskId;
+      if(!id||blocked.has(id))continue;
+      if(this.getTask(id).status==='unscheduled'&&this.activeBinding(id)?.state==='ready'&&!this.dispatchBlocker(id))return event;
+      blocked.add(id);
+    }
   }
   /** No enqueue has been attempted: persist bounded backoff without consuming a wake attempt. */
   deferManagerEvent(id:string,reason:string,until:number,error=false):void {
@@ -314,12 +358,32 @@ export class Store {
     return current+legacy;
   }
   resetUnconfirmedManagerEvents():void {
+    // A historical tool response can be recovered as content; only the native log can prove delivery.
+    this.db.prepare(`UPDATE outbox SET state='unknown',
+        payload=json_remove(json_set(payload,'$.legacyDelivery',json_extract(payload,'$.chatDelivery')),'$.chatDelivery')
+        WHERE kind='manager.notify' AND state='done' AND json_extract(payload,'$.deliveryOnly')=1
+          AND json_extract(payload,'$.chatDelivery.explicit')=1`).run();
     // Older versions requeued entered attempts without an end proof. Reconcile those before any fresh wake.
     this.db.prepare("UPDATE outbox SET state='entered' WHERE kind='manager.notify' AND state='pending' AND attempts>0 AND json_extract(payload,'$.deliveryOnly')=1 AND json_extract(payload,'$.deliveryAttemptEnd') IS NULL AND json_extract(payload,'$.messageId') IS NOT NULL").run();
     // A legacy pending row with any prior enqueue hint is NOT proof that delivery never happened.
     this.db.prepare("UPDATE outbox SET state='unknown' WHERE kind='manager.notify' AND state='pending' AND (attempts>0 OR json_extract(payload,'$.messageId') IS NOT NULL) AND NOT (coalesce(json_extract(payload,'$.deliveryOnly'),0)=1 AND json_extract(payload,'$.messageId') IS NOT NULL AND coalesce(json_extract(payload,'$.deliveryAttemptEnd.messageId')=json_extract(payload,'$.messageId'),0)=1)").run();
     // Keep entered delivery attempts until the adapter verifies their durable turn/end; never requeue on restart alone.
     this.db.prepare("UPDATE outbox SET state='unknown' WHERE kind='manager.notify' AND (state='sending' OR (state='entered' AND coalesce(json_extract(payload,'$.deliveryOnly'),0)!=1))").run();
+    // Repair legacy unsent intents only when a strictly newer run has a matching Worker enqueue receipt.
+    this.db.prepare(`WITH fulfilled AS MATERIALIZED (
+        SELECT notice.id, (SELECT r.id FROM runs r JOIN inputs i ON i.id=r.inputId
+          JOIN outbox receipt ON receipt.taskId=r.taskId AND json_extract(receipt.payload,'$.runId')=r.id
+          WHERE r.taskId=notice.taskId AND i.state IN ('enqueued','entered') AND receipt.state='done'
+            AND coalesce(json_extract(receipt.payload,'$.dispatchRowVersion') >=
+              CAST(substr(notice.id,length('manager-event:capacity:' || notice.taskId || ':')+1) AS INTEGER),r.createdAt>notice.createdAt)
+            AND receipt.id IN ('input:' || r.inputId,'run:' || r.id)
+          ORDER BY r.createdAt,r.id LIMIT 1) AS runId
+        FROM outbox notice JOIN tasks t ON t.id=notice.taskId
+        WHERE notice.kind='manager.notify' AND notice.state IN ('pending','blocked') AND notice.attempts=0
+          AND notice.id GLOB 'manager-event:capacity:' || t.id || ':*'
+          AND json_extract(notice.payload,'$.botId')=t.botId AND json_extract(notice.payload,'$.messageId') IS NULL
+      ) UPDATE outbox SET state='done',payload=json_set(payload,'$.fulfilledByRunId',fulfilled.runId)
+        FROM fulfilled WHERE outbox.id=fulfilled.id AND fulfilled.runId IS NOT NULL`).run();
   }
   managerNotifications(botId:string,limit=-1):ManagerEvent[] {
     return this.db.prepare("SELECT id,taskId,payload,state,createdAt FROM outbox WHERE kind='manager.notify' AND state NOT IN ('done','superseded','handled') AND json_extract(payload,'$.botId')=? ORDER BY createdAt DESC,id LIMIT ?").all(botId,limit) as unknown as ManagerEvent[];
@@ -331,31 +395,30 @@ export class Store {
     return this.db.prepare("UPDATE outbox SET state='unknown' WHERE id=? AND kind='manager.notify' AND json_extract(payload,'$.deliveryOnly')=1 AND state IN ('pending','sending','entered')").run(id).changes===1;
   }
   managerNotificationDelivered(id:string,sessionId:string,proof:{turn:number;messageId:string;seq:number;endSeq:number}):void {
+    const row=this.db.prepare("SELECT taskId,payload,state FROM outbox WHERE id=? AND kind='manager.notify'").get(id);
+    if(!row||['done','superseded','handled'].includes(String(row.state)))return;
+    const payload=JSON.parse(String(row.payload));
+    if(this.activeManager(payload.botId)?.sessionId!==sessionId)throw new AppError('manager-stale','交付会话已经改变。');
+    if(payload.deliveryOnly) {
+      const task=this.getTask(String(row.taskId)),result=this.taskDetail(task.id).result;
+      if(task.botId!==payload.botId||task.taskRevision!==payload.taskRevision||!result||result.id!==payload.resultId||
+        result.taskRevision!==task.taskRevision||!['review','completed'].includes(task.lifecycle))throw new AppError('result-stale','交付成果已经改变。');
+    }else if(row.state!=='entered'&&row.state!=='unknown')return;
     this.command(`manager-delivered:${id}`,'manager.delivered',{id,sessionId,...proof},()=>{
-      const row=this.db.prepare("SELECT taskId,payload,state FROM outbox WHERE id=? AND kind='manager.notify'").get(id);if(!row||['done','superseded','handled'].includes(String(row.state)))return {};
-      const payload=JSON.parse(String(row.payload));
-      if(this.activeManager(payload.botId)?.sessionId!==sessionId)throw new AppError('manager-stale','交付会话已经改变。');
-      if(payload.deliveryOnly) {
-        const task=this.getTask(String(row.taskId)),result=this.taskDetail(task.id).result;
-        if(task.taskRevision!==payload.taskRevision||result?.id!==payload.resultId||!['review','completed'].includes(task.lifecycle))throw new AppError('result-stale','交付成果已经改变。');
-      }else if(row.state!=='entered'&&row.state!=='unknown')return {};
       this.db.prepare("UPDATE outbox SET state='done',payload=json_set(payload,'$.chatDelivery',json(?)) WHERE id=?").run(JSON.stringify({sessionId,...proof}),id);
       if(JSON.parse(this.get(`managerProblem:${payload.botId}`)??'null')?.eventId===id)this.managerProblem(payload.botId,'');
       this.event('manager.delivered',row.taskId as string|null,{eventId:id,sessionId,...proof,...(payload.resultId?{resultId:payload.resultId}:{})});return {};
     });
   }
-  /** Explicit chat delivery: records the plugin-rendered delivery and closes its notification in one transaction. */
-  managerDeliver<T extends {taskId:string;resultId:string;text:string}>(requestId:string,botId:string,sessionId:string,delivery:T):T {
-    return this.command(requestId,'manager.deliver',{botId,taskId:delivery.taskId,resultId:delivery.resultId,text:delivery.text},()=>{
-      const id=`manager-event:delivery:${delivery.resultId}`;
-      const row=this.db.prepare("SELECT state,payload FROM outbox WHERE id=? AND kind='manager.notify'").get(id);
-      if(row&&row.state==='done'&&JSON.parse(String(row.payload)).chatDelivery?.explicit)return JSON.parse(String(row.payload)).chatDelivery.delivery as T;
-      if(this.activeManager(botId)?.sessionId!==sessionId)throw new AppError('manager-stale','交付会话已经改变。');
-      const task=this.getTask(delivery.taskId),result=this.taskDetail(task.id).result;
-      if(task.botId!==botId||result?.id!==delivery.resultId||!['review','completed'].includes(task.lifecycle))throw new AppError('result-stale','交付成果已经改变。');
-      const receipt={sessionId,explicit:true,requestId,delivery};
-      if(row)this.db.prepare("UPDATE outbox SET state='done',payload=json_set(payload,'$.chatDelivery',json(?)) WHERE id=?").run(JSON.stringify(receipt),id);
-      this.event('manager.delivered',task.id,{eventId:row?id:null,sessionId,resultId:delivery.resultId,explicit:true});
+  /** A tool result is prepared content. Only the native chat receipt settles its notification. */
+  managerDeliver<T extends {taskId:string;resultId:string;text:string}>(requestId:string,botId:string,
+    sessionId:string,callId:string,delivery:T):T {
+    if(this.activeManager(botId)?.sessionId!==sessionId)throw new AppError('manager-stale','交付会话已经改变。');
+    const task=this.getTask(delivery.taskId),result=this.taskDetail(task.id).result;
+    if(task.botId!==botId||result?.id!==delivery.resultId||result.taskRevision!==task.taskRevision||!['review','completed'].includes(task.lifecycle))throw new AppError('result-stale','交付成果已经改变。');
+    return this.command(requestId,'manager.deliver',{botId,taskId:task.id,resultId:result.id,text:delivery.text},()=>{
+      this.enqueueManager(botId,`delivery:${result.id}`,RESULT_DELIVERY_REASON,task.id,5,
+        {resultId:result.id,taskRevision:task.taskRevision,deliverSessionId:sessionId,deliverCallId:callId});
       return delivery;
     });
   }
@@ -414,24 +477,107 @@ export class Store {
     const {botContext:_context,workdirRequest:rawWorkdir,...rest}=row as Omit<Task,'workdirRequest'>&{botContext?:string;workdirRequest?:string|null};
     const task:Task={...rest,workdirRequest:rawWorkdir?JSON.parse(rawWorkdir):null};
     let status=taskStatus(task);const run=this.latestRun(task.id);
+    let blockingAttention: Task['blockingAttention'] = null;
     if(task.lifecycle==='open'||task.lifecycle==='review') {
-      if(this.db.prepare("SELECT 1 FROM attentions WHERE taskId=? AND kind='recovery' AND state='open'").get(task.id))status='recovery';
+      const open=this.db.prepare(`SELECT kind,taskRevision FROM attentions WHERE taskId=? AND ${BLOCKING_ATTENTIONS}
+        ORDER BY CASE kind WHEN 'recovery' THEN 0 WHEN 'approval' THEN 1 ELSE 2 END`).all(task.id);
+      blockingAttention=(open.find(row=>row.taskRevision===task.taskRevision)?.kind as Task['blockingAttention']) ?? null;
+      // Keep the conservative recovery status for command guards, including a stale open recovery record.
+      const has=(kind: string)=>open.some(row=>row.kind===kind);
+      if(has('recovery'))status='recovery';
       else if(run?.state==='cancelling')status='stopping';
-      else if(this.db.prepare("SELECT 1 FROM attentions WHERE taskId=? AND kind='approval' AND state='open'").get(task.id))status='approval';
+      else if(has('approval'))status='approval';
       else if(run?.state==='running')status='running';
       else if(run?.state==='queued')status='queued';
-      else if(this.db.prepare("SELECT 1 FROM attentions WHERE taskId=? AND kind='input' AND state='open'").get(task.id))status='needs-input';
+      else if(has('input'))status='needs-input';
     }
     const managerReviewed=!!(run&&this.db.prepare("SELECT 1 FROM reviews JOIN results ON results.id=reviews.resultId WHERE results.runId=? AND reviews.actor LIKE 'manager:%' LIMIT 1").get(run.id));
-    return {...task,status,managerReviewed};
+    return {...task,status,managerReviewed,blockingAttention};
   }
-  taskDetail(id: string): { task: Task; binding: Binding | null; bindingHistory:Binding[]; run:Run|null; runHeld:boolean; runTurn:RunTurn|null; input:RunInput|null; result:Result|null; attentions: Attention[]; events: { id: number; kind: string; data: string; createdAt: number }[];wait:DispatchWait|null } {
-    const task=this.getTask(id),binding=this.activeBinding(id),run=this.latestRun(id);
-    const wait=binding&&task.status==='unscheduled'&&this.db.prepare('SELECT 1 FROM waits WHERE taskId=?').get(id)?this.dispatchWait(id):null;
-    return { task,wait,runHeld:!!(run&&this.db.prepare('SELECT 1 FROM resources WHERE runId=?').get(run.id)),runTurn:run?this.runTurn(run.id):null,binding,bindingHistory:this.db.prepare("SELECT * FROM bindings WHERE taskId=? AND state='released' ORDER BY generation DESC").all(id).map(row=>this.toBinding(row)),run,input:this.pendingInput(id)??(run?this.getRunInput(run.id):null),result:run&&run.taskRevision===task.taskRevision&&run.bindingId===binding?.id?this.runResult(run.id):null,
-      attentions: this.db.prepare('SELECT * FROM attentions WHERE taskId=? ORDER BY createdAt,id').all(id) as unknown as Attention[],
-      events: this.db.prepare('SELECT id,kind,data,createdAt FROM events WHERE taskId=? ORDER BY id DESC LIMIT 50').all(id) as unknown as { id: number; kind: string; data: string; createdAt: number }[],
+  private withDelivery(task: Task): Task {
+    if(task.lifecycle!=='review'&&task.lifecycle!=='completed') return task;
+    const run=this.latestRun(task.id);
+    if(!run || run.taskRevision!==task.taskRevision || run.bindingId!==this.activeBinding(task.id)?.id) return task;
+    const receipt=this.db.prepare(`SELECT e.createdAt FROM results r
+      JOIN outbox o ON o.id='manager-event:delivery:' || r.id AND o.taskId=r.taskId
+      JOIN events e ON e.taskId=r.taskId AND e.kind='manager.delivered' AND json_extract(e.data,'$.eventId')=o.id
+      WHERE r.runId=? AND o.state='done' AND json_extract(o.payload,'$.chatDelivery.messageId') IS NOT NULL
+        AND json_extract(e.data,'$.resultId')=r.id AND coalesce(json_extract(e.data,'$.explicit'),0)=0
+      ORDER BY e.id DESC LIMIT 1`).get(run.id);
+    return typeof receipt?.createdAt==='number' ? {...task,deliveredAt:receipt.createdAt} : task;
+  }
+  private chatDeliveryStatus(task:Task,result:Result|null):ChatDeliveryStatus|null {
+    if(!result||!['review','completed'].includes(task.lifecycle))return null;
+    const row=this.db.prepare(`SELECT state,payload FROM outbox WHERE id=? AND kind='manager.notify' AND taskId=?
+      AND json_extract(payload,'$.botId')=? AND json_extract(payload,'$.taskRevision')=?`)
+      .get(`manager-event:delivery:${result.id}`,task.id,task.botId,task.taskRevision);
+    if(!row)return {state:task.lifecycle==='review'&&!task.managerReviewed?'awaiting-review':'uncertain'};
+    const payload=JSON.parse(String(row.payload));
+    if(row.state==='done'&&payload.chatDelivery?.messageId)return {state:'delivered'};
+    if(row.state==='handled')return {state:'handled'};
+    const problem=JSON.parse(this.get(`managerProblem:${task.botId}`)??'null') as {eventId?:string;message:string}|null;
+    const pending=['pending','sending','entered'].includes(String(row.state));
+    const diagnostic=problem?.eventId===`manager-event:delivery:${result.id}`?problem.message:undefined;
+    const reason=pending?(payload.deferReason??diagnostic):(diagnostic??payload.reconcileNote??payload.deferReason);
+    return {state:pending?'pending':'uncertain',...(reason?{reason}:{})};
+  }
+  taskDetail(id: string) {
+    const task=this.withDelivery(this.getTask(id)),binding=this.activeBinding(id),run=this.latestRun(id);
+    const canWait=binding?.state==='ready'&&task.status==='unscheduled';
+    const resourceNotice=canWait&&this.db.prepare(`SELECT 1 FROM outbox WHERE kind='manager.notify' AND taskId=?
+      AND id GLOB 'manager-event:capacity:' || taskId || ':*' AND json_extract(payload,'$.botId')=?
+      AND state IN ('pending','sending','entered') LIMIT 1`).get(id,task.botId);
+    const manager=resourceNotice?this.activeManager(task.botId):null;
+    const autoDispatchPending=!!manager?.sessionId&&this.botForSession(manager.sessionId)?.id===task.botId;
+    const wait=canWait&&(resourceNotice||this.db.prepare('SELECT 1 FROM waits WHERE taskId=?').get(id))?this.dispatchWait(id):null;
+    const attentions=this.db.prepare('SELECT * FROM attentions WHERE taskId=? ORDER BY createdAt,id').all(id) as unknown as Attention[];
+    const result=run&&run.taskRevision===task.taskRevision&&run.bindingId===binding?.id?this.runResult(run.id):null;
+    const currentRun=run?.taskRevision===task.taskRevision&&run.bindingId===binding?.id?run:null;
+    return { task,wait,autoDispatchPending,runHeld:!!(run&&this.db.prepare('SELECT 1 FROM resources WHERE runId=?').get(run.id)),runTurn:run?this.runTurn(run.id):null,binding,bindingHistory:this.db.prepare("SELECT * FROM bindings WHERE taskId=? AND state='released' ORDER BY generation DESC").all(id).map(row=>this.toBinding(row)),run,input:this.pendingInput(id)??(run?this.getRunInput(run.id):null),result,
+      chatDelivery:this.chatDeliveryStatus(task,result),progress:this.taskProgress(task,currentRun,result),
+      attentions,pendingQuestions:this.pendingWorkerQuestions(task,binding,attentions),
+      events: this.db.prepare("SELECT id,kind,data,createdAt FROM events WHERE taskId=? AND kind NOT GLOB 'child-wait.*' ORDER BY id DESC LIMIT 50").all(id) as unknown as { id: number; kind: string; data: string; createdAt: number }[],
     };
+  }
+  private taskProgress(task: Task, run: Run | null, result: Result | null): TaskProgress {
+    const worker=this.db.prepare(`SELECT p.runId,json_extract(p.data,'$.summary') AS summary,p.createdAt AS at
+      FROM runs r JOIN reports p ON p.runId=r.id WHERE r.taskId=? AND r.taskRevision=? AND p.kind='progress'
+      ORDER BY p.createdAt DESC,p.rowid DESC LIMIT 1`).get(task.id,task.taskRevision);
+    const entered=run&&this.db.prepare(`SELECT createdAt FROM events WHERE taskId=? AND kind='input.entered'
+      AND json_extract(data,'$.runId')=? ORDER BY id LIMIT 1`).get(task.id,run.id);
+    const accepted=task.lifecycle==='completed'&&result&&this.db.prepare(`SELECT createdAt AS at,CASE WHEN actor='user' THEN 'user' ELSE 'bot' END AS actor
+      FROM reviews WHERE resultId=? AND ((actor='user' AND verdict='accepted') OR (actor=? AND verdict='accept'))
+      ORDER BY createdAt DESC LIMIT 1`).get(result.id,`manager:${task.botId}`);
+    const applied=result&&this.db.prepare(`SELECT data,createdAt FROM events WHERE taskId=? AND kind='dev.reload-applied'
+      AND json_extract(data,'$.resultId')=? ORDER BY id DESC LIMIT 1`).get(task.id,result.id);
+    const reload=applied?{...JSON.parse(String(applied.data)),at:Number(applied.createdAt)} as ReloadReceipt:null;
+    return { worker:worker ? { runId: String(worker.runId), summary: String(worker.summary), at: Number(worker.at) } : null,
+      runId:run?.id??null, inputEnteredAt:typeof entered?.createdAt==='number'?entered.createdAt:null,
+      acceptance:accepted ? { actor: accepted.actor==='user'?'user':'bot', at: Number(accepted.at) } : null, reload };
+  }
+  devReloadResult(resultId: string, root: string): { taskId: string; result: Result } {
+    const result=this.resultById(resultId);
+    const detail=result&&this.taskDetail(result.taskId);
+    if(!result||!detail||detail.result?.id!==result.id||detail.run?.state!=='settled'||detail.binding?.cwd!==root
+      ||!['review','completed'].includes(detail.task.lifecycle)||detail.task.blockingAttention) {
+      throw new AppError('result-stale','请选择当前仓库中已收敛、仍可核对的 Super Bot 成果。');
+    }
+    return { taskId:result.taskId,result };
+  }
+  recordDevReload(root: string, receipt: Omit<ReloadReceipt,'at'>): void {
+    this.command(`dev-reload:${receipt.build}`,'dev.reload-applied',receipt,()=>{
+      const { taskId }=this.devReloadResult(receipt.resultId,root);
+      this.event('dev.reload-applied',taskId,receipt);return {};
+    });
+  }
+  taskResultRecords(id: string): MirrorRecords {
+    const results = this.db.prepare(`SELECT id,runId,taskRevision,summary,checks,createdAt,humanAcceptedAt,
+      json_array_length(evidence) AS fileCount FROM results WHERE taskId=? ORDER BY createdAt DESC,id LIMIT 11`)
+      .all(id) as unknown as ResultRecord[];
+    const reviews = this.db.prepare(`SELECT reviews.id,resultId,CASE WHEN actor='user' THEN 'user' ELSE 'bot' END AS actor,
+      verdict,reviews.createdAt FROM reviews JOIN results ON results.id=reviews.resultId
+      WHERE results.taskId=? ORDER BY reviews.createdAt DESC,reviews.id LIMIT 31`).all(id) as unknown as ReviewRecord[];
+    return { results: results.slice(0, 10), reviews: reviews.slice(0, 30), moreResults: results.length > 10, moreReviews: reviews.length > 30 };
   }
   reviseTask(requestId: string, id: string, expectedRowVersion: number, input: Pick<NewTask,'goal'|'scope'|'acceptance'>): Task {
     const payload = { id, expectedRowVersion, goal: requiredText(input.goal,'任务目标'), scope: optionalText(input.scope,'任务范围'), acceptance: optionalText(input.acceptance,'验收条件') };
@@ -466,7 +612,28 @@ export class Store {
       const key = row.lifecycle as Task['lifecycle']; counts[key] = Number(row.n); counts.all += Number(row.n);
     }
     const snapshotVersion = Number(this.db.prepare('SELECT coalesce(max(id),0) AS n FROM events').get()?.n);
-    return { items: rows.map(task => this.decorateTask(task)), total, limit, offset, counts, snapshotVersion };
+    return { items: rows.map(row=>this.withDelivery(this.decorateTask(row))), total, limit, offset, counts, snapshotVersion };
+  }
+  taskInbox(botId: string): TaskPage & { truncated: boolean } {
+    const open=this.listTasks({botId,lifecycle:'open',limit:100});
+    const review=this.listTasks({botId,lifecycle:'review',limit:100});
+    const completed=this.listTasks({botId,lifecycle:'completed',limit:30});
+    const cancelled=this.listTasks({botId,lifecycle:'cancelled',limit:8});
+    const visible=new Map([...open.items,...review.items,...completed.items,...cancelled.items].map(task=>[task.id,task]));
+    // Keep an active blocker or late delivery visible even when its task is outside the usual window.
+    const freshSince=Date.now()-RESULT_FRESH_MS;
+    const additional=this.db.prepare(`SELECT t.id FROM tasks t WHERE t.botId=? AND t.lifecycle IN ('open','review')
+      AND EXISTS(SELECT 1 FROM attentions WHERE taskId=t.id AND taskRevision=t.taskRevision AND ${BLOCKING_ATTENTIONS})
+      UNION SELECT t.id FROM events e JOIN tasks t ON t.id=e.taskId WHERE t.botId=? AND t.lifecycle IN ('review','completed')
+      AND e.kind='manager.delivered' AND e.createdAt>? AND json_extract(e.data,'$.resultId') IS NOT NULL`)
+      .all(botId,botId,freshSince);
+    for(const { id } of additional) {
+      if(visible.has(String(id))) continue;
+      const task=this.withDelivery(this.getTask(String(id)));
+      if(task.blockingAttention || (task.deliveredAt ?? 0)>freshSince) visible.set(task.id,task);
+    }
+    const items=[...visible.values()];
+    return {...open,items,limit:items.length,truncated:open.total>open.items.length||review.total>review.items.length};
   }
   private toBinding(row:unknown):Binding {
     const {workdir,...binding}=row as Omit<Binding,'workdir'>&{workdir?:string|null};
@@ -589,6 +756,13 @@ export class Store {
     const run=this.db.prepare('SELECT * FROM runs WHERE taskId=? ORDER BY createdAt DESC,rowid DESC LIMIT 1').get(taskId) as unknown as Run|undefined;
     return run?{...run}:null;
   }
+  taskRuns(taskId:string):Run[] {
+    return this.db.prepare('SELECT * FROM runs WHERE taskId=? ORDER BY createdAt DESC,rowid DESC').all(taskId) as unknown as Run[];
+  }
+  runModelPlan(runId:string):WorkerModelPlan|null {
+    const plan=this.get(`run-model-plan:${runId}`);
+    return plan?JSON.parse(plan) as WorkerModelPlan:null;
+  }
   getRun(id:string):Run {
     const run=this.db.prepare('SELECT * FROM runs WHERE id=?').get(id) as unknown as Run|undefined;
     if(!run)throw new AppError('not-found','执行记录不存在。');return {...run};
@@ -620,6 +794,9 @@ export class Store {
     this.command(`turn-end:${runId}`,'run.turn-end',{runId,endSeq,endKind,quiet,reportId},()=>{
       this.db.prepare('UPDATE run_turns SET endSeq=?,endKind=?,quiet=?,reportId=? WHERE runId=?').run(endSeq,endKind,Number(quiet),reportId,runId);return {};
     });
+  }
+  workerTaskForSession(sessionId:string):string|undefined {
+    return this.db.prepare("SELECT taskId FROM bindings WHERE sessionId=? AND state='ready'").get(sessionId)?.taskId as string|undefined;
   }
   nativeIntervention(sessionId:string,messageId:string):boolean {
     const binding=this.db.prepare("SELECT * FROM bindings WHERE sessionId=? AND state='ready'").get(sessionId) as unknown as Binding|undefined;
@@ -670,27 +847,36 @@ export class Store {
     const seq=Number(this.db.prepare('SELECT coalesce(max(seq),0)+1 AS n FROM waits').get()?.n);
     this.db.prepare('INSERT OR IGNORE INTO waits(taskId,createdAt,seq) VALUES (?,?,?)').run(taskId,Date.now(),seq);
   }
-  reserveRun(requestId:string,taskId:string,expectedRowVersion:number):Run {
+  reserveRun(requestId:string,taskId:string,expectedRowVersion:number,expectedModel?:WorkerModelPlan):Run {
     return this.command(requestId,'task.dispatch',{taskId,expectedRowVersion},()=>{
       const task=this.getTask(taskId);const b=this.activeBinding(taskId);
       if(task.rowVersion!==expectedRowVersion)throw new AppError('version-conflict','任务已经更新，请刷新后再执行。');
-      if(task.lifecycle!=='open'||task.controlMode!=='auto'||!task.scope||!task.acceptance)throw new AppError('not-ready','任务当前不能自动执行，请核对目标和管理方式。');
-      if(!b||b.state!=='ready'||!b.sessionId)throw new AppError('not-ready','请先准备执行会话。');
-      if(this.db.prepare("SELECT 1 FROM attentions WHERE taskId=? AND state='open'").get(taskId))throw new AppError('needs-attention','请先处理当前待办。');
-      const held=this.db.prepare('SELECT resources.*,runs.taskId,tasks.botId FROM resources JOIN runs ON runs.id=resources.runId JOIN tasks ON tasks.id=runs.taskId').all();
-      if(held.some(r=>r.taskId===taskId))throw new AppError('run-active','这个任务的上次执行尚未收敛。');
-      const blocker=this.dispatchBlocker(taskId);
-      if(blocker)throw new AppError(blocker,blocker==='capacity'?'执行名额已占用，请等待或核对已有执行。':'这个工作目录与另一执行重叠。');
-      this.db.prepare('DELETE FROM waits WHERE taskId=?').run(taskId);
-      const pending=this.pendingInput(taskId);const id=randomUUID(),inputId=pending?.id??randomUUID(),now=Date.now();
-      if(!pending)this.db.prepare('INSERT INTO inputs(id,taskId,kind,content,createdAt) VALUES (?,?,?,?,?)').run(inputId,taskId,'dispatch',task.goal,now);
-      this.db.prepare('INSERT INTO runs(id,taskId,bindingId,sessionId,taskRevision,generation,inputId,state,createdAt) VALUES (?,?,?,?,?,?,?,?,?)').run(id,taskId,b.id,b.sessionId,task.taskRevision,b.generation,inputId,'queued',now);
-      this.db.prepare('INSERT INTO run_turns(runId) VALUES (?)').run(id);
-      this.db.prepare('INSERT INTO resources VALUES (?,?)').run(id,b.cwd);
-      this.db.prepare('INSERT INTO outbox(id,kind,taskId,payload,createdAt) VALUES (?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET payload=excluded.payload').run(`input:${inputId}`,'input.deliver',taskId,JSON.stringify({runId:id,inputId}),now);
-      this.db.prepare('UPDATE tasks SET rowVersion=rowVersion+1,updatedAt=? WHERE id=?').run(now,taskId);
-      this.event('run.queued',taskId,{runId:id,inputId});return this.getRun(id);
+      return this.allocateRun(task,b,false,expectedModel);
     });
+  }
+  private allocateRun(task:Task,b:Binding|null,recovering:boolean,expectedModel?:WorkerModelPlan):Run {
+    const taskId=task.id;
+    if(task.lifecycle!=='open'||task.controlMode!=='auto'||!task.scope||!task.acceptance)throw new AppError('not-ready','任务当前不能自动执行，请核对目标和管理方式。');
+    if(!b||b.state!=='ready'||!b.sessionId)throw new AppError('not-ready','请先准备执行会话。');
+    if(this.db.prepare("SELECT 1 FROM attentions WHERE taskId=? AND state='open'").get(taskId))throw new AppError('needs-attention','请先处理当前待办。');
+    if(this.heldRuns().some(run=>run.taskId===taskId))throw new AppError('run-active','这个任务的上次执行尚未收敛。');
+    const blocker=this.dispatchBlocker(taskId);
+    if(blocker)throw new AppError(blocker,blocker==='capacity'?'执行名额已占用，请等待或核对已有执行。':'这个工作目录与另一执行重叠。');
+    const pending=this.pendingInput(taskId);
+    if(recovering&&pending&&(pending.messageId!==null||pending.messageJson!==null||
+      this.db.prepare("SELECT 1 FROM outbox WHERE id=? AND state!='pending'").get(`input:${pending.id}`))) {
+      throw new AppError('input-uncertain','已有任务输入的投递状态无法确认，请先核对该输入。');
+    }
+    this.db.prepare('DELETE FROM waits WHERE taskId=?').run(taskId);
+    const id=randomUUID(),inputId=pending?.id??randomUUID(),now=Date.now();
+    if(!pending)this.db.prepare('INSERT INTO inputs(id,taskId,kind,content,createdAt) VALUES (?,?,?,?,?)').run(inputId,taskId,'dispatch',task.goal,now);
+    this.db.prepare('INSERT INTO runs(id,taskId,bindingId,sessionId,taskRevision,generation,inputId,state,createdAt) VALUES (?,?,?,?,?,?,?,?,?)').run(id,taskId,b.id,b.sessionId,task.taskRevision,b.generation,inputId,'queued',now);
+    this.db.prepare('INSERT INTO run_turns(runId) VALUES (?)').run(id);
+    if(expectedModel)this.set(`run-model-plan:${id}`,JSON.stringify(expectedModel));
+    this.db.prepare('INSERT INTO resources VALUES (?,?)').run(id,b.cwd);
+    this.db.prepare('INSERT INTO outbox(id,kind,taskId,payload,createdAt) VALUES (?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET payload=excluded.payload').run(`input:${inputId}`,'input.deliver',taskId,JSON.stringify({runId:id,inputId,dispatchRowVersion:task.rowVersion}),now);
+    this.db.prepare('UPDATE tasks SET rowVersion=rowVersion+1,updatedAt=? WHERE id=?').run(now,taskId);
+    this.event('run.queued',taskId,{runId:id,inputId});return this.getRun(id);
   }
   saveRunMessage(id:string,messageId:string,messageJson:string):RunInput {
     return this.command(`message:${id}`,'input.identify',{id,messageId,messageJson},()=>{
@@ -704,8 +890,20 @@ export class Store {
     return this.db.prepare("UPDATE outbox SET state='sending',attempts=attempts+1 WHERE id IN (?,?) AND state='pending'").run(`input:${run.inputId}`,`run:${id}`).changes===1;
   }
   inputEnqueued(id:string):void {
-    const run=this.getRun(id);this.db.prepare("UPDATE inputs SET state='enqueued' WHERE id=? AND state='accepted'").run(run.inputId);
-    this.db.prepare("UPDATE outbox SET state='done' WHERE id IN (?,?)").run(`input:${run.inputId}`,`run:${id}`);
+    this.command(`enqueued:${id}`,'input.enqueued',{id},()=>{
+      const run=this.getRun(id),task=this.getTask(run.taskId);
+      this.db.prepare("UPDATE inputs SET state='enqueued' WHERE id=? AND state='accepted'").run(run.inputId);
+      const receipt=this.db.prepare("SELECT json_extract(payload,'$.dispatchRowVersion') AS dispatchRowVersion FROM outbox WHERE id=?").get(`input:${run.inputId}`);
+      this.db.prepare("UPDATE outbox SET state='done' WHERE id IN (?,?)").run(`input:${run.inputId}`,`run:${id}`);
+      // An already sent notice still needs its own Manager receipt or recovery.
+      if(run.finishedAt===null)this.db.prepare(`UPDATE outbox SET state='done',payload=json_set(payload,'$.fulfilledByRunId',?)
+        WHERE kind='manager.notify' AND taskId=? AND id GLOB 'manager-event:capacity:' || taskId || ':*'
+          AND json_extract(payload,'$.botId')=? AND state IN ('pending','blocked') AND attempts=0
+          AND json_extract(payload,'$.messageId') IS NULL
+          AND coalesce(CAST(substr(id,length('manager-event:capacity:' || taskId || ':')+1) AS INTEGER)<=?,createdAt<?)`)
+        .run(id,task.id,task.botId,receipt?.dispatchRowVersion??null,run.createdAt);
+      return {};
+    });
   }
   inputEntered(id:string,messageId:string,seq:number):void {
     this.command(`entered:${id}:${messageId}`,'input.entered',{id,messageId,seq},()=>{
@@ -871,21 +1069,35 @@ export class Store {
       this.event('task.revised',taskId,{taskRevision:task.taskRevision+1,attentionId,source});return this.getTask(taskId);
     });
   }
+  private pendingWorkerQuestions(task:Task,binding:Binding|null,attentions:Attention[]):Attention[] {
+    if(task.lifecycle!=='open'||binding?.state!=='ready'||!binding.sessionId||binding.sessionId!==task.sessionId
+      ||binding.taskRevision!==task.taskRevision)return [];
+    const open=attentions.filter(a=>a.taskId===task.id&&a.kind==='input'&&a.state==='open'&&a.taskRevision===task.taskRevision&&a.id.startsWith('run:'));
+    if(!open.length||this.heldRuns().some(run=>run.taskId===task.id))return [];
+    const waitingRun=this.db.prepare(`SELECT 1 FROM runs JOIN reports ON reports.runId=runs.id
+      WHERE runs.id=? AND runs.taskId=? AND runs.bindingId=? AND runs.taskRevision=? AND runs.generation=?
+      AND runs.sessionId=? AND runs.state='settled' AND reports.kind='waiting'`);
+    return open.filter(a=>waitingRun.get(a.id.slice(4),task.id,binding.id,task.taskRevision,binding.generation,binding.sessionId));
+  }
+
   respondAttention(requestId:string,attentionId:string,expectedRowVersion:number,text:string,source?:ChatSource):RunInput {
     const content=requiredText(text,'回答');
     return this.command(requestId,'attention.respond',{attentionId,expectedRowVersion,content,...(source?{source}:{})},()=>{
       const attention=this.db.prepare('SELECT * FROM attentions WHERE id=?').get(attentionId) as unknown as Attention|undefined;
       if(!attention)throw new AppError('not-found','待办不存在。');const task=this.getTask(attention.taskId);
       if(task.rowVersion!==expectedRowVersion)throw new AppError('version-conflict','任务已经更新，请刷新后回答。');
-      if(attention.kind!=='input'||attention.state!=='open'||attention.taskRevision!==task.taskRevision)throw new AppError('attention-stale','问题已失效或已有回答。');
-      if(!this.activeBinding(task.id))throw new AppError('not-execution-question','请使用修改任务补全范围和验收条件。');
+      if(attention.kind!=='input'||attention.state!=='open'||attention.taskRevision!==task.taskRevision||task.lifecycle!=='open')throw new AppError('attention-stale','问题已失效或已有回答。');
+      const binding=this.activeBinding(task.id);
+      if(!binding)throw new AppError('not-execution-question','请使用修改任务补全范围和验收条件。');
       if(this.heldRuns().some(r=>r.taskId===task.id))throw new AppError('run-active','执行尚未收敛，暂未提交回答。');
+      if(!this.pendingWorkerQuestions(task,binding,[attention]).length)throw new AppError('attention-stale','问题已失效或已有回答。');
       const id=randomUUID();this.db.prepare('INSERT INTO inputs(id,taskId,kind,content,attentionId,createdAt) VALUES (?,?,?,?,?,?)').run(id,task.id,'answer',content,attentionId,Date.now());
       this.db.prepare('INSERT INTO outbox(id,kind,taskId,payload,createdAt) VALUES (?,?,?,?,?)').run(`input:${id}`,'input.deliver',task.id,JSON.stringify({inputId:id}),Date.now());
       this.db.prepare("UPDATE attentions SET state='responding' WHERE id=?").run(attentionId);
       this.db.prepare('UPDATE tasks SET rowVersion=rowVersion+1,updatedAt=? WHERE id=?').run(Date.now(),task.id);
       this.enqueueManager(task.botId,`answer:${id}`,'用户回答已保存，请核对管理方式后继续。',task.id,10);
-      this.event('attention.answered',task.id,{attentionId,inputId:id,...(source?{source}:{})});return this.pendingInput(task.id)!;
+      this.event('attention.answered',task.id,{attentionId,inputId:id,...(source?{source}:{})});
+      return {...this.db.prepare('SELECT * FROM inputs WHERE id=?').get(id)} as unknown as RunInput;
     });
   }
   rejectResult(requestId:string,taskId:string,expectedRowVersion:number,resultId:string,text:string,source?:ChatSource):Task {
@@ -904,23 +1116,58 @@ export class Store {
       this.event('result.rejected',taskId,{resultId,inputId,...(source?{source}:{})});return this.getTask(taskId);
     });
   }
+  recoveryTarget(taskId:string,expectedRowVersion:number,continuation?:RecoveryContinuation) {
+    const task=this.getTask(taskId),latest=this.latestRun(taskId),binding=this.activeBinding(taskId);
+    if(task.rowVersion!==expectedRowVersion)throw new AppError('version-conflict','任务已经更新，请刷新后核对。');
+    if(latest?.finishedAt===null)throw new AppError('run-active','请先停止当前执行。');
+    const run=latest&&binding&&latest.bindingId===binding.id&&latest.sessionId===binding.sessionId&&
+      latest.generation===binding.generation&&latest.taskRevision===task.taskRevision?latest:null;
+    const attentions=this.db.prepare(`SELECT id FROM attentions WHERE taskId=? AND taskRevision=? AND kind='recovery'
+      AND state='open' AND id IN (?,?) ORDER BY id`).all(taskId,task.taskRevision,`restore:${taskId}`,run?`run:${run.id}`:null)
+      .map(row=>String(row.id));
+    if(!['open','review'].includes(task.lifecycle)||!attentions.length)throw new AppError('recovery-stale','当前没有可核对的执行恢复事项。');
+    if(this.heldRuns().some(held=>held.taskId===taskId&&held.id!==run?.id))throw new AppError('run-active','还有其他执行占用待核对。');
+    if(binding?(binding.state!=='ready'||!binding.sessionId||task.sessionId!==binding.sessionId||task.taskRevision!==binding.taskRevision):task.sessionId!==null) {
+      throw new AppError('binding-stale','执行会话关联待核对，请先确认当前关联。');
+    }
+    if(continuation) {
+      if(!attentions.includes(continuation.attentionId))throw new AppError('recovery-stale','这个恢复事项已经改变，请刷新后核对。');
+      if(!binding||binding.id!==continuation.bindingId||binding.generation!==continuation.expectedBindingGeneration) {
+        throw new AppError('binding-stale','执行会话关联已经改变，请刷新后核对。');
+      }
+      if(task.lifecycle!=='open'||!task.scope||!task.acceptance)throw new AppError('not-ready','当前任务只能完成核对，请保留已有成果或先补全任务。');
+    }
+    return {task,binding,run,attentions};
+  }
   resolveRunRecovery(requestId:string,taskId:string,expectedRowVersion:number):Task {
     return this.command(requestId,'run.resolve-recovery',{taskId,expectedRowVersion},()=>{
-      const task=this.getTask(taskId),run=this.latestRun(taskId);
-      if(task.rowVersion!==expectedRowVersion)throw new AppError('version-conflict','任务已经更新，请刷新后核对。');
-      if(run?.finishedAt===null)throw new AppError('run-active','请先停止当前执行。');
-      if(!run&&!this.db.prepare("SELECT 1 FROM attentions WHERE id=? AND state='open'").get(`restore:${taskId}`))throw new AppError('not-found','没有待核对的执行。');
-      if(run) {
-        this.db.prepare('DELETE FROM resources WHERE runId=?').run(run.id);
-        this.db.prepare("UPDATE attentions SET state='resolved' WHERE id=? AND kind='recovery'").run(`run:${run.id}`);
-        this.db.prepare("UPDATE inputs SET state='discarded' WHERE id=? AND state IN ('accepted','unknown','enqueued')").run(run.inputId);
-        const input=this.getRunInput(run.id);if(input.attentionId&&input.state==='discarded')this.db.prepare("UPDATE attentions SET state='open' WHERE id=? AND state='responding'").run(input.attentionId);
-      }
-      this.db.prepare("UPDATE attentions SET state='resolved' WHERE id=? AND kind='recovery'").run(`restore:${taskId}`);
-      this.db.prepare("UPDATE attentions SET state='stale' WHERE taskId=? AND kind='approval' AND state='open'").run(taskId);
-      this.db.prepare("UPDATE tasks SET controlMode='paused',rowVersion=rowVersion+1,updatedAt=? WHERE id=?").run(Date.now(),taskId);
-      this.event('run.recovery-confirmed',taskId,{runId:run?.id??null,actor:'user'});return this.getTask(taskId);
+      const target=this.recoveryTarget(taskId,expectedRowVersion);
+      this.closeRecovery(target,'paused');
+      return this.getTask(taskId);
     });
+  }
+  continueRunRecovery(requestId:string,taskId:string,expectedRowVersion:number,continuation:RecoveryContinuation,expectedModel?:WorkerModelPlan):Run {
+    return this.command(requestId,'run.continue-recovery',{taskId,expectedRowVersion,...continuation},()=>{
+      const target=this.recoveryTarget(taskId,expectedRowVersion,continuation);
+      this.closeRecovery(target,'auto');
+      return this.allocateRun(this.getTask(taskId),target.binding,true,expectedModel);
+    });
+  }
+  private closeRecovery({task,run,attentions}:ReturnType<Store['recoveryTarget']>,mode:'paused'|'auto'):void {
+    if(run) {
+      this.db.prepare('DELETE FROM resources WHERE runId=?').run(run.id);
+      this.db.prepare("UPDATE inputs SET state='discarded' WHERE id=? AND state IN ('accepted','unknown','enqueued')").run(run.inputId);
+      const input=this.getRunInput(run.id);
+      if(input.state==='discarded') {
+        this.db.prepare("UPDATE outbox SET state='cancelled' WHERE id IN (?,?) AND state IN ('pending','sending','unknown')")
+          .run(`input:${input.id}`,`run:${run.id}`);
+        if(input.attentionId)this.db.prepare("UPDATE attentions SET state='open' WHERE id=? AND state='responding'").run(input.attentionId);
+      }
+    }
+    for(const id of attentions)this.db.prepare("UPDATE attentions SET state='resolved' WHERE id=?").run(id);
+    this.db.prepare("UPDATE attentions SET state='stale' WHERE taskId=? AND kind='approval' AND state='open'").run(task.id);
+    this.db.prepare('UPDATE tasks SET controlMode=?,rowVersion=rowVersion+1,updatedAt=? WHERE id=?').run(mode,Date.now(),task.id);
+    this.event('run.recovery-confirmed',task.id,{runId:run?.id??null,actor:'user'});
   }
   managerReview(requestId:string,botId:string,taskId:string,expectedRowVersion:number,resultId:string,verdict:'accept'|'rework'|'human',text:string,requested?:{verdict:'accept';note:string},chatReview?:{reviewSessionId:string;reviewCallId:string}):Task {
     const note=requiredText(text,'验收判断');
@@ -949,7 +1196,7 @@ export class Store {
         this.db.prepare('UPDATE tasks SET rowVersion=rowVersion+1,updatedAt=? WHERE id=?').run(Date.now(),taskId);
         if(verdict==='rework'&&reworks>=2)this.db.prepare("UPDATE tasks SET controlMode='paused' WHERE id=?").run(taskId);
       }
-      if(decision!=='rework')this.enqueueManager(botId,`delivery:${resultId}`,'成果已检查但尚需在当前对话交付。用 super_bot_manage 的 deliver（taskId、resultId、简短说明：完成内容、检查与未验证项）交付，并原样回复返回的 markdown；不得重新执行或改变任务。',taskId,5,{resultId,taskRevision:task.taskRevision,...chatReview});
+      if(decision!=='rework')this.enqueueManager(botId,`delivery:${resultId}`,RESULT_DELIVERY_REASON,taskId,5,{resultId,taskRevision:task.taskRevision,...chatReview});
       this.event('manager.reviewed',taskId,{resultId,decision,note});return this.getTask(taskId);
     });
   }

@@ -2,7 +2,9 @@
 export interface WorkspaceApi {
   call<T>(action: string, payload?: Record<string, unknown>, signal?: AbortSignal): Promise<T>;
   openSession(id: string): void;
+  openChildSession?(parentId: string, childId: string): void;
   beginNavigation(): AbortSignal;
   openBot(id: string, navigation?: AbortSignal): Promise<void>;
   currentSession?(): string | undefined;
+  watchCurrentSession?(listener: () => void): () => void;
 }

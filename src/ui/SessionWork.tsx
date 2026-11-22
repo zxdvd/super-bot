@@ -1,9 +1,12 @@
 import { useEffect, useState, useSyncExternalStore } from 'react';
 import type { ISidebarRight } from '@deepseek-ai/dsh-client-ui-sidebar-right/client';
 import type { TabId } from '@deepseek-ai/dsh-client-ui-sidebar-right/client';
+import type { LocaleRuntime } from '@deepseek-ai/dsh-client-locale/client';
 import type { Bot } from '../model.ts';
+import type { SessionOrigin } from '../mirror.ts';
+import type { WorkLink } from '../work-links.ts';
 import { Workspace, type WorkspaceApi } from './Workspace.tsx';
-import { watchSessionBot, toggleSessionWork } from './work-navigation.ts';
+import { watchSessionBot, toggleSessionWork, watchSessionOrigin } from './work-navigation.ts';
 
 type Resolved = { sessionId: string; bot: Bot | null; error?: string };
 const buttonStyle = {
@@ -27,8 +30,28 @@ export function WorkButton({ api, sessionId, sidebar }: { api: WorkspaceApi; ses
     onClick={() => toggleSessionWork(sessionId, sidebar)} style={buttonStyle}>工作</button>;
 }
 
-export function SessionWork({ api, sessionId, sidebar, tabId }: {
+type HintLocale = Pick<LocaleRuntime, 'subscribe' | 'getSnapshot' | 'resolveText'>;
+
+export function SessionOriginHint({ api, sessionId, sidebar, locale }: {
+  api: WorkspaceApi; sessionId: string; sidebar: ISidebarRight; locale?: HintLocale;
+}) {
+  const current = useSyncExternalStore(listener => sidebar.mounted.subscribe(listener), () => sidebar.mounted.getSnapshot());
+  useSyncExternalStore(listener => locale?.subscribe(listener) ?? (() => {}), () => locale?.getSnapshot());
+  const [resolved, setResolved] = useState<{ sessionId: string; origin: SessionOrigin }>();
+  useEffect(() => watchSessionOrigin(api, sessionId, sidebar.mounted,
+    origin => setResolved(origin && { sessionId, origin })), [api, sessionId, sidebar]);
+  if (current !== sessionId || resolved?.sessionId !== sessionId) return null;
+  const { owner, local } = resolved.origin, label = owner === 'web' ? 'Web' : 'Desktop';
+  const text = local ? { zh: `${label} 创建`, en: `Created on ${label}` }
+    : { zh: `${label} 创建 · 请在 ${label} 继续`, en: `Created on ${label} · Continue on ${label}` };
+  return <span title={locale?.resolveText(text) ?? text.zh} style={{ fontSize: '0.85em', whiteSpace: 'nowrap' }}>
+    {locale?.resolveText(text) ?? text.zh}
+  </span>;
+}
+
+export function SessionWork({ api, sessionId, sidebar, tabId, linkedWork }: {
   api: WorkspaceApi; sessionId: string; sidebar: ISidebarRight; tabId: TabId;
+  linkedWork?: { link: WorkLink; botId: string; revision: number };
 }) {
   const resolved = useSessionBot(api, sessionId, sidebar);
   const back = () => { if (sidebar.mounted.getSnapshot() === sessionId) sidebar.hide(tabId); };
@@ -39,6 +62,10 @@ export function SessionWork({ api, sessionId, sidebar, tabId }: {
       <button onClick={back}>← 返回聊天</button><p role={resolved?.error ? 'alert' : 'status'}>{text}</p>
     </div>;
   }
-  return <Workspace key={`${sessionId}:${resolved.bot.id}`} api={api} initialBotId={resolved.bot.id} sessionId={sessionId} compact
-    onReturn={back}/>;
+  const target = linkedWork?.botId === resolved.bot.id ? linkedWork : undefined;
+  if (linkedWork && !target) return <div style={{ padding: 20 }}>
+    <button onClick={back}>← 返回聊天</button><p role="alert">当前对话的归属已改变，请重新打开链接。</p>
+  </div>;
+  return <Workspace key={`${sessionId}:${resolved.bot.id}:${target?.revision ?? ''}`} api={api} initialBotId={resolved.bot.id}
+    sessionId={sessionId} initialLink={target?.link} compact onReturn={back}/>;
 }

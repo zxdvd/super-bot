@@ -1,5 +1,10 @@
 /** Pure labels and grouping for tasks; no React so tests can import it directly. */
-import type { Task, WorkdirInfo } from '../../model.ts';
+import { isTestTask, RESULT_FRESH_MS, type Task, type WorkdirInfo } from '../../model.ts';
+import type { Detail } from './types.ts';
+
+export function canStartTask({ binding, task, wait, autoDispatchPending }: Detail): boolean {
+  return binding?.state === 'ready' && task.status === 'unscheduled' && !wait && !autoDispatchPending;
+}
 
 const labels: Record<Task['status'], string> = {
   unscheduled: '待安排', 'needs-input': '等你补充', approval: '原生审批待处理', paused: '已暂停', manual: '人工接管',
@@ -17,6 +22,7 @@ const eventLabels: Record<string, string> = {
   'task.cancelled': '用户取消任务', 'session.detached': '解除执行会话关联', 'work.report-stale': '保留已失效报告的审计',
   'approval.asked': '原生工具请求审批', 'approval.decided': '原生审批已有结果', 'workdir.failed': '工作目录准备失败',
   'workdir.cleanup': '工作目录已清理', 'workdir.cleanup-failed': '工作目录自动清理失败',
+  'dev.reload-applied': '关联构建的原生重载已确认',
 };
 const approvalOutcomes: Record<string, string> = {
   'allowed-once': '原生审批：仅允许本次', rejected: '原生审批：已拒绝', cancelled: '原生审批：已撤回',
@@ -24,6 +30,14 @@ const approvalOutcomes: Record<string, string> = {
 };
 
 export function eventTitle(event: { kind: string; data: string }): string {
+  if (event.kind === 'manager.delivered') {
+    try {
+      const data = JSON.parse(event.data);
+      if (data.explicit) return '历史交付工具回包';
+      if (data.resultId) return '原聊天成果链接已确认';
+    } catch { /* Older audit entries may not contain detail. */ }
+    return '原聊天已回复通知';
+  }
   if (event.kind === 'approval.decided') try {
     const outcome = JSON.parse(event.data).outcome as string;
     return approvalOutcomes[outcome] ?? eventLabels[event.kind]!;
@@ -49,7 +63,7 @@ export function resultHeading(task: Task): string {
 export type WorkGroup = 'doing' | 'needs-you' | 'delivered' | 'cancelled';
 export const workGroups: readonly WorkGroup[] = ['needs-you', 'doing', 'delivered', 'cancelled'];
 export const groupTitles: Record<WorkGroup, string> = {
-  'needs-you': '哪里需要我', doing: '正在做什么', delivered: '交付了什么', cancelled: '已取消',
+  'needs-you': '哪里需要我', doing: '正在做什么', delivered: '成果', cancelled: '已取消',
 };
 export function workGroup(task: Task): WorkGroup {
   if (task.lifecycle === 'cancelled') return 'cancelled';
@@ -73,48 +87,68 @@ export const stageLabels: Record<Stage, string> = {
 export const stageTones: Record<Stage, StageTone> = {
   'needs-you': 'attention', review: 'info', running: 'success', waiting: 'neutral', done: 'neutral', cancelled: 'neutral',
 };
-const NEEDS_YOU = ['needs-input', 'approval', 'recovery', 'manual'];
+const BLOCKERS = { input: 'needs-input', approval: 'approval', recovery: 'recovery' } as const;
 const RUNNING = ['running', 'queued', 'stopping'];
+
+function blocker(task: Task): Task['status'] | undefined {
+  if (task.blockingAttention) return BLOCKERS[task.blockingAttention];
+  // Older mirrored sources only include the display status.
+  if (task.blockingAttention === undefined && Object.values(BLOCKERS).some(status => status === task.status)) return task.status;
+}
 
 export function stage(task: Task): Stage {
   if (task.lifecycle === 'cancelled') return 'cancelled';
   if (task.lifecycle === 'completed') return 'done';
+  if (blocker(task)) return 'needs-you';
   if (task.lifecycle === 'review') return 'review';
-  if (NEEDS_YOU.includes(task.status)) return 'needs-you';
   return RUNNING.includes(task.status) ? 'running' : 'waiting';
 }
 /** The short status a row shows: the stage, refined by the concrete reason where that helps. */
-export function stageText(task: Task): string {
+export function stageText(task: Task, readOnly = false): string {
   const s = stage(task);
-  if (s === 'needs-you' || s === 'running') return labels[task.status];
-  if (s === 'waiting' && task.status === 'paused') return labels.paused;
+  if (s === 'needs-you') {
+    const status = blocker(task) ?? task.status;
+    return status === 'needs-input' && readOnly ? '待补充' : labels[status];
+  }
+  if (s === 'running' || s === 'waiting' && (task.status === 'paused' || task.status === 'manual')) return labels[task.status];
   return stageLabels[s];
 }
-export const stageTone = (task: Task): StageTone => task.status === 'recovery' ? 'danger' : stageTones[stage(task)];
+export const stageTone = (task: Task): StageTone => blocker(task) === 'recovery' ? 'danger' : stageTones[stage(task)];
 
-/** A finished result counts as new for a few days until its task is opened. */
-export const RESULT_FRESH_MS = 3 * 24 * 3600 * 1000;
 export function unseenResult(task: Task, seenAt: number | undefined, now: number): boolean {
-  return task.lifecycle === 'completed' && (seenAt ?? 0) < task.updatedAt && now - task.updatedAt < RESULT_FRESH_MS;
+  const at = task.deliveredAt;
+  return (task.lifecycle === 'review' || task.lifecycle === 'completed') && at !== undefined
+    && (seenAt ?? 0) < at && now - at < RESULT_FRESH_MS;
 }
 
-export type InboxSection = 'attention' | 'active' | 'recent';
-export function inboxSection(task: Task, seenAt: number | undefined, now: number): InboxSection {
-  const s = stage(task);
-  if (s === 'needs-you' || s === 'review' || unseenResult(task, seenAt, now)) return 'attention';
-  return s === 'running' || s === 'waiting' ? 'active' : 'recent';
+function urgency(task: Task): number {
+  const status = blocker(task);
+  if (status === 'recovery') return 0;
+  if (status === 'approval') return 1;
+  if (status === 'needs-input') return 2;
+  return RUNNING.includes(task.status) ? 3 : 4;
 }
-const urgency = (task: Task) => task.status === 'recovery' ? 0 : task.status === 'approval' ? 1 : task.status === 'needs-input' ? 2
-  : task.lifecycle === 'review' ? 3 : task.status === 'manual' ? 4 : RUNNING.includes(task.status) ? 5 : 6;
-const byUrgency = (a: Task, b: Task) => urgency(a) - urgency(b) || b.updatedAt - a.updatedAt;
+const newest = (a: Task, b: Task) => b.updatedAt - a.updatedAt;
+const byUrgency = (a: Task, b: Task) => urgency(a) - urgency(b) || newest(a, b);
 
-/** Inbox order: what needs the user (most urgent first), what is moving, then a short recent tail. */
 export function inboxGroups(tasks: readonly Task[], seen: Record<string, number>, now: number, recentLimit = 8) {
-  const groups: Record<InboxSection, Task[]> = { attention: [], active: [], recent: [] };
-  for (const task of tasks) groups[inboxSection(task, seen[task.id], now)].push(task);
-  groups.attention.sort(byUrgency); groups.active.sort(byUrgency);
-  groups.recent = groups.recent.sort((a, b) => b.updatedAt - a.updatedAt).slice(0, recentLimit);
-  return groups;
+  const groups = { attention: [] as Task[], review: [] as Task[], fresh: [] as Task[],
+    active: [] as Task[], recent: [] as Task[], tests: [] as Task[], blockedTests: [] as Task[] };
+  for (const task of tasks) {
+    const s = stage(task);
+    if (isTestTask(task)) { (s === 'needs-you' ? groups.blockedTests : groups.tests).push(task); continue; }
+    const fresh = unseenResult(task, seen[task.id], now);
+    if (fresh) groups.fresh.push(task);
+    if (s === 'needs-you') groups.attention.push(task);
+    else if (s === 'review') groups.review.push(task);
+    else if (s === 'running' || s === 'waiting') groups.active.push(task);
+    else if (!fresh) groups.recent.push(task);
+  }
+  groups.attention.sort(byUrgency); groups.active.sort(byUrgency); groups.tests.sort(byUrgency); groups.review.sort(newest);
+  groups.blockedTests.sort(byUrgency);
+  groups.fresh.sort((a, b) => (b.deliveredAt ?? 0) - (a.deliveredAt ?? 0));
+  groups.recent = groups.recent.sort(newest).slice(0, recentLimit);
+  return { ...groups, attentionCount: groups.attention.length + groups.blockedTests.length };
 }
 
 export type BoardColumn = Exclude<Stage, 'cancelled'>;

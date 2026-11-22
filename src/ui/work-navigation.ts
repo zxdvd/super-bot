@@ -1,8 +1,49 @@
+import type { Context } from '@deepseek-ai/cordis';
 import type { ISidebarRight } from '@deepseek-ai/dsh-client-ui-sidebar-right/client';
 import type { Bot, ManagerBinding, Task } from '../model.ts';
+import { managedSessionId, type SessionOrigin } from '../mirror.ts';
 import type { WorkspaceApi } from './Workspace.tsx';
+import { parseWorkLink, workUrl, type WorkLink } from '../work-links.ts';
 
 export const WORK_TAB = 'super-bot-work';
+
+declare module '@deepseek-ai/dsh-client-ui-sidebar-right/client' {
+  interface SidebarRightTabParamsMap {
+    [WORK_TAB]: { sessionId: string; botId: string; href: string };
+  }
+}
+
+export function workLinkForUrl(url: URL, origin: string): WorkLink | undefined {
+  if (url.origin === origin && url.pathname === '/' && !url.searchParams.has('resultId') && !url.searchParams.has('attentionId')) {
+    return parseWorkLink(url.hash);
+  }
+}
+
+export async function openWorkLink(
+  api: WorkspaceApi, sidebar: Pick<Context['sidebarRight'], 'mounted' | 'active' | 'openTab' | 'tabsIn'>, link: WorkLink,
+  signal: AbortSignal,
+): Promise<'sidebar' | 'work' | undefined> {
+  if (signal.aborted) return;
+  const sessionId = sidebar.mounted.getSnapshot();
+  if (!sessionId || link.kind === 'task') return 'work';
+  const navigation = api.beginNavigation(), request = new AbortController();
+  const unsubscribe = sidebar.mounted.subscribe(() => request.abort());
+  const current = AbortSignal.any([signal, navigation, request.signal]);
+  try {
+    const bot = await readSessionBot(api, sessionId, current, () => sidebar.mounted.getSnapshot());
+    if (current.aborted || bot === undefined) return;
+    if (!bot) return 'work';
+    const active = sidebar.active();
+    const existing = active?.kind === WORK_TAB ? active : sidebar.tabsIn(sessionId).find(tab => tab.kind === WORK_TAB);
+    sidebar.openTab(WORK_TAB, {
+      params: { sessionId, botId: bot.id, href: workUrl(link) },
+      ...(existing ? { replaceTab: existing.id } : {}),
+    });
+    return 'sidebar';
+  } catch {
+    if (!current.aborted && sidebar.mounted.getSnapshot() === sessionId) return 'work';
+  } finally { unsubscribe(); }
+}
 
 /** No remembered Bot participates in this lookup. Undefined means a superseded read. */
 export async function readSessionBot(
@@ -24,6 +65,26 @@ export interface SessionSource {
 }
 export type SessionBotState = { bot: Bot | null; error?: string };
 
+export function watchSessionOrigin(
+  api: WorkspaceApi, sessionId: string, source: SessionSource, receive: (origin: SessionOrigin | undefined) => void,
+): () => void {
+  let controller: AbortController | undefined;
+  const changed = () => {
+    controller?.abort();
+    receive(undefined);
+    if (source.getSnapshot() !== sessionId || !managedSessionId.test(sessionId)) return;
+    controller = new AbortController();
+    const { signal } = controller;
+    void api.call<SessionOrigin | null>('session.origin', { sessionId }, signal).then(origin => {
+      if (!signal.aborted && source.getSnapshot() === sessionId && origin
+        && (origin.owner === 'web' || origin.owner === 'desktop') && typeof origin.local === 'boolean') receive(origin);
+    }).catch(() => { /* No hint until the origin is known. */ });
+  };
+  const unsubscribe = source.subscribe(changed);
+  changed();
+  return () => { controller?.abort(); unsubscribe(); };
+}
+
 /** UI-only refresh; native selection changes invalidate reads synchronously, including A → B → A. */
 export function watchSessionBot(
   api: WorkspaceApi, sessionId: string, source: SessionSource, receive: (state: SessionBotState | undefined) => void,
@@ -33,7 +94,7 @@ export function watchSessionBot(
   async function pull(signal: AbortSignal) {
     try {
       const bot = await readSessionBot(api, sessionId, signal, () => source.getSnapshot());
-      if (bot !== undefined) receive({ bot });
+      if (!signal.aborted && bot !== undefined) receive({ bot });
     } catch (error) {
       if (!signal.aborted) receive({ bot: null, error: error instanceof Error ? error.message : '暂时无法读取会话归属。' });
     }

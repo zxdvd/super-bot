@@ -19,8 +19,11 @@ function EmptyList({ w }: { w: WorkspaceState }) {
   const narrowed = Boolean(w.query || w.filter);
   return <div className="empty">
     <h2>{narrowed ? '没有匹配的任务' : '还没有任务'}</h2>
-    <p>{narrowed ? '调整关键词或状态筛选。' : '把一个具体目标放进来，先写清怎样算完成。'}</p>
-    {!narrowed && <button disabled={!w.online} onClick={() => w.setForm('task')}>新建任务</button>}
+    {narrowed && <p>调整关键词或状态筛选。</p>}
+    {!narrowed && !w.mirror && <>
+      <p>把一个具体目标放进来，先写清怎样算完成。</p>
+      <button disabled={!w.online} onClick={() => w.setForm('task')}>新建任务</button>
+    </>}
   </div>;
 }
 
@@ -29,7 +32,8 @@ function Groups({ w }: { w: WorkspaceState }) {
   return <>{workGroups.map(group => {
     const tasks = items.filter(t => workGroup(t) === group);
     return tasks.length > 0 && <div key={group} className="work-group">
-      <h3>{groupTitles[group]} <span className="muted">· 本页 {tasks.length}</span></h3>
+      <h3>{w.mirror && group === 'needs-you' ? '来源端待处理' : groupTitles[group]}
+        <span className="muted"> · 本页 {tasks.length}</span></h3>
       {tasks.map(t => <TaskRow key={t.id} w={w} task={t}/>)}
     </div>;
   })}</>;

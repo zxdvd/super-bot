@@ -15,10 +15,16 @@ import {Store} from '../../src/store.ts';
 import {readEvidence} from '../../src/evidence.ts';
 
 function fixture(t:TestContext,workspace=false,extra:(directory:string)=>Record<string,unknown>=()=>({})) {
-  t.mock.timers.enable({apis:['setInterval']});
+  t.mock.timers.enable({apis:['Date','setInterval']});
   const root=realpathSync(process.cwd());mkdirSync(join(root,'.runtime'),{recursive:true});
   const directory=mkdtempSync(join(root,'.runtime','p2-adapter-')),database=join(directory,'ledger.sqlite');
-  let store=new Store(database);
+  const extras=extra(directory);
+  const openStore=()=>{
+    const store=new Store(database),maxRunningTasks=extras.maxRunningTasks;
+    if(typeof maxRunningTasks==='number')store.maxRunningTasks=maxRunningTasks;
+    return store;
+  };
+  let store=openStore();
   const bot=store.createBot('bot',{name:'P2 Bot',instructions:'Synthetic regression only'});
   const manager=store.beginManager('manager',bot.id,directory);store.confirmManager(manager.id,manager.requestedSessionId);
   const listeners=new Map<string,Function[]>(),tools=new Map<string,any>(),agents=new Map<string,any>();
@@ -43,7 +49,7 @@ function fixture(t:TestContext,workspace=false,extra:(directory:string)=>Record<
     effect:(callback:()=>unknown)=>callback(),
     on:(name:string,callback:Function)=>{const list=listeners.get(name)??[];list.push(callback);listeners.set(name,list);return ()=>{list.splice(list.indexOf(callback),1);};},
     tools:{register:(tool:any,options:any)=>{tools.set(tool.name,tool);const off=registry.register(tool,options);registrations.push(off);return off;}},
-    agents:{list:()=>[],isOwnedBy:()=>false},jobs:{list:()=>[]},
+    agents:{get:(id:string)=>agents.get(id),list:()=>[],isOwnedBy:()=>false},jobs:{list:()=>[]},
     workingDirectory:{get:(session:any)=>session.header.cwd},
     sessionProjections:{snapshot:()=>({values:{modelSelection:{next:{provider:'synthetic',model:'synthetic'}}}})},
     workspaceRegistry:{create:async(cwd:string)=>({id:cwd,attachSession:async()=>{}})},
@@ -53,29 +59,40 @@ function fixture(t:TestContext,workspace=false,extra:(directory:string)=>Record<
         const agent:any={id:sessionId,session:{id:sessionId,header:{cwd:workspaceId}},status:'idle',
           model:{current:()=>({provider:'synthetic',model:'synthetic'}),select:()=>{}},inbox:{nextTurn:[],nextStep:[],remove:()=>{}},
           ctx:{systemPrompt:{section:()=>()=>{}},tools:{restrict:()=>()=>{},guard:()=>()=>{}},on:()=>()=>{}},
-          followup:(message:any)=>{delivered=message;agent.status='running';agent.turn=(agent.turn??0)+1;void emit({type:'turn/start',data:{turn:agent.turn}},sessionId);idle=new Promise<void>(resolve=>{resolveIdle=resolve;});},
-          whenIdle:()=>idle,finish:()=>{void emit({type:'turn/end',data:{turn:agent.turn,reason:{kind:'completed'}}},sessionId);agent.status='idle';resolveIdle();},cancel:()=>{agent.status='idle';resolveIdle();}};
+          messages:[],
+          followup:(message:any)=>{delivered=message;agent.messages.push(message);agent.status='running';agent.turn=(agent.turn??0)+1;void emit({type:'turn/start',data:{turn:agent.turn}},sessionId);idle=new Promise<void>(resolve=>{resolveIdle=resolve;});},
+          whenIdle:()=>idle,finish:()=>{const ended=emit({type:'turn/end',data:{turn:agent.turn,reason:{kind:'completed'}}},sessionId);agent.status='idle';resolveIdle();return ended;},cancel:()=>{agent.status='idle';resolveIdle();}};
         agents.set(sessionId,agent);return {sessionId};
       },
       resolveAgent:async(sessionId:string)=>agents.has(sessionId)?{agent:agents.get(sessionId)}:{error:'synthetic missing session'},
     },
   } as unknown as Context;
-  const options=()=>({fullAccess:workspace,...(workspace?{workspace:directory}:{}),...extra(directory)});
+  const options=()=>({fullAccess:workspace,...(workspace?{workspace:directory}:{}),...extras});
   let execution=new DshExecution(ctx,store,directory,options()),managers=new Managers(ctx,store,execution,directory,()=> 'https://example.test',options());
   const install=()=>{execution.install();managers.install();};install();
-  const emit=async(event:any,sessionId=manager.requestedSessionId)=>{if(sessionId!==manager.requestedSessionId){const events=workerEvents.get(sessionId)??[];event={...event,seq:events.length,...(event.type==='user/message'?{surfaceOp:'append'}:{})};events.push(event);workerEvents.set(sessionId,events);}for(const listener of listeners.get('session/event')??[])await listener({id:sessionId},event);};
+  const managerSession={id:manager.requestedSessionId};
+  const emit=async(event:any,sessionId=manager.requestedSessionId)=>{
+    const session=agents.get(sessionId)?.session??(sessionId===managerSession.id?managerSession:{id:sessionId});
+    if(sessionId!==manager.requestedSessionId||agents.has(sessionId)) {
+      const events=workerEvents.get(sessionId)??[];
+      event={...event,seq:events.length,...(event.type==='user/message'?{surfaceOp:'append'}:{})};
+      events.push(event);workerEvents.set(sessionId,events);
+    }
+    for(const listener of listeners.get('session/event')??[])await listener(session,event);
+  };
   const native=async(id:string,seq:number,text:string)=>emit({type:'user/message',seq,data:{id,source:{kind:'user',rpcId:`rpc:${id}`},content:[{type:'text',text}]}});
   return {get store(){return store;},get execution(){return execution;},bot,manager,directory,tools,emit,native,nativeResult,ctx,agents,get managers(){return managers;},
     schemas:()=>registry.schemas(),
     nativeCall:async(callId:string,args:Record<string,unknown>)=>{const result=await nativeResult(callId,args);assert.ok(!result.isError,JSON.stringify(result.error));return result.value as any;},
     delivered:()=>delivered,
     finish:async(taskId:string,files:string[],kind:'ready'|'waiting'='ready')=>{
-      const run=store.latestRun(taskId)!;await emit({type:'user/message',seq:1,data:delivered},run.sessionId);
+      const run=store.latestRun(taskId)!,agent=agents.get(run.sessionId);
+      await emit({type:'user/message',seq:1,data:agent.messages.at(-1)},run.sessionId);
       const report=await tools.get('super_bot_report').execute({kind,summary:kind==='ready'?'合成成果':'请补充语言',checks:'逐项回读',files},{agent:agents.get(run.sessionId),callId:'ready',signal:new AbortController().signal,concludeTurn:()=>{}});
       agents.get(run.sessionId).finish();await new Promise<void>(resolve=>setImmediate(resolve));return report;
     },
     call:(callId:string,args:Record<string,unknown>,signal=new AbortController().signal)=>tools.get('super_bot_manage').execute(args,{agent:{id:manager.requestedSessionId},callId,signal}),
-    reload:async()=>{await managers.dispose();await execution.dispose();registrations.splice(0).forEach(off=>off());listeners.clear();store.close();store=new Store(database);execution=new DshExecution(ctx,store,directory,options());managers=new Managers(ctx,store,execution,directory,()=> 'https://example.test',options());install();},
+    reload:async()=>{await managers.dispose();await execution.dispose();registrations.splice(0).forEach(off=>off());listeners.clear();store.close();store=openStore();execution=new DshExecution(ctx,store,directory,options());managers=new Managers(ctx,store,execution,directory,()=> 'https://example.test',options());install();},
     close:async()=>{await managers.dispose();await execution.dispose();registrations.splice(0).forEach(off=>off());store.close();assert.equal(realpathSync(directory),directory);assert.ok(directory.startsWith(join(root,'.runtime','p2-adapter-')));rmSync(directory,{recursive:true,force:true});t.mock.timers.reset();},
   };
 }
@@ -267,7 +284,7 @@ for(const damage of ['modified','deleted'] as const)test(`P2 ${damage} evidence 
     assert.deepEqual(after.task,before.task);assert.deepEqual(after.result,before.result);assert.deepEqual(after.attentions,before.attentions);assert.deepEqual(after.run,before.run);assert.deepEqual(after.events,before.events);
     assert.equal(after.evidenceValidation.status,'failed');assert.equal(after.evidenceValidation.code,damage==='modified'?'evidence-changed':'evidence-unavailable');assert.ok(after.evidenceValidation.message);
     assert.deepEqual(after.files,[],'no partially verified batch or changed bytes may escape');
-    assert.equal(after.delivery.workUrl,`/#super-bot-task=${created.task.id}`);
+    assert.equal(after.delivery.workUrl,`/#super-bot-task=${created.task.id}&resultId=${report.resultId}`);
     const expected={code:damage==='modified'?'evidence-changed':'evidence-unavailable'};
     await assert.rejects(f.execution.accept('accept-damaged',created.task.id,after.task.rowVersion,report.resultId),expected);
     await assert.rejects(f.call('manager-accept',{action:'review',taskId:created.task.id,expectedRowVersion:after.task.rowVersion,resultId:report.resultId,verdict:'accept',note:'不能忽略校验失败'}),expected);
@@ -433,6 +450,201 @@ test('one-step create keeps explicit Bot fields and queues instead of failing wh
 });
 
 const work=(directory:string)=>{const path=join(directory,'work');mkdirSync(path,{recursive:true});return path;};
+
+async function parallelFixture(t:TestContext,maxRunningTasks=2){
+  const f=fixture(t,false,directory=>({allowedRoots:[work(directory)],maxRunningTasks}));
+  t.after(()=>f.close());
+  const root=work(f.directory);
+  const dir=(name:string)=>{const path=join(root,name);mkdirSync(path,{recursive:true});return path;};
+  const create=(name:string,path:string)=>f.call(`parallel-create:${name}`,{action:'create',goal:name,workdir:{mode:'existing',path}});
+  const dispatch=(name:string,taskId:string)=>f.call(name,{action:'dispatch',taskId,expectedRowVersion:f.store.getTask(taskId).rowVersion});
+  const pump=()=> (f.managers as unknown as {pump():Promise<void>}).pump();
+  const notice=(id:string)=>f.store.managerNotifications(f.bot.id).find(event=>event.id===id);
+  const openManager=async()=>{
+    await f.ctx.sessionController.create({workspaceId:f.directory as any,sessionId:f.manager.requestedSessionId as any});
+    return f.agents.get(f.manager.requestedSessionId);
+  };
+  const endManager=async(agent:any,text:string)=>{
+    await f.emit({type:'assistant/message',surfaceOp:'append',data:{turn:agent.turn,
+      message:{id:`reply-${agent.turn}`,source:{kind:'model'},content:[{type:'text',text}]},
+      stream:[{type:'chunk',chunk:{type:'finish',reason:{kind:'stop'}}}]}},agent.id);
+    await agent.finish();await new Promise<void>(resolve=>setImmediate(resolve));
+  };
+  const enterManager=(agent:any)=>f.emit({type:'user/message',data:agent.messages.at(-1)},agent.id);
+  await f.native('parallel-request',1,'合成并行任务');
+  return {f,root,dir,create,dispatch,pump,notice,openManager,enterManager,endManager};
+}
+
+for(const [kind,waiters] of [['directory',1],['directory',12],['capacity',12]] as const){
+  test(`DF-13 pump skips ${waiters} older ${kind} waits for independent Worker notification`,async t=>{
+    const byDirectory=kind==='directory';
+    const {f,dir,create,pump,notice,openManager,enterManager,endManager}=await parallelFixture(t);
+    const independent=await create('Independent',dir('independent'));
+    const file=join(dir('independent'),'result.md');writeFileSync(file,'Independent evidence');
+    const shared=dir('shared'),holder=await create('Holder',shared);
+    assert.ok(holder.run);
+    if(!byDirectory)f.store.maxRunningTasks=1; // The holder continues to occupy the remaining slot after settlement.
+    const waiting=[];
+    for(let i=0;i<waiters;i++){
+      const queued=await create(`Queued ${i}`,byDirectory?shared:dir(`slot-${i}`));
+      assert.equal(queued.reason,byDirectory?'resource-conflict':'capacity');
+      waiting.push(`manager-event:capacity:${queued.task.id}:${queued.task.rowVersion}`);
+    }
+    t.mock.timers.tick(1);
+    await f.finish(independent.task.id,[file]);
+    const ready=f.store.taskDetail(independent.task.id),settled=`manager-event:settled:${independent.run.id}`;
+    const manager=await openManager();
+    await pump();
+    assert.deepEqual(manager.messages.map((message:any)=>message.source.eventId),[settled]);
+    assert.ok(waiting.every(id=>notice(id)?.state==='pending'),'older blocked waits keep their place');
+    await pump();assert.equal(manager.messages.length,1,'one Manager wake per Bot while the native turn is active');
+    await enterManager(manager);
+    await f.call('review-independent',{action:'review',taskId:ready.task.id,expectedRowVersion:ready.task.rowVersion,
+      resultId:ready.result!.id,verdict:'human',note:'Evidence read'});
+    await endManager(manager,'Independent Worker result examined');
+    assert.equal(notice(settled),undefined,'the independent settlement has a durable native reply');
+    const deliveryId=`manager-event:delivery:${ready.result!.id}`;
+    assert.equal(notice(deliveryId)?.state,'pending','a review alone does not deliver');
+    await pump();assert.equal(manager.messages.at(-1).source.eventId,deliveryId);
+    await enterManager(manager);
+    const {delivery}=await f.call('deliver-independent',{action:'deliver',taskId:ready.task.id,resultId:ready.result!.id,text:'Evidence ready'});
+    await endManager(manager,delivery.markdown);
+    assert.equal(notice(deliveryId),undefined,'independent delivery has a durable native final receipt');
+  });
+}
+
+test('DF-13 A wake dispatches B, whose same attention appears only once in automatic Manager replies',async t=>{
+  const {f,root,dir,create,dispatch,pump,notice,openManager,enterManager,endManager}=await parallelFixture(t);
+  const holder=await create('Root holder',root);
+  const a=await create('A',dir('a'));
+  t.mock.timers.tick(1);
+  const b=await create('B',dir('b'));
+  const oldB=`manager-event:capacity:${b.task.id}:${b.task.rowVersion}`;
+  assert.equal(a.deferred,true);assert.equal(b.deferred,true);assert.equal(notice(oldB)?.state,'pending');
+  await f.finish(holder.task.id,[],'waiting');
+  f.store.settleManagerEvent(`manager-event:settled:${holder.run.id}`);
+  const manager=await openManager();
+  await pump();
+  assert.equal(manager.messages.at(-1).source.eventId,`manager-event:capacity:${a.task.id}:${a.task.rowVersion}`);
+  await enterManager(manager);
+  const aStarted=await dispatch('start-a',a.task.id),bStarted=await dispatch('start-b',b.task.id);
+  assert.ok(aStarted.run&&bStarted.run);assert.equal(f.store.heldRuns().length,2);
+  t.mock.timers.tick(1);
+  await f.finish(b.task.id,[],'waiting');
+  const question=f.store.taskDetail(b.task.id).pendingQuestions[0]!;
+  assert.equal(question.id,`run:${bStarted.run.id}`);
+  await endManager(manager,'A and B started');
+
+  const displayed:string[]=[];
+  const notices:string[]=[];
+  for(let i=0;i<2;i++){
+    await pump();
+    if(manager.status!=='running')break;
+    notices.push(manager.messages.at(-1).source.eventId);
+    await enterManager(manager);
+    const detail=await f.call(`read-B-question:${i}`,{action:'detail',taskId:b.task.id});
+    displayed.push(...detail.pendingQuestions.map((item:any)=>item.id));
+    await endManager(manager,detail.pendingQuestions.map((item:any)=>item.markdown).join('\n')||'No current question');
+    t.mock.timers.tick(1);
+  }
+  assert.deepEqual(displayed,[question.id],`native followups: ${notices.join(', ')}`);
+  assert.deepEqual(notices,[`manager-event:settled:${bStarted.run.id}`]);
+  assert.equal(notice(oldB),undefined,'B dispatch fulfilled its old capacity intent');
+  const explicit=await f.call('explicit-B-detail',{action:'detail',taskId:b.task.id});
+  assert.equal(explicit.pendingQuestions[0]?.id,question.id,'an explicit detail request still shows the open question');
+  const answer=f.store.respondAttention('answer-B',question.id,f.store.getTask(b.task.id).rowVersion,'Use Chinese');
+  await pump();
+  assert.equal(manager.messages.at(-1).source.eventId,`manager-event:answer:${answer.id}`);
+  await enterManager(manager);
+  const next=await dispatch('continue-B',b.task.id);
+  await endManager(manager,'B continues with the answer');
+  await f.finish(b.task.id,[],'waiting');
+  await pump();await enterManager(manager);
+  const later=await f.call('new-B-detail',{action:'detail',taskId:b.task.id});
+  assert.deepEqual(later.pendingQuestions.map((item:any)=>item.id),[`run:${next.run.id}`]);
+  await endManager(manager,later.pendingQuestions[0].markdown);
+});
+
+test('DF-13 pump and real dispatch preserve FIFO for the same nested directory',async t=>{
+  const {f,root,dir,create,dispatch,pump,openManager,enterManager,endManager}=await parallelFixture(t);
+  const holder=await create('Root holder',root),parent=dir('parent'),child=dir('parent/child');
+  const a=await create('First waiter',parent);t.mock.timers.tick(1);
+  const b=await create('Second waiter',child);
+  await f.finish(holder.task.id,[],'waiting');
+  f.store.settleManagerEvent(`manager-event:settled:${holder.run.id}`);
+  const manager=await openManager();
+  await pump();await enterManager(manager);
+  assert.equal(manager.messages.at(-1).source.eventId,`manager-event:capacity:${a.task.id}:${a.task.rowVersion}`);
+  const premature=await dispatch('try-B-before-A',b.task.id);
+  assert.equal(premature.holderTaskId,a.task.id);
+  assert.ok((await dispatch('start-FIFO-A',a.task.id)).run);
+  await endManager(manager,'First waiter started');
+  await pump();assert.equal(manager.messages.length,1,'B waits for A even with a free global slot');
+  await f.finish(a.task.id,[],'waiting');
+  f.store.settleManagerEvent(`manager-event:settled:${f.store.latestRun(a.task.id)!.id}`);
+  await pump();await enterManager(manager);
+  assert.equal(manager.messages.at(-1).source.eventId,`manager-event:capacity:${b.task.id}:${b.task.rowVersion}`);
+  assert.ok((await dispatch('start-FIFO-B',b.task.id)).run);
+  await endManager(manager,'Second waiter started');
+});
+
+test('DF-13 unknown Worker enqueue retains recovery and only a confirmed retry fulfills the old intent',async t=>{
+  const {f,root,dir,create,dispatch,pump,notice,openManager,enterManager,endManager}=await parallelFixture(t);
+  const holder=await create('Root holder',root),task=await create('Retry after recovery',dir('retry'));
+  const old=`manager-event:capacity:${task.task.id}:${task.task.rowVersion}`;
+  await f.finish(holder.task.id,[],'waiting');
+  f.store.settleManagerEvent(`manager-event:settled:${holder.run.id}`);
+  const binding=f.store.activeBinding(task.task.id)!,worker=f.agents.get(binding.sessionId!);
+  const followup=worker.followup;
+  worker.followup=()=>{throw Error('Synthetic Worker receipt lost');};
+  await assert.rejects(dispatch('unknown-start',task.task.id),/Synthetic Worker receipt lost/);
+  const unknown=f.store.latestRun(task.task.id)!;
+  assert.equal(unknown.state,'interrupted');assert.equal(notice(old)?.state,'pending');
+  assert.equal(f.store.getRunInput(unknown.id).state,'unknown');
+  const manager=await openManager();
+  await pump();await enterManager(manager);
+  assert.equal(manager.messages.at(-1).source.eventId,`manager-event:recovery:${unknown.id}`);
+  await endManager(manager,'Recovery requires user confirmation');
+  await pump();assert.equal(manager.messages.length,1);
+  assert.ok(f.store.heldRuns().some(run=>run.id===unknown.id),'unknown execution retains its directory');
+  worker.followup=followup;
+  const version=f.store.getTask(task.task.id).rowVersion;
+  const continuation={attentionId:`run:${unknown.id}`,bindingId:binding.id,expectedBindingGeneration:binding.generation};
+  const resumed=await f.execution.recover('resume-confirmed',task.task.id,version,true,continuation);
+  assert.notEqual(resumed.id,unknown.id);assert.equal(notice(old),undefined);
+  assert.equal((await f.execution.recover('resume-confirmed',task.task.id,version,true,continuation)).id,resumed.id);
+  assert.equal(worker.messages.length,1);
+});
+test('DF-13 reopen fulfills only a legacy unsent intent with a newer Worker receipt',async t=>{
+  const {f,dir,create,dispatch,pump,notice,openManager,enterManager,endManager}=await parallelFixture(t);
+  const shared=dir('legacy');
+  const holder=await create('Legacy holder',shared),queued=await create('Legacy waiter',shared);
+  const id=`manager-event:capacity:${queued.task.id}:${queued.task.rowVersion}`;
+  f.store.enqueueManager(f.bot.id,`capacity:${queued.task.id}:1`,'Old Manager receipt lost',queued.task.id);
+  const uncertain=`manager-event:capacity:${queued.task.id}:1`;
+  const message={id:'lost-manager-message',source:{kind:'super-bot-manager',botId:f.bot.id,managerId:f.manager.id,eventId:uncertain}};
+  assert.equal(f.store.claimManagerEvent(uncertain,message.id,JSON.stringify(message)),true);
+  t.mock.timers.tick(1);
+  await f.finish(holder.task.id,[],'waiting');
+  f.store.settleManagerEvent(`manager-event:settled:${holder.run.id}`);
+  const {run}=await dispatch('start-legacy',queued.task.id);
+  await f.finish(queued.task.id,[],'waiting');
+  assert.equal(notice(uncertain)?.state,'sending','Worker admission cannot prove that a Manager message was received');
+  f.store.db.prepare("UPDATE outbox SET state='pending',payload=json_remove(payload,'$.fulfilledByRunId') WHERE id=?").run(id);
+  f.store.db.prepare("UPDATE outbox SET payload=json_remove(payload,'$.dispatchRowVersion') WHERE id=?").run(`input:${run.inputId}`);
+  t.mock.timers.tick(1);
+  f.store.enqueueManager(f.bot.id,`capacity:${queued.task.id}:999`,'A later intent',queued.task.id);
+  const later=`manager-event:capacity:${queued.task.id}:999`;
+  await f.reload();
+  assert.equal(notice(id),undefined);
+  assert.equal(notice(uncertain)?.state,'unknown');
+  assert.equal(notice(later)?.state,'pending');
+  const manager=await openManager();
+  await pump();await enterManager(manager);
+  assert.deepEqual(manager.messages.map((msg:any)=>msg.source.eventId),[`manager-event:settled:${run.id}`]);
+  await endManager(manager,'One question after restart');
+});
+
 test('Bot-chosen existing directories are exclusive: the second task waits in FIFO with its holder named',async t=>{
   const f=fixture(t,false,directory=>({allowedRoots:[work(directory)]}));try {
     const app=join(f.directory,'work','app');mkdirSync(app);

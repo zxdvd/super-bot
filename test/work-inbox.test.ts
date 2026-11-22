@@ -1,10 +1,8 @@
 /** Pure inbox/board projection used by the work view; no React or host needed. */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import type { Task } from '../src/model.ts';
-import {
-  RESULT_FRESH_MS, ago, boardGroups, inboxGroups, inboxSection, stage, stageText, stageTone, unseenResult,
-} from '../src/ui/work/format.ts';
+import { RESULT_FRESH_MS, type Task } from '../src/model.ts';
+import { ago, boardGroups, inboxGroups, stage, stageText, stageTone, unseenResult } from '../src/ui/work/format.ts';
 
 const NOW = 1_800_000_000_000;
 let n = 0;
@@ -21,7 +19,9 @@ test('stages collapse twelve statuses into six and keep the concrete reason as t
   assert.equal(stage(task({ status: 'needs-input' })), 'needs-you');
   assert.equal(stage(task({ status: 'approval' })), 'needs-you');
   assert.equal(stage(task({ status: 'recovery' })), 'needs-you');
-  assert.equal(stage(task({ status: 'manual' })), 'needs-you');
+  assert.equal(stage(task({ status: 'manual' })), 'waiting');
+  assert.equal(stage(task({ status: 'needs-input', blockingAttention: null })), 'waiting');
+  assert.equal(stageText(task({ status: 'stopping', blockingAttention: 'approval' })), '原生审批待处理');
   for (const status of ['running', 'queued', 'stopping'] as const) assert.equal(stage(task({ status })), 'running');
   assert.equal(stage(task({ status: 'paused' })), 'waiting');
   assert.equal(stage(task({ status: 'unscheduled' })), 'waiting');
@@ -41,21 +41,31 @@ test('inbox puts what needs the user first, ordered by urgency, then active work
   const recovery = task({ status: 'recovery', updatedAt: NOW - 900 });
   const running = task({ status: 'running' });
   const waiting = task({ status: 'unscheduled', updatedAt: NOW - 5 });
-  const fresh = task({ lifecycle: 'completed', status: 'completed', updatedAt: NOW - 60_000 });
+  const fresh = task({ lifecycle: 'completed', status: 'completed', updatedAt: NOW - 60_000, deliveredAt: NOW - 10 });
+  const test = task({ goal: '【测试】指定活验', status: 'running', blockingAttention: 'input' });
+  const ordinary = task({ goal: '修复并做活验', status: 'running', blockingAttention: 'input' });
   const old = task({ lifecycle: 'completed', status: 'completed', updatedAt: NOW - RESULT_FRESH_MS - 1 });
   const cancelled = task({ lifecycle: 'cancelled', status: 'cancelled' });
-  const groups = inboxGroups([waiting, old, review, running, fresh, input, cancelled, recovery], {}, NOW);
-  assert.deepEqual(groups.attention.map(t => t.id), [recovery.id, input.id, review.id, fresh.id]);
+  const groups = inboxGroups([waiting, old, review, running, fresh, input, cancelled, recovery, test, ordinary], {}, NOW);
+  assert.deepEqual(groups.attention.map(t => t.id), [recovery.id, input.id, ordinary.id]);
+  assert.deepEqual(groups.review.map(t => t.id), [review.id]);
+  assert.deepEqual(groups.fresh.map(t => t.id), [fresh.id]);
+  assert.equal(groups.attentionCount, 4);
+  assert.deepEqual(groups.blockedTests.map(t => t.id), [test.id]);
+  assert.deepEqual(groups.tests, []);
   assert.deepEqual(groups.active.map(t => t.id), [running.id, waiting.id]);
   assert.deepEqual(new Set(groups.recent.map(t => t.id)), new Set([old.id, cancelled.id]));
 });
 
-test('a finished result stays new until opened at its current version', () => {
-  const done = task({ lifecycle: 'completed', status: 'completed', updatedAt: NOW - 1000 });
-  assert.equal(unseenResult(done, undefined, NOW), true);
-  assert.equal(inboxSection(done, done.updatedAt, NOW), 'recent');
-  assert.equal(unseenResult(done, done.updatedAt - 1, NOW), true, 'a later update is new again');
-  assert.equal(unseenResult(task({ lifecycle: 'review', status: 'review' }), undefined, NOW), false);
+test('a verified delivery stays new until opened regardless of acceptance', () => {
+  const deliveredAt = NOW - 1000;
+  const review = task({ lifecycle: 'review', status: 'review', deliveredAt });
+  const done = { ...review, lifecycle: 'completed', status: 'completed', updatedAt: NOW - 500 } as const;
+  assert.equal(unseenResult(review, undefined, NOW), true);
+  assert.equal(unseenResult(done, deliveredAt, NOW), false);
+  assert.equal(unseenResult(done, deliveredAt - 1, NOW), true);
+  assert.equal(unseenResult(done, undefined, deliveredAt + RESULT_FRESH_MS), false);
+  assert.equal(unseenResult({ ...done, deliveredAt: undefined }, undefined, NOW), false);
 });
 
 test('recent tail is bounded and newest first', () => {

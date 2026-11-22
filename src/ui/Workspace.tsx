@@ -1,7 +1,8 @@
 /** Bot work view: an inbox first, an optional board and full list, settings behind ⋯, and task detail in a drawer. */
 import type { Bot, Task } from '../model.ts';
+import { ownerLabel } from '../mirror.ts';
 import { styles } from './styles.ts';
-import { inboxGroups, stage, time, type Stage } from './work/format.ts';
+import { inboxGroups, time } from './work/format.ts';
 import { BotForm, TaskForm } from './work/forms.tsx';
 import { BotPanel } from './work/BotPanel.tsx';
 import { Board } from './work/Board.tsx';
@@ -18,9 +19,10 @@ const VIEWS: readonly (readonly [WorkView, string])[] = [['inbox', '收件箱'],
 
 function Summary({ w }: { w: WorkspaceState }) {
   if (w.view === 'list' || w.view === 'settings' || !w.page) return null;
-  const groups = inboxGroups(w.page.items, w.seen, w.now), count = (key: Stage) => groups.attention.filter(t => stage(t) === key).length;
+  const groups = inboxGroups(w.page.items, w.seen, w.now);
   return <span className="summary">
-    需要你 <strong>{count('needs-you')}</strong> · 待验收 <strong>{count('review')}</strong> · 进行中 <strong>{groups.active.length}</strong>
+    需要你 <strong>{groups.attentionCount}</strong> · 待验收 <strong>{groups.review.length}</strong>
+    {' · '}进行中 <strong>{groups.active.length}</strong>
   </span>;
 }
 
@@ -29,9 +31,11 @@ function Header({ w, compact, onReturn }: { w: WorkspaceState; compact: boolean;
   return <header className="sb-header">
     <div className="sb-title">
       {onReturn && <button className="small" onClick={onReturn}>← 返回聊天</button>}
-      <h1>{w.bot?.name ?? 'Super Bot'}</h1>
-      <span className="connection" title={w.synced ? `同步于 ${time(w.synced)}` : undefined}>
-        <span className={`dot ${w.online ? '' : 'offline'}`}/>{w.loading ? '连接中…' : w.online ? '在线' : '离线'}
+      <h1>{w.mirror?.bot.name ?? w.bot?.name ?? 'Super Bot'}</h1>
+      {w.mirror && <span className="muted wrap">{ownerLabel[w.mirror.owner]} 创建 · 只读 · {w.mirror.bot.id}</span>}
+      <span className="connection" title={w.synced ? `读取于 ${time(w.synced)}` : undefined}>
+        <span className={`dot ${w.online ? '' : 'offline'}`}/>
+        {w.loading ? '连接中…' : w.online ? '在线' : w.mirror ? '来源不可用' : '离线'}
       </span>
       <Summary w={w}/>
     </div>
@@ -51,10 +55,11 @@ function Header({ w, compact, onReturn }: { w: WorkspaceState; compact: boolean;
 function Notices({ w }: { w: WorkspaceState }) {
   const problem = w.error || w.connectionError;
   return <>
+    {!w.mirror && w.status?.mirrorIssue && <p className="notice slim" role="status">镜像暂停 · {w.status.mirrorIssue}</p>}
     {problem && <div className="notice error" role="alert"><span>{problem}</span>
       <button onClick={() => { w.setError(''); w.setConnectionError(''); w.setRefresh(n => n + 1); }}>刷新状态</button>
     </div>}
-    {!w.online && !w.loading && <div className="notice slim">
+    {!w.mirror && !w.online && !w.loading && <div className="notice slim">
       离线 · {w.synced ? `显示 ${time(w.synced)} 的快照` : '尚未读取到工作台数据'}，重新连接前操作暂不可用。
     </div>}
   </>;
@@ -98,11 +103,13 @@ export function Workspace(props: WorkspaceProps) {
       <Header w={w} compact={compact} onReturn={props.onReturn}/>
       <Notices w={w}/>
       {w.loading ? <div className="card"><div className="skeleton"/><div className="skeleton"/><div className="skeleton"/></div> : <>
-        <BotForms w={w}/>
-        {w.online && w.bots.length === 0 && w.form !== 'bot' && <Welcome w={w}/>}
-        {bot && <><NewTask w={w}/><Body w={w} bot={bot}/></>}
+        {w.mirror ? w.online && <><TaskFilters w={w}/><TaskList w={w}/></> : <>
+          <BotForms w={w}/>
+          {w.online && w.bots.length === 0 && w.form !== 'bot' && <Welcome w={w}/>}
+          {bot && <><NewTask w={w}/><Body w={w} bot={bot}/></>}
+        </>}
       </>}
     </div></div>
-    <TaskDrawer w={w} compact={compact}/>
+    <TaskDrawer w={w} compact={compact} onReturn={props.onReturn}/>
   </div>;
 }

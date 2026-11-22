@@ -5,9 +5,13 @@ import {writeFile} from 'node:fs/promises';
 import {setTimeout as delay} from 'node:timers/promises';
 import {hostClient} from './host-client.mjs';
 const client=await hostClient(process.argv[2]),prefix=`chat:${randomUUID()}`;
-async function call(action,payload={}) {
+async function rpc(action,payload) {
   const r=await (await client.post('/api/super-bot',{type:'client-request',rpcId:randomUUID(),method:'super-bot',payload:{action,...payload}})).json();
-  assert.equal(r.result.ok,true,JSON.stringify(r));return r.result.value;
+  return r.result;
+}
+async function call(action,payload={}) {
+  const result=await rpc(action,payload);
+  assert.equal(result.ok,true,JSON.stringify(result));return result.value;
 }
 async function probe(body){const r=await (await client.post('/api/super-bot-probe',body)).json();assert.equal(r.ok,true,JSON.stringify(r));return r;}
 async function wait(test,label){for(let n=0;n<250;n++){const value=await test();if(value)return value;await delay(100);}assert.fail(`Timed out: ${label}`);}
@@ -37,7 +41,9 @@ let detail=await call('task.detail',{id:task.id});
 const source=JSON.parse(detail.events.find(e=>e.kind==='task.created').data).source;
 assert.equal(source.text,request);assert.equal(source.sessionId,manager.sessionId);
 const download=`/api/super-bot-file?resultId=${detail.result.id}&index=0`;
-await wait(async()=>{const session=await inspect();return session.status==='idle'&&session.assistantTexts.some(text=>text.includes(download)&&text.includes(`#super-bot-task=${task.id}`)&&text.includes('等待你确认'));},'delivery in original chat');
+const resultLink=(taskId,resultId)=>`${client.base}/#super-bot-task=${taskId}&resultId=${resultId}`;
+await wait(async()=>{const session=await inspect();return session.status==='idle'&&session.assistantTexts.some(text=>
+  text.includes(client.base+download)&&text.includes(resultLink(task.id,detail.result.id))&&text.includes('等待你确认'));},'versioned delivery in original chat');
 assert.equal(detail.result.humanAcceptedAt,null);
 const file=await client.get(download);assert.equal(file.status,200);assert.match(await file.text(),/事实一/);
 assert.equal((await client.get(download.replace('index=0','index=99'))).status,404);
@@ -47,15 +53,35 @@ await say('再加一句结论。');
 detail=await wait(async()=>{const d=await call('task.detail',{id:task.id});return d.result?.id!==oldResult&&d.task.lifecycle==='review'&&d.task.managerReviewed&&d;},'chat rework returns a new result');
 assert.equal((await page()).total,1);assert.equal(detail.result.humanAcceptedAt,null);
 assert.equal(detail.input.content,'再加一句结论。');
-await wait(async()=>{const s=await inspect();return s.status==='idle'&&!s.pending;},'manager idle after delivery');
-await call('result.accept',{requestId:prefix+':accept',id:task.id,expectedRowVersion:detail.task.rowVersion,resultId:detail.result.id});
+await wait(async()=>{const s=await inspect();return s.status==='idle'&&!s.pending&&s.assistantTexts.some(text=>text.includes(resultLink(task.id,detail.result.id)));},'versioned delivery after rework');
+const linkedOld=await call('task.detail',{id:task.id,sessionId:manager.sessionId,resultId:oldResult});
+const linkedNew=await call('task.detail',{id:task.id,sessionId:manager.sessionId,resultId:detail.result.id});
+assert.equal(linkedOld.linkedResultBelongs,true);assert.equal(linkedNew.linkedResultBelongs,true);
+assert.notEqual(linkedOld.result.id,oldResult);
+const staleAccept=await rpc('result.accept',{requestId:prefix+':old-accept',sessionId:manager.sessionId,id:task.id,expectedRowVersion:detail.task.rowVersion,resultId:oldResult});
+assert.equal(staleAccept.error?.code,'result-stale');
+assert.equal((await client.get(download)).status,409,'old file URL must refuse changed bytes');
+const newFile=await client.get(`/api/super-bot-file?resultId=${detail.result.id}&index=0`);
+assert.equal(newFile.status,200);assert.match(await newFile.text(),/已按返工要求补充说明/);
+await call('result.accept',{requestId:prefix+':accept',sessionId:manager.sessionId,id:task.id,expectedRowVersion:detail.task.rowVersion,resultId:detail.result.id});
 assert.ok((await call('task.detail',{id:task.id})).result.humanAcceptedAt);
 await say('请写一份说明，先确认读者。');
 const questionTask=await wait(async()=>{const p=await page();return p.items.find(t=>t.status==='needs-input');},'worker question');
-await wait(async()=>{const s=await inspect();return s.status==='idle'&&s.assistantTexts.some(t=>t.includes('请说明文档面向谁'));},'question in Bot chat');
+const waiting=await call('task.detail',{id:questionTask.id,sessionId:manager.sessionId});
+const question=waiting.pendingQuestions[0];assert.equal(question.taskId,questionTask.id);
+const wrongRead=await rpc('task.detail',{id:questionTask.id,sessionId:waiting.binding.sessionId});
+assert.equal(wrongRead.error?.code,'not-found','a Worker session has no Bot work scope');
+const wrongWrite=await rpc('attention.respond',{requestId:prefix+':wrong-question',id:task.id,sessionId:manager.sessionId,
+  attentionId:question.id,expectedRowVersion:waiting.task.rowVersion,text:'错误任务的回答'});
+assert.equal(wrongWrite.error?.code,'not-found');
+const questionLink=`[回答](${client.base}/#super-bot-task=${questionTask.id}&attentionId=${encodeURIComponent(question.id)})`;
+await wait(async()=>{const s=await inspect();return s.status==='idle'&&s.assistantTexts.some(t=>t.includes('请说明文档面向谁')&&t.includes(questionLink));},'exact question in Bot chat');
 await say('读者是新同事，保持简短。');
 const answered=await wait(async()=>{const d=await call('task.detail',{id:questionTask.id});return d.task.lifecycle==='review'&&d.task.managerReviewed&&d;},'chat answer continues execution');
-assert.equal(answered.input.content,'读者是新同事，保持简短。');assert.equal((await page()).total,2);
+assert.equal(answered.input.content,'读者是新同事，保持简短。');assert.equal(answered.input.attentionId,question.id);
+assert.deepEqual(answered.pendingQuestions,[]);assert.equal((await page()).total,2);
+const wrongResult=await call('task.detail',{id:questionTask.id,sessionId:manager.sessionId,resultId:oldResult});
+assert.equal(wrongResult.linkedResultBelongs,false);
 // File-changing commands still belong to a Task/Worker; no external CLI/service dependency.
 await wait(async()=>{const s=await inspect();return s.status==='idle'&&!s.pending;},'manager idle before CLI request');
 await say('请用 Shell 运行本机命令，把合成检查结果保存成文件。');
@@ -67,7 +93,12 @@ assert.ok(worker.executedTools.includes('bash'));assert.ok(worker.modelTools.inc
 assert.ok((await inspect()).executedTools.every(name=>name==='super_bot_manage'||name==='bash'));
 assert.deepEqual((await inspect()).modelTools.slice().sort(),managerTools);
 assert.equal(await (await client.get(`/api/super-bot-file?resultId=${cliDetail.result.id}&index=0`)).text(),'LOCAL_CLI_OK\n');
-await wait(async()=>{const s=await inspect();return s.status==='idle'&&s.assistantTexts.some(text=>text.includes(`#super-bot-task=${cliTask.id}`));},'CLI result delivered in Bot chat');
+await wait(async()=>{
+  const s=await inspect();
+  const detail=await call('task.detail',{id:cliTask.id});
+  return s.status==='idle'&&s.assistantTexts.some(text=>text.includes(resultLink(cliTask.id,cliDetail.result.id)))
+    &&detail.events.some(e=>e.kind==='manager.delivered'&&JSON.parse(e.data).resultId===cliDetail.result.id);
+},'CLI result is reconciled in the original chat');
 assert.equal(cliDetail.result.humanAcceptedAt,null);assert.equal((await page()).total,3);
-const result={ok:true,model:'deterministic fixture; no real-model quality claim',botId:bot.id,sessionId:manager.sessionId,taskId:questionTask.id,resultId:answered.result.id,checks:['Bot exposes exactly seven native query tools plus management','read-only Bot Bash returns real output with zero Tasks','native executor rejects Bot sleep with zero Tasks','file-changing CLI request creates Task and executes native Bash in Worker','ordinary chat creates no task','native message provenance','chat request automatically dispatches','readable delivery and verified download in same chat','unauthenticated file access denied','chat rework reuses task','acceptance remains an explicit user action','Worker question and human answer stay in Bot chat']};
+const result={ok:true,model:'deterministic fixture; no real-model quality claim',botId:bot.id,sessionId:manager.sessionId,taskId:questionTask.id,resultId:answered.result.id,checks:['Bot exposes exactly seven native query tools plus management','read-only Bot Bash returns real output with zero Tasks','native executor rejects Bot sleep with zero Tasks','file-changing CLI request creates Task and executes native Bash in Worker','ordinary chat creates no task','native message provenance','chat request automatically dispatches','readable delivery and verified download in same chat','unauthenticated file access denied','chat rework reuses task with a new versioned link and old file URL rejects changed bytes','acceptance remains an explicit user action','Worker question and human answer stay in Bot chat with the exact attentionId','CLI result uses the same versioned chat receipt']};
 await writeFile('.runtime/chat-smoke.json',JSON.stringify(result,null,2));console.log(JSON.stringify(result,null,2));

@@ -9,6 +9,7 @@ export interface WorkspaceStatus {
   journalMode: string;
   startedAt: number;
   configWarnings?: string[];
+  mirrorIssue?: string;
 }
 
 export class AppError extends Error {
@@ -45,10 +46,16 @@ export interface Task {
   updatedAt: number;
   status: 'unscheduled' | 'needs-input' | 'approval' | 'paused' | 'manual' | 'completed' | 'cancelled' | 'review' | 'queued' | 'running' | 'stopping' | 'recovery';
   managerReviewed?:boolean;
+  blockingAttention?: 'input' | 'approval' | 'recovery' | null;
+  deliveredAt?: number;
   botConfigRevision:number;
   /** What the Bot asked for when creating the task; null means the configured default. */
   workdirRequest?:WorkdirRequest|null;
 }
+export const RESULT_FRESH_MS = 3 * 24 * 3600 * 1000;
+export const TEST_TASK_PREFIX = '【测试】';
+export const isTestTask = (task: Pick<Task, 'goal'>): boolean => task.goal.startsWith(TEST_TASK_PREFIX);
+
 export interface TaskPage {
   items: Task[];
   total: number;
@@ -78,12 +85,74 @@ export interface ExistingSessionGrant {
 export interface ExistingSessionPreview {sessionId:string;cwd:string;quiet:boolean;reason:string}
 export interface ManagerBinding {id:string;botId:string;generation:number;configRevision:number;requestedSessionId:string;sessionId:string|null;cwd:string;state:'creating'|'ready'|'recovery'|'released';createdAt:number}
 export interface ManagerEvent {id:string;taskId:string|null;payload:string;state:string;createdAt:number}
+export type ChatDeliveryStatus = { state: 'awaiting-review' | 'pending' | 'uncertain' | 'delivered' | 'handled'; reason?: string };
+export type ReloadReceipt = { resultId: string; build: string; from: string; to: string; pid: number; at: number };
+export type TaskProgress = {
+  worker: { runId: string; summary: string; at: number } | null;
+  runId: string | null;
+  inputEnteredAt: number | null;
+  acceptance: { actor: 'user' | 'bot'; at: number } | null;
+  reload: ReloadReceipt | null;
+};
 export interface Run {
   id:string; taskId:string; bindingId:string; sessionId:string; taskRevision:number; generation:number;
   inputId:string; state:'queued'|'running'|'settled'|'failed'|'cancelling'|'cancelled'|'interrupted';
   createdAt:number; finishedAt:number|null; note:string;
 }
 export interface RunInput {id:string; taskId:string; kind:string; content:string; state:string; messageId:string|null; messageJson:string|null; attentionId:string|null; createdAt:number}
+
+export interface ModelRoute {
+  provider: string;
+  model: string;
+  reasoningEffort: string | null;
+}
+export type WorkerModelPlan = ModelRoute & (
+  { source: 'role-override' | 'native-selection' } |
+  { source: 'manager-inheritance'; sourceSessionId: string }
+);
+export interface ActualModelRequest extends ModelRoute {
+  turn: number;
+  step: number;
+  eventSeq: number;
+  headerSeq: number | null;
+  evidence: 'assistant/message' | 'assistant/attempt';
+}
+export interface RunModels {
+  runId: string;
+  sessionId: string;
+  createdAt: number;
+  expected: WorkerModelPlan | null;
+  actual: ActualModelRequest[];
+}
+export interface TaskModels {
+  current: ModelRoute | null;
+  expected: WorkerModelPlan | null;
+  runs: RunModels[];
+}
+export interface ChildWaitMember {
+  nativeRunId: string;
+  childId: string;
+  parentSessionId: string;
+  sessionId: string | null;
+  startedAt: number;
+  endedAt: number | null;
+  stopReason: string | null;
+}
+export interface RunChildWait {
+  id: string;
+  runId: string;
+  turn: number;
+  startSeq: number;
+  inputSeq: number;
+  source: 'ready' | 'turn-stopping';
+  startedAt: number;
+  endedAt: number | null;
+  outcome: 'waiting' | 'checking' | 'converged' | 'clear' | 'cancelled' | 'unknown';
+  pendingCount: number | null;
+  children: ChildWaitMember[];
+}
+export type ChildWaitDetail = RunChildWait & { elapsedMs: number | null };
+
 export interface Evidence {path:string;sha256:string;bytes:number}
 export interface WorkReport {kind:'progress'|'waiting'|'ready'|'blocked'|'failed';summary:string;checks?:string;evidence?:Evidence[];requestedFiles?:string[]}
 export interface Result {id:string;runId:string;taskId:string;taskRevision:number;summary:string;checks:string;evidence:Evidence[];createdAt:number;humanAcceptedAt:number|null}
@@ -118,6 +187,21 @@ export interface ChatSource { sessionId:string; messageId:string; seq:number; te
 
 /** Why a prepared task is not running yet; holder is the task that has (or is ahead in line for) the slot or directory. */
 export interface DispatchWait {code:'capacity'|'resource-conflict';holderTaskId:string|null;holderGoal:string|null}
+
+export interface RecoveryContinuation {
+  attentionId: string; bindingId: string; expectedBindingGeneration: number;
+}
+export type RecoveryInputKind = 'human' | 'task' | 'job-result' | 'child-result' | 'other';
+export interface RecoveryInput {
+  queue: 'next-turn' | 'next-step'; kind: RecoveryInputKind; count: number;
+}
+export interface RecoveryDetail {
+  attentionId: string | null;
+  canContinue: boolean;
+  worker: { sessionId: string; status: string | null; inputs: RecoveryInput[] | null } | null;
+  jobs: { id: string; sessionId: string; status: string }[] | null;
+  subtree: { state: 'active' | 'clear' | 'unknown'; children: { sessionId: string; status: string }[] };
+}
 
 /** Immutable process-observed boundary; quiet is evidence from the original process, not a fresh Job list. */
 export interface RunTurn {

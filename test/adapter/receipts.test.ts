@@ -67,14 +67,14 @@ for(const scenario of ['human','accept','rework','large'] as const)test(`Manager
 
 test('Worker committed report retries do not reread changed files or bypass ended authority',async()=>{
  const directory=mkdtempSync(join(tmpdir(),'super-bot-report-')),store=new Store(':memory:');let execute:Handler=()=>{throw Error('Not installed');};let conclusions=0;
- const ctx={effect:(callback:()=>unknown)=>callback(),on:()=>()=>{},tools:{register:(tool:{execute:Handler})=>{execute=tool.execute;return ()=>{};}}} as unknown as Context;
+ const ctx={effect:(callback:()=>unknown)=>callback(),on:()=>()=>{},jobs:{list:()=>[]},agents:{list:()=>[]},tools:{register:(tool:{execute:Handler})=>{execute=tool.execute;return ()=>{};}}} as unknown as Context;
  const execution=new DshExecution(ctx,store,directory,{fullAccess:false});execution.install();
  try{
   const bot=store.createBot('bot',{name:'Bot',instructions:'Files'}),task=store.createTask('task',{botId:bot.id,goal:'Facts',scope:'Own directory',acceptance:'Read facts',reviewPolicy:'human'});
   const binding=store.beginBinding('binding',task.id,task.rowVersion,directory);store.claimBindingCreation(binding.id);store.confirmBinding(binding.id,binding.requestedSessionId);
   const run=store.reserveRun('run',task.id,store.getTask(task.id).rowVersion);store.saveRunMessage(run.id,'message','{}');store.claimDispatch(run.id);store.inputEntered(run.id,'message',1);
   const file=join(directory,'result.md');writeFileSync(file,'Original facts');
-  const args={kind:'ready',summary:'Ready',checks:'Read facts',files:[file]},exec={agent:{id:run.sessionId},callId:'report-call',signal:new AbortController().signal,concludeTurn:()=>{conclusions++;}};
+  const args={kind:'ready',summary:'Ready',checks:'Read facts',files:[file]},exec={agent:{id:run.sessionId,inbox:{nextStep:[]}},callId:'report-call',signal:new AbortController().signal,concludeTurn:()=>{conclusions++;}};
   const first=await execute(args,exec);writeFileSync(file,'Changed after committed report');assert.deepEqual(await execute(args,exec),first);
   unlinkSync(file);assert.deepEqual(await execute(args,exec),first);assert.equal(store.db.prepare('SELECT count(*) AS n FROM reports').get()?.n,1);assert.equal(store.db.prepare('SELECT count(*) AS n FROM results').get()?.n,1);
   await assert.rejects(execute({...args,summary:'New claim'},exec),{code:'idempotency-conflict'});
@@ -88,7 +88,7 @@ test('reinstalled execution adapter cannot revive authority while the old Agent 
  const directory=realpathSync(mkdtempSync(join(tmpdir(),'super-bot-live-reload-'))),store=new Store(':memory:');const handlers:Handler[]=[];let guard:(args:any)=>unknown=()=>undefined,deliveries=0,release!:()=>void;
  const idle=new Promise<void>(resolve=>{release=resolve;});let selection:{provider:string;model:string}|null=null;
  const agent:any={id:'synthetic-worker',status:'idle',model:{current:()=>({provider:'fake',model:'fake'})},inbox:{nextTurn:[],nextStep:[],remove:()=>{}},ctx:{tools:{restrict:()=>()=>{},guard:(callback:(args:any)=>unknown)=>{guard=callback;return ()=>{};}},on:()=>()=>{}},whenIdle:()=>idle,followup:()=>{deliveries++;agent.status='running';},cancel:()=>{agent.status='idle';release();}};
- const ctx={sessionProjections:{snapshot:()=>({values:{modelSelection:{next:selection}}})},effect:(callback:()=>unknown)=>callback(),on:()=>()=>{},tools:{register:(tool:{execute:Handler})=>{handlers.push(tool.execute);return ()=>{};}},sessionController:{resolveAgent:async()=>({agent})},workingDirectory:{get:()=>directory},jobs:{list:()=>[]},agents:{list:()=>[]}} as unknown as Context;
+ const ctx={sessionProjections:{snapshot:()=>({values:{modelSelection:{next:selection}}})},effect:(callback:()=>unknown)=>callback(),on:()=>()=>{},tools:{register:(tool:{execute:Handler})=>{handlers.push(tool.execute);return ()=>{};}},sessionController:{resolveAgent:async()=>({agent})},workingDirectory:{get:()=>directory},jobs:{list:()=>[]},agents:{get:(id:string)=>id===agent.id?agent:undefined,list:()=>[agent]}} as unknown as Context;
  const old=new DshExecution(ctx,store,directory,{fullAccess:false}),replacement=new DshExecution(ctx,store,directory,{fullAccess:false});old.install();
  try{
   const bot=store.createBot('bot',{name:'Bot',instructions:'Files'}),task=store.createTask('task',{botId:bot.id,goal:'Facts',scope:'Own directory',acceptance:'Read facts',reviewPolicy:'human'});
@@ -98,7 +98,7 @@ test('reinstalled execution adapter cannot revive authority while the old Agent 
   replacement.install();assert.equal(agent.status,'running');assert.equal(store.getTask(task.id).status,'recovery');assert.equal(store.heldRuns().length,1);
   assert.match(String(guard({name:'write',arguments:{file_path:join(directory,'result.md')}})),/no longer/);
   await assert.rejects(handlers[0]!({kind:'progress',summary:'Late report'},{agent,callId:'late',signal:new AbortController().signal}),{code:'report-scope'});
-  await assert.rejects(replacement.dispatch('new-dispatch',task.id,store.getTask(task.id).rowVersion),{code:'session-busy'});
+  await assert.rejects(replacement.dispatch('new-dispatch',task.id,store.getTask(task.id).rowVersion),{code:'recovery-required'});
   await assert.rejects(replacement.recover('recover',task.id,store.getTask(task.id).rowVersion,true),{code:'session-busy'});assert.equal(deliveries,1);
   agent.cancel();await old.dispose();assert.equal(store.getTask(task.id).status,'recovery');assert.equal(store.heldRuns().length,1);
  }finally{agent.cancel();await old.dispose();await replacement.dispose();store.close();rmSync(directory,{recursive:true,force:true});}
@@ -145,7 +145,7 @@ test('chat result links expose verified bytes; user rework never counts as accep
   const run=f.store.reserveRun('run',task.id,f.store.getTask(task.id).rowVersion);f.store.saveRunMessage(run.id,'message','{}');f.store.claimDispatch(run.id);f.store.inputEntered(run.id,'message',1);
   const path=join(f.directory,'result.md');writeFileSync(path,'两项事实');
   const evidence=await collectEvidence(f.directory,[path]);const report=f.store.workerReport(run.id,'ready',{kind:'ready',summary:'已写好',checks:'已回读',evidence});f.store.settleRun(run.id);
-  const detail=await f.call('detail',{action:'detail',taskId:task.id});assert.equal(detail.delivery.workUrl,`/#super-bot-task=${task.id}`);assert.equal(detail.delivery.files[0].url,`/api/super-bot-file?resultId=${report.resultId}&index=0`);
+  const detail=await f.call('detail',{action:'detail',taskId:task.id});assert.equal(detail.delivery.workUrl,`/#super-bot-task=${task.id}&resultId=${report.resultId}`);assert.equal(detail.delivery.files[0].url,`/api/super-bot-file?resultId=${report.resultId}&index=0`);
   assert.equal((await readEvidence(f.directory,evidence[0])).toString(),'两项事实');writeFileSync(path,'changed');await assert.rejects(readEvidence(f.directory,evidence[0]),{code:'evidence-changed'});
   const args={action:'rework',taskId:task.id,resultId:report.resultId,expectedRowVersion:detail.task.rowVersion};
   await assert.rejects(f.call('rework',args),{code:'human-message-required'});

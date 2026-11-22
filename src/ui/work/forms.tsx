@@ -96,15 +96,3 @@ export function ReplyForm({ label, busy, submit }: {
     <Hint>启用 Manager 后会自动安排；未启用时需点击“开始执行”。暂停或人工接管期间保留输入，需先恢复自动管理。</Hint>
   </form>;
 }
-
-export function RecoveryPanel({ busy, confirm }: { busy: boolean; confirm: () => void }) {
-  const [checked, setChecked] = useState(false);
-  return <div className="attention-box">
-    <p>请打开原生会话，检查文件与可能的外部效果。确认后会释放本次占用，任务保持暂停，不会重放旧输入。</p>
-    <label className="check">
-      <input disabled={busy} type="checkbox" checked={checked} onChange={e => setChecked(e.target.checked)}/>
-      我已检查，确认可以结束本次尝试
-    </label>
-    <button disabled={busy || !checked} onClick={confirm}>完成核对</button>
-  </div>;
-}

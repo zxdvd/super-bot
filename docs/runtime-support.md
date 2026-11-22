@@ -30,7 +30,7 @@
 | 首次模型选择与错误提示 | 已验证 API 与 UI | 使用原生 modelSelection 投影区分已选模型与默认路由；未选 Worker 不创建 Run，Manager 保留通知/0 次唤醒。真实 turn/end 的缺凭证错误显示明确原因，不抄录提供方原始错误正文。`smoke-model-errors.mjs`、实际 tgz `smoke-package.mjs` |
 | Dashboard 离线 | 已验证 | 仅保留快照并禁用变更；重连不重放操作，恢复筛选和位置。100 项分页通过；恢复旧备份时清除失效任务/Bot 选择并钳制页码，同页任务消失路径 UI 通过 |
 | 运行中热卸载/热替换 | 空闲插件原生 HMR 已实测 | 独立宿主验证 link 源码监听及 tgz→link 配置重组：同 PID、同版本换成新模块。真实 Super Bot 后端重挂载、前端 rebuilt SSE 通过。`dev:reload` 用于日常空闲重载，`dev` 用于隔离自动监听；活动执行期间不热替换 |
-| Desktop | 仅静态核对，体验未验证 | 本轮只读安装包为 `0.2.2-rc.1`，确认使用本地动态端口；未实际验证 Desktop 聊天/UI 兼容，产品验证目标仍为 Web rc.1 |
+| 同机 Web 与 macOS Desktop | 真实原生 Host 已验证，日常界面待验收 | Web rc.1、rc.5 与实际 Desktop rc.5 Host。各自原账本、原生聊天和验收可用，对端只读查阅。Desktop 动态端口、两端热载与断线重连通过。[启用说明](../README.md#同机-web-与-desktop-只读镜像) |
 | 真实模型质量、Token/费用 | 四轮 dogfooding 已完成；无精确费用归因 | Sol medium Bot 委派 Sol xhigh Full Access Worker，实际 Shell/子 Agent/测试、补充需求、原对话交付及同任务返工通过；多任务歧义、用户最终接受和费用评估仍待验证。自动审查超时等异常见接手说明 |
 
 Bot 默认（省略 `fullAccess` 或 true）开放 `skill`、`bash`、`read`、`read_image`、`job_output`、`job_list`、`job_kill` 与 `super_bot_manage`。工具列表和执行 guard 双重约束，无 write/edit 或原生 Worker/subagent 工具。轻量只读/状态查询、lark-cli 查询及 Shell skill 可在 Bot 直接执行；代码/文件修改、多步骤和长任务仍委派 Worker。Shell 不构成只读沙箱，程序不声称能识别任意命令的副作用，意图分工由指令引导。

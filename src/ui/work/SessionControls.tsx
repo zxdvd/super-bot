@@ -3,7 +3,7 @@ import { useRef, useState } from 'react';
 import type { ExistingSessionPreview, Task } from '../../model.ts';
 import { ConfirmAction, Hint } from '../kit.tsx';
 import type { WorkspaceApi } from './api.ts';
-import { settling } from './format.ts';
+import { canStartTask, settling } from './format.ts';
 import type { Detail, Submit } from './types.ts';
 import type { WorkspaceState } from './useWorkspace.ts';
 
@@ -67,7 +67,7 @@ function Bound({ w, detail }: { w: WorkspaceState; detail: Detail }) {
     <p className="muted wrap">{binding.cwd}</p>
     {binding.state === 'ready' ? <>
       <button onClick={() => w.api.openSession(binding.sessionId!)}>打开任务会话</button>{' '}
-      <button className="primary" disabled={w.locked || task.status !== 'unscheduled'} onClick={dispatch}>开始执行</button>
+      {canStartTask(detail) && <button className="primary" disabled={w.locked} onClick={dispatch}>开始执行</button>}
       <Hint>可打开任务会话查看执行过程；尚未配置模型时可在会话中选择。会话关联后暂锁定目标，避免执行版本不一致。</Hint>
     </> : <>
       <p>会话创建需要核对。</p>

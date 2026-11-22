@@ -9,12 +9,22 @@ export async function hostClient(logPath='.runtime/host.log') {
     match=log.match(/dsh web: (http:\/\/127\.0\.0\.1:\d+\/\?token=\S+)/);if(match)break;await delay(100);
   }
   assert.ok(match,'dedicated host has not announced a URL');
-  const base=new URL(match[1]).origin;const cookies=new Map();let url=match[1];
+  return authenticateHost(match[1]);
+}
+
+export async function authenticateHost(launchUrl) {
+  const base=new URL(launchUrl).origin;const cookies=new Map();let url=launchUrl;
   for(let n=0;n<5;n++) {
     const response=await fetch(url,{redirect:'manual',headers:{cookie:[...cookies].map(([k,v])=>`${k}=${v}`).join('; ')}});
     for(const cookie of response.headers.getSetCookie()) {const [pair]=cookie.split(';');const i=pair.indexOf('=');cookies.set(pair.slice(0,i),pair.slice(i+1));}
     const location=response.headers.get('location');if(!location)break;url=new URL(location,url).href;
     assert.equal(new URL(url).origin,base,'authentication stays on dedicated host');
   }
-  return {base,get:async(path)=>fetch(base+path,{redirect:'manual',headers:{cookie:[...cookies].map(([k,v])=>`${k}=${v}`).join('; ')}}),post:async(path,body={})=>fetch(base+path,{method:'POST',headers:{cookie:[...cookies].map(([k,v])=>`${k}=${v}`).join('; '),origin:base,'content-type':'application/json'},body:JSON.stringify(body)})};
+  const cookie = [...cookies].map(([key, value]) => `${key}=${value}`).join('; ');
+  return { base, get: path => fetch(base + path, { redirect: 'manual', headers: { cookie } }),
+    post: (path, body = {}, headers = {}) => fetch(base + path, {
+      method: 'POST', redirect: 'manual', headers: { cookie, origin: base, 'content-type': 'application/json', ...headers },
+      body: JSON.stringify(body),
+    }),
+  };
 }
