@@ -669,16 +669,30 @@ export class DshExecution {
     this.assertQuiet(resolved.agent);await verifyEvidence(detail.binding.cwd,detail.result.evidence);this.assertQuiet(resolved.agent);
     return detail;
   }
-  async stop(requestId:string,taskId:string,rowVersion:number) {
-    const receipt=this.store.requestStop(requestId,taskId,rowVersion);
+  async stop(requestId:string,taskId:string,rowVersion:number,expectedRunId?:string) {
+    const exact=expectedRunId?this.store.latestRun(taskId):null;
+    if(exact&&exact.id===expectedRunId&&this.finishing.has(exact.id)) {
+      // A repeat may read its receipt, but a fresh stop must not change ongoing settlement.
+      const prior=this.store.commandReceipt<ReturnType<Store['requestStop']>>(requestId,'task.stop',
+        {taskId,expectedRowVersion:rowVersion,expectedRunId});
+      if(prior)return prior;
+      throw new AppError('run-finishing','这次执行正在结算，请等待结算回执。');
+    }
+    const receipt=this.store.requestStop(requestId,taskId,rowVersion,expectedRunId);
+    if(exact?.id===receipt.runId&&exact.state==='cancelling')return receipt;
     if(this.store.getRun(receipt.runId).finishedAt!==null)return receipt;
     if(this.finishing.has(receipt.runId))return receipt; // Do not cancel a following human driver while the old end is being verified.
     const active=this.running.get(receipt.runId);
     if(!active){if(this.store.getRun(receipt.runId).finishedAt===null)this.store.runRecovery(receipt.runId,'停止请求已记录，但当前宿主没有这个执行句柄，请核对原生会话。');return receipt;}
-    const input=this.store.getRunInput(receipt.runId);
-    if(input.messageId)active.agent.inbox.remove(input.messageId as UserMessage['id']);
-    active.agent.cancel({kind:'user'},{keepInbox:true});
-    for(const job of this.ctx.jobs.list(active.agent.id))if(job.owner===active.agent.id&&['running','stopping'].includes(job.status))this.ctx.jobs.kill(job.id,active.agent.id,'Super Bot stop');
+    try {
+      const input=this.store.getRunInput(receipt.runId);
+      if(input.messageId)active.agent.inbox.remove(input.messageId as UserMessage['id']);
+      active.agent.cancel({kind:'user'},{keepInbox:true});
+      for(const job of this.ctx.jobs.list(active.agent.id))if(job.owner===active.agent.id&&['running','stopping'].includes(job.status))this.ctx.jobs.kill(job.id,active.agent.id,'Super Bot stop');
+    }catch {
+      this.store.runRecovery(receipt.runId,'停止请求已记录，但宿主停止操作未能确认，请核对原生会话与后台工作。');
+      return receipt;
+    }
     const timeout=setTimeout(()=>{if(!this.disposed&&this.store.getRun(receipt.runId).finishedAt===null)this.store.runRecovery(receipt.runId,'停止已请求，但 10 秒内未确认收敛。请核对原生会话与后台工作。');},10000);timeout.unref();
     void active.done.finally(()=>clearTimeout(timeout));return receipt;
   }
@@ -838,13 +852,27 @@ export class DshExecution {
       }
     });
   }
-  async endTaskLink(action:'task.cancel'|'session.detach',requestId:string,taskId:string,rowVersion:number) {
-    const receipt=this.store.commandReceipt<Task>(requestId,action,{taskId,expectedRowVersion:rowVersion});if(receipt)return receipt;
-    if(this.store.getTask(taskId).status==='recovery')throw new AppError('needs-attention','请先完成待核对事项。');
+  async endTaskLink(action:'task.cancel'|'session.detach',requestId:string,taskId:string,rowVersion:number,authorize=()=>{}) {
+    const receipt=()=>this.store.commandReceipt<Task>(requestId,action,{taskId,expectedRowVersion:rowVersion});
+    authorize();
+    const prior=receipt();if(prior)return prior;
     const binding=this.store.activeBinding(taskId);
+    const validate=()=>{
+      if(this.disposed)throw new AppError('unavailable','插件正在退出。');
+      const task=this.store.getTask(taskId),current=this.store.activeBinding(taskId);
+      if(task.rowVersion!==rowVersion||current?.id!==binding?.id||current?.sessionId!==binding?.sessionId||
+        current?.generation!==binding?.generation||current?.state!==binding?.state) {
+        throw new AppError('version-conflict','任务或会话关联已经更新，请刷新后再操作。');
+      }
+      if(task.status==='recovery')throw new AppError('needs-attention','请先完成待核对事项。');
+    };
+    validate();
     if(binding?.sessionId) {
       const resolved=await this.ctx.sessionController.resolveAgent(SessionId(binding.sessionId));
-      if('error' in resolved)throw new AppError('session-unavailable','无法核对原生会话，请恢复会话后再操作。');
+      authorize();
+      const duplicate=receipt();if(duplicate)return duplicate;
+      validate();
+      if('error' in resolved||resolved.agent.id!==binding.sessionId)throw new AppError('session-unavailable','无法核对原生会话，请恢复会话后再操作。');
       this.assertQuiet(resolved.agent);
     }
     if(action==='session.detach')return this.store.detachSession(requestId,taskId,rowVersion);

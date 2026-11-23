@@ -8,6 +8,7 @@ import type { Detail } from './types.ts';
 import type { WorkspaceState } from './useWorkspace.ts';
 import { ResultDeliveryCheck } from './SystemIssues.tsx';
 import { ResultFilePreview } from './ResultFilePreview.tsx';
+import { WorkMarkdown } from './WorkMarkdown.tsx';
 
 function Review({ w, detail }: { w: WorkspaceState; detail: Detail }) {
   const { task } = detail, result = detail.result!;
@@ -25,9 +26,9 @@ function Review({ w, detail }: { w: WorkspaceState; detail: Detail }) {
 }
 
 export function ResultReport({ summary, checks }: { summary: string; checks: string }) {
-  return <details><summary>完整 Worker 报告</summary>
-    <p className="full-text">{summary}</p>
-    {checks && <><p className="muted">Worker 自述的检查与未验证项</p><p className="full-text">{checks}</p></>}
+  return <details className="prose-details"><summary>完整 Worker 报告</summary>
+    <WorkMarkdown text={summary}/>
+    {checks && <><p className="muted">Worker 自述的检查与未验证项</p><WorkMarkdown text={checks}/></>}
   </details>;
 }
 
@@ -63,7 +64,7 @@ export function ResultCard({ w, detail, onReturn }: { w: WorkspaceState; detail:
   const receipt = detail.progress?.reload;
   const matchingReceipt = receipt?.resultId === result.id ? receipt : undefined;
   return <div className="attention-box result">
-    <h3>{resultHeading(task)}</h3><p className="clamp">{result.summary}</p>
+    <h3>{resultHeading(task)}</h3><p className="clamp prose-preview">{result.summary}</p>
     <ResultDeliveryCheck w={w} result={result} status={detail.chatDelivery} onReturn={onReturn}/>
     <ResultReport summary={result.summary} checks={result.checks}/>
     <ResultFiles result={result} sessionId={w.sessionId}/>

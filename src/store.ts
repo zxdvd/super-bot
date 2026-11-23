@@ -1107,10 +1107,18 @@ export class Store {
       this.event('run.budget-reached',run.taskId,{runId:id,kind,limit:kind==='steps'?40:600,note});return true;
     });
   }
-  requestStop(requestId:string,taskId:string,expectedRowVersion:number):{runId:string;requested:true} {
-    return this.command(requestId,'task.stop',{taskId,expectedRowVersion},()=>{
+  requestStop(requestId:string,taskId:string,expectedRowVersion:number,expectedRunId?:string):{runId:string;requested:true} {
+    return this.command(requestId,'task.stop',{taskId,expectedRowVersion,expectedRunId},()=>{
       const task=this.getTask(taskId);const run=this.latestRun(taskId);
       if(task.rowVersion!==expectedRowVersion)throw new AppError('version-conflict','任务已经更新，请刷新后再停止。');
+      if(expectedRunId) {
+        const binding=this.activeBinding(taskId);
+        if(!run||run.id!==expectedRunId||binding?.state!=='ready'||binding.id!==run.bindingId||
+          binding.sessionId!==run.sessionId||binding.generation!==run.generation||task.taskRevision!==run.taskRevision) {
+          throw new AppError('run-stale','指定执行或会话关联已经改变，请重新读取任务。');
+        }
+        if(run.state==='cancelling')return {runId:run.id,requested:true};
+      }
       if(!run||run.finishedAt!==null)throw new AppError('no-active-run','没有正在执行的尝试；未知状态请使用核对。');
       this.db.prepare("UPDATE tasks SET controlMode='paused',rowVersion=rowVersion+1,updatedAt=? WHERE id=?").run(Date.now(),taskId);
       this.db.prepare("UPDATE runs SET state='cancelling' WHERE id=?").run(run.id);

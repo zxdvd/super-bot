@@ -17,16 +17,33 @@ function expected(plan: WorkerModelPlan | null) {
   return plan ? `${route(plan)} · ${sourceLabels[plan.source]}` : '未知';
 }
 
+function compactRoute(model: ModelRoute) {
+  const name = model.model === 'codex/gpt-6.2-sol' ? 'Sol 6.2' : model.model;
+  return `${name} · ${model.reasoningEffort ?? '档位未知'}`;
+}
+
+function ModelChip({ label, description }: { label: string; description: string }) {
+  return <span className="badge" title={description}>
+    <span aria-hidden="true">{label}</span>
+    <span className="model-chip-description">{description}</span>
+  </span>;
+}
+
 export function ModelPreview({ model, showExpected, canStartManually }: {
   model: WorkerModelPreview; showExpected: boolean; canStartManually: boolean;
 }) {
-  return <dl className="full-text">
-    {showExpected && <><dt>下次派发预计 Worker 模型</dt><dd>{expected(model.expected)}</dd></>}
-    <dt>Worker 当前原生选择</dt><dd>{model.current ? route(model.current) : '未知'}
-      {canStartManually && model.expected?.source !== 'role-override' && !model.current &&
-        <span className="muted"> · 手动开始前请在 Worker 会话选择模型</span>}
-    </dd>
-  </dl>;
+  const { current, expected: next } = model;
+  const differs = current?.provider !== next?.provider || current?.model !== next?.model ||
+    current?.reasoningEffort !== next?.reasoningEffort;
+  const sameNext = showExpected && !differs ? ` · 下次派发预计${next ? `相同 · ${sourceLabels[next.source]}` : '未知'}` : '';
+  const currentDescription = `Worker 当前原生选择：${current ? route(current) : '未知'}${sameNext}`;
+  return <div className="model-preview">
+    <ModelChip label={current ? compactRoute(current) : 'Worker 模型未知'} description={currentDescription}/>
+    {showExpected && differs && <ModelChip label={`下次派发预计 · ${next ? compactRoute(next) : '未知'}`}
+      description={`下次派发预计 Worker 模型：${expected(next)}`}/>}
+    {canStartManually && next?.source !== 'role-override' && !current &&
+      <span className="muted">手动开始前请在 Worker 会话选择模型</span>}
+  </div>;
 }
 
 function RunModelEvidence({ run, title }: { run: RunModels; title: string }) {

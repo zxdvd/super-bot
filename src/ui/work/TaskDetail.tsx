@@ -15,6 +15,7 @@ import { SessionControls } from './SessionControls.tsx';
 import type { Detail } from './types.ts';
 import type { WorkspaceState } from './useWorkspace.ts';
 import { WorkdirCard } from './WorkdirCard.tsx';
+import { WorkMarkdown } from './WorkMarkdown.tsx';
 
 const attentionTitles: Record<Attention['kind'], string> = {
   recovery: '需要核对', review: '请验收成果', approval: '请处理原生审批', input: '需要你补充',
@@ -27,8 +28,8 @@ function AttentionBox({ w, detail, attention }: { w: WorkspaceState; detail: Det
   const { task, binding } = detail;
   const canReply = detail.pendingQuestions.some(question => question.id === attention.id);
   return <div className="attention-box" id={`sb-attention-${attention.id}`}>
-    <strong>{attentionTitles[attention.kind]}</strong><p className="clamp">{attention.question}</p>
-    <details><summary>完整说明</summary><p className="full-text">{attention.question}</p></details>
+    <strong>{attentionTitles[attention.kind]}</strong><p className="clamp prose-preview">{attention.question}</p>
+    <details className="prose-details"><summary>完整说明</summary><WorkMarkdown text={attention.question}/></details>
     {attention.kind === 'approval' && binding?.sessionId && <p>
       <button disabled={w.locked} onClick={() => w.api.openSession(binding.sessionId!)}>打开会话处理审批</button>
     </p>}
@@ -97,14 +98,14 @@ export function TaskDetailHeader({ w, detail, close, controls = true, onReturn, 
   </header>;
 }
 
-function Definition({ w, detail }: { w: WorkspaceState; detail: Pick<Detail, 'task'> & Partial<Pick<Detail, 'binding'>> }) {
+export function TaskDefinition({ w, detail }: { w: WorkspaceState; detail: Pick<Detail, 'task'> & Partial<Pick<Detail, 'binding'>> }) {
   const { task } = detail, editable = !w.mirror && !detail.binding && task.lifecycle === 'open';
   return <Section title="目标、范围与验收" aside={editable && <button className="small" disabled={w.locked}
     onClick={() => w.setForm('edit')}>修改</button>}>
     {task.goal.length > 120 && <details><summary className="muted">完整目标</summary><p className="full-text">{task.goal}</p></details>}
     <dl>
-      <dt>任务范围</dt><dd>{task.scope || '尚未填写'}</dd>
-      <dt>验收条件</dt><dd>{task.acceptance || '尚未填写'}</dd>
+      <dt>任务范围</dt><dd>{task.scope ? <WorkMarkdown text={task.scope}/> : '尚未填写'}</dd>
+      <dt>验收条件</dt><dd>{task.acceptance ? <WorkMarkdown text={task.acceptance}/> : '尚未填写'}</dd>
       <dt>最终验收</dt><dd>{w.mirror ? task.reviewPolicy === 'human' ? '在创建端由用户确认' : '已授权 Bot 验收'
         : reviewLabel(task, true)}</dd>
     </dl>
@@ -172,7 +173,7 @@ export function LinkedTaskContent({ w, detail, link, close, onReturn }: {
     {current ? <ResultCard w={w} detail={detail} onReturn={onReturn}/> : linked ? <div className="attention-box result">
       <h3>历史成果 · 只读</h3>
       <p role="status">{newer ? '这份成果已被新版替代。' : '这份成果当前不可验收。'}</p>
-      <p className="clamp">{linked.summary}</p>
+      <p className="clamp prose-preview">{linked.summary}</p>
       <ResultReport summary={linked.summary} checks={linked.checks}/>
       <ResultFiles result={linked} sessionId={w.sessionId}/>
       {newer && ['review', 'completed'].includes(task.lifecycle)
@@ -220,7 +221,7 @@ const verdictLabels: Record<string, string> = {
 
 function MirrorResult({ result }: { result: ResultRecord }) {
   return <>
-    <p>{result.summary}</p><ResultReport summary={result.summary} checks={result.checks}/>
+    <p className="prose-preview">{result.summary}</p><ResultReport summary={result.summary} checks={result.checks}/>
     <p className="muted">成果 {result.id} · {time(result.createdAt)}
       {result.humanAcceptedAt !== null && ` · 人工接受于 ${time(result.humanAcceptedAt)}`}</p>
     {result.fileCount > 0 && <p className="muted">已报告 {result.fileCount} 份文件，请在创建端打开或下载附件。</p>}
@@ -247,7 +248,7 @@ function MirrorTaskContent({ w, detail, owner, close }: {
       {detail.progress?.reload && <ResultLoadReceipt host={`创建端 ${ownerLabel[owner]}`} resultId={result.id}
         receipt={detail.progress.reload}/>}
     </div>}
-    <Definition w={w} detail={detail}/>
+    <TaskDefinition w={w} detail={detail}/>
     {(history.length > 0 || records.reviews.length > 0) && <details className="advanced"><summary>历史成果与验收记录</summary>
       {records.reviews.map(review => <p key={review.id}>{time(review.createdAt)} · {review.actor === 'user' ? '用户' : 'Bot'}
         {` · ${verdictLabels[review.verdict] ?? review.verdict} · 成果 ${review.resultId}`}</p>)}
@@ -303,7 +304,7 @@ export function TaskDrawer({ w, compact, onReturn }: { w: WorkspaceState; compac
         <WorkdirCard w={w} detail={detail}/>
         {w.form === 'edit' ? <TaskForm key={detail.task.id} task={detail.task} busy={w.locked} cancel={() => w.setForm(null)}
           submit={data => w.mutate('task.revise', { ...data, id: detail.task.id }, () => w.setForm(null))}/>
-          : <Definition w={w} detail={detail}/>}
+          : <TaskDefinition w={w} detail={detail}/>}
         <InputState detail={detail}/>
         <SessionControls w={w} detail={detail}/>
         <MoreActions w={w} detail={detail}/>

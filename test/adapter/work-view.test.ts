@@ -3,14 +3,15 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import type { Context } from '@deepseek-ai/cordis';
 import type { ISidebarRight } from '@deepseek-ai/dsh-client-ui-sidebar-right/client';
-import type { Bot, ManagerBinding, Task, TaskModelHistory } from '../../src/model.ts';
-import { loadModelHistory } from '../../src/ui/work/ModelDetails.tsx';
+import type { Bot, ManagerBinding, Task, TaskModelHistory, WorkerModelPreview } from '../../src/model.ts';
+import { loadModelHistory, ModelPreview } from '../../src/ui/work/ModelDetails.tsx';
 import { Store } from '../../src/store.ts';
 import { parseWorkLink, resultFileUrl, workUrl, type WorkLink } from '../../src/work-links.ts';
-import { LinkedTaskContent, TaskDetailHeader } from '../../src/ui/work/TaskDetail.tsx';
+import { LinkedTaskContent, TaskDefinition, TaskDetailHeader } from '../../src/ui/work/TaskDetail.tsx';
 import { ResultLoadReceipt, ResultReport } from '../../src/ui/work/ResultCard.tsx';
 import { SessionControls } from '../../src/ui/work/SessionControls.tsx';
 import { ReplyForm } from '../../src/ui/work/forms.tsx';
+import { WorkMarkdown } from '../../src/ui/work/WorkMarkdown.tsx';
 import type { WorkspaceState } from '../../src/ui/work/useWorkspace.ts';
 import { apply as applyClient, inject } from '../../src/client.tsx';
 import { SessionOriginHint, SessionWork, WorkButton } from '../../src/ui/SessionWork.tsx';
@@ -45,6 +46,74 @@ function source(initial?: string) {
 function apiWith(call: WorkspaceApi['call'], opened: string[] = []): WorkspaceApi {
   return { call, openSession: id => { opened.push(id); }, beginNavigation: () => new AbortController().signal, openBot: async () => {} };
 }
+
+test('the matching native and expected model routes share a compact chip with accessible details', () => {
+  const current = { provider: 'magpie-responses', model: 'codex/gpt-6.2-sol', reasoningEffort: 'xhigh' };
+  const model: WorkerModelPreview = { current, expected: { ...current, source: 'role-override' } };
+  const [native, next, hint] = ModelPreview({ model, showExpected: true, canStartManually: true }).props.children;
+  const chip = native.type(native.props);
+  const [visible, accessible] = chip.props.children;
+  assert.equal(chip.props.className, 'badge');
+  assert.equal(visible.props.children, 'Sol 6.2 · xhigh');
+  assert.equal(visible.props['aria-hidden'], 'true');
+  assert.match(accessible.props.children, /Worker 当前原生选择：magpie-responses \/ codex\/gpt-6\.2-sol · 推理档位 xhigh/);
+  assert.match(accessible.props.children, /下次派发预计相同 · Super Bot Worker 角色覆盖/);
+  assert.equal(chip.props.title, accessible.props.children);
+  assert.equal(next, false);
+  assert.equal(hint, false);
+});
+
+test('the next-run chip identifies differences in provider, model or effort separately from the native route', () => {
+  const current = { provider: 'magpie-responses', model: 'codex/gpt-6.2-sol', reasoningEffort: 'xhigh' };
+  for (const patch of [{ provider: 'other-route' }, { model: 'fixture-model' }, { reasoningEffort: 'medium' }]) {
+    const expected = { ...current, ...patch, source: 'role-override' as const };
+    const [native, next] = ModelPreview({ model: { current, expected }, showExpected: true, canStartManually: false }).props.children;
+    assert.equal(native.props.label, 'Sol 6.2 · xhigh');
+    assert.equal(next.props.label,
+      `下次派发预计 · ${expected.model === current.model ? 'Sol 6.2' : expected.model} · ${expected.reasoningEffort}`);
+    assert.ok(next.props.description.includes(`${expected.provider} / ${expected.model} · 推理档位 ${expected.reasoningEffort}`));
+    assert.match(next.props.description, /下次派发预计 Worker 模型.*Super Bot Worker 角色覆盖/);
+  }
+});
+
+test('compact model chips preserve unknowns, manual model guidance and the closed-task preview rule', () => {
+  const preview = (model: WorkerModelPreview, showExpected = true) =>
+    ModelPreview({ model, showExpected, canStartManually: true }).props.children;
+  const [unknown, noDuplicate, hint] = preview({ current: null, expected: null });
+  assert.equal(unknown.props.label, 'Worker 模型未知');
+  assert.match(unknown.props.description, /Worker 当前原生选择：未知 · 下次派发预计未知/);
+  assert.equal(noDuplicate, false);
+  assert.match(hint.props.children, /手动开始前请在 Worker 会话选择模型/);
+  const current = { provider: 'fixture', model: 'fixture-model', reasoningEffort: null };
+  const [effortUnknown, nextUnknown] = preview({ current, expected: null });
+  assert.equal(effortUnknown.props.label, 'fixture-model · 档位未知');
+  assert.equal(nextUnknown.props.label, '下次派发预计 · 未知');
+  const expected = { ...current, reasoningEffort: 'high', source: 'manager-inheritance' as const, sourceSessionId: 'fixture' };
+  const [native, next, manual] = preview({ current: null, expected });
+  assert.equal(native.props.label, 'Worker 模型未知');
+  assert.match(next.props.description, /下次派发预计.*由 Bot 派发时继承/);
+  assert.ok(manual);
+  assert.equal(preview({ current, expected }, false)[1], false);
+});
+
+test('work detail sends the full scope and acceptance fields to Markdown and keeps missing-field labels', () => {
+  const f = fixture();
+  try {
+    const w = { locked: false } as WorkspaceState;
+    const scope = 'Read **all** relevant files.', acceptance = '- Run `npm test`\n- Review the output';
+    const definitions = (task: Task) => TaskDefinition({ w, detail: { task } }).props.children[1].props.children;
+    const [scopeLabel, scopeField, acceptanceLabel, acceptanceField] = definitions({ ...f.ta, scope, acceptance });
+    assert.equal(scopeLabel.props.children, '任务范围');
+    assert.equal(acceptanceLabel.props.children, '验收条件');
+    assert.equal(scopeField.props.children.type, WorkMarkdown);
+    assert.equal(scopeField.props.children.props.text, scope);
+    assert.equal(acceptanceField.props.children.type, WorkMarkdown);
+    assert.equal(acceptanceField.props.children.props.text, acceptance);
+    const missing = definitions({ ...f.ta, scope: '', acceptance: '' });
+    assert.equal(missing[1].props.children, '尚未填写');
+    assert.equal(missing[3].props.children, '尚未填写');
+  } finally { f.store.close(); }
+});
 
 test('execution model history drops requests after task and native session switches', async () => {
   const current = source('chat-a');
@@ -543,14 +612,24 @@ test('the linked task drawer offers only the exact answer or explicitly selected
       f.store.confirmBinding(binding.id, binding.requestedSessionId);
     }
     const one = inTask(f.ta.id, 'question-a'), two = inTask(f.tb.id, 'question-b');
+    const questionText = '**Question** about [this document](https://example.test/document).';
     for (const [run, key] of [[one, 'one'], [two, 'two']] as const) {
-      f.store.workerReport(run.id, key, { kind: 'waiting', summary: `Question ${key}` }); f.store.settleRun(run.id);
+      f.store.workerReport(run.id, key, { kind: 'waiting', summary: key === 'one' ? questionText : 'Different question' });
+      f.store.settleRun(run.id);
     }
     const question = { kind: 'question', taskId: f.ta.id, attentionId: `run:${one.id}` } as const;
     const [head, questionBox] = drawer(question);
     assert.equal(head.props.controls, false);
     assert.equal(questionBox.props.attention.id, question.attentionId);
-    const answerForm = questionBox.type(questionBox.props).props.children.find((node: any) => node?.type === ReplyForm);
+    const questionChildren = questionBox.type(questionBox.props).props.children;
+    const [, preview, explanation] = questionChildren;
+    assert.equal(preview.type, 'p');
+    assert.equal(preview.props.className, 'clamp prose-preview');
+    assert.equal(preview.props.children, questionText);
+    assert.equal(explanation.props.className, 'prose-details');
+    assert.equal(explanation.props.children[1].type, WorkMarkdown);
+    assert.equal(explanation.props.children[1].props.text, questionText);
+    const answerForm = questionChildren.find((node: any) => node?.type === ReplyForm);
     await answerForm.props.submit('合成回答', 'answer');
     assert.deepEqual(mutations, [['attention.respond', { requestId: 'answer', id: question.taskId, attentionId: question.attentionId,
       expectedRowVersion: f.store.getTask(f.ta.id).rowVersion, text: '合成回答' }]]);
@@ -559,14 +638,15 @@ test('the linked task drawer offers only the exact answer or explicitly selected
     assert.equal(answer.attentionId, question.attentionId);
     const responding = drawer(question)[1];
     assert.ok(!responding.type(responding.props).props.children.some((node: any) => node?.type === ReplyForm));
-    const ready = (key: string, checks = 'Read the delivered file') => {
+    const ready = (key: string, checks = 'Read the delivered file', summary = key) => {
       const run = inTask(f.ta.id, key);
-      const { resultId } = f.store.workerReport(run.id, key, { kind: 'ready', summary: key, checks,
+      const { resultId } = f.store.workerReport(run.id, key, { kind: 'ready', summary, checks,
         evidence: [{ path: '/synthetic/result.md', sha256: key, bytes: 1 }] });
       f.store.settleRun(run.id); return { kind: 'result', taskId: f.ta.id, resultId: resultId! } as const;
     };
-    const selfReported = 'Worker says Web loaded. Desktop unverified.';
-    const old = ready('old', selfReported);
+    const selfReported = '- Worker says **Web loaded**.\n- Desktop unverified.';
+    const oldSummary = '**Old** [reference](https://example.test/notes).';
+    const old = ready('old', selfReported, oldSummary);
     assert.match(drawer(question)[1].props.children, /已回答/);
     assert.equal(drawer(old)[0].props.controls, true);
     const cardChildren = (link: typeof old, eligible: boolean): any[] => {
@@ -578,9 +658,14 @@ test('the linked task drawer offers only the exact answer or explicitly selected
       return entry?.type(entry.props).props.children;
     };
     const reportView = cardChildren(old, true).find(node => node?.type === ResultReport);
-    const checkBlock = reportView.type(reportView.props).props.children[2].props.children;
+    const [reportLabel, fullSummary, checks] = reportView.type(reportView.props).props.children;
+    assert.equal(reportLabel.props.children, '完整 Worker 报告');
+    assert.equal(fullSummary.type, WorkMarkdown);
+    assert.equal(fullSummary.props.text, oldSummary);
+    const checkBlock = checks.props.children;
     assert.equal(checkBlock[0].props.children, 'Worker 自述的检查与未验证项');
-    assert.equal(checkBlock[1].props.children, selfReported);
+    assert.equal(checkBlock[1].type, WorkMarkdown);
+    assert.equal(checkBlock[1].props.text, selfReported);
     assert.match(loadPanel(old, true)[0].props.children.join(''), /本端宿主 · 暂无匹配/);
     f.store.recordDevReload(`/synthetic/${f.ta.id}`, { resultId: old.resultId, build: 'old-build', from: 'before', to: 'after', pid: 42 });
     const matched = loadPanel(old, true);
@@ -597,7 +682,8 @@ test('the linked task drawer offers only the exact answer or explicitly selected
     assert.equal(oldHead.props.controls, false);
     const [, replacement, summary, report, files, next] = oldNotice.props.children;
     assert.match(replacement.props.children, /已被新版替代/);
-    assert.equal(summary.props.children, 'old');
+    assert.equal(summary.props.className, 'clamp prose-preview');
+    assert.equal(summary.props.children, oldSummary);
     assert.equal(report.props.checks, selfReported);
     assert.equal(files.props.result.id, old.resultId);
     assert.equal(next.props.href, workUrl(latest));

@@ -2,6 +2,7 @@ import { useState } from 'react';
 import type { RecoveryDetail, RecoveryInputKind } from '../../model.ts';
 import type { Detail } from './types.ts';
 import type { WorkspaceState } from './useWorkspace.ts';
+import { WorkMarkdown } from './WorkMarkdown.tsx';
 
 const inputLabel: Record<RecoveryInputKind, string> = {
   human: '用户消息', task: 'Super Bot 任务输入', 'job-result': '已完成的作业结果待读取',
@@ -22,7 +23,7 @@ export function RecoveryPanel({ w, detail, recovery }: { w: WorkspaceState; deta
   const version = { id: task.id, expectedRowVersion: task.rowVersion, acknowledged: true };
   return <section className="attention-box" aria-label="恢复核对">
     <strong>恢复核对</strong>
-    {recoveryItem && <p className="full-text">{recoveryItem.question}</p>}
+    {recoveryItem && <WorkMarkdown text={recoveryItem.question}/>}
     <dl>
       <dt>Worker</dt><dd>{worker?.status ? statuses[worker.status] ?? worker.status
         : worker ? '当前未加载，状态待确认' : '无可确认的当前 Worker'}</dd>

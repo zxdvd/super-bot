@@ -757,3 +757,20 @@ ELECTRON_RUN_AS_NODE=1 '/Applications/DeepSeek Harness.app/Contents/MacOS/DeepSe
 
 - 重新打开已有 Bot 和宿主冷恢复都会配置 Manager 角色。模型投影明确没有记录时才填入 `managerModel`。缺失投影时保留原生状态。回归先复现两条路径覆盖已有选择，修复后通过。Worker 模型覆盖和原生权限预设回归通过。
 - Node `24.17.0` 下全量检查通过 87 项核心、285 项适配、行数检查、类型检查与双端构建。独立启动 Web rc.1 和 Desktop rc.5 Host，以合成配置验证新 Bot 获得默认模型、A→B→A 保留各自选择、完整退出后重启继续保留，未调用模型。[全量检查](../../../.runtime/attachment-and-model-fix/check.log) · [隔离宿主结果](../../../.runtime/attachment-and-model-fix/native/model-proof.json)
+
+## 2026-11-23 · 原 Bot 对话中的工作控制
+
+- `super_bot_manage` 增加 `pause`、`resume`、`stop`、`cancel`。控制操作要求当前管理会话同一轮中由原生 RPC 记录的 owner 消息，且工具传入其中的明确指令原文。复用工作台的账本与执行方法。停止在事务内核对 Task 版本、Run ID 和绑定，回读实际状态。取消解析原生会话后再次检查用户轮次、Bot 归属、Task 版本和绑定，并由现有账本命令检查收敛。
+- Node `24.22.1` 下 135 项定向测试通过，覆盖运行中暂停及恢复、精确停止及重复回执、丢失执行句柄后待核对、执行未收敛时拒绝取消、历史保留、非 owner 输入和自动通知拒绝，以及原生查找期间的会话授权、版本和绑定竞争。`SUPER_BOT_BUILD_OUTDIR=.runtime/chat-controls/build npm run check` 通过行数、类型、87 项核心、290 项适配及 Host/Client 构建。使用合成账本和原生事件夹具，真实对话与模型未试用。[回归源码](../../../test/adapter/intervention.test.ts) · [定向日志](../../../.runtime/chat-controls/targeted.log) · [全量日志](../../../.runtime/chat-controls/check.log)
+- 单任务下一次 Worker 模型覆盖留待后续。仓库锁定的 DSH SDK 中，`agent.model.select()` 写持久会话选择，`modelSelection.next` 在请求后也可沿用上次模型。仅删除任务覆盖会让原覆盖作为原生选择继续参与回退。下一步先验证宿主是否提供限定为单次 Run 的模型选择，或验证能否以持久原生坐标区分注入的选择、此前原生选择及之后的人工切换，并覆盖原生选择原本为空和重启两种情况。确认边界后，再接入带版本的 Task 字段，按 `modelCatalog` 核对 provider、model 和推理档位，并让 `workerModelPlan` 在预览、聊天/面板派发和核对后继续共用任务覆盖优先规则。当前 Run 计划与历史证据继续读取各自原记录。[选模与证据](../../../src/dsh-model.ts)
+
+### 复核修正与 Worker 模型标签
+
+- 对话工具核对当前 owner 消息全文及其中的工作链接。链接指向其他任务或多个任务时拒绝操作。工具验证消息来源、全文及链接归属，Bot 仍负责判断否定、歧义和明确意图。普通 Run 开始结算后拒绝新的精确停止，并允许读取已记录的同一停止回执。原生停止抛错立即转待核对并保留占用。工作台旧的隐式停止入口仍可在结算期间登记停止。
+- 任务详情用 `Sol 6.2 · xhigh` 等短标签呈现 Worker 原生选择，以标题和辅助技术可读描述提供完整路由、档位与来源。预计按 provider、model 和档位与原生选择比较，仅有差异时另显示「下次派发预计」。未知值继续显示，实际调用仍在「执行模型」内按 Run 读取。单任务选模继续按上文延期。
+- 复核夹具先复现截断指令、链接串任务、结算期精确停止及原生停止抛错四条失败。修正后 161 项定向测试通过，包含模型标签及回执回归。Node `24.22.1` 下 `SUPER_BOT_BUILD_OUTDIR=.runtime/chat-controls-review/build npm run check` 通过行数、类型、87 项核心、296 项适配及 Host/Client 构建。验证使用本地合成夹具，运行界面和实际会话留待验证。[修正前定向日志](../../../.runtime/chat-controls-review/red.log) · [定向日志](../../../.runtime/chat-controls-review/targeted.log) · [全量日志](../../../.runtime/chat-controls-review/check.log)
+
+## 2026-11-23 · 工作详情 Markdown
+
+- 完整说明及提问、恢复核对文字、任务范围和验收条件、完整 Worker 报告及检查使用现有 `marked` 词法解析和 React 元素。折叠预览为纯文本，展开时隐藏相邻预览。链接仅支持无凭证且有效的绝对 HTTP(S) 地址，成果文件继续使用既有入口。HTML 和图片按纯文本显示，拒绝的链接保留标签文字。
+- Node `24.22.1` 下 26 项定向测试通过，覆盖普通字符和换行、列表、加粗、代码、可用链接、危险地址和 HTML，以及详情字段和折叠预览。`SUPER_BOT_BUILD_OUTDIR=.runtime/work-markdown/build npm run check` 通过行数、类型、87 项核心、299 项适配及 Host/Client 构建。合成模块加载检查确认客户端可从既有工厂加载。UI 验证限于合成 React 结构，浏览器和原生窗口留待验证。[定向日志](../../../.runtime/work-markdown/targeted.log) · [全量日志](../../../.runtime/work-markdown/check.log) · [客户端加载](../../../.runtime/work-markdown/client-factory.log)
