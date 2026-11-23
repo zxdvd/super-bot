@@ -4,9 +4,10 @@ import type { TabId } from '@deepseek-ai/dsh-client-ui-sidebar-right/client';
 import type { LocaleRuntime } from '@deepseek-ai/dsh-client-locale/client';
 import type { Bot } from '../model.ts';
 import type { SessionOrigin } from '../mirror.ts';
-import type { WorkLink } from '../work-links.ts';
+import { resultFileUrl, type WorkLink } from '../work-links.ts';
 import { Workspace, type WorkspaceApi } from './Workspace.tsx';
-import { watchSessionBot, toggleSessionWork, watchSessionOrigin } from './work-navigation.ts';
+import { watchSessionBot, toggleSessionWork, watchSessionOrigin, type FileTarget } from './work-navigation.ts';
+import { ResultFilePreview } from './work/ResultFilePreview.tsx';
 
 type Resolved = { sessionId: string; bot: Bot | null; error?: string };
 const buttonStyle = {
@@ -49,9 +50,10 @@ export function SessionOriginHint({ api, sessionId, sidebar, locale }: {
   </span>;
 }
 
-export function SessionWork({ api, sessionId, sidebar, tabId, linkedWork }: {
+export function SessionWork({ api, sessionId, sidebar, tabId, linkedWork, file }: {
   api: WorkspaceApi; sessionId: string; sidebar: ISidebarRight; tabId: TabId;
   linkedWork?: { link: WorkLink; botId: string; revision: number };
+  file?: FileTarget;
 }) {
   const resolved = useSessionBot(api, sessionId, sidebar);
   const back = () => { if (sidebar.mounted.getSnapshot() === sessionId) sidebar.hide(tabId); };
@@ -66,6 +68,14 @@ export function SessionWork({ api, sessionId, sidebar, tabId, linkedWork }: {
   if (linkedWork && !target) return <div style={{ padding: 20 }}>
     <button onClick={back}>← 返回聊天</button><p role="alert">当前对话的归属已改变，请重新打开链接。</p>
   </div>;
+  if (file) {
+    const href = resultFileUrl(file.resultId, file.index, sessionId);
+    return <section aria-label="成果文件预览" style={{ padding: 20, overflowWrap: 'anywhere' }}>
+      <button onClick={back}>← 返回聊天</button>
+      <h3>{file.name || '成果文件'}</h3>
+      <ResultFilePreview key={href} href={href} showDownload/>
+    </section>;
+  }
   return <Workspace key={`${sessionId}:${resolved.bot.id}:${target?.revision ?? ''}`} api={api} initialBotId={resolved.bot.id}
     sessionId={sessionId} initialLink={target?.link} compact onReturn={back}/>;
 }

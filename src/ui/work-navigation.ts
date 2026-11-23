@@ -7,10 +7,11 @@ import { parseResultFileLink, parseWorkLink, RESULT_FILE_PATH, workUrl, type Wor
 import type { Detail } from './work/types.ts';
 
 export const WORK_TAB = 'super-bot-work';
+export type FileTarget = NonNullable<ReturnType<typeof parseResultFileLink>> & { name: string };
 
 declare module '@deepseek-ai/dsh-client-ui-sidebar-right/client' {
   interface SidebarRightTabParamsMap {
-    [WORK_TAB]: { sessionId: string; botId: string; href: string };
+    [WORK_TAB]: { sessionId: string } & ({ botId: string; href: string } | { file: FileTarget });
   }
 }
 

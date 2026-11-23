@@ -20,14 +20,23 @@ test('fresh profiles can omit role overrides but incomplete model selections fai
 test('full roles select independent models and the complete native permission preset',()=>{
   const selected:unknown[]=[],presets:unknown[]=[];
   const session={id:'role-session'};
-  const ctx={permissionPresets:{set:(target:unknown,name:string)=>presets.push({target,name})}} as unknown as Context;
+  let snapshots=0;
+  const ctx={permissionPresets:{set:(target:unknown,name:string)=>presets.push({target,name})},
+    sessionProjections:{snapshot:()=>{snapshots++;return {values:{modelSelection:{next:selected.at(-1)??null}}};}}} as unknown as Context;
   const agent={session,model:{select:(value:unknown)=>selected.push(value)},ctx:new Proxy({}, {get(){throw Error('Native Agent context has no plugin service injection');}})} as unknown as Agent;
   const managerModel={provider:'test',model:'sol',reasoningEffort:ReasoningEffortId('medium')};
   const workerModel={provider:'test',model:'sol',reasoningEffort:ReasoningEffortId('xhigh')};
   configureRole(ctx,agent,'manager',{fullAccess:true,managerModel,workerModel});
   configureRole(ctx,agent,'worker',{managerModel,workerModel});
   assert.deepEqual(selected,[managerModel,workerModel]);
+  assert.equal(snapshots,1);
   assert.deepEqual(presets,[{target:session,name:'danger-full-access'},{target:session,name:'danger-full-access'}]);
+});
+
+test('Manager defaults require an available model selection projection',()=>{
+  const ctx={sessionProjections:{snapshot:()=>({values:{}})}} as unknown as Context;
+  const agent={session:{},model:{select:()=>assert.fail('cannot prove that the session is unconfigured')}} as unknown as Agent;
+  configureRole(ctx,agent,'manager',{fullAccess:false,managerModel:{provider:'test',model:'sol'}});
 });
 
 test('legacy file roles leave native permissions and existing model selection alone',()=>{

@@ -8,29 +8,73 @@ import {apply as applyClient} from '../../src/client.tsx';
 import {Store} from '../../src/store.ts';
 import {Managers} from '../../src/manager.ts';
 import type {DshExecution} from '../../src/dsh.ts';
+import type {RuntimeOptions} from '../../src/runtime.ts';
 import type {WorkspaceApi} from '../../src/ui/work/api.ts';
 
-function fixture(){
+function fixture(options:RuntimeOptions={}){
   const directory=mkdtempSync(join(tmpdir(),'super-bot-manager-retry-')),store=new Store(':memory:');
   const bot=store.createBot('bot',{name:'Bot',instructions:'Original config'});
   const agents=new Map<string,any>();let creates=0,resolves=0;
   let beforeResolve:((id:string)=>Promise<void>)|undefined;
+  let agentCreated:((event:{agent:any})=>void)|undefined;
   const titles=new Map<any,any>();
   const ctx={
+    effect:(register:()=>void)=>register(),tools:{register:()=>()=>{}},agents:{list:()=>[]},
+    on:(event:string,handler:typeof agentCreated)=>{if(event==='agent/created')agentCreated=handler;return ()=>{};},
     permissionPresets:{set:()=>{}},
     sessionTitle:{get:(session:any)=>titles.get(session),rename:(session:any,title:string)=>{const value={title,source:{kind:'user'}};titles.set(session,value);return value;}},
     sessions:{flush:async()=>true},
     sessionProjections:{snapshot:(session:any)=>({values:{modelSelection:{next:agents.get(session.id).selection}}})},
     workspaceRegistry:{create:async(cwd:string)=>({id:cwd,attachSession:async()=>{}})},
     sessionController:{
-      create:async({sessionId,workspaceId}:any)=>{creates++;const agent:any={id:sessionId,session:{id:sessionId,header:{id:sessionId,cwd:workspaceId,isSeeded:false}},status:'idle',inbox:{nextTurn:[],nextStep:[]},selection:null};agent.model={select:(model:any)=>{agent.selection=model;}};agents.set(sessionId,agent);return {sessionId};},
+      create:async({sessionId,workspaceId}:any)=>{
+        creates++;
+        const agent:any={id:sessionId,session:{id:sessionId,header:{id:sessionId,cwd:workspaceId,isSeeded:false}},
+          status:'idle',inbox:{nextTurn:[],nextStep:[]},whenIdle:async()=>{},selection:null,
+          ctx:{tools:{restrict:()=>()=>{},guard:()=>()=>{}},on:()=>()=>{},systemPrompt:{section:()=>()=>{}}}};
+        agent.model={select:(model:any)=>{agent.selection=model;}};
+        agents.set(sessionId,agent);agentCreated?.({agent});return {sessionId};
+      },
       rename:async()=>{},resolveAgent:async(id:string)=>{resolves++;await beforeResolve?.(id);return agents.has(id)?{agent:agents.get(id)}:{error:'missing'};},
     },
   } as unknown as Context;
-  const managers=new Managers(ctx,store,{} as DshExecution,directory);
-  return {store,bot,managers,agents,counts:()=>({creates,resolves}),beforeResolve:(callback:(id:string)=>Promise<void>)=>{beforeResolve=callback;},close:async()=>{await managers.dispose();store.close();rmSync(directory,{recursive:true,force:true});}};
+  const createManagers=()=>new Managers(ctx,store,{} as DshExecution,directory,undefined,options);
+  const managers=createManagers();
+  return {store,bot,managers,agents,counts:()=>({creates,resolves}),beforeResolve:(callback:(id:string)=>Promise<void>)=>{beforeResolve=callback;},
+    reopenAgent:(id:string)=>agentCreated?.({agent:agents.get(id)}),createManagers,
+    close:async()=>{await managers.dispose();store.close();rmSync(directory,{recursive:true,force:true});}};
 }
 const model={provider:'fake',model:'explicit-original'};
+
+test('reopening Bot chats preserves their own selections and only a new chat receives the Manager default', async () => {
+  const managerModel={provider:'fake',model:'manager-default'};
+  const f=fixture({managerModel});f.managers.install();
+  try {
+    const {sessionId}=await f.managers.prepare('open-a',f.bot.id);
+    const a=f.agents.get(sessionId!);
+    assert.deepEqual(a.selection,managerModel);
+    a.model.select(model);
+
+    const other=f.store.createBot('other',{name:'Other',instructions:'Synthetic'});
+    const b=await f.managers.prepare('open-b',other.id);
+    assert.deepEqual(f.agents.get(b.sessionId!).selection,managerModel);
+    assert.equal((await f.managers.prepare('reopen-a',f.bot.id)).sessionId,sessionId);
+    assert.deepEqual(a.selection,model);
+  } finally { await f.close(); }
+});
+
+test('a cold Manager attachment preserves the persisted selection', async () => {
+  const f=fixture({managerModel:{provider:'fake',model:'manager-default'}});
+  const restored=f.createManagers();
+  try {
+    const {sessionId}=await f.managers.prepare('open',f.bot.id);
+    const agent=f.agents.get(sessionId!);
+    agent.model.select(model);
+    restored.install();
+    f.reopenAgent(sessionId!);
+    assert.deepEqual(agent.selection,model);
+  } finally { await restored.dispose();await f.close(); }
+});
 
 test('client openBot reuses the ready native chat and follows its replacement', async () => {
   const f = fixture();

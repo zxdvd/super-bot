@@ -2,7 +2,7 @@
 import assert from 'node:assert/strict';
 import { createHash, randomUUID } from 'node:crypto';
 import { mkdir, readFile, realpath, rename, writeFile } from 'node:fs/promises';
-import { join } from 'node:path';
+import { basename, join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 
 const workPath = (taskId, resultId) => `/#super-bot-task=${taskId}&resultId=${resultId}`;
@@ -118,13 +118,20 @@ export async function smokeChatResultLinks({ base, configure, launch, stop, rpc,
     };
     await openResult(link(oldOrigin + fragment), id);
     await accept.waitFor();
-    const download = page.waitForEvent('download', { timeout: 5000 });
+    const preview = page.getByRole('region', { name: '成果文件预览' });
+    let downloads = 0;
+    page.on('download', () => downloads++);
     await link(oldFile).click();
+    await preview.getByLabel('成果文件内容').waitFor();
+    assert.equal(await preview.getByLabel('成果文件内容').textContent(), firstBytes.toString('utf8'));
+    assert.equal(downloads, 0);
+    const download = page.waitForEvent('download', { timeout: 5000 });
+    await preview.getByRole('link', { name: '下载' }).click();
     const originalDownload = await download;
     assert.equal(originalDownload.url(), host.base + filePath(id, bot.managerId));
     assert.equal(sha256(await readFile(await originalDownload.path())), first.result.evidence[0].sha256);
-    console.log(`PASS original native Markdown and attachment used the restarted Desktop Host; no request to ${oldOrigin}`);
-    await close();
+    console.log(`PASS file preview and explicit download used the restarted Desktop Host; no request to ${oldOrigin}`);
+    await preview.getByRole('button', { name: '← 返回聊天' }).click();
 
     await say('再加一句结论。');
     const revised = await wait(async () => {
@@ -143,7 +150,7 @@ export async function smokeChatResultLinks({ base, configure, launch, stop, rpc,
     await openResult(link(oldOrigin + fragment), id);
     await drawer.getByRole('heading', { name: '历史成果 · 只读' }).waitFor();
     await drawer.getByText('这份成果已被新版替代。', { exact: true }).waitFor();
-    await drawer.getByText('完整报告与验证记录', { exact: true }).click();
+    await drawer.getByText('完整 Worker 报告', { exact: true }).click();
     await drawer.getByText(first.result.checks, { exact: true }).waitFor();
     assert.ok(await drawer.getByText(first.result.summary, { exact: true }).first().isVisible());
     assert.equal(await accept.count(), 0);
@@ -159,6 +166,10 @@ export async function smokeChatResultLinks({ base, configure, launch, stop, rpc,
     const nextBytes = await readFile(path);
     await rename(path, parked);
     try {
+      await drawer.getByRole('button', { name: basename(path), exact: true }).click();
+      await drawer.getByLabel('成果文件内容').waitFor();
+      assert.equal(await drawer.getByLabel('成果文件内容').textContent(), firstBytes.toString('utf8'));
+      assert.equal(downloads, 1);
       const matching = page.waitForEvent('download', { timeout: 5000 });
       await drawer.locator(`a[href="${filePath(id, bot.managerId)}"]`).click();
       assert.equal(sha256(await readFile(await (await matching).path())), first.result.evidence[0].sha256);
@@ -217,6 +228,7 @@ export async function smokeChatResultLinks({ base, configure, launch, stop, rpc,
     assert.equal((await call(host, 'task.detail', { id: question.task.id, resultId: id, sessionId: bot.managerId })).linkedResult, null);
     for (const sessionId of [otherBot.managerId, first.binding.sessionId, webBot.managerId]) {
       assert.equal((await host.get(filePath(id, sessionId))).status, 404);
+      assert.equal((await host.get(filePath(id, sessionId) + '&preview=1')).status, 404);
     }
     const mirror = await call(web, 'mirror.detail', { owner: 'desktop', botId: bot.id, id: task.id });
     assert.ok(mirror.records.results.some(result => result.id === id && result.fileCount === 1));
@@ -224,7 +236,9 @@ export async function smokeChatResultLinks({ base, configure, launch, stop, rpc,
     assert.equal(await call(web, 'bot.for-session', { sessionId: bot.managerId }), null);
     assert.equal((await rpc(web, 'task.detail', { id: task.id, resultId: id, sessionId: bot.managerId })).error.code, 'not-found');
     assert.equal((await web.get(filePath(id, bot.managerId))).status, 404);
+    assert.equal((await web.get(filePath(id, bot.managerId) + '&preview=1')).status, 404);
     assert.notEqual((await fetch(host.base + filePath(id, bot.managerId), { redirect: 'manual' })).status, 200);
+    assert.notEqual((await fetch(host.base + filePath(id, bot.managerId) + '&preview=1', { redirect: 'manual' })).status, 200);
     assert.notEqual((await host.post('/api/super-bot', {
       type: 'client-request', rpcId: randomUUID(), method: 'super-bot',
       payload: { action: 'task.detail', id: task.id, sessionId: bot.managerId, resultId: id },

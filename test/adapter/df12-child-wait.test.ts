@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
 import { test, type TestContext } from 'node:test';
 import { Context } from '@deepseek-ai/cordis';
 import { agentEvents, type Agent } from '@deepseek-ai/dsh-agent';
@@ -175,9 +176,16 @@ async function fixture(t: TestContext, version: NativeVersion) {
   return {
     api, worker, other, run, startTurn, turnEnd, makeChild,
     onEvidenceRead: (callback: () => void) => { afterEvidenceRead = callback; },
-    download: (resultId: string) => fetch(new Request(
-      `http://localhost/api/super-bot-file?resultId=${resultId}&index=0&sessionId=${manager.requestedSessionId}`),
+    download: (resultId: string, preview = false, sessionId: string = manager.requestedSessionId) => fetch(new Request(
+      `http://localhost/api/super-bot-file?resultId=${resultId}&index=0&sessionId=${sessionId}${preview ? '&preview=1' : ''}`),
     connection.browserPeer),
+    async dropAttachment(resultId: string) {
+      await close();
+      const db = new DatabaseSync(join(dataDir, 'ledger.sqlite'));
+      try { db.prepare('DELETE FROM result_attachments WHERE resultId = ?').run(resultId); }
+      finally { db.close(); }
+      await apply(ctx, { dataDir, fullAccess: true });
+    },
     file,
     injectWrongTurn(turn: number) {
       const spoof = Session.create(worker.id);
@@ -216,6 +224,38 @@ test('ready downloads the exact bytes read before the final native quiet check',
   const response = await f.download(resultId);
   assert.equal(response.status, 200);
   assert.deepEqual(Buffer.from(await response.arrayBuffer()), submitted);
+  assert.equal((await f.download(resultId, true)).status, 415);
+});
+
+test('text preview uses the same scoped, immutable bytes as download', async t => {
+  const f = await fixture(t, 'rc.1');
+  const submitted = Buffer.from('最终内容\n<b>literal markup</b>\n');
+  writeFileSync(f.file, submitted);
+  f.startTurn(1);
+  f.onEvidenceRead(() => writeFileSync(f.file, 'changed after validation'));
+  const { resultId } = await f.ready('ready-preview');
+  assert.ok(resultId);
+  f.turnEnd(1);
+  const response = await f.download(resultId, true);
+  assert.equal(response.status, 200);
+  assert.equal(response.headers.get('content-type'), 'text/plain; charset=utf-8');
+  assert.equal(response.headers.get('content-disposition'), null);
+  assert.equal(response.headers.get('cache-control'), 'no-store');
+  assert.equal(response.headers.get('x-content-type-options'), 'nosniff');
+  assert.deepEqual(Buffer.from(await response.arrayBuffer()), submitted);
+  assert.equal((await f.download(resultId, true, f.other.id)).status, 404);
+  const download = await f.download(resultId);
+  assert.match(download.headers.get('content-disposition') ?? '', /^attachment;/);
+  assert.deepEqual(Buffer.from(await download.arrayBuffer()), submitted);
+
+  await f.dropAttachment(resultId);
+  assert.equal((await f.download(resultId, true)).status, 409); // The workspace now contains different bytes.
+  writeFileSync(f.file, submitted);
+  assert.deepEqual(Buffer.from(await (await f.download(resultId, true)).arrayBuffer()), submitted);
+  rmSync(f.file);
+  const missing = await f.download(resultId, true);
+  assert.equal(missing.status, 409);
+  assert.match(await missing.text(), /未保存附件副本.*无法读取.*恢复到原路径.*重新提交/);
 });
 
 for (const version of ['rc.1', 'rc.5'] as const) {

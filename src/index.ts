@@ -7,11 +7,12 @@ import type {} from '@deepseek-ai/dsh-host-webserver';
 import type {} from '@deepseek-ai/dsh-app-boot';
 import type {} from '@deepseek-ai/dsh-hmr';
 import type {} from '@deepseek-ai/dsh-cmdline';
+import { isUtf8 } from 'node:buffer';
 import { createHash } from 'node:crypto';
 import { createRequire } from 'node:module';
 import { realpathSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { basename,join,resolve } from 'node:path';
+import { basename,extname,join,resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { startReloadHost } from './dev-reload-host.ts';
 import { ReloadAdmission } from './reload-admission.ts';
@@ -30,6 +31,7 @@ import { managedSessionId, oppositeOwner, type BotOwner, type MirrorBot, type Mi
 import { AppError, requiredText, optionalText,type WorkspaceStatus, type NewBot, type NewTask, type ControlMode } from './model.ts';
 
 export const name = 'super-bot';
+const previewExtensions = new Set(['.md', '.diff', '.patch', '.json', '.jsonl', '.txt']);
 export const inject = ['connection', 'sessionController', 'workspaceRegistry','agents','tools','jobs','systemPrompt','workingDirectory','sessionProjections','webServer','permissionPresets','sessions','sessionPersistence','sessionTitle'];
 const roleModel=Schema.union([Schema.const(undefined),Schema.object({provider:Schema.string().required(),model:Schema.string().required(),reasoningEffort:Schema.string()})]);
 const workdirHook=Schema.object({
@@ -235,13 +237,14 @@ export async function apply(ctx: Context, config: RuntimeOptions & { dataDir?: s
   }
   // Read-only artifact links work in native chat. Never accept a caller-supplied path.
   ctx.effect(()=>ctx.connection.fetch.register({path:RESULT_FILE_PATH,methods:['GET'],requestBody:'buffered',fetch:async request=>{
+    const headers = { 'Cache-Control':'no-store', 'X-Content-Type-Options':'nosniff' };
     try {
       const params=new URL(request.url).searchParams,resultId=params.get('resultId')??'',index=Number(params.get('index'));
       const result=store.resultById(resultId);
       const sessions=params.getAll('sessionId');
       if(!result||!params.has('index')||!Number.isSafeInteger(index)||index<0||!result.evidence[index]
         ||(sessions.length>0&&(sessions.length!==1||store.botForSession(sessions[0])?.id!==store.getTask(result.taskId).botId))) {
-        return new Response('找不到成果文件。',{status:404});
+        return new Response('找不到成果文件。',{status:404,headers});
       }
       const evidence = result.evidence[index];
       let bytes = store.resultAttachment(result.id, index);
@@ -251,8 +254,15 @@ export async function apply(ctx: Context, config: RuntimeOptions & { dataDir?: s
       } else if (bytes.length !== evidence.bytes || createHash('sha256').update(bytes).digest('hex') !== evidence.sha256) {
         throw new AppError('attachment-invalid','保存的附件副本无法通过校验。请从有效的账本备份恢复，或请 Bot 重新提交成果。');
       }
-      return new Response(new Uint8Array(bytes),{headers:{'Content-Type':'application/octet-stream','Content-Disposition':`attachment; filename*=UTF-8''${encodeURIComponent(basename(evidence.path))}`,'Cache-Control':'no-store','X-Content-Type-Options':'nosniff'}});
-    }catch(error){return new Response(error instanceof AppError?error.message:'无法读取成果文件。',{status:409,headers:{'Cache-Control':'no-store'}});}
+      if (params.get('preview') === '1') {
+        if (!previewExtensions.has(extname(evidence.path).toLowerCase()) || !isUtf8(bytes) || bytes.includes(0)) {
+          return new Response('此文件不支持文本预览，可下载原文件。',{status:415,headers});
+        }
+        return new Response(new Uint8Array(bytes),{headers:{...headers,'Content-Type':'text/plain; charset=utf-8'}});
+      }
+      return new Response(new Uint8Array(bytes),{headers:{...headers,'Content-Type':'application/octet-stream',
+        'Content-Disposition':`attachment; filename*=UTF-8''${encodeURIComponent(basename(evidence.path))}`}});
+    }catch(error){return new Response(error instanceof AppError?error.message:'无法读取成果文件。',{status:409,headers});}
   }}));
   // Exact routes are authenticated and owner-only by DSH Connection on every carrier.
   // Do not take its sole shared-RPC interceptor (that belongs to the API Gateway).

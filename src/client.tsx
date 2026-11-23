@@ -13,7 +13,7 @@ import { WorkButton, SessionOriginHint, SessionWork } from './ui/SessionWork.tsx
 import { WORK_TAB, chatDeliveryLink, openBotConversation, openWorkLink, sameWorkHost, workLinkForUrl } from './ui/work-navigation.ts';
 import { BotHome } from './ui/BotHome.tsx';
 import { installBotSidebar } from './ui/BotSidebar.tsx';
-import { parseWorkLink, RESULT_FILE_PATH, resultFileUrl, workUrl } from './work-links.ts';
+import { parseWorkLink, RESULT_FILE_PATH, workUrl } from './work-links.ts';
 
 export const inject = ['slots', 'uiWorkspace', 'connection', 'layout', 'sidebarRight', 'sidebarRightTabs'];
 type ClientContext = Omit<Context, 'connection'> & { connection: ConnectionHandle };
@@ -71,10 +71,9 @@ export function apply(context: Context): void {
         if (delivery.kind === 'file') {
           const sessionId = ctx.sidebarRight.mounted.getSnapshot();
           if (!sessionId) return;
-          const download = document.createElement('a');
-          download.href = new URL(resultFileUrl(delivery.resultId, delivery.index, sessionId), current).href;
-          // The server's Content-Disposition downloads success; an error shows recovery instructions.
-          download.click();
+          intent?.abort();
+          const { resultId, index } = delivery;
+          ctx.sidebarRight.openTab(WORK_TAB, { params: { sessionId, file: { resultId, index, name: link.textContent ?? '' } } });
           return;
         }
       } else if (event.type === 'click' && sameWorkHost(url, current) && url.pathname === RESULT_FILE_PATH) {
@@ -115,11 +114,14 @@ export function apply(context: Context): void {
   }
   type TabProps={sessionId:SessionId;useTabInfo:UseSidebarRightTabInfo};
   ctx.slots.inject('sidebar.right.pane.tab',()=>ctx.slots.register({name:'sidebar.right.pane.tab',key:WORK_TAB},(props:TabProps)=>{
-    const {tab}=props.useTabInfo(), params = tab.navigation.params;
-    const link = params?.sessionId === props.sessionId && typeof params.href === 'string' && params.href.startsWith('/#')
+    const {tab}=props.useTabInfo(), raw = tab.navigation.params;
+    const params = raw?.sessionId === props.sessionId ? raw : undefined;
+    const linked = params && 'href' in params && typeof params.href === 'string' && params.href.startsWith('/#')
       ? parseWorkLink(params.href.slice(1)) : undefined;
     return tab.visible ? <SessionWork api={api} sessionId={props.sessionId} sidebar={ctx.sidebarRight} tabId={tab.id}
-      linkedWork={link && params ? { link, botId: params.botId, revision: tab.navigation.revision } : undefined}/> : null;
+      file={params && 'file' in params ? params.file : undefined}
+      linkedWork={linked && params && 'botId' in params
+        ? { link: linked, botId: params.botId, revision: tab.navigation.revision } : undefined}/> : null;
   }));
   ctx.slots.inject('main', () => ctx.slots.register({ name: 'main', key: 'super-bot', inject: () => ({}) }, () => <BotHome api={api}/>));
   ctx.slots.inject('sidebar.panellist', () => ctx.slots.register(

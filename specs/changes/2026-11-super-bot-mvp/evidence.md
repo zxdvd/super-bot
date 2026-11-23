@@ -746,3 +746,14 @@ ELECTRON_RUN_AS_NODE=1 '/Applications/DeepSeek Harness.app/Contents/MacOS/DeepSe
 - 已有目录和父子目录允许多个独立任务并行。同一 Task 的执行去重和全局执行名额沿用现有规则。schema 10→11 的回归验证已有 Run 的名额和绑定保留。
 - Node `24.22.1` 的全量 `npm run check` 通过 87 项账本测试、281 项适配测试、静态检查和构建。DSH Web `0.2.2-rc.1` 隔离 Host 使用确定性模型，确认两个独立原生 Worker Session 同时在完全相同的目录运行。名额满时第三项未创建 Run，释放一个名额后第三项由另一 Bot 派发。[全量检查](../../../.runtime/shared-workdir-check.log) · [原生宿主结果](../../../.runtime/shared-workdir-native-T2rjVuiL/proof.json)
 - 日常 Web 和 Desktop 分别在原宿主进程完成受保护的热重载。
+
+## 2026-11-23 · 原聊天成果文件预览
+
+- DSH rc.1 和已安装的 Desktop rc.5 原生交付卡使用会话、事件序号和文件序号查询 `present` 的路径，再通过 `workspaceFiles` 读取当前文件系统。DS-Bot 的 `deliverables.file.actions` 只在这类原生卡上增加 Save。Super Bot 的不可变附件存在 SQLite，原生预览契约没有按成果坐标读取这些字节的入口。复用现有「工作」右栏、成果内的文件列表和原认证路由。文本预览与显式下载使用同一版本的校验字节，纯文本在 `pre` 中呈现。
+- Node `24.17.0` 的 107 项定向回归和隔离输出下的 `npm run check` 通过。包含 87 项核心、282 项适配、行数、类型和双端构建。覆盖原字节和附件响应头、纯文本响应、二进制拒绝、会话作用域、旧记录的原文件恢复和缺失说明。[定向日志](../../../.runtime/file-preview/targeted.log) · [全量日志](../../../.runtime/file-preview/check.log)
+- 隔离浏览器用合成模型和原生 Desktop rc.5 Host 的 HTTP 载体，点换端口前的原聊天文件名打开预览，未触发下载。点「下载」后 SHA-256 匹配。返工后临时移走合成工作文件，旧成果详情内仍能预览、下载旧版本；新版保留验收控件，隔离任务保留两个 Run 和两条原聊天回执，未写入人工接受。另核对未认证、外 Bot/Worker 会话及 Web rc.1 镜像不能读取附件。探针关闭 HMR；日常 profile、原生 Desktop 窗口和真实模型未参与。[浏览器证据](../../../.runtime/file-preview/ui-final/chat-result-proof.json) · [烟测日志](../../../.runtime/file-preview/ui-final.log)
+
+## 2026-11-23 · Bot 模型选择保留
+
+- 重新打开已有 Bot 和宿主冷恢复都会配置 Manager 角色。模型投影明确没有记录时才填入 `managerModel`。缺失投影时保留原生状态。回归先复现两条路径覆盖已有选择，修复后通过。Worker 模型覆盖和原生权限预设回归通过。
+- Node `24.17.0` 下全量检查通过 87 项核心、285 项适配、行数检查、类型检查与双端构建。独立启动 Web rc.1 和 Desktop rc.5 Host，以合成配置验证新 Bot 获得默认模型、A→B→A 保留各自选择、完整退出后重启继续保留，未调用模型。[全量检查](../../../.runtime/attachment-and-model-fix/check.log) · [隔离宿主结果](../../../.runtime/attachment-and-model-fix/native/model-proof.json)

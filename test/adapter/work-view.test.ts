@@ -301,6 +301,12 @@ test('real client registration is additive, session-scoped, and ignores forged t
   assert.deepEqual(nativeLink('native-a', 1), { link, botId: 'a', revision: 1 });
   assert.deepEqual(nativeLink('native-a', 2), { link, botId: 'a', revision: 2 });
   assert.equal(nativeLink('native-b', 1), undefined);
+  const file = { resultId: link.resultId, index: 1, name: 'result.md' };
+  const fileTab = (sessionId: string) => body.render({ ...props, useTabInfo: () => ({
+    tab: { id: 'tab-a', visible: true, navigation: { params: { sessionId, file } } },
+  }) }).props.file;
+  assert.deepEqual(fileTab('native-a'), file);
+  assert.equal(fileTab('native-b'), undefined);
   assert.equal(body.render({ ...props, useTabInfo: () => ({ tab: { visible: false, navigation: {} } }) }), null);
   assert.ok(entries.every(entry => !['root', 'rightbar', 'conversation.session.header.corner'].includes(entry.options.name)));
 });

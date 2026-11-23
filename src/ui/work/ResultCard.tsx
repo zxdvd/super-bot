@@ -1,4 +1,5 @@
-/** The current result: summary, evidence downloads, and accept or rework controls. */
+/** The current result: summary, evidence, and accept or rework controls. */
+import { useState } from 'react';
 import type { ReloadReceipt, Result } from '../../model.ts';
 import { resultFileUrl } from '../../work-links.ts';
 import { resultHeading, time } from './format.ts';
@@ -6,6 +7,7 @@ import { ReplyForm } from './forms.tsx';
 import type { Detail } from './types.ts';
 import type { WorkspaceState } from './useWorkspace.ts';
 import { ResultDeliveryCheck } from './SystemIssues.tsx';
+import { ResultFilePreview } from './ResultFilePreview.tsx';
 
 function Review({ w, detail }: { w: WorkspaceState; detail: Detail }) {
   const { task } = detail, result = detail.result!;
@@ -41,11 +43,18 @@ export function ResultLoadReceipt({ host, resultId, receipt }: {
 }
 
 export function ResultFiles({ result, sessionId }: { result: Result; sessionId?: string }) {
-  return <ul>{result.evidence.map((file, index) => <li key={file.path} className="wrap">
-    <a href={resultFileUrl(result.id, index, sessionId)}>{file.path.split('/').pop()}</a>{' '}
-    <span className="muted">（{file.bytes} 字节）</span>
-    <details><summary>文件路径</summary>{file.path}</details>
-  </li>)}</ul>;
+  const [preview, setPreview] = useState<string>();
+  return <ul>{result.evidence.map((file, index) => {
+    const href = resultFileUrl(result.id, index, sessionId), expanded = preview === href;
+    return <li key={file.path} className="wrap">
+      <button type="button" className="small" aria-expanded={expanded} onClick={() => setPreview(expanded ? undefined : href)}>
+        {file.path.split('/').pop()}
+      </button>{' '}
+      <span className="muted">（{file.bytes} 字节）</span> <a href={href}>下载</a>
+      {expanded && <ResultFilePreview key={href} href={href}/>}
+      <details><summary>文件路径</summary>{file.path}</details>
+    </li>;
+  })}</ul>;
 }
 
 export function ResultCard({ w, detail, onReturn }: { w: WorkspaceState; detail: Detail; onReturn?: () => void }) {

@@ -2,6 +2,7 @@
 import type {Context} from '@deepseek-ai/cordis';
 import type {Agent,ModelSelection} from '@deepseek-ai/dsh-agent';
 import type {} from '@deepseek-ai/dsh-permission-presets';
+import type {} from '@deepseek-ai/dsh-session-projection';
 import type {WorkdirConfig} from './workdir.ts';
 
 export interface RuntimeOptions extends WorkdirConfig {
@@ -25,6 +26,9 @@ export function fullAccessEnabled(options:RuntimeOptions):boolean { return optio
 
 export function configureRole(ctx:Context,agent:Agent,role:'manager'|'worker',options:RuntimeOptions):void {
   const model=role==='manager'?options.managerModel:options.workerModel;
-  if(model)agent.model.select(model);
+  // A missing projection cannot establish that the session has no recorded selection.
+  if(model&&(role==='worker'||ctx.sessionProjections.snapshot(agent.session,['modelSelection']).values.modelSelection?.next===null)) {
+    agent.model.select(model);
+  }
   if(fullAccessEnabled(options))ctx.permissionPresets.set(agent.session,'danger-full-access');
 }

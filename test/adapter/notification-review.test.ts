@@ -10,7 +10,7 @@ import { readLocalMirror } from '../../src/mirror-queries.ts';
 import { parseMirrorQuery } from '../../src/mirror-host.ts';
 import { SystemIssues } from '../../src/ui/work/SystemIssues.tsx';
 import { LinkedTaskContent, TaskDetailHeader } from '../../src/ui/work/TaskDetail.tsx';
-import { ResultCard } from '../../src/ui/work/ResultCard.tsx';
+import { ResultCard, ResultFiles } from '../../src/ui/work/ResultCard.tsx';
 import { ConfirmAction } from '../../src/ui/kit.tsx';
 import { ReplyForm } from '../../src/ui/work/forms.tsx';
 import type { WorkspaceState } from '../../src/ui/work/useWorkspace.ts';
@@ -120,7 +120,7 @@ async function fixture(t: TestContext) {
 function elements(node: any): any[] {
   if (Array.isArray(node)) return node.flatMap(elements);
   if (!node?.props) return [];
-  if (typeof node.type === 'function' && ![ConfirmAction, TaskDetailHeader, ReplyForm].includes(node.type)) {
+  if (typeof node.type === 'function' && ![ConfirmAction, TaskDetailHeader, ReplyForm, ResultFiles].includes(node.type)) {
     return elements(node.type(node.props));
   }
   return [node, ...elements(node.props.children)];
@@ -162,6 +162,7 @@ test('unknown result deliveries stay identifiable and one owner confirmation han
   const historical = () => detail(f.old.resultId).then(d => elements(LinkedTaskContent({ w, detail: d, link: oldLink, close: () => {} })));
   const oldNodes = await historical();
   assert.ok(oldNodes.some(node => node.type === 'h3' && text(node) === '历史成果 · 只读'));
+  assert.equal(oldNodes.find(node => node.type === ResultFiles)?.props.result.id, f.old.resultId);
   assert.equal(oldNodes.find(node => node.type === TaskDetailHeader)?.props.controls, false);
   assert.ok(oldNodes.some(node => node.type === 'p' && text(node).includes(f.reasons[0]!)));
   assert.ok(oldNodes.some(node => node.type === 'p' && /原聊天核对第 4 轮/.test(text(node))));
