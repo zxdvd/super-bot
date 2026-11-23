@@ -317,7 +317,7 @@ export class Managers {
     this.timer=setInterval(()=>{void this.pump();},1000);this.timer.unref();
   }
   /** Flush then read the native durable log. Live session/event and idle are not storage receipts. */
-  /** Reserve a run on an already prepared binding; capacity and directory conflicts queue a resource notification. */
+  /** Reserve a Run on an already prepared binding or queue a capacity notification. */
   private async runPrepared(requestId:string,botId:string,task:Task,manager:Agent,authorize:()=>void) {
     const binding=this.store.activeBinding(task.id);
     if(!binding?.sessionId)throw new AppError('session-recovery','执行会话需要核对，不能自动重建。');
@@ -327,13 +327,13 @@ export class Managers {
       return {run,workdir,expectedModel:this.store.runModelPlan(run.id)};
     }
     catch(error){
-      if(!(error instanceof AppError)||!['capacity','resource-conflict'].includes(error.code))throw error;
+      if(!(error instanceof AppError)||error.code!=='capacity')throw error;
       this.store.recordWait(task.id);
-      this.store.enqueueManager(botId,`capacity:${task.id}:${task.rowVersion}`,'资源等待：名额和目录可用后再次核对任务并派发。',task.id);
+      this.store.enqueueManager(botId,`capacity:${task.id}:${task.rowVersion}`,'等待执行名额：名额可用后再次核对任务并派发。',task.id);
       const wait=this.store.dispatchWait(task.id);
       const behind=wait?.holderTaskId?`排在任务 ${wait.holderTaskId}（${(wait.holderGoal??'').slice(0,80)}）之后`:'等待执行名额';
       return {deferred:true,reason:wait?.code??error.code,holderTaskId:wait?.holderTaskId??null,holderGoal:wait?.holderGoal??null,
-        workdir,message:`${wait?.code==='resource-conflict'?'工作目录被占用':'执行名额已满'}，已按先后顺序排队（${behind}）。轮到时会通知你，不要轮询。`};
+        workdir,message:`执行名额已满，已按先后顺序排队（${behind}）。轮到时会通知你，不要轮询。`};
     }
   }
   private runWorkdir(run:Run):string|null {const binding=this.store.getBinding(run.bindingId);return binding?workdirSummary(binding.cwd,binding.workdir):null;}

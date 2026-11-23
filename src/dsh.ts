@@ -170,7 +170,7 @@ export class DshExecution {
           }
           if(joined||treeCheck?.revision!==revision||hasPendingChildResult(agent)) {
             if(receipt)throw new AppError('report-stale','已提交候选后又有子树活动，请核对，不能重用旧报告。');
-            return {accepted:false,reason:'subtree-joined',next:'已等待子 Agent 树收敛。本次未提交成果，父轮次与目录占用仍在。请核对子 Agent 结果、文件与测试，再在本轮重新调用 ready。'};
+            return {accepted:false,reason:'subtree-joined',next:'已等待子 Agent 树收敛。本次未提交成果，父轮次继续占用执行名额。请核对子 Agent 结果、文件与测试，再在本轮重新调用 ready。'};
           }
         }
         assertCurrent();
@@ -422,11 +422,11 @@ export class DshExecution {
     }
   }
   private assertObservedTreeQuiet(check?:TreeCheck):void {
-    if(check?.pendingWaits||check?.active.size)throw new AppError('child-active','子 Agent 树仍有活动或清理未完成，保留目录占用。');
+    if(check?.pendingWaits||check?.active.size)throw new AppError('child-active','子 Agent 树仍有活动或清理未完成，保留执行名额。');
     if(check?.service) {
       const tree=this.nativeSubagents();
       if(check.waitFailed||originalService(tree)!==check.service||(!tree?.waitForTreeWork&&!tree?.waitForChildren)) {
-        throw new AppError('child-unknown','原生子树状态不可核对，保留目录占用。');
+        throw new AppError('child-unknown','原生子树状态不可核对，保留执行名额。');
       }
     }
   }

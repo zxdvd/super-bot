@@ -10,7 +10,7 @@
 - Run：queued / running / settled / failed / cancelling / cancelled / interrupted；终态只记录一次。未知执行事实保存在资源占用与恢复事项，不把 failed 当作可安全重试。
 - 幂等键在用户本地账户/调用者命名空间中唯一，并保存命令名与规范化 payload hash；同键不同命令或内容拒绝。Input、Report 各自去重。
 - 更新已有对象使用 expectedRowVersion；结果、Review、报告另带 taskRevision/resultId/bindingGeneration。陈旧报告保留审计但不进入当前事实投影。
-- 部分唯一约束保证一个 Bot 一个当前 Manager、Task 一个当前执行绑定、同一 Session 一个未结束任务。资源占用另行防止跨 Task 双跑。
+- 部分唯一约束保证一个 Bot 一个当前 Manager、Task 一个当前执行绑定、同一 Session 一个未结束 Run。资源占用记录用于全局 Worker 名额和执行收敛核对。
 - 任务范围不完整可持久创建，但不可派发，建立一个具体澄清事项。
 
 命令最少包含 task.create/revise/dispatch/control、session.attach/detach、work.report/ask/read、task.review、attention.respond、result.accept；查询包括 bot.summary、task.list/detail、分页 events/results。版本冲突返回明确错误和刷新提示，不静默覆盖。

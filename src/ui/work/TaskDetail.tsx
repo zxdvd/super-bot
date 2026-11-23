@@ -84,7 +84,7 @@ export function TaskDetailHeader({ w, detail, close, controls = true, onReturn, 
     {controls && detail.model && <ModelPreview model={detail.model} showExpected={task.lifecycle === 'open'}
       canStartManually={canStartTask(detail)}/>}
     {controls && queued && <p className="notice" role="status">
-      {wait && <>{wait.code === 'resource-conflict' ? '工作目录被占用' : '等待执行名额'}
+      {wait && <>等待执行名额
         {blocker && <>，排在「{blocker.slice(0, 80)}」之后</>}。</>}
       {autoDispatchPending
         ? (wait ? '资源就绪且管理会话可用时，Bot 会继续安排。' : '资源已就绪，等管理会话可用后由 Bot 继续安排。')

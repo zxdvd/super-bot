@@ -1,6 +1,6 @@
 import { DatabaseSync } from 'node:sqlite';
 import { mkdirSync } from 'node:fs';
-import { dirname,relative,isAbsolute,sep } from 'node:path';
+import { dirname } from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
 import schemaVersion from '../schema-version.json' with {type:'json'};
 import { AppError, requiredText, optionalText, taskStatus, type ChatSource, type Bot, type Task, type NewBot, type NewTask, type TaskPage, type ControlMode, type Attention, type Binding, type Run, type RunInput, type WorkReport, type Result,type ManagerBinding,type ManagerEvent,type ExistingSessionGrant,type ReferenceMaterial,type TaskBotContext,type DispatchWait,type WorkdirInfo,type RunTurn,botDraft } from './model.ts';
@@ -79,7 +79,7 @@ export class Store {
         CREATE TABLE IF NOT EXISTS run_turns (runId TEXT PRIMARY KEY REFERENCES runs(id),turn INTEGER,startSeq INTEGER,inputSeq INTEGER,endSeq INTEGER,endKind TEXT,quiet INTEGER NOT NULL DEFAULT 0,reportId TEXT);
         CREATE UNIQUE INDEX IF NOT EXISTS runs_active_task ON runs(taskId) WHERE finishedAt IS NULL;
         CREATE UNIQUE INDEX IF NOT EXISTS runs_active_session ON runs(sessionId) WHERE finishedAt IS NULL;
-        CREATE TABLE IF NOT EXISTS resources (runId TEXT PRIMARY KEY REFERENCES runs(id),cwd TEXT NOT NULL UNIQUE);
+        CREATE TABLE IF NOT EXISTS resources (runId TEXT PRIMARY KEY REFERENCES runs(id));
         CREATE TABLE IF NOT EXISTS reports (id TEXT PRIMARY KEY,runId TEXT NOT NULL REFERENCES runs(id),kind TEXT NOT NULL,data TEXT NOT NULL,createdAt INTEGER NOT NULL);
         CREATE TABLE IF NOT EXISTS results (id TEXT PRIMARY KEY,runId TEXT NOT NULL UNIQUE REFERENCES runs(id),taskId TEXT NOT NULL REFERENCES tasks(id),taskRevision INTEGER NOT NULL,summary TEXT NOT NULL,checks TEXT NOT NULL,evidence TEXT NOT NULL,createdAt INTEGER NOT NULL,humanAcceptedAt INTEGER);
         CREATE TABLE IF NOT EXISTS result_attachments (
@@ -104,6 +104,12 @@ export class Store {
       if(!taskColumns.includes('workdirRequest'))this.db.exec('ALTER TABLE tasks ADD COLUMN workdirRequest TEXT;');
       const bindingColumns=this.db.prepare('PRAGMA table_info(bindings)').all().map(row=>row.name);
       if(!bindingColumns.includes('workdir'))this.db.exec('ALTER TABLE bindings ADD COLUMN workdir TEXT;');
+      if(version.user_version>0&&version.user_version<11)this.db.exec(`
+        CREATE TABLE resources_next (runId TEXT PRIMARY KEY REFERENCES runs(id));
+        INSERT INTO resources_next SELECT runId FROM resources;
+        DROP TABLE resources;
+        ALTER TABLE resources_next RENAME TO resources;
+      `);
       this.db.exec(`PRAGMA user_version=${schemaVersion}; COMMIT;`);
     } catch (error) {
       this.db.close();
@@ -893,30 +899,21 @@ export class Store {
     });
     return true;
   }
-  dispatchBlocker(taskId:string):'capacity'|'resource-conflict'|null {return this.dispatchWait(taskId)?.code??null;}
-  /** Directory and slot admission with FIFO fairness: earlier live waiters keep their place in line. */
+  dispatchBlocker(taskId:string):'capacity'|null {return this.dispatchWait(taskId)?.code??null;}
+  /** Earlier live waiters keep their place when execution slots free up. */
   dispatchWait(taskId:string):DispatchWait|null {
-    const goal=(id:string|null)=>id?String(this.db.prepare('SELECT goal FROM tasks WHERE id=?').get(id)?.goal??''):null;
-    const contains=(parent:string,child:string)=>{const path=relative(parent,child);return path===''||(!isAbsolute(path)&&path!=='..'&&!path.startsWith(`..${sep}`));};
-    const overlaps=(a:string,b:string)=>contains(a,b)||contains(b,a);
-    const held=this.db.prepare('SELECT resources.cwd,runs.taskId FROM resources JOIN runs ON runs.id=resources.runId').all().map(r=>({cwd:String(r.cwd),taskId:String(r.taskId)}));
-    const binding=this.activeBinding(taskId);
-    const holder=binding?held.find(r=>r.taskId!==taskId&&overlaps(r.cwd,binding.cwd)):undefined;
-    if(holder)return {code:'resource-conflict',holderTaskId:holder.taskId,holderGoal:goal(holder.taskId)};
-    if(held.length>=this.maxRunningTasks)return {code:'capacity',holderTaskId:null,holderGoal:null};
+    const held=Number(this.db.prepare('SELECT count(*) AS n FROM resources').get()?.n);
+    if(held>=this.maxRunningTasks)return {code:'capacity',holderTaskId:null,holderGoal:null};
     const mine=this.db.prepare('SELECT seq FROM waits WHERE taskId=?').get(taskId);
-    // Only waiters that are still eligible and still have a live resource notification hold a place.
-    const earlier=this.db.prepare(`SELECT w.taskId,b.cwd FROM waits w JOIN tasks t ON t.id=w.taskId
+    // Only eligible waiters with a live capacity notification hold a place.
+    const earlier=this.db.prepare(`SELECT w.taskId,t.goal FROM waits w JOIN tasks t ON t.id=w.taskId
       JOIN bindings b ON b.taskId=w.taskId AND b.state='ready'
       WHERE w.taskId!=? AND (? IS NULL OR w.seq<?) AND t.lifecycle='open' AND t.controlMode='auto'
       AND NOT EXISTS (SELECT 1 FROM runs r WHERE r.taskId=w.taskId AND r.finishedAt IS NULL)
       AND EXISTS (SELECT 1 FROM outbox o WHERE o.kind='manager.notify' AND o.taskId=w.taskId AND o.id LIKE 'manager-event:capacity:%' AND o.state IN ('pending','sending','entered'))
-      ORDER BY w.seq`).all(taskId,mine?.seq??null,mine?.seq??null).map(r=>({cwd:String(r.cwd),taskId:String(r.taskId)}));
-    const ahead=binding?earlier.find(r=>overlaps(r.cwd,binding.cwd)):undefined;
-    if(ahead)return {code:'resource-conflict',holderTaskId:ahead.taskId,holderGoal:goal(ahead.taskId)};
-    const runnable=earlier.filter(r=>!held.some(h=>overlaps(h.cwd,r.cwd)));
-    if(held.length+runnable.length>=this.maxRunningTasks)return {code:'capacity',holderTaskId:runnable[0]?.taskId??null,holderGoal:goal(runnable[0]?.taskId??null)};
-    return null;
+      ORDER BY w.seq`).all(taskId,mine?.seq??null,mine?.seq??null);
+    if(held+earlier.length<this.maxRunningTasks)return null;
+    return {code:'capacity',holderTaskId:String(earlier[0].taskId),holderGoal:String(earlier[0].goal)};
   }
   /** Joins the FIFO line once; a later deferral of the same task keeps its original place. */
   recordWait(taskId:string):void {
@@ -937,7 +934,7 @@ export class Store {
     if(this.db.prepare("SELECT 1 FROM attentions WHERE taskId=? AND state='open'").get(taskId))throw new AppError('needs-attention','请先处理当前待办。');
     if(this.heldRuns().some(run=>run.taskId===taskId))throw new AppError('run-active','这个任务的上次执行尚未收敛。');
     const blocker=this.dispatchBlocker(taskId);
-    if(blocker)throw new AppError(blocker,blocker==='capacity'?'执行名额已占用，请等待或核对已有执行。':'这个工作目录与另一执行重叠。');
+    if(blocker)throw new AppError(blocker,'执行名额已占用，请等待或核对已有执行。');
     const pending=this.pendingInput(taskId);
     if(recovering&&pending&&(pending.messageId!==null||pending.messageJson!==null||
       this.db.prepare("SELECT 1 FROM outbox WHERE id=? AND state!='pending'").get(`input:${pending.id}`))) {
@@ -949,7 +946,7 @@ export class Store {
     this.db.prepare('INSERT INTO runs(id,taskId,bindingId,sessionId,taskRevision,generation,inputId,state,createdAt) VALUES (?,?,?,?,?,?,?,?,?)').run(id,taskId,b.id,b.sessionId,task.taskRevision,b.generation,inputId,'queued',now);
     this.db.prepare('INSERT INTO run_turns(runId) VALUES (?)').run(id);
     if(expectedModel)this.set(`run-model-plan:${id}`,JSON.stringify(expectedModel));
-    this.db.prepare('INSERT INTO resources VALUES (?,?)').run(id,b.cwd);
+    this.db.prepare('INSERT INTO resources(runId) VALUES (?)').run(id);
     this.db.prepare('INSERT INTO outbox(id,kind,taskId,payload,createdAt) VALUES (?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET payload=excluded.payload').run(`input:${inputId}`,'input.deliver',taskId,JSON.stringify({runId:id,inputId,dispatchRowVersion:task.rowVersion}),now);
     this.db.prepare('UPDATE tasks SET rowVersion=rowVersion+1,updatedAt=? WHERE id=?').run(now,taskId);
     this.event('run.queued',taskId,{runId:id,inputId});return this.getRun(id);

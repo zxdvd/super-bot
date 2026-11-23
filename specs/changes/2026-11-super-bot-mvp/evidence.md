@@ -728,3 +728,21 @@ ELECTRON_RUN_AS_NODE=1 '/Applications/DeepSeek Harness.app/Contents/MacOS/DeepSe
 - Run `93115b9d-8ddd-42a7-9634-0bbdb7b5b479` 从原日常 Web 聊天派发，在已有仓库执行。顶栏与收件箱按当前开放阻塞事项计数，测试任务折叠，交付按原聊天有效回执显示。Worker 进度、程序记录和可归属的开发重载回执各自带时间。实际运行未重载日常宿主。源码、暂存区和共享构建核验见[本轮文件清单](../../../.runtime/inbox-93115b9d/worktree-summary.json)。
 - Node `24.22.1` 的全量 `npm run check` 通过行宽、TypeScript、87 项核心、273 项适配及 Host/Client 构建。重载测试使用合成原生 HMR 边界，覆盖源码不匹配和同进程接棒。构建和校验值仅在 `.runtime`。[全量检查](../../../.runtime/inbox-93115b9d/check-final.log) · [构建校验值](../../../.runtime/inbox-93115b9d/build.sha256)
 - 现装 Web rc.5 与 macOS Desktop rc.5 原生 Host 在隔离 profile 完成确定性聊天、进度、创建端和双向只读回归。配对缺失、权限和错配降级时本地可写；归属错误拒绝开库。测试关闭 HMR，使用原生载体发布客户端资源并检查认证路径。日常 Web/Desktop 界面和真实回执启用留待人工核对。[烟测日志](../../../.runtime/inbox-93115b9d/native-verified.log) · [隔离证据](../../../.runtime/inbox-93115b9d/native-verified/proof.json)
+
+## 2026-11-23 · 固定 Bot 直达入口受宿主契约阻塞
+
+- 本 checkout 的 DSH SDK 为 `0.2.2-rc.1`。侧栏 README、类型及发行代码均显示，`sidebar.panellist` 只注册图标、标签和顺序，原生按钮调用 `layout.selectPanel(id)` 并要求同名 `main`。`sidebar.panellist.actions` 在「更多」菜单内，`sidebar.workspaces` 是原生浏览器占用的单一插槽。已安装的布局 bundle 在 Node 中验证了缺少 `main` 时拒绝选择、重复选择同一面板会中止进行中的导航。中转面板也会替换中央视图并隐藏原生右栏，等待 `openBot` 完成后才返回对话。当前缺少可放在 Workspaces 上方且直接调用 `openBot` 的受支持入口。
+- 两项合成回归验证现有能力。`openBot` 重开已就绪的 Bot 会话时复用同一原生 ID，替换后打开新绑定，两种情况都不会额外创建会话。Worker 进入运行状态后，本端 Bot 列表顺序保持稳定。[导航回归](../../../test/adapter/manager-lifecycle.test.ts) · [排序回归](../../../test/execution.test.ts)
+- Node `24.22.1` 下，`node --import tsx --test test/execution.test.ts test/adapter/{manager-lifecycle,sidebar,work-view}.test.ts` 通过 81 项，`npm run typecheck` 和隔离输出目录中的 `npm run build` 通过。侧栏入口未实现。未启动真实 DSH、打开会话或验证 rc.5 与实际界面。
+
+## 2026-11-23 · Bot 与 Workspace 侧栏切换
+
+- Super Bot 默认占用 `sidebar.workspaces` 并按账本创建顺序显示本端 Bot。同一个 `sidebar.footer.action` 按钮切换模式；进入 Workspace 模式时撤销插件注册，由 DSH 恢复原生列表。Bot 点击走现有 `manager.prepare` 和原生对话导航；撤销列表时终止尚未完成的侧栏点击导航。
+- Node `24.22.1` 下，`node --import tsx --test test/execution.test.ts test/adapter/{manager-lifecycle,sidebar,sidebar-mode,work-view}.test.ts` 通过 82 项。新测试核对四次往返仅撤销插件自己的注册、固定按钮始终只有一个、释放时中止侧栏导航信号。隔离输出目录下的 `npm run check` 通过行数检查、类型检查、88 项核心测试、283 项适配测试和双端构建。[全量日志](../../../.runtime/sidebar-switch-LExmby/check.log)
+- 仓库锁定的 DSH Web `0.2.2-rc.1` 在独立 home、profile 和浏览器数据目录里冷启动，关闭 HMR。默认按账本顺序显示两个合成 Bot；已准备的普通 Worker 会话未出现在 Bot 列表。点 Alpha、Beta 再点 Alpha，原生会话归属查询核对了已存在的会话 ID，绑定未变。打开 Alpha 的右侧工作视图后往返四次，原生 Workspaces 列表每次恢复，当前编辑器和打开的工作面板节点、页面 URL 均保持一致。在原生列表展开了合成 Worker 所属的 Workspace，重新加载页面后恢复默认 Bot 模式。本轮浏览器验证覆盖 rc.1 Web 和合成数据；rc.5、原生 Desktop 窗口和真实模型留待复验。[浏览器结果](../../../.runtime/sidebar-switch-LExmby/proof.json)
+
+## 2026-11-23 · 同目录 Worker 并发
+
+- 已有目录和父子目录允许多个独立任务并行。同一 Task 的执行去重和全局执行名额沿用现有规则。schema 10→11 的回归验证已有 Run 的名额和绑定保留。
+- Node `24.22.1` 的全量 `npm run check` 通过 87 项账本测试、281 项适配测试、静态检查和构建。DSH Web `0.2.2-rc.1` 隔离 Host 使用确定性模型，确认两个独立原生 Worker Session 同时在完全相同的目录运行。名额满时第三项未创建 Run，释放一个名额后第三项由另一 Bot 派发。[全量检查](../../../.runtime/shared-workdir-check.log) · [原生宿主结果](../../../.runtime/shared-workdir-native-T2rjVuiL/proof.json)
+- 日常 Web 和 Desktop 分别在原宿主进程完成受保护的热重载。

@@ -516,7 +516,8 @@ test('once granted, Worker dispatch and Manager automatic wake cannot enter befo
   const f = fixture(t);
   const s = scheduler(t, f.root);
   const { task, sessionId } = s.createTask('protected');
-  const other = s.createTask('same-directory');
+  const other = s.createTask('second-task');
+  s.store.maxRunningTasks = 1;
   const notice = s.notify();
   const endpoint = await f.mount(hmrFixture(), s.admission, s.blockers).ready;
   writeFileSync(f.hold, 'hold staging');
@@ -539,7 +540,7 @@ test('once granted, Worker dispatch and Manager automatic wake cannot enter befo
   assert.equal(run.sessionId, sessionId);
   assert.equal(s.store.heldRuns()[0]?.id, run.id);
   assert.equal((await s.execution.dispatch('dispatch', task.id, task.rowVersion)).id, run.id);
-  await assert.rejects(s.execution.dispatch('second', other.task.id, other.task.rowVersion), { code: 'resource-conflict' });
+  await assert.rejects(s.execution.dispatch('second', other.task.id, other.task.rowVersion), { code: 'capacity' });
   await s.pulse();
   assert.deepEqual(s.wakes, [sessionId, s.managerAgent.id]);
   assert.equal(notice()?.attempts, 1);

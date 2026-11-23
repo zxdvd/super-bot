@@ -40,6 +40,34 @@ test('a frozen version 2 ledger upgrades with old responsibility and inputs pres
   const dir=mkdtempSync(join(tmpdir(),'super-bot-migrate-'));try {const file=join(dir,'ledger.sqlite');oldLedger(file);assertOld(file);assertUpgraded(file);}finally{rmSync(dir,{recursive:true,force:true});}
 });
 
+test('a version 10 ledger keeps held Runs while dropping directory exclusivity',t=>{
+  const dir=mkdtempSync(join(tmpdir(),'super-bot-migrate-'));
+  const file=join(dir,'ledger.sqlite'),cwd=join(dir,'shared');
+  t.after(()=>rmSync(dir,{recursive:true,force:true}));
+  const old=new Store(file);
+  const bot=old.createBot('bot',{name:'Bot',instructions:'Synthetic'});
+  const task=(name:string)=>{
+    const created=old.createTask(`task:${name}`,{botId:bot.id,goal:name,scope:'Own files',acceptance:'Read back',reviewPolicy:'human'});
+    const binding=old.beginBinding(`bind:${name}`,created.id,created.rowVersion,cwd);
+    old.confirmBinding(binding.id,binding.requestedSessionId);
+    return old.getTask(created.id);
+  };
+  const first=task('first'),second=task('second');
+  const run=old.reserveRun('first',first.id,first.rowVersion);
+  old.db.exec('DROP TABLE resources; CREATE TABLE resources (runId TEXT PRIMARY KEY REFERENCES runs(id),cwd TEXT NOT NULL UNIQUE); PRAGMA user_version=10;');
+  old.db.prepare('INSERT INTO resources VALUES (?,?)').run(run.id,cwd);
+  old.close();
+
+  const upgraded=new Store(file);
+  try {
+    assert.deepEqual(upgraded.heldRuns().map(item=>item.id),[run.id]);
+    assert.equal(upgraded.activeBinding(first.id)?.cwd,cwd);
+    const next=upgraded.reserveRun('second',second.id,second.rowVersion);
+    assert.deepEqual(new Set(upgraded.heldRuns().map(item=>item.id)),new Set([run.id,next.id]));
+    assert.deepEqual(upgraded.db.prepare('PRAGMA foreign_key_check').all(),[]);
+  }finally{upgraded.close();}
+});
+
 test('migration failure rolls back new tables and version, leaving old data repairable',()=>{
   const dir=mkdtempSync(join(tmpdir(),'super-bot-migrate-'));try {
     const file=join(dir,'ledger.sqlite');oldLedger(file);

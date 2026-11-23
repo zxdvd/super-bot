@@ -93,7 +93,7 @@ SUPER_BOT_PROFILE=super-bot-trial npm run dev:reload -- --wait 30
 - `npm run smoke`：测试宿主运行时检查真实状态、WAL、未认证访问与跨域拒绝。
 - `npm pack --dry-run`：核对分发清单；运行数据和契约测试插件不进入安装包。
 
-Node 用 fnm 管理时，可用 `fnm exec --using=24.21.0 npm run dev`，无需改变机器默认版本。完整执行流程和可靠性门槛见任务清单。未启用 Manager 时，创建任务只保存目标，“开始执行”才调用原生会话中选定的模型。启用 Manager 后，完整且未暂停的任务会自动安排执行；Bot 的 `create` 默认在同一次调用内准备 Worker 会话并派发（名额或目录占用时排队等待），缺省的范围/验收由 Bot 推断或使用保守默认值；`dispatch: false` 保留先澄清缺项的流程。需要先核对时，请在创建表单选择“先暂停”。Worker 使用普通 DSH Session。默认（省略 `fullAccess` 或设为 `true`）使用原生 Full Access 预设和宿主可用工具，包括 Shell、Git 与子 Agent；Super Bot 不再附加工具白名单、目录守卫或执行步数/时长上限。每个任务的工作目录由 Bot 按实际情况选择（见下文“任务工作目录”），配置只给出允许范围、默认策略和可选 hook。全局默认最多两个未收敛任务；不同目录可并发，同一或嵌套目录按先后顺序（FIFO）排队，Bot 会被告知排在哪个任务之后。暂停阻止后续派发，停止请求取消并核对收敛。只有显式 `fullAccess: false` 才启用 files 模式，用于兼容和隔离验证：只允许任务目录内 read/write/edit 与报告，每次最多 40 步或 10 分钟，目录变化和预算耗尽转核对。
+Node 用 fnm 管理时，可用 `fnm exec --using=24.21.0 npm run dev`，无需改变机器默认版本。完整执行流程和可靠性门槛见任务清单。未启用 Manager 时，创建任务只保存目标，“开始执行”才调用原生会话中选定的模型。启用 Manager 后，完整且未暂停的任务会自动安排执行；Bot 的 `create` 默认在同一次调用内准备 Worker 会话并派发（执行名额满时排队），缺省的范围/验收由 Bot 推断或使用保守默认值；`dispatch: false` 保留先澄清缺项的流程。需要先核对时，请在创建表单选择“先暂停”。Worker 使用普通 DSH Session。默认（省略 `fullAccess` 或设为 `true`）使用原生 Full Access 预设和宿主可用工具，包括 Shell、Git 与子 Agent；Super Bot 不再附加工具白名单、目录守卫或执行步数/时长上限。每个任务的工作目录由 Bot 按实际情况选择（见下文“任务工作目录”），配置只给出允许范围、默认策略和可选 hook。全局默认最多两个未收敛任务。独立任务可在同一或嵌套目录并行，执行名额满时按先后顺序排队。暂停阻止后续派发，停止请求取消并核对收敛。只有显式 `fullAccess: false` 才启用 files 模式，用于兼容和隔离验证：只允许任务目录内 read/write/edit 与报告，每次最多 40 步或 10 分钟，目录变化和预算耗尽转核对。
 
 
 可选限额（Super Bot `config` 下，均为正整数）：`maxRunningTasks`（全局同时执行的 Worker 任务，默认 2）、`managerWakesPerHour`（每个 Bot 每小时自动唤醒，默认 20；达到后在状态里记录一次问题并保留通知，下一次成功唤醒后清除）、`managerConcurrentWakes`（同时唤醒的 Bot，默认 2）、`managerTurnMinutes`（单次自动 Bot 轮次上限，默认 5 分钟）。补交付最多 3 次、files 模式 40 步/10 分钟仍为固定值。
@@ -147,7 +147,7 @@ Bot 在 `super_bot_manage` 的 `create`/`dispatch` 中可传 `workdir`，按任�
 
 | mode | 含义 | 必填 |
 | --- | --- | --- |
-| `existing` | 直接在已有目录工作（独占；同一/嵌套目录的后来任务排队） | `path` |
+| `existing` | 直接在已有目录工作，多个任务可以共用该目录 | `path` |
 | `isolated` | 在 `defaultIsolatedDir`（或 `under`）下新建 `<name>-<id8>` 空目录 | 无 |
 | `worktree` | 从 Git 仓库顶层的已提交 `base`（默认 `HEAD`）建 worktree，分支 `sb/<name>-<id8>`（或 `branch`） | `repo` |
 | `hook` | 运行配置的 `workdirHook.create`，读取 stdout 最后一行 `SB_WORKDIR=<dir>`（缺省为 hook cwd 下的 `<name>`） | 无 |
@@ -185,7 +185,7 @@ Bot 在 `super_bot_manage` 的 `create`/`dispatch` 中可传 `workdir`，按任�
 
 第一次使用真实账号时，可按 [真实模型试用步骤](docs/first-trial.md) 走一项本地文件任务。
 
-1. 在 Super Bot 中填写名字，点击“创建并聊天”；职责可以留空。已有 Bot 点“继续聊天”即回到原对话。
+1. 在 Super Bot 中填写名字，点击“创建并聊天”；职责可以留空。已有 Bot 可从左侧列表直接回到当前原生对话。
 2. 在原生模型选择器中选择并配置模型。直接交代工作，例如：“写一份新同事入职准备清单，保存成 Markdown，包含入职前、第一天和第一周三部分。”
 3. Bot 自行安排文件任务；有问题在原对话回答。完成后在同一对话查看摘要、检查说明和成果下载链接。
 4. 需要修改就继续说；Bot 将实际用户消息交给对应任务返工。完成后点交付中的“查看成果并确认”，直接进入该成果详情，检查后点击“接受成果”。Bot 不能代替人点击接受。
@@ -222,6 +222,10 @@ fnm exec --using=24.21.0 node --import tsx --test test/adapter/work-view.test.ts
 ```
 
 Worker 完成源码验证后，外层已在 Bot/Worker 空闲时执行原生 HMR，并核对入口、宽窄屏和真实返工；所有成果继续待人工验收。
+
+## 切换 Bot 与 Workspace 侧栏
+
+左侧默认按创建顺序显示本端已有的 Bot。点击名称打开该 Bot 当前绑定的原生对话。左下角「切换到 Workspace」恢复 DSH 的工作区和会话列表，Worker 会话沿用 DSH 的原生展示规则。同一按钮可切回 Bot 列表。切换时当前聊天与右侧工作视图保持打开，重新加载页面后默认显示 Bot 列表。
 
 ## 原生侧栏命名与整理（DF-08）
 
@@ -315,7 +319,7 @@ npm run restore:ledger -- /absolute/path/backup.sqlite /absolute/path/new-super-
 
 如果只有 tgz，先解包，然后用 `node /absolute/path/package/scripts/restore-ledger.mjs /absolute/path/backup.sqlite /absolute/path/new-super-bot-data` 调用包内脚本。
 
-恢复脚本检查完整性和 schema，拒绝覆盖现有目录。恢复后的未完成任务全部暂停并产生待核对事项，旧管理通知不自动重放；备份之后真实文件或会话可能已经变化，需要逐项核对。原账本与备份不会被修改。当前 schema 为 10，恢复脚本接受 schema 6～10 的备份。旧账本在新宿主首次打开时事务升级。schema 10 增加按成果版本保存的附件副本，历史成果继续以原记录为准。schema 9 新增 Run 的原进程轮次/事件坐标与后台收敛证据；旧 Run 不补造证据，未完成且证据不足时仍保留资源待核对。其他版本会拒绝，需先使用对应版本处理。升级前应先备份；旧插件不能打开已升级账本。回退时停止宿主，使用旧版插件、对应旧版恢复脚本和升级前的备份恢复到新目录，不能覆盖或降级当前数据库。
+恢复脚本检查完整性和 schema，拒绝覆盖现有目录。恢复后的未完成任务全部暂停并产生待核对事项，旧管理通知不自动重放；备份之后真实文件或会话可能已经变化，需要逐项核对。原账本与备份不会被修改。当前 schema 为 11，恢复脚本接受 schema 6～11 的备份。旧账本在新宿主首次打开时事务升级。schema 11 移除执行记录的目录唯一约束，保留已占用的 Worker 名额。schema 10 增加按成果版本保存的附件副本，历史成果继续以原记录为准。schema 9 新增 Run 的原进程轮次/事件坐标与后台收敛证据；旧 Run 不补造证据，未完成且证据不足时仍保留资源待核对。其他版本会拒绝，需先使用对应版本处理。升级前应先备份；旧插件不能打开已升级账本。回退时停止宿主，使用旧版插件、对应旧版恢复脚本和升级前的备份恢复到新目录，不能覆盖或降级当前数据库。
 
 脚本完成后、启动前，将对应备份的 `memory/` 放入新数据目录，保留各 Bot ID 和原有私有权限。SQLite 恢复会带回历史任务约定快照及已保存的附件，但不会从快照重建 Markdown 默认约定和决策笔记。启动时设置 `SUPER_BOT_DATA_DIR=/absolute/path/new-super-bot-data`，或设置优先级更高的插件 `dataDir`。继续使用原 DSH home，或先恢复对应会话与旧成果所需的原文件。切回原账本时，停止宿主并撤销该设置。每组会话和成果由一个宿主运行。
 

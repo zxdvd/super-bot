@@ -276,7 +276,7 @@ export function workdirGuidance(policy:WorkdirPolicy):string {
     policy.hook?`hook {name?, args?} = run the user's provisioning hook. Hook purpose: ${policy.hook.description??'(no description)'}. Allowed args: ${(policy.hook.argNames??[]).join(', ')||'none'}.`:'hook = not configured.',
     'Pick from the request and context: if the user named a repo or folder and wants it changed in place use existing; if they want changes to a repo without touching their checkout, or another task already uses it, use worktree; otherwise isolated.',
     'Give name as a short English kebab-case phrase. If the repository is unclear, check with read-only shell commands or ask; do not guess a root and leave the Worker to search.',
-    'workdir-rejected means the plugin refused the path; choose another mode or ask the user, never work around it. A deferred resource-conflict names the holder task: tell the user it is queued behind that task and offer worktree if parallel work is wanted. Mention the working directory when delivering.',
+    'workdir-rejected means the plugin refused the path; choose another mode or ask the user, never work around it. Mention the working directory when delivering.',
   ].join('\n');
 }
 /** One line for the Worker message and the Bot: where and how this task works. */

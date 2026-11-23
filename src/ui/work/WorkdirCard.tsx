@@ -24,7 +24,7 @@ export function WorkdirCard({ w, detail }: { w: WorkspaceState; detail: Detail }
       {info.branch && <> 分支 <code>{info.branch}</code></>}{info.repo && <> · 仓库 <code>{info.repo}</code></>}
       {info.note && <> · {info.note}</>}
     </p>}
-    {info?.mode === 'existing' && <p className="muted hint">已有目录由用户维护，Super Bot 不会删除它；同一目录的其他任务会排队。</p>}
+    {info?.mode === 'existing' && <p className="muted hint">多个任务可以共用这个目录。目录由用户维护。</p>}
     {cleanable && <ConfirmAction key={`cleanup:${binding!.id}`} label="清理工作目录" disabled={w.locked}
       explanation="将删除此任务创建的目录。含未提交改动的 worktree 会保留。已保存的成果附件仍可下载，旧成果若只有原路径将无法下载。"
       submit={() => w.mutate('workdir.cleanup', { id: task.id })}/>}

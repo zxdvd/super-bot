@@ -12,6 +12,7 @@ import type { UseSidebarRightTabInfo } from '@deepseek-ai/dsh-client-ui-sidebar-
 import { WorkButton, SessionOriginHint, SessionWork } from './ui/SessionWork.tsx';
 import { WORK_TAB, chatDeliveryLink, openBotConversation, openWorkLink, sameWorkHost, workLinkForUrl } from './ui/work-navigation.ts';
 import { BotHome } from './ui/BotHome.tsx';
+import { installBotSidebar } from './ui/BotSidebar.tsx';
 import { parseWorkLink, RESULT_FILE_PATH, resultFileUrl, workUrl } from './work-links.ts';
 
 export const inject = ['slots', 'uiWorkspace', 'connection', 'layout', 'sidebarRight', 'sidebarRightTabs'];
@@ -123,4 +124,5 @@ export function apply(context: Context): void {
   ctx.slots.inject('main', () => ctx.slots.register({ name: 'main', key: 'super-bot', inject: () => ({}) }, () => <BotHome api={api}/>));
   ctx.slots.inject('sidebar.panellist', () => ctx.slots.register(
     { name: 'sidebar.panellist', id: 'super-bot', order: 11, label: () => 'Super Bot' }, Icon));
+  ctx.effect(() => installBotSidebar(ctx.slots, api));
 }

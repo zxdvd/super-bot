@@ -197,7 +197,7 @@ export function optionalText(value: unknown, label: string, max = 10000): string
 export interface ChatSource { sessionId:string; messageId:string; seq:number; text:string; messages?:{messageId:string;seq:number;text:string}[] }
 
 /** Why a prepared task is not running yet; holder is the task that has (or is ahead in line for) the slot or directory. */
-export interface DispatchWait {code:'capacity'|'resource-conflict';holderTaskId:string|null;holderGoal:string|null}
+export interface DispatchWait {code:'capacity';holderTaskId:string|null;holderGoal:string|null}
 
 export interface RecoveryContinuation {
   attentionId: string; bindingId: string; expectedBindingGeneration: number;

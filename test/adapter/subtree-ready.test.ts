@@ -77,7 +77,7 @@ async function fixture(version:'rc.1'|'rc.5'='rc.5') {
     close:async()=>{joined.resolve(true);agent.cancel();agent.status='idle';idle.resolve();await execution.dispose();store.close();assert.ok(directory.startsWith(resolve('.runtime/subtree-ready-')));rmSync(directory,{recursive:true,force:true});}};
 }
 
-for(const version of ['rc.1','rc.5'] as const)test(`${version} early ready holds the directory and requires a fresh same-turn report`,async()=>{
+for(const version of ['rc.1','rc.5'] as const)test(`${version} early ready holds the execution slot and requires a fresh same-turn report`,async()=>{
   const f=await fixture(version);try {
     f.startChild();let returned=false;
     const first=f.call('early-ready').finally(()=>{returned=true;});void first.catch(()=>{});
@@ -87,9 +87,10 @@ for(const version of ['rc.1','rc.5'] as const)test(`${version} early ready holds
     assert.equal(returned,false,'the first ready stays in the parent turn until tree work converges');
     assert.equal(f.store.runResult(f.run.id),null,'do not hash or commit evidence before the child finishes');
     assert.equal(f.store.getRun(f.run.id).finishedAt,null);assert.equal(f.store.heldRuns().length,1);assert.equal(f.released(),false);
-    const other=f.store.createTask('other',{botId:f.task.botId,goal:'Conflicting work',scope:'Same directory',acceptance:'No overlap',reviewPolicy:'human'});
+    f.store.maxRunningTasks=1;
+    const other=f.store.createTask('other',{botId:f.task.botId,goal:'Queued work',scope:'Same directory',acceptance:'Own files',reviewPolicy:'human'});
     const binding=f.store.beginBinding('other-bind',other.id,other.rowVersion,f.directory);f.store.confirmBinding(binding.id,binding.requestedSessionId);
-    assert.equal(f.store.dispatchBlocker(other.id),'resource-conflict');
+    assert.equal(f.store.dispatchBlocker(other.id),'capacity');
     f.enqueueChildResult();f.finishChild();const continuation=await first;
     assert.equal(continuation.accepted,false);assert.equal(continuation.reason,'subtree-joined');assert.match(continuation.next,/子 Agent/);
     assert.equal(f.conclusions(),0);assert.equal(f.store.finalReport(f.run.id),null);assert.equal(f.store.heldRuns().length,1);
@@ -99,6 +100,7 @@ for(const version of ['rc.1','rc.5'] as const)test(`${version} early ready holds
     await f.stopping();f.order.push('parent-end');await f.emit('turn/end',{turn:1,reason:{kind:'completed'}});
     assert.equal(f.store.getRun(f.run.id).state,'settled');assert.equal(f.store.getTask(f.task.id).lifecycle,'review');
     assert.equal(f.store.heldRuns().length,0);assert.equal(result.humanAcceptedAt,null);
+    assert.equal(f.store.dispatchBlocker(other.id),null);
     assert.deepEqual(f.order,['early-ready','child-end','final-ready','conclude','parent-end']);
     assert.equal(f.store.runTurn(f.run.id)?.quiet,1);
   }finally{await f.close();}

@@ -474,14 +474,13 @@ test('real ready, settlement, pause, rework and cancellation facts project disti
   } finally { f.store.close(); }
 });
 
-for (const reason of ['directory', 'capacity'] as const) test(`DF-13 task detail explains ${reason} waits and offers consistent actions`, () => {
+test('DF-13 task detail explains capacity waits and offers consistent actions', () => {
   const f = fixture();
   const w = { locked: false } as WorkspaceState;
   try {
     f.store.maxRunningTasks = 1;
-    const occupied = '/synthetic/occupied';
-    for (const [task, path] of [[f.ta, occupied], [f.tb, reason === 'directory' ? occupied : '/synthetic/other']] as const) {
-      const binding = f.store.beginBinding(`binding-${task.id}`, task.id, task.rowVersion, path);
+    for (const task of [f.ta, f.tb]) {
+      const binding = f.store.beginBinding(`binding-${task.id}`, task.id, task.rowVersion, '/synthetic/shared');
       f.store.confirmBinding(binding.id, binding.requestedSessionId);
     }
     const holder = f.store.reserveRun('holder', f.ta.id, f.store.getTask(f.ta.id).rowVersion);
@@ -497,12 +496,12 @@ for (const reason of ['directory', 'capacity'] as const) test(`DF-13 task detail
       return { detail, status: text(head.at(-2)), starts: [start(primary.type(primary.props)), start(advanced.type(advanced.props))] };
     };
     const rowVersion = f.store.getTask(f.tb.id).rowVersion;
-    assert.throws(() => f.store.reserveRun('blocked', f.tb.id, rowVersion), { code: reason === 'directory' ? 'resource-conflict' : 'capacity' });
+    assert.throws(() => f.store.reserveRun('blocked', f.tb.id, rowVersion), { code: 'capacity' });
     f.store.recordWait(f.tb.id);
     f.store.enqueueManager(f.b.id, `capacity:${f.tb.id}:${rowVersion}`, 'Synthetic wait', f.tb.id);
     const blocked = show();
     assert.deepEqual(blocked.starts, [false, false]);
-    assert.match(blocked.status, reason === 'directory' ? /工作目录被占用，排在「A+」之后/ : /等待执行名额/);
+    assert.match(blocked.status, /等待执行名额/);
     assert.match(blocked.status, /Bot 会继续安排/);
     f.store.saveRunMessage(holder.id, 'holder-input', '{}');
     f.store.claimDispatch(holder.id);f.store.inputEntered(holder.id, 'holder-input', 1);

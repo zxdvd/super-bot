@@ -1,9 +1,10 @@
-/** Two live native Workers share one Bot; another Bot waits for a released slot. */
+/** Two live native Workers share one directory; another Bot waits for a released slot. */
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import { setTimeout as delay } from 'node:timers/promises';
 import { hostClient } from './host-client.mjs';
-const client=await hostClient(),prefix=`capacity:${randomUUID()}`;
+const client=await hostClient(process.env.SUPER_BOT_TEST_LOG),prefix=`capacity:${randomUUID()}`;
+const shared=process.env.SUPER_BOT_TEST_SHARED_WORKDIR;
 async function raw(action,payload={}) {const response=await client.post('/api/super-bot',{type:'client-request',rpcId:randomUUID(),method:'super-bot',payload:{action,...payload}});assert.equal(response.status,200);return (await response.json()).result;}
 async function call(action,payload={}) {const result=await raw(action,payload);assert.equal(result.ok,true,JSON.stringify(result));return result.value;}
 async function select(sessionId) {const response=await client.post('/api/super-bot-probe',{action:'select-test-model',sessionId});assert.equal(response.status,200);}
@@ -13,12 +14,17 @@ const secondBot=await call('bot.create',{requestId:prefix+':bot-b',name:'等待�
 const held=[];
 try {
   for(let n=0;n<2;n++) {
-    const task=await call('task.create',{requestId:prefix+':task-'+n,botId:firstBot.id,goal:'STOP_PROBE',scope:'本任务目录',acceptance:'明确停止',reviewPolicy:'human'});
+    const task=await call('task.create',{requestId:prefix+':task-'+n,botId:firstBot.id,goal:'STOP_PROBE',scope:'本任务目录',acceptance:'明确停止',reviewPolicy:'human',
+      ...(shared?{workdir:{mode:'existing',path:shared}}:{})});
     const binding=await call('session.prepare',{requestId:prefix+':prepare-'+n,id:task.id,expectedRowVersion:task.rowVersion});await select(binding.sessionId);
     const current=(await call('task.detail',{id:task.id})).task;await call('task.dispatch',{requestId:prefix+':dispatch-'+n,id:task.id,expectedRowVersion:current.rowVersion});held.push(task.id);
     await waitFor(task.id,state=>state.input.state==='entered');
   }
-  const both=await Promise.all(held.map(id=>call('task.detail',{id})));assert.ok(both.every(state=>state.run.state==='running'));assert.notEqual(both[0].binding.sessionId,both[1].binding.sessionId);assert.notEqual(both[0].binding.cwd,both[1].binding.cwd);
+  const both=await Promise.all(held.map(id=>call('task.detail',{id})));
+  assert.ok(both.every(state=>state.run.state==='running'));
+  assert.notEqual(both[0].binding.sessionId,both[1].binding.sessionId);
+  if(shared)assert.deepEqual(both.map(state=>state.binding.cwd),[shared,shared]);
+  else assert.notEqual(both[0].binding.cwd,both[1].binding.cwd);
   const task=await call('task.create',{requestId:prefix+':third',botId:secondBot.id,goal:'等待名额后生成说明',scope:'自己的任务目录',acceptance:'有两项事实',reviewPolicy:'human'});
   const binding=await call('session.prepare',{requestId:prefix+':prepare-third',id:task.id,expectedRowVersion:task.rowVersion});await select(binding.sessionId);
   const current=(await call('task.detail',{id:task.id})).task;
@@ -28,7 +34,7 @@ try {
   const stopState=await call('task.detail',{id:held[0]});await call('task.stop',{requestId:prefix+':free-slot',id:held[0],expectedRowVersion:stopState.task.rowVersion});await waitFor(held[0],state=>state.run.state==='cancelled');
   const result=await waitFor(task.id,state=>state.task.lifecycle==='review');assert.equal(result.input.state,'entered');assert.equal(result.binding.sessionId,binding.sessionId);assert.equal(result.task.botId,secondBot.id);
   assert.equal((await call('task.detail',{id:held[1]})).run.state,'running');
-  console.log(JSON.stringify({ok:true,heldTasks:held,waitingTask:task.id,checks:['two Workers of one Bot actually run concurrently','third dispatch creates no Run when full','Manager capacity event waits without overselling','released slot admits the other Bot while second Worker stays active']},null,2));
+  console.log(JSON.stringify({ok:true,heldTasks:held,waitingTask:task.id,sharedWorkdir:shared??null,checks:['two Workers of one Bot actually run concurrently','third dispatch creates no Run when full','Manager capacity event waits without overselling','released slot admits the other Bot while second Worker stays active']},null,2));
 }finally {
   for(const id of held){const state=await call('task.detail',{id});if(state.run.finishedAt===null){await call('task.stop',{requestId:prefix+':cleanup:'+id,id,expectedRowVersion:state.task.rowVersion});await waitFor(id,state=>state.run.state==='cancelled');}}
 }

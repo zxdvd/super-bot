@@ -19,6 +19,26 @@ function entered(store:Store,key='1') {
 }
 const ready={kind:'ready' as const,summary:'说明已生成',checks:'两项事实均在文档中',evidence:[{path:'/tmp/result.md',sha256:'synthetic',bytes:30}]};
 
+test('the local Bot list retains its order after Worker activity', t => {
+  const store = new Store(':memory:');
+  let now = Date.now();
+  t.mock.method(Date, 'now', () => ++now);
+  try {
+    const first = prepared(store, 'first'), second = prepared(store, 'second');
+    const botOrder = () => store.listBots().map(bot => bot.id);
+    const expected = [first.botId, second.botId];
+    assert.deepEqual(botOrder(), expected);
+
+    const run = store.reserveRun('dispatch-first', first.id, first.rowVersion);
+    store.saveRunMessage(run.id, 'message-first', JSON.stringify({ id: 'message-first' }));
+    assert.equal(store.claimDispatch(run.id), true);
+    store.inputEnqueued(run.id);
+    store.inputEntered(run.id, 'message-first', 15);
+    assert.equal(store.getTask(first.id).status, 'running');
+    assert.deepEqual(botOrder(), expected);
+  } finally { store.close(); }
+});
+
 test('evidence reads have hard byte limits and previews disclose truncation while verifying full hashes',async()=>{
   const root=mkdtempSync(join(tmpdir(),'super-bot-bounds-'));
   try {
@@ -193,14 +213,6 @@ test('resuming management after native input cannot revive the previous run auth
     assert.throws(()=>store.workerReport(run.id,'late',ready),/执行或目标已改变/);
   }finally{store.close();}
 });
-test('capacity and overlapping work directories reject additional dispatches',()=>{
-  const store=new Store(':memory:');try {
-    const one=prepared(store,'1','/tmp/shared');store.reserveRun('d1',one.id,one.rowVersion);
-    const nested=prepared(store,'nested','/tmp/shared/child');assert.throws(()=>store.reserveRun('dn',nested.id,nested.rowVersion),/重叠/);
-    const two=prepared(store,'2','/tmp/other');store.reserveRun('d2',two.id,two.rowVersion);
-    const three=prepared(store,'3','/tmp/third');assert.throws(()=>store.reserveRun('d3',three.id,three.rowVersion),/名额已占用/);
-  }finally{store.close();}
-});
 test('answer stays pending until its own message enters, and a cancelled answer reopens the question',()=>{
   const store=new Store(':memory:');try {
     const {task,run}=entered(store);store.workerReport(run.id,'ask',{kind:'waiting',summary:'面向谁？'});store.settleRun(run.id);
@@ -360,22 +372,16 @@ test('run budgets persist the reason, retain ownership until stopped, and requir
   }finally{store.close();}
 });
 
-test('directory overlap includes the filesystem root in either acquisition order',()=>{
-  for(const [first,second] of [['/','/tmp/project'],['/tmp/project','/'],['/tmp/project','/tmp/project/nested']]) {
-    const store=new Store(':memory:');try {
-      const a=prepared(store,'a',first),b=prepared(store,'b',second);store.reserveRun('run-a',a.id,a.rowVersion);
-      assert.throws(()=>store.reserveRun('run-b',b.id,b.rowVersion),/目录.*重叠/);assert.equal(store.latestRun(b.id),null);
-    }finally{store.close();}
-  }
-});
-
 test('maxRunningTasks bounds global execution slots',()=>{
   const directory=mkdtempSync(join(tmpdir(),'super-bot-slots-'));const store=new Store(join(directory,'ledger.sqlite'));
   try {
     store.maxRunningTasks=1;
-    const one=prepared(store,'slot-1','/tmp/slot-1'),two=prepared(store,'slot-2','/tmp/slot-2');
+    const one=prepared(store,'slot-1','/tmp/shared'),two=prepared(store,'slot-2','/tmp/shared');
     store.reserveRun('slot-run-1',one.id,one.rowVersion);
     assert.equal(store.dispatchBlocker(two.id),'capacity');assert.throws(()=>store.reserveRun('slot-run-2',two.id,two.rowVersion),{code:'capacity'});
     store.maxRunningTasks=2;assert.equal(store.dispatchBlocker(two.id),null);
+    assert.equal(store.reserveRun('slot-run-2',two.id,two.rowVersion).state,'queued');
+    const three=prepared(store,'slot-3','/tmp/other');
+    assert.throws(()=>store.reserveRun('slot-run-3',three.id,three.rowVersion),{code:'capacity'});
   }finally{store.close();rmSync(directory,{recursive:true,force:true});}
 });

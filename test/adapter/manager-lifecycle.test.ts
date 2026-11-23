@@ -4,9 +4,11 @@ import {mkdtempSync,rmSync} from 'node:fs';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 import type {Context} from '@deepseek-ai/cordis';
+import {apply as applyClient} from '../../src/client.tsx';
 import {Store} from '../../src/store.ts';
 import {Managers} from '../../src/manager.ts';
 import type {DshExecution} from '../../src/dsh.ts';
+import type {WorkspaceApi} from '../../src/ui/work/api.ts';
 
 function fixture(){
   const directory=mkdtempSync(join(tmpdir(),'super-bot-manager-retry-')),store=new Store(':memory:');
@@ -29,6 +31,51 @@ function fixture(){
   return {store,bot,managers,agents,counts:()=>({creates,resolves}),beforeResolve:(callback:(id:string)=>Promise<void>)=>{beforeResolve=callback;},close:async()=>{await managers.dispose();store.close();rmSync(directory,{recursive:true,force:true});}};
 }
 const model={provider:'fake',model:'explicit-original'};
+
+test('client openBot reuses the ready native chat and follows its replacement', async () => {
+  const f = fixture();
+  try {
+    const opened: string[] = [];
+    let api: WorkspaceApi | undefined;
+    let navigation = new AbortController();
+    applyClient({
+      effect: () => {},
+      slots: {
+        inject: (_name: string, register: () => void) => register(),
+        register: (slot: { name: string; key?: string }, render: () => { props: { api: WorkspaceApi } }) => {
+          if (slot.name === 'main' && slot.key === 'super-bot') api = render().props.api;
+        },
+      },
+      connection: { rpc: { call: async (path: string, method: string, payload: Record<string, string>) => {
+        assert.equal(path, '/api');
+        assert.equal(method, 'super-bot');
+        assert.equal(payload.action, 'manager.prepare');
+        assert.equal(payload.botId, f.bot.id);
+        return { ok: true, value: await f.managers.prepare(payload.requestId, payload.botId) };
+      } } },
+      layout: { beginNavigation: () => {
+        navigation.abort();
+        navigation = new AbortController();
+        return navigation.signal;
+      } },
+      uiWorkspace: { openSession: (id: string) => opened.push(id) },
+    } as unknown as Context);
+    assert.ok(api);
+
+    const first = await f.managers.prepare('first', f.bot.id);
+    await api.openBot(f.bot.id);
+    await api.openBot(f.bot.id);
+    assert.deepEqual(opened, [first.sessionId, first.sessionId]);
+    assert.equal(f.counts().creates, 1);
+
+    const next = await f.managers.replace('replacement', f.bot.id, first.generation);
+    assert.notEqual(next.sessionId, first.sessionId);
+    await api.openBot(f.bot.id);
+    assert.deepEqual(opened, [first.sessionId, first.sessionId, next.sessionId]);
+    assert.equal(f.counts().creates, 2);
+  } finally { await f.close(); }
+});
+
 test('prepare retries return their own released generation after Bot configuration changes',async()=>{
   const f=fixture();try{
     const first=await f.managers.prepare('prepare',f.bot.id);

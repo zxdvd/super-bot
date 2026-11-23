@@ -1,4 +1,4 @@
-/** FIFO admission for shared directories and execution slots, through ledger commands. */
+/** FIFO admission for execution slots, through ledger commands. */
 import {test} from 'node:test';
 import assert from 'node:assert/strict';
 import {Store} from '../src/store.ts';
@@ -18,21 +18,15 @@ function setup(max=2) {
   return {store,bot,task,run,wait,finish};
 }
 
-test('a second task on the same existing directory waits behind the holder, and later arrivals queue behind it',()=>{
-  const {store,task,run,wait,finish}=setup();
-  const a=task('a','/repo/app'),b=task('b','/repo/app'),c=task('c','/repo/app/sub'),d=task('d','/repo/other');
+test('independent tasks can share a directory and a nested directory',t=>{
+  const {store,task,run}=setup(3);
+  t.after(()=>store.close());
+  const a=task('a','/repo/app'),b=task('b','/repo/app'),c=task('c','/repo/app/sub');
   const first=run(a);
-  assert.deepEqual(store.dispatchWait(b),{code:'resource-conflict',holderTaskId:a,holderGoal:'Goal a'});
-  assert.throws(()=>run(b),{code:'resource-conflict'});wait(b);
-  assert.equal(store.taskDetail(b).wait?.holderTaskId,a);
-  assert.equal(store.dispatchWait(c)?.holderTaskId,a,'nested directories conflict too');
-  assert.equal(store.dispatchWait(d),null,'unrelated directories are not blocked');
-  finish(first.id);
-  assert.deepEqual(store.dispatchWait(c),{code:'resource-conflict',holderTaskId:b,holderGoal:'Goal b'},'a later task cannot overtake a live waiter');
+  assert.throws(()=>run(a),{code:'run-active'},'the same task still cannot get a second Run');
   assert.equal(store.dispatchWait(b),null);
-  run(b);
-  assert.equal(store.db.prepare('SELECT count(*) AS n FROM waits WHERE taskId=?').get(b)?.n,0,'a started task leaves the line');
-  assert.equal(store.dispatchWait(c)?.holderTaskId,b);
+  const second=run(b),third=run(c);
+  assert.deepEqual(new Set(store.heldRuns().map(r=>r.id)),new Set([first.id,second.id,third.id]));
 });
 test('slot fairness counts earlier runnable waiters; stale or paused waiters do not block the line',()=>{
   const {store,task,run,wait,finish}=setup(1);

@@ -12,7 +12,7 @@
 
 Input 追踪 accepted→enqueued→entered（或 discarded/unknown）。Inbox claimed 不能直接等同于 entered；准备阶段取消时，输入可能未进入持久 user/message。没有宿主事实不显示“已读”。
 
-单任务、单 Session 只允许一个未收敛 Run。不同 Session 仍须检查规范化写目录和资源占用。`realpath`/父子目录重叠需要识别；独立 worktree 只隔离 checkout，不隔离共享数据库、端口或 Git 外部副作用。
+单任务、单 Session 只允许一个未收敛 Run。独立任务可以在同一目录或父子目录并行，派发统一按全局 Worker 名额排队。工作目录仍按既有授权范围核对，实际路径记录在执行绑定上。
 
 ## 停止、接管与重启
 

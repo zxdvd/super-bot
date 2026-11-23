@@ -402,8 +402,8 @@ test('configured workspace dispatches two tasks into independent directories',as
 });
 
 
-test('overlapping legacy bindings defer and pump waits for both capacity and directory release',async t=>{
-  const f=fixture(t);try {
+test('legacy bindings in the same directory defer only while capacity is full',async t=>{
+  const f=fixture(t,false,()=>({maxRunningTasks:1}));try {
     const tasks=[1,2].map(n=>f.store.createTask(`legacy-${n}`,{botId:f.bot.id,goal:`Legacy ${n}`,scope:'Own files',acceptance:'Read files',reviewPolicy:'human'}));
     for(const task of tasks) {
       const binding=f.store.beginBinding(`binding-${task.id}`,task.id,task.rowVersion,f.directory);
@@ -412,7 +412,7 @@ test('overlapping legacy bindings defer and pump waits for both capacity and dir
     }
     const first=await f.call('first',{action:'dispatch',taskId:tasks[0].id,expectedRowVersion:f.store.getTask(tasks[0].id).rowVersion});
     const deferred=await f.call('second',{action:'dispatch',taskId:tasks[1].id,expectedRowVersion:f.store.getTask(tasks[1].id).rowVersion});
-    assert.equal(deferred.deferred,true);assert.equal(f.store.latestRun(tasks[1].id),null);
+    assert.equal(deferred.reason,'capacity');assert.equal(f.store.latestRun(tasks[1].id),null);
     f.store.db.exec("UPDATE outbox SET state='done' WHERE kind='manager.notify' AND id NOT LIKE 'manager-event:capacity:%'");
     assert.ok(f.store.pendingManagerEvents(f.bot.id)[0].id.startsWith('manager-event:capacity:'));
     await f.ctx.sessionController.create({workspaceId:f.directory as any,sessionId:f.manager.requestedSessionId as any});
@@ -476,19 +476,18 @@ async function parallelFixture(t:TestContext,maxRunningTasks=2){
   return {f,root,dir,create,dispatch,pump,notice,openManager,enterManager,endManager};
 }
 
-for(const [kind,waiters] of [['directory',1],['directory',12],['capacity',12]] as const){
-  test(`DF-13 pump skips ${waiters} older ${kind} waits for independent Worker notification`,async t=>{
-    const byDirectory=kind==='directory';
+for(const waiters of [1,12]){
+  test(`DF-13 pump skips ${waiters} older capacity waits for independent Worker notification`,async t=>{
     const {f,dir,create,pump,notice,openManager,enterManager,endManager}=await parallelFixture(t);
     const independent=await create('Independent',dir('independent'));
     const file=join(dir('independent'),'result.md');writeFileSync(file,'Independent evidence');
     const shared=dir('shared'),holder=await create('Holder',shared);
     assert.ok(holder.run);
-    if(!byDirectory)f.store.maxRunningTasks=1; // The holder continues to occupy the remaining slot after settlement.
+    f.store.maxRunningTasks=1; // The holder continues to occupy the remaining slot after settlement.
     const waiting=[];
     for(let i=0;i<waiters;i++){
-      const queued=await create(`Queued ${i}`,byDirectory?shared:dir(`slot-${i}`));
-      assert.equal(queued.reason,byDirectory?'resource-conflict':'capacity');
+      const queued=await create(`Queued ${i}`,shared);
+      assert.equal(queued.reason,'capacity');
       waiting.push(`manager-event:capacity:${queued.task.id}:${queued.task.rowVersion}`);
     }
     t.mock.timers.tick(1);
@@ -516,14 +515,16 @@ for(const [kind,waiters] of [['directory',1],['directory',12],['capacity',12]] a
 
 test('DF-13 A wake dispatches B, whose same attention appears only once in automatic Manager replies',async t=>{
   const {f,root,dir,create,dispatch,pump,notice,openManager,enterManager,endManager}=await parallelFixture(t);
-  const holder=await create('Root holder',root);
+  const holders=[await create('First holder',root),await create('Second holder',root)];
   const a=await create('A',dir('a'));
   t.mock.timers.tick(1);
   const b=await create('B',dir('b'));
   const oldB=`manager-event:capacity:${b.task.id}:${b.task.rowVersion}`;
   assert.equal(a.deferred,true);assert.equal(b.deferred,true);assert.equal(notice(oldB)?.state,'pending');
-  await f.finish(holder.task.id,[],'waiting');
-  f.store.settleManagerEvent(`manager-event:settled:${holder.run.id}`);
+  for(const holder of holders){
+    await f.finish(holder.task.id,[],'waiting');
+    f.store.settleManagerEvent(`manager-event:settled:${holder.run.id}`);
+  }
   const manager=await openManager();
   await pump();
   assert.equal(manager.messages.at(-1).source.eventId,`manager-event:capacity:${a.task.id}:${a.task.rowVersion}`);
@@ -566,8 +567,8 @@ test('DF-13 A wake dispatches B, whose same attention appears only once in autom
   await endManager(manager,later.pendingQuestions[0].markdown);
 });
 
-test('DF-13 pump and real dispatch preserve FIFO for the same nested directory',async t=>{
-  const {f,root,dir,create,dispatch,pump,openManager,enterManager,endManager}=await parallelFixture(t);
+test('DF-13 pump and dispatch preserve FIFO when there is one execution slot',async t=>{
+  const {f,root,dir,create,dispatch,pump,openManager,enterManager,endManager}=await parallelFixture(t,1);
   const holder=await create('Root holder',root),parent=dir('parent'),child=dir('parent/child');
   const a=await create('First waiter',parent);t.mock.timers.tick(1);
   const b=await create('Second waiter',child);
@@ -580,7 +581,7 @@ test('DF-13 pump and real dispatch preserve FIFO for the same nested directory',
   assert.equal(premature.holderTaskId,a.task.id);
   assert.ok((await dispatch('start-FIFO-A',a.task.id)).run);
   await endManager(manager,'First waiter started');
-  await pump();assert.equal(manager.messages.length,1,'B waits for A even with a free global slot');
+  await pump();assert.equal(manager.messages.length,1,'B waits while A occupies the slot');
   await f.finish(a.task.id,[],'waiting');
   f.store.settleManagerEvent(`manager-event:settled:${f.store.latestRun(a.task.id)!.id}`);
   await pump();await enterManager(manager);
@@ -590,7 +591,7 @@ test('DF-13 pump and real dispatch preserve FIFO for the same nested directory',
 });
 
 test('DF-13 unknown Worker enqueue retains recovery and only a confirmed retry fulfills the old intent',async t=>{
-  const {f,root,dir,create,dispatch,pump,notice,openManager,enterManager,endManager}=await parallelFixture(t);
+  const {f,root,dir,create,dispatch,pump,notice,openManager,enterManager,endManager}=await parallelFixture(t,1);
   const holder=await create('Root holder',root),task=await create('Retry after recovery',dir('retry'));
   const old=`manager-event:capacity:${task.task.id}:${task.task.rowVersion}`;
   await f.finish(holder.task.id,[],'waiting');
@@ -607,7 +608,7 @@ test('DF-13 unknown Worker enqueue retains recovery and only a confirmed retry f
   assert.equal(manager.messages.at(-1).source.eventId,`manager-event:recovery:${unknown.id}`);
   await endManager(manager,'Recovery requires user confirmation');
   await pump();assert.equal(manager.messages.length,1);
-  assert.ok(f.store.heldRuns().some(run=>run.id===unknown.id),'unknown execution retains its directory');
+  assert.ok(f.store.heldRuns().some(run=>run.id===unknown.id),'unknown execution keeps its execution slot');
   worker.followup=followup;
   const version=f.store.getTask(task.task.id).rowVersion;
   const continuation={attentionId:`run:${unknown.id}`,bindingId:binding.id,expectedBindingGeneration:binding.generation};
@@ -617,7 +618,7 @@ test('DF-13 unknown Worker enqueue retains recovery and only a confirmed retry f
   assert.equal(worker.messages.length,1);
 });
 test('DF-13 reopen fulfills only a legacy unsent intent with a newer Worker receipt',async t=>{
-  const {f,dir,create,dispatch,pump,notice,openManager,enterManager,endManager}=await parallelFixture(t);
+  const {f,dir,create,dispatch,pump,notice,openManager,enterManager,endManager}=await parallelFixture(t,1);
   const shared=dir('legacy');
   const holder=await create('Legacy holder',shared),queued=await create('Legacy waiter',shared);
   const id=`manager-event:capacity:${queued.task.id}:${queued.task.rowVersion}`;
@@ -646,23 +647,22 @@ test('DF-13 reopen fulfills only a legacy unsent intent with a newer Worker rece
   await endManager(manager,'One question after restart');
 });
 
-test('Bot-chosen existing directories are exclusive: the second task waits in FIFO with its holder named',async t=>{
-  const f=fixture(t,false,directory=>({allowedRoots:[work(directory)]}));try {
-    const app=join(f.directory,'work','app');mkdirSync(app);
-    await f.native('request',1,'在 app 里改两处。');
-    const first=await f.call('wd-1',{action:'create',goal:'改登录',workdir:{mode:'existing',path:app}});
-    assert.ok(first.run,JSON.stringify(first));assert.match(first.workdir,/existing/);
-    assert.ok(f.delivered().content[0].text.includes(`Working directory: ${app} (existing directory`));
-    assert.equal(f.store.activeBinding(first.task.id)?.cwd,app);
-    const second=await f.call('wd-2',{action:'create',goal:'改注册',workdir:{mode:'existing',path:app}});
-    assert.equal(second.deferred,true);assert.equal(second.reason,'resource-conflict');assert.equal(second.holderTaskId,first.task.id);
-    assert.match(second.message,/改登录/);
-    assert.equal(f.store.taskDetail(second.task.id).wait?.holderTaskId,first.task.id);
-    const isolated=await f.call('wd-3',{action:'create',goal:'独立调研',workdir:{mode:'isolated',name:'research'}});
-    assert.ok(isolated.run,'an isolated task runs beside the existing-directory holder');
-    assert.equal(f.store.activeBinding(isolated.task.id)?.cwd,join(f.directory,'work','.super-bot-workspaces',`research-${isolated.task.id.slice(0,8)}`));
-    assert.throws(()=>f.store.reserveRun('late',second.task.id,f.store.getTask(second.task.id).rowVersion),{code:'resource-conflict'});
-  }finally{await f.close();}
+test('Bot can dispatch two Workers into the same existing directory',async t=>{
+  const {f,root,create}=await parallelFixture(t);
+  const first=await create('改登录',root),second=await create('改注册',root);
+  assert.ok(first.run&&second.run);
+  assert.notEqual(first.run.sessionId,second.run.sessionId);
+  for(const started of [first,second]) {
+    assert.match(started.workdir,/existing/);
+    assert.equal(f.store.activeBinding(started.task.id)?.cwd,root);
+    assert.match(f.agents.get(started.run.sessionId).messages[0].content[0].text,/Working directory: .* \(existing directory/);
+  }
+  assert.deepEqual(new Set(f.store.heldRuns().map(run=>run.id)),new Set([first.run.id,second.run.id]));
+  const file=join(root,'register.md');writeFileSync(file,'Registration evidence');
+  await f.finish(second.task.id,[file]);
+  assert.equal(f.store.taskDetail(second.task.id).result?.evidence[0]?.path,file);
+  assert.equal(f.store.taskDetail(first.task.id).runHeld,true);
+  assert.equal(f.store.taskDetail(first.task.id).result,null);
 });
 
 test('code delivery from native chat preserves a dirty Git baseline and reports only attributable work', async t => {
