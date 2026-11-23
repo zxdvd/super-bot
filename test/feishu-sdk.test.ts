@@ -148,6 +148,84 @@ test('requires active group, robot membership, and owner on a paginated roster',
   assert.ok(f.calls.some(call => call.url?.endsWith('/members') && call.params.page_token === 'next'));
 });
 
+test('uses the calling robot’s paginated joined groups only for the is_in_chat scope error', async t => {
+  let scenario = 'http-scope';
+  const f = fixture(request => {
+    const url = request.url ?? '';
+    if (url.endsWith('/members/is_in_chat')) {
+      if (scenario === 'http-scope') throw Object.assign(Error('Forbidden'), {
+        config: request, response: { status: 400, data: { code: 99991672, msg: config.appSecret } },
+      });
+      if (scenario === 'body-error') return { code: 99991671 };
+      if (scenario === 'negative') return { code: 0, data: { is_in_chat: false } };
+      return { code: 99991672 };
+    }
+    if (url.endsWith('/im/v1/chats')) {
+      assert.equal(request.method, 'get');
+      assert.equal(request.headers.Authorization, `Bearer ${token}`);
+      assert.equal(request.params.page_size, 100);
+      if (!request.params.page_token) return { code: 0, data: { items: [{ chat_id: 'oc_target_other' }], has_more: true, page_token: 'next' } };
+      return { code: 0, data: { items: scenario === 'missing' ? [] : [{ chat_id: 'oc_target' }], has_more: false } };
+    }
+    assert.ok(url.endsWith('/chats/oc_target'));
+    return { code: 0, data: { name: '群主已授权', chat_mode: 'group', owner_id: config.ownerOpenId } };
+  });
+  t.after(() => f.transport.stop());
+  assert.deepEqual(await f.transport.inspectGroup('oc_target'), { chatId: 'oc_target', name: '群主已授权' });
+  scenario = 'body-scope';
+  assert.deepEqual(await f.transport.inspectGroup('oc_target'), { chatId: 'oc_target', name: '群主已授权' });
+  scenario = 'missing';
+  await assert.rejects(f.transport.inspectGroup('oc_target'), { code: 'feishu-bot-not-in-group' });
+  const visited = f.calls.length;
+  scenario = 'body-error';
+  await assert.rejects(f.transport.inspectGroup('oc_target'), { code: 'feishu-group-lookup' });
+  scenario = 'negative';
+  await assert.rejects(f.transport.inspectGroup('oc_target'), { code: 'feishu-bot-not-in-group' });
+  assert.deepEqual(f.calls.slice(visited).map(call => call.url?.split('/').at(-1)), ['is_in_chat', 'is_in_chat']);
+  assert.equal(f.calls.filter(call => call.url?.endsWith('/members')).length, 0);
+  assert.equal(f.calls.filter(call => call.url?.endsWith('/chats/oc_target')).length, 2);
+});
+
+test('joined groups cannot prove the configured user is a member when someone else owns the chat', async t => {
+  const f = fixture(request => {
+    const url = request.url ?? '';
+    if (url.endsWith('/members/is_in_chat')) return { code: 99991672 };
+    if (url.endsWith('/im/v1/chats')) return { code: 0, data: { items: [{ chat_id: 'oc_target' }] } };
+    if (url.endsWith('/members')) return { code: 99991672, msg: config.appSecret };
+    return { code: 0, data: { name: '他人为群主', chat_mode: 'group', owner_id: 'ou_other' } };
+  });
+  t.after(() => f.transport.stop());
+  await assert.rejects(f.transport.inspectGroup('oc_target'), (error: unknown) => {
+    assert.equal((error as { code: string }).code, 'feishu-group-lookup');
+    assert.doesNotMatch(String(error), /SYNTHETIC_PRIVATE_/);
+    return true;
+  });
+  assert.equal(f.calls.filter(call => call.url?.endsWith('/im/v1/chats')).length, 1);
+  assert.equal(f.calls.filter(call => call.url?.endsWith('/members')).length, 1);
+});
+
+test('joined groups rejects repeated tokens and observes the shared request deadline', async t => {
+  const deadline = 150;
+  let waitForAbort = false;
+  const f = fixture(async request => {
+    if (request.url?.endsWith('/members/is_in_chat')) return { code: 99991672 };
+    assert.ok(request.url?.endsWith('/im/v1/chats'));
+    if (waitForAbort && request.params.page_token) {
+      await new Promise<void>(resolve => request.signal!.addEventListener!('abort', () => resolve()));
+      throw Error('aborted');
+    }
+    return { code: 0, data: { items: [], has_more: true, page_token: 'repeated' } };
+  }, deadline);
+  t.after(() => f.transport.stop());
+  await assert.rejects(f.transport.inspectGroup('oc_target'), { code: 'feishu-group-lookup' });
+  assert.equal(f.calls.filter(call => call.url?.endsWith('/im/v1/chats')).length, 2);
+  waitForAbort = true;
+  await Promise.all([
+    assert.rejects(f.transport.inspectGroup('oc_target'), { code: 'feishu-timeout' }), delay(deadline + 5),
+  ]);
+  assert.equal(f.calls.filter(call => call.url?.endsWith('/im/v1/chats')).length, 4);
+});
+
 test('network and connection failures expose only fixed messages and HTTP work has a deadline', async t => {
   const deadline = 150;
   let result = 'permanent';

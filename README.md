@@ -6,7 +6,7 @@
 
 当前为本地开发预览，通过 DSH Web 安装。与 Bot 聊天即可安排普通 Full Access Worker 执行，原对话接收交付并继续补充或返工。另一台机器试用只需一个 Web profile。macOS 同机只读镜像是可选功能。
 
-- **自动验证。** Node `24.22.1` 的完整检查通过，含 98 项核心与 SDK 测试、310 项宿主适配测试、行数检查、类型检查及 Host/Client 构建。隔离 DSH 原生 Host 使用确定性模型验证聊天交付、版本附件与 Markdown 记忆等契约。
+- **自动验证。** Node `24.22.1` 的完整检查通过，含 104 项核心与 SDK 测试、310 项宿主适配测试、行数检查、类型检查及 Host/Client 构建。隔离 DSH 原生 Host 使用确定性模型验证聊天交付、版本附件与 Markdown 记忆等契约。
 - **真实使用记录。** 日常 Web 已实际从原聊天派发普通 Worker、交错回答两个任务的问题、收取并打开精确成果、返工和核对恢复。隔离浏览器曾由开发者点击接受新版，账本记录了该测试的人工接受。各项范围见 [实施路线](ROADMAP.md)。
 - **待用户验证。** 全新克隆后用自己的模型完成个人首版试用及最终接受，核对真实模型处理歧义与成果质量。日常 Web 和 macOS Desktop 的同机配对体验、精确费用归因也待核对。试用步骤见 [第一次真实模型试用](docs/first-trial.md)。
 
@@ -110,9 +110,9 @@ Node 用 fnm 管理时，可用 `fnm exec --using=24.21.0 npm run dev`，无需�
 
 ### 准备飞书应用和宿主
 
-1. 在飞书开放平台创建企业自建应用，启用机器人能力，确保应用可用范围包含你要授权的账号。申请 `im:chat:create`、`im:chat:read`、`im:chat.members:read`、`im:message:send_as_bot`。要免 `@` 发送，再申请 `im:message.group_msg`（接收群聊中所有消息事件，敏感权限）；若仅获准使用 `im:message.group_at_msg:readonly`，请在每条群消息里 `@` 机器人并附上正文。[飞书消息权限](https://open.feishu.cn/document/uAjLw4CM/ukTMukTMukTM/reference/im-v1)
+1. 在飞书开放平台创建企业自建应用，启用机器人能力，确保应用可用范围包含你要授权的账号。申请 `im:chat:create`、`im:chat:read`、`im:message:send_as_bot`。要绑定由他人担任群主的现有群，再申请 `im:chat.members:read`，用于核验授权账号的群成员身份。若授权账号是群主，应用可以通过机器人已加入的群列表核验机器人在群。要免 `@` 发送，再申请 `im:message.group_msg`（接收群聊中所有消息事件，敏感权限）；若使用 `im:message.group_at_msg:readonly`，请在每条群消息里 `@` 机器人并附上正文。[飞书消息权限](https://open.feishu.cn/document/uAjLw4CM/ukTMukTMukTM/reference/im-v1) [机器人所在群列表](https://open.feishu.cn/document/server-docs/group/chat/list)
 2. 获取应用的 App ID、App Secret 和授权账号在**这个应用下**的 `open_id`。可在同一应用的飞书 API 调试台通过手机号或邮箱查询，选择 `open_id` 类型。该查找操作需要 `contact:user.id:readonly`，Super Bot 运行时直接使用你提供的 ID。[通过手机号或邮箱获取用户 ID](https://open.feishu.cn/document/uAjLw4CM/ukTMukTMukTM/reference/contact-v3/user/batch_get_id)
-3. 在专门运行飞书接入的 profile 中配置 Super Bot。选该宿主自己的原账本目录。同一个飞书应用只在一个 Super Bot 宿主启用。其他 profile 默认关闭。
+3. 在专门运行飞书接入的 profile 中配置 Super Bot。选该宿主自己的原账本目录。一个飞书应用供同一宿主里的所有 Bot 共用。让这个宿主独占应用的事件长连接。如果 OpenClaw、Hermes、另一个 Super Bot 宿主或 `lark-cli event consume` 同时监听相同的 App ID，飞书只向其中一个连接分发每个事件，部分群消息可能在 Super Bot 中看不到。用 lark-cli 查询或发送消息可以照常进行。[飞书长连接分发说明](https://open.feishu.cn/document/uAjLw4CM/ukTMukTMukTM/event-subscription-guide/event-card-faq)
 
    在该 profile 的 `cordis.patch.yml` 为现有 `super-bot` 配置追加 `feishu.enabled`，保留已有字段：
 
@@ -369,7 +369,7 @@ npm run restore:ledger -- /absolute/path/backup.sqlite /absolute/path/new-super-
 
 如果只有 tgz，先解包，然后用 `node /absolute/path/package/scripts/restore-ledger.mjs /absolute/path/backup.sqlite /absolute/path/new-super-bot-data` 调用包内脚本。
 
-恢复脚本检查完整性和 schema，拒绝覆盖现有目录。恢复后的未完成任务全部暂停并产生待核对事项，旧管理通知不自动重放；备份之后真实文件或会话可能已经变化，需要逐项核对。原账本与备份不会被修改。当前 schema 为 11，恢复脚本接受 schema 6～11 的备份。旧账本在新宿主首次打开时事务升级。schema 11 移除执行记录的目录唯一约束，保留已占用的 Worker 名额。schema 10 增加按成果版本保存的附件副本，历史成果继续以原记录为准。schema 9 新增 Run 的原进程轮次/事件坐标与后台收敛证据；旧 Run 不补造证据，未完成且证据不足时仍保留资源待核对。其他版本会拒绝，需先使用对应版本处理。升级前应先备份；旧插件不能打开已升级账本。回退时停止宿主，使用旧版插件、对应旧版恢复脚本和升级前的备份恢复到新目录，不能覆盖或降级当前数据库。
+恢复脚本检查完整性和 schema，拒绝覆盖现有目录。恢复后的未完成任务全部暂停并产生待核对事项，旧管理通知不自动重放；备份之后真实文件或会话可能已经变化，需要逐项核对。原账本与备份不会被修改。当前 schema 为 12，恢复脚本接受 schema 6～12 的备份。旧账本在新宿主首次打开时事务升级。schema 12 增加飞书群绑定、建群请求记录和入站消息去重凭据。schema 11 移除执行记录的目录唯一约束，保留已占用的 Worker 名额。schema 10 增加按成果版本保存的附件副本，历史成果继续以原记录为准。schema 9 新增 Run 的原进程轮次/事件坐标与后台收敛证据；旧 Run 不补造证据，未完成且证据不足时仍保留资源待核对。其他版本会拒绝，需先使用对应版本处理。升级前应先备份；旧插件不能打开已升级账本。回退时停止宿主，使用旧版插件、对应旧版恢复脚本和升级前的备份恢复到新目录，不能覆盖或降级当前数据库。
 
 脚本完成后、启动前，将对应备份的 `memory/` 放入新数据目录，保留各 Bot ID 和原有私有权限。SQLite 恢复会带回历史任务约定快照及已保存的附件，但不会从快照重建 Markdown 默认约定和决策笔记。启动时设置 `SUPER_BOT_DATA_DIR=/absolute/path/new-super-bot-data`，或设置优先级更高的插件 `dataDir`。继续使用原 DSH home，或先恢复对应会话与旧成果所需的原文件。切回原账本时，停止宿主并撤销该设置。每组会话和成果由一个宿主运行。
 

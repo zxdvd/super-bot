@@ -7,6 +7,7 @@ import { isFeishuChatId, type FeishuConfig, type FeishuConnectionState, type Fei
 const MESSAGE_EVENT = 'im.message.receive_v1';
 const REQUEST_TIMEOUT_MS = 12_000;
 const MAX_TEXT_BODY_BYTES = 150_000;
+const MISSING_FEISHU_SCOPE = 99991672;
 const SEND_THROTTLED_CODES = new Set([230020, 99991400]);
 const MONTHLY_QUOTA_CODE = 99991403;
 const noop = () => {};
@@ -24,6 +25,10 @@ type TransportOptions = {
 };
 type Connection = { handlers: FeishuHandlers; state: FeishuConnectionState; socket?: Socket };
 type RequestBudget = { signal: AbortSignal; allowSend?: () => boolean };
+type PageResponse<T> = {
+  code?: number;
+  data?: { items?: T[]; has_more?: boolean; page_token?: string };
+};
 
 function object(value: unknown): Record<string, unknown> {
   return value && typeof value === 'object' ? value as Record<string, unknown> : {};
@@ -93,6 +98,20 @@ function dataFrom<T>(response: { code?: number; data?: T }, failure: () => AppEr
   return response.data;
 }
 
+async function hasPageItem<T>(readPage: (pageToken?: string) => Promise<PageResponse<T>>, matches: (item: T) => boolean): Promise<boolean> {
+  const tokens = new Set<string>();
+  let pageToken: string | undefined;
+  do {
+    const page = dataFrom(await readPage(pageToken), inspectError);
+    if (page.items?.some(matches)) return true;
+    if (!page.has_more) return false;
+    pageToken = page.page_token;
+    if (!pageToken || tokens.has(pageToken)) throw inspectError();
+    tokens.add(pageToken);
+  } while (pageToken);
+  return false;
+}
+
 function displayName(name: string | undefined): string {
   return name?.trim() || '（无主题）';
 }
@@ -150,21 +169,26 @@ export function createFeishuTransport(config: FeishuConfig, options: TransportOp
     }
   }
 
-  async function ownerInGroup(chatId: string): Promise<boolean> {
-    const tokens = new Set<string>();
-    let pageToken: string | undefined;
-    do {
-      const response = await im.chatMembers.get({
-        path: {chat_id: chatId}, params: {member_id_type: 'open_id', page_size: 100, page_token: pageToken},
-      });
-      const page = dataFrom(response, inspectError);
-      if (page.items?.some(member => member.member_id === ownerOpenId)) return true;
-      if (!page.has_more) return false;
-      pageToken = page.page_token;
-      if (!pageToken || tokens.has(pageToken)) throw inspectError();
-      tokens.add(pageToken);
-    } while (pageToken);
-    return false;
+  async function robotInGroup(chatId: string): Promise<boolean> {
+    const path = { chat_id: chatId };
+    const membership = await im.chatMembers.isInChat({ path }).catch(error => {
+      const { response, config } = object(error);
+      const code = object(object(response).data).code;
+      const { url } = object(config);
+      if (code === MISSING_FEISHU_SCOPE && typeof url === 'string' && url.endsWith(`/im/v1/chats/${chatId}/members/is_in_chat`)) {
+        return { code: MISSING_FEISHU_SCOPE, data: undefined };
+      }
+      throw error;
+    });
+    if (membership?.code !== MISSING_FEISHU_SCOPE) return dataFrom(membership, inspectError)?.is_in_chat === true;
+    // This app-token endpoint lists only chats the calling bot belongs to.
+    return hasPageItem(pageToken => im.chat.list({ params: { page_size: 100, page_token: pageToken } }), item => item.chat_id === chatId);
+  }
+
+  function ownerInGroup(chatId: string): Promise<boolean> {
+    return hasPageItem(pageToken => im.chatMembers.get({
+      path: { chat_id: chatId }, params: { member_id_type: 'open_id', page_size: 100, page_token: pageToken },
+    }), member => member.member_id === ownerOpenId);
   }
 
   function changeState(current: Connection, state: FeishuConnectionState): void {
@@ -227,8 +251,7 @@ export function createFeishuTransport(config: FeishuConfig, options: TransportOp
       return rest(async () => {
         assertChatId(chatId);
         const path = { chat_id: chatId };
-        const membership = dataFrom(await im.chatMembers.isInChat({ path }), inspectError);
-        if (membership.is_in_chat !== true) throw new AppError('feishu-bot-not-in-group', '请先将此飞书应用的机器人加入群聊。');
+        if (!await robotInGroup(chatId)) throw new AppError('feishu-bot-not-in-group', '请先将此飞书应用的机器人加入群聊。');
         const group = dataFrom(await im.chat.get({ path, params: { user_id_type: 'open_id' } }), inspectError);
         if ((group.chat_mode !== 'group' && group.chat_mode !== 'topic') || (group.chat_status && group.chat_status !== 'normal')) {
           throw new AppError('feishu-not-group', '该 chat_id 对应的会话不是可用的飞书群。');

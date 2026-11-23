@@ -57,6 +57,7 @@ test('preview uses the verified group name and bind checks membership again befo
   const { groups, remote, first, second } = fixture(t);
   await assert.rejects(groups.preview(first, 'https://feishu.cn/chat'), { code: 'feishu-chat-id' });
   await assert.rejects(groups.preview(first, 'oc_unknown'), { code: 'feishu-bot-not-in-group' });
+  assert.deepEqual(remote.inspections, ['oc_unknown']);
   const preview = await groups.preview(first, ` ${existing.chatId} `);
   assert.equal(preview.name, existing.name);
   assert.equal(groups.get(first), null);
@@ -162,8 +163,12 @@ test('concurrent create and a crash before a response reuse the durable UUID and
 test('creation resumes group verification once the chat is known and expired ambiguous requests are never replayed', async t => {
   const { store, remote, first, second } = fixture(t);
   const lostAck = new AppError('feishu-timeout', '响应超时。');
-  const groups = new FeishuGroups(store, config, { ...remote.transport, async inspectGroup() { throw lostAck; } });
+  let failedInspections = 0;
+  const groups = new FeishuGroups(store, config, { ...remote.transport,
+    async inspectGroup() { failedInspections++; throw lostAck; },
+  });
   await assert.rejects(groups.create(first, '已创建群', 'known'), { code: 'feishu-timeout' });
+  assert.equal(failedInspections, 1);
   const resumed = new FeishuGroups(store, config, remote.transport);
   await resumed.create(first, '已创建群', 'known');
   assert.equal(remote.creationCalls.length, 1);
@@ -181,6 +186,75 @@ test('creation resumes group verification once the chat is known and expired amb
   assert.equal(recovered.chatId, chat.chatId);
   await assert.rejects(resumed.create(second, '结果未知群', 'unknown'), { code: 'feishu-create-stale' });
   assert.equal(remote.creationCalls.length, 2);
+});
+
+test('a newly created group can become visible on a bounded retry shared by concurrent requests', async t => {
+  const { store, groups, first, remote } = fixture(t);
+  const prior = await groups.bind(first, (await groups.preview(first, existing.chatId)).confirmationToken);
+  groups.unbind(first, prior.id);
+  const checked = latch();
+  const reads: string[] = [];
+  const creating = new FeishuGroups(store, config, { ...remote.transport, async inspectGroup(chatId) {
+    reads.push(chatId);
+    assert.equal(store.db.prepare('SELECT chatId FROM feishu_group_creations WHERE botId=?').get(first)?.chatId, chatId);
+    if (reads.length === 1) {
+      checked.release();
+      throw new AppError('feishu-bot-not-in-group', '机器人入群尚未可见。');
+    }
+    return remote.transport.inspectGroup(chatId);
+  } });
+  const firstCall = creating.create(first, '正在同步的群', 'creating-one');
+  await checked.promise;
+  const duplicate = creating.create(first, '正在同步的群', 'creating-two');
+  creating.unbind(first, prior.id);
+  assert.equal(creating.get(first), null);
+  const [binding, replay] = await Promise.all([firstCall, duplicate]);
+  assert.deepEqual(replay, binding);
+  assert.deepEqual(reads, [binding.chatId, binding.chatId]);
+  assert.deepEqual(remote.creationCalls, [binding.id]);
+});
+
+test('when group visibility retries are exhausted, the original name resumes the same chat', async t => {
+  const { store, first, remote } = fixture(t);
+  const reads: string[] = [];
+  let visible = false;
+  const groups = new FeishuGroups(store, config, { ...remote.transport, async inspectGroup(chatId) {
+    reads.push(chatId);
+    if (!visible) throw new AppError('feishu-bot-not-in-group', '机器人尚未加入群。');
+    return remote.transport.inspectGroup(chatId);
+  } });
+  await assert.rejects(groups.create(first, '仍待确认的群', 'original'), {
+    code: 'feishu-created-not-visible', message: /核对机器人已入群，再用原群名称重试/,
+  });
+  const [createdId] = remote.creationCalls;
+  const created = remote.creations.get(createdId!)!;
+  assert.equal(groups.get(first), null);
+  assert.deepEqual(reads, Array(4).fill(created.chatId));
+  visible = true;
+  const recovered = await groups.create(first, '仍待确认的群', 'retry');
+  assert.equal(recovered.chatId, created.chatId);
+  assert.deepEqual(remote.creationCalls, [recovered.id]);
+});
+
+test('stopping during a visibility retry keeps the known chat available for restart without another read', async t => {
+  const { store, first, remote } = fixture(t);
+  const checked = latch();
+  let active = true, inspections = 0;
+  const groups = new FeishuGroups(store, config, { ...remote.transport, async inspectGroup() {
+    inspections++;
+    checked.release();
+    throw new AppError('feishu-bot-not-in-group', '机器人入群尚未可见。');
+  } }, () => active);
+  const creating = groups.create(first, '停止后仍可核验的群', 'shutdown');
+  await checked.promise;
+  await new Promise(resolve => setImmediate(resolve));
+  active = false;
+  await assert.rejects(creating, { code: 'feishu-stopped' });
+  assert.equal(groups.get(first), null);
+  assert.equal(inspections, 1);
+  const restarted = new FeishuGroups(store, config, remote.transport);
+  const binding = await restarted.create(first, '停止后仍可核验的群', 'shutdown');
+  assert.deepEqual(remote.creationCalls, [binding.id]);
 });
 
 test('shutdown prevents a late confirmation or creation from committing a binding', async t => {

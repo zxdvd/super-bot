@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto';
+import { setTimeout as delay } from 'node:timers/promises';
 import { AppError, requiredText } from './model.ts';
 import type { Store } from './store.ts';
 import { isFeishuChatId, type FeishuBinding, type FeishuConfig, type FeishuGroup, type FeishuGroupPreview,
@@ -8,6 +9,7 @@ export type { FeishuBinding } from './feishu-types.ts';
 const PREVIEW_LIFETIME_MS = 5 * 60 * 1000;
 // Leave a margin within Feishu's create-chat deduplication window.
 const CREATE_RETRY_WINDOW_MS = 60 * 60 * 1000;
+const CREATED_GROUP_CHECK_DELAYS_MS = [0, 250, 750, 1500];
 const BINDING_FIELDS = 'id, botId, chatId, name, boundAt';
 const CREATION_FIELDS = 'id, botId, appId, ownerOpenId, name, startedAt, chatId, resolvedAt';
 
@@ -147,6 +149,20 @@ export class FeishuGroups {
     return group;
   }
 
+  private async inspectCreatedGroup(chatId: string): Promise<FeishuGroup> {
+    for (const delayMs of CREATED_GROUP_CHECK_DELAYS_MS) {
+      if (delayMs) await delay(delayMs);
+      this.assertActive();
+      try {
+        return await this.inspectGroup(chatId);
+      } catch (error) {
+        if (!(error instanceof AppError) || error.code !== 'feishu-bot-not-in-group') throw error;
+        this.assertActive();
+      }
+    }
+    throw new AppError('feishu-created-not-visible', '飞书已建群，但暂时无法确认机器人在群。请在飞书核对机器人已入群，再用原群名称重试绑定。');
+  }
+
   private pending(botId: string): Creation | undefined {
     return this.store.db.prepare(`SELECT ${CREATION_FIELDS} FROM feishu_group_creations
       WHERE botId=? AND appId=? AND ownerOpenId=? AND resolvedAt IS NULL`).get(botId, this.appId, this.ownerOpenId) as Creation | undefined;
@@ -202,7 +218,7 @@ export class FeishuGroups {
       if (!persisted.changes) throw new AppError('feishu-create-stale', '飞书建群状态已变更，请刷新后核对。');
       chatId = group.chatId;
     }
-    const group = await this.inspectGroup(chatId);
+    const group = await this.inspectCreatedGroup(chatId);
     const current = this.get(creation.botId);
     if (current?.id === creation.id && current.chatId === chatId) return current;
     if (this.pending(creation.botId)?.id !== creation.id) {
