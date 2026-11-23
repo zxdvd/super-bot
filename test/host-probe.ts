@@ -148,6 +148,7 @@ class ProbeAdapter extends LlmAdapter {
       const clarification=value?.attentions?.find((a:any)=>a.kind==='input'&&a.state==='open'&&!a.id.startsWith('run:'));
       let reply='已核对当前状态。';
       if(trigger?.source?.kind==='user'&&text.startsWith('CHAT_LINK_MARKDOWN:'))reply=text.slice('CHAT_LINK_MARKDOWN:'.length);
+      else if(trigger?.source?.kind==='user'&&text.startsWith('FEISHU_SMOKE_'))reply=`已收到 ${text}`;
       else if(prior?.action==='deliver')reply='请查看上面的交付卡片。';
       else if(detail?.delivery&&(prior?.action==='review'||text.startsWith('DF14_SHOW_RESULT:'))) {
         reply=`等待你确认。\n${detail.delivery.chatMarkdown}`;

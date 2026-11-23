@@ -25,6 +25,7 @@ import { Managers } from './manager.ts';
 import { NativeSidebar } from './sidebar.ts';
 import { createLedgerBackup } from './backups.ts';
 import { bindMirror, parseMirrorQuery, startMirror } from './mirror-host.ts';
+import { startFeishuHost } from './feishu-host.ts';
 import { readLocalMirror } from './mirror-queries.ts';
 import { RESULT_FILE_PATH } from './work-links.ts';
 import { managedSessionId, oppositeOwner, type BotOwner, type MirrorBot, type MirrorCatalog, type SessionOrigin } from './mirror.ts';
@@ -51,9 +52,13 @@ export const Config = Schema.object({ dataDir: Schema.string().description('Supe
   workdirCleanup:Schema.union([Schema.const('manual'),Schema.const('on-complete')]).default('manual').description('任务完成或取消后是否自动清理隔离目录 / worktree / hook 目录；已有目录从不清理'),
   workspace:Schema.string().description('已弃用：等同 allowedRoots: [workspace]'),
   mirrorDir: Schema.string().description('可选。同机 Web 与 Desktop 只读镜像的私有配对目录，含 pair.json。'),
+  feishu: Schema.union([Schema.const(undefined), Schema.object({ enabled: Schema.boolean().default(false) })])
+    .description('仅在当前 profile 启用飞书群。凭证从该 profile 的私有文件读取。'),
   maxRunningTasks:Schema.natural().min(1).default(2).description('全局同时执行的 Worker 任务数'),managerWakesPerHour:Schema.natural().min(1).default(20).description('每个 Bot 每小时自动唤醒上限；达到后记录问题并暂停自动唤醒'),managerConcurrentWakes:Schema.natural().min(1).default(2).description('同时自动唤醒的 Bot 数'),managerTurnMinutes:Schema.natural().min(1).default(5).description('单次自动 Bot 轮次上限（分钟）'),managerModel:roleModel,workerModel:roleModel });
 
-export async function apply(ctx: Context, config: RuntimeOptions & { dataDir?: string; mirrorDir?: string } = {}): Promise<void> {
+export async function apply(ctx: Context, config: RuntimeOptions & {
+  dataDir?: string; mirrorDir?: string; feishu?: { enabled?: boolean };
+} = {}): Promise<void> {
   const checkout = fileURLToPath(new URL('..', import.meta.url));
   const dataDir = resolve(config.dataDir ?? process.env.SUPER_BOT_DATA_DIR ?? join(process.env.DSH_HOME ?? join(homedir(), '.dsh'), 'super-bot'));
   const profile = ctx.get?.('profileContext');
@@ -71,8 +76,10 @@ export async function apply(ctx: Context, config: RuntimeOptions & { dataDir?: s
   const managers=new Managers(ctx,store,execution,dataDir,()=>ctx.webServer.getOrigin(),config,reloadAdmission);
   const sidebar=new NativeSidebar(ctx,store);
   let reloadHost: ReturnType<typeof startReloadHost>;
+  let feishuReady: ReturnType<typeof startFeishuHost> | undefined;
   ctx.effect(() => async () => {
     reloadHost?.close();
+    await (await feishuReady)?.close();
     await (await mirrorReady)?.close();
     await managers.dispose();await execution.dispose();store.close();
     reloadHost?.retired();
@@ -80,6 +87,7 @@ export async function apply(ctx: Context, config: RuntimeOptions & { dataDir?: s
   const mirror = await mirrorReady;
   execution.install();
   managers.install();
+  const feishu = await (feishuReady = startFeishuHost(ctx, store, managers, config.feishu?.enabled === true, profile?.dir));
   const require = createRequire(import.meta.url);
   const runtime = require('@deepseek-ai/dsh-agent/package.json').version as string;
   const startedAt = Date.now();
@@ -131,6 +139,7 @@ export async function apply(ctx: Context, config: RuntimeOptions & { dataDir?: s
         return { ok: true, value: await mirror.read(query) };
       }
       if ('owner' in payload) throw new AppError('invalid-input', '此入口只操作本机原账本。');
+      if (endpoint.startsWith('feishu.')) return { ok: true, value: await feishu.invoke(endpoint, payload) };
       if (endpoint === 'manager.notification.resolve') {
         const botId = requiredText(payload.botId, 'Bot 标识', 200);
         if (payload.sessionId !== undefined && store.botForSession(requiredText(payload.sessionId, '会话标识', 200))?.id !== botId) {

@@ -6,7 +6,7 @@
 
 当前为本地开发预览，通过 DSH Web 安装。与 Bot 聊天即可安排普通 Full Access Worker 执行，原对话接收交付并继续补充或返工。另一台机器试用只需一个 Web profile。macOS 同机只读镜像是可选功能。
 
-- **自动验证。** Node `24.22.1` 的完整检查通过，含 87 项账本测试、281 项适配测试、行数检查、类型检查及 Host/Client 构建。隔离 DSH 原生 Host 使用确定性模型验证聊天交付、版本附件与 Markdown 记忆等契约。
+- **自动验证。** Node `24.22.1` 的完整检查通过，含 98 项核心与 SDK 测试、310 项宿主适配测试、行数检查、类型检查及 Host/Client 构建。隔离 DSH 原生 Host 使用确定性模型验证聊天交付、版本附件与 Markdown 记忆等契约。
 - **真实使用记录。** 日常 Web 已实际从原聊天派发普通 Worker、交错回答两个任务的问题、收取并打开精确成果、返工和核对恢复。隔离浏览器曾由开发者点击接受新版，账本记录了该测试的人工接受。各项范围见 [实施路线](ROADMAP.md)。
 - **待用户验证。** 全新克隆后用自己的模型完成个人首版试用及最终接受，核对真实模型处理歧义与成果质量。日常 Web 和 macOS Desktop 的同机配对体验、精确费用归因也待核对。试用步骤见 [第一次真实模型试用](docs/first-trial.md)。
 
@@ -89,6 +89,8 @@ SUPER_BOT_PROFILE=super-bot-trial npm run dev:reload -- --wait 30
 - `npm run check` 包含行数检查、类型检查、核心账本测试、DSH 适配层测试和 Host/Client 构建。`npm test` 单独运行账本测试。
 - `npm run smoke:notifications`：自建全新隔离 home/profile/账本与确定性提供方，验证 Manager 未就绪、额度恢复、通知回执崩溃及重复重启；无真实模型费用、无生产连接。
 - `npm run smoke:chat`：在专用探针宿主上验证聊天接单、同对话交付、文件下载、提问回答、返工、Bot 直接 Shell 查询/noWait 拒绝与 Worker 原生 Shell 文件任务；仅确定性模型，不依赖外部服务。可传专用宿主日志：`npm run smoke:chat -- .runtime/permissions-host.log`。
+- `npm run smoke:feishu`：启动两个独立 DSH profile，以合成飞书传输和确定性模型验证绑定、网页发起任务、飞书追问和作答、原生聊天交付、断线重连及重启。无需真实飞书或模型凭证。
+  设置 `SUPER_BOT_TEST_PLAYWRIGHT` 和 `SUPER_BOT_TEST_BROWSER` 为 Playwright 模块、Chromium 可执行文件的绝对路径，还可检查真实 Web 设置面板和原生聊天。
 - `node scripts/smoke-delivery-receipt.mjs <隔离宿主日志>`：使用确定性探针和每小时一次的唤醒限额，验证工具回包、原聊天链接回执、版本下载及人工验收状态。运行条件与证据见 [DF-14](specs/changes/2026-11-super-bot-mvp/evidence.md#2026-11-21-df-14--原聊天成果回执)。
 - `npm run smoke`：测试宿主运行时检查真实状态、WAL、未认证访问与跨域拒绝。
 - `npm pack --dry-run`：核对分发清单；运行数据和契约测试插件不进入安装包。
@@ -101,6 +103,47 @@ Node 用 fnm 管理时，可用 `fnm exec --using=24.21.0 npm run dev`，无需�
 ## 从 Bot 对话管理已有任务
 
 在原 Bot 对话中明确指出任务和动作，例如「暂停文档任务的自动管理」「恢复文档任务的自动管理」「停止文档任务当前这次执行」或「取消文档任务」。消息里的工作链接会限定本次操作对应的任务。暂停期间，已在执行的 Worker 可以继续。停止只请求结束当前这次执行并暂停自动管理，Bot 按回执报告正在停止、已停止或待核对。取消要求执行已收敛，保留历史和成果记录。需要先停止或核对时，Bot 会报告当前限制，由你决定下一步。
+
+## 在飞书群继续与 Bot 聊天
+
+每个本端 Bot 可绑定一个群。群成员都能看到发到群里的内容，只有配置的飞书账号发出的文本会进入 Bot 的原生管理对话。绑定后，网页真人消息和 Bot 的最终可见文本回复会发到群中。关闭网页后，只要 DSH 宿主还在运行且长连接可用，就可以继续在群里发消息。
+
+### 准备飞书应用和宿主
+
+1. 在飞书开放平台创建企业自建应用，启用机器人能力，确保应用可用范围包含你要授权的账号。申请 `im:chat:create`、`im:chat:read`、`im:chat.members:read`、`im:message:send_as_bot`。要免 `@` 发送，再申请 `im:message.group_msg`（接收群聊中所有消息事件，敏感权限）；若仅获准使用 `im:message.group_at_msg:readonly`，请在每条群消息里 `@` 机器人并附上正文。[飞书消息权限](https://open.feishu.cn/document/uAjLw4CM/ukTMukTMukTM/reference/im-v1)
+2. 获取应用的 App ID、App Secret 和授权账号在**这个应用下**的 `open_id`。可在同一应用的飞书 API 调试台通过手机号或邮箱查询，选择 `open_id` 类型。该查找操作需要 `contact:user.id:readonly`，Super Bot 运行时直接使用你提供的 ID。[通过手机号或邮箱获取用户 ID](https://open.feishu.cn/document/uAjLw4CM/ukTMukTMukTM/reference/contact-v3/user/batch_get_id)
+3. 在专门运行飞书接入的 profile 中配置 Super Bot。选该宿主自己的原账本目录。同一个飞书应用只在一个 Super Bot 宿主启用。其他 profile 默认关闭。
+
+   在该 profile 的 `cordis.patch.yml` 为现有 `super-bot` 配置追加 `feishu.enabled`，保留已有字段：
+
+   ```yaml
+   - id: super-bot
+     config:
+       feishu:
+         enabled: true
+   ```
+
+   用本地编辑器在同一 profile 目录保存 `super-bot.feishu.json`。Web CLI 的目录是 `$DSH_HOME/profiles/<profile>`，其中 `DSH_HOME` 默认 `~/.dsh`。该文件由启动 DSH 的用户持有，设为 `0600`，例如在目录内执行 `chmod 600 super-bot.feishu.json`。将占位符换成你的凭证值。
+
+   ```json
+   {
+     "appId": "cli_REPLACEAPPID",
+     "appSecret": "REPLACE_WITH_APP_SECRET",
+     "ownerOpenId": "ou_REPLACEOPENID"
+   }
+   ```
+
+4. 启动该 DSH 宿主。在飞书开发者后台「事件与回调 → 事件配置」选择**使用长连接接收事件**，添加「接收消息」`im.message.receive_v1`，发布包含权限和事件配置的应用版本，并完成租户要求的审批。如果控制台要求已连上的实例再保存，请先保持宿主运行。宿主向飞书发起 HTTPS 和 WebSocket 连接，无需对飞书开放回调端口。[飞书长连接事件配置](https://open.feishu.cn/document/ukTMukTMukTM/uYDNxYjL2QTM24iN0EjN/event-subscription-configure-)
+
+### 绑定与试用
+
+1. 从 Super Bot 首页打开本端 Bot 的「继续聊天」，在原生管理对话选择可用的模型。回到首页，从该 Bot 的「工作 → ⋯ → 飞书群」核对连接状态。
+2. 选择「新建私有群」并输入群名。新群包含应用机器人与配置的飞书账号。也可先将机器人和授权账号加入已有群，选择「绑定已有群」，输入 `oc_` 开头的群 `chat_id`，预览群名并确认。可用同一应用在飞书 API 调试台「获取用户或机器人所在的群列表」找到 `chat_id`。[飞书群 API](https://open.feishu.cn/document/server-docs/group/chat/intro)
+3. 点击「在飞书打开群」。从网页发一句新消息，在群里回复，再回原生 Bot 对话核对。可用一项需要追问的合成任务演练，把答案发到群里，回工作台检查成果并验收。
+
+可以在群里委派任务、回答追问或要求返工。暂停、恢复、停止、取消和最终验收请在 Web 完成。同步只覆盖长连接就绪后、绑定生效后的新文本，断线期间的消息和已有历史不会补发。图片、文件、卡片等内容不传输。可从 Web 下载成果附件，正文内已有的成果链接仍适用原宿主的访问权限。
+
+连接或投递异常会显示在「飞书群」设置。请核对应用版本、权限和机器人群成员资格；原对话保留有效内容。建群结果待核对时，用原名称重试；若飞书已经建群，可以找到 `chat_id` 后预览绑定。「解绑」立即撤销后续同步，飞书内的群和已发送的消息会保留。要停止整个 profile 的接入，移除 `feishu.enabled` 或设为 `false` 后重启宿主。更换凭证后也需要重启，旧绑定会按原应用和授权账号识别。
 
 ## 使用完整原生 Worker
 

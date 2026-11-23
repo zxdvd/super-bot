@@ -59,6 +59,7 @@
     "smoke:manager": "node scripts/smoke-manager.mjs",
     "smoke:notifications": "node scripts/smoke-notifications.mjs",
     "smoke:chat": "node scripts/smoke-chat.mjs",
+    "smoke:feishu": "node scripts/smoke-feishu.mjs",
     "seed:ui": "node scripts/seed-ui.mjs",
     "restore:ledger": "node scripts/restore-ledger.mjs",
     "test:adapter": "node --import tsx --test test/adapter/*.test.ts",
@@ -67,6 +68,7 @@
     "smoke:reliability": "node scripts/smoke-reliability.mjs"
   },
   "dependencies": {
+    "@larksuiteoapi/node-sdk": "1.77.0",
     "marked": "17.0.1"
   },
   "devDependencies": {

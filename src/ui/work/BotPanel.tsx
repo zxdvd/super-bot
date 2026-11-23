@@ -2,6 +2,7 @@
 import type { Bot } from '../../model.ts';
 import type { BackupInfo } from '../../backups.ts';
 import { Hint, Section } from '../kit.tsx';
+import { FeishuPanel } from './FeishuPanel.tsx';
 import { managerOpener } from './SystemIssues.tsx';
 import type { WorkspaceState } from './useWorkspace.ts';
 
@@ -79,6 +80,7 @@ export function BotPanel({ w, bot }: { w: WorkspaceState; bot: Bot }) {
       {bot.materials.map(material => <p key={material.path} className="wrap caption">{material.path} · {material.bytes} 字节</p>)}
     </Section>
     <ManagerSection w={w} bot={bot}/>
+    <FeishuPanel key={bot.id} api={w.api} botId={bot.id} botName={bot.name} locked={w.locked}/>
     <Section title="侧栏"><SidebarActions w={w} bot={bot}/></Section>
     <Maintenance w={w}/>
   </div>;

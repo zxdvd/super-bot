@@ -92,6 +92,26 @@ export class Store {
         CREATE TABLE IF NOT EXISTS managers (id TEXT PRIMARY KEY,botId TEXT NOT NULL REFERENCES bots(id),generation INTEGER NOT NULL,configRevision INTEGER NOT NULL,requestedSessionId TEXT NOT NULL UNIQUE,sessionId TEXT UNIQUE,cwd TEXT NOT NULL,state TEXT NOT NULL,createdAt INTEGER NOT NULL,UNIQUE(botId,generation));
         CREATE UNIQUE INDEX IF NOT EXISTS managers_active ON managers(botId) WHERE state!='released';
         CREATE TABLE IF NOT EXISTS waits (taskId TEXT PRIMARY KEY REFERENCES tasks(id),createdAt INTEGER NOT NULL,seq INTEGER NOT NULL);
+        CREATE TABLE IF NOT EXISTS feishu_group_bindings (
+          id TEXT NOT NULL UNIQUE, botId TEXT PRIMARY KEY REFERENCES bots(id),
+          appId TEXT NOT NULL, ownerOpenId TEXT NOT NULL,
+          chatId TEXT NOT NULL UNIQUE, name TEXT NOT NULL, boundAt INTEGER NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS feishu_group_creations (
+          id TEXT PRIMARY KEY, botId TEXT NOT NULL REFERENCES bots(id), appId TEXT NOT NULL,
+          ownerOpenId TEXT NOT NULL, name TEXT NOT NULL, startedAt INTEGER NOT NULL,
+          chatId TEXT, resolvedAt INTEGER
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS feishu_group_creation_pending
+          ON feishu_group_creations(botId,appId,ownerOpenId) WHERE resolvedAt IS NULL;
+        CREATE TABLE IF NOT EXISTS feishu_group_creation_requests (
+          requestId TEXT PRIMARY KEY, creationId TEXT NOT NULL REFERENCES feishu_group_creations(id)
+        );
+        CREATE TABLE IF NOT EXISTS feishu_inbound_receipts (
+          messageId TEXT PRIMARY KEY, nativeMessageId TEXT NOT NULL UNIQUE, bindingId TEXT NOT NULL,
+          botId TEXT NOT NULL, sessionId TEXT NOT NULL, senderOpenId TEXT NOT NULL, appId TEXT NOT NULL,
+          textDigest TEXT NOT NULL, acceptedAt INTEGER NOT NULL, nativeSeq INTEGER
+        );
         `);
       const inputColumns=this.db.prepare('PRAGMA table_info(inputs)').all().map(row=>row.name);
       if(!inputColumns.includes('messageId'))this.db.exec('ALTER TABLE inputs ADD COLUMN messageId TEXT; ALTER TABLE inputs ADD COLUMN messageJson TEXT;');
