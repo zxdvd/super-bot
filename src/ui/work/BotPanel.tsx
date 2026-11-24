@@ -80,7 +80,7 @@ export function BotPanel({ w, bot, focusFeishu }: { w: WorkspaceState; bot: Bot;
       {bot.materials.map(material => <p key={material.path} className="wrap caption">{material.path} · {material.bytes} 字节</p>)}
     </Section>
     <ManagerSection w={w} bot={bot}/>
-    <FeishuPanel key={bot.id} api={w.api} botId={bot.id} botName={bot.name} locked={w.locked} focus={focusFeishu}/>
+    <FeishuPanel key={`feishu:${bot.id}`} api={w.api} botId={bot.id} botName={bot.name} locked={w.locked} focus={focusFeishu}/>
     <Section title="侧栏"><SidebarActions w={w} bot={bot}/></Section>
     <Maintenance w={w}/>
   </div>;
