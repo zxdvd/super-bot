@@ -58,25 +58,25 @@ if (prebuilt) {
   assert.equal(await new Promise((resolve, reject) => { built.once('error', reject); built.once('exit', resolve); }), 0);
 }
 
-async function configure(role, options = {}) {
+async function configure(role, { bundleDir = bundle, ...options } = {}) {
   const { profile, data } = roles[role];
   await mkdir(join(profile, 'node_modules/@zxdvd'), { recursive: true });
   await mkdir(data, { recursive: true, mode: 0o700 });
-  await symlink(bundle, join(profile, 'node_modules/@zxdvd/super-bot'));
+  await symlink(bundleDir, join(profile, 'node_modules/@zxdvd/super-bot'));
   await writeFile(join(profile, 'package.json'), JSON.stringify({
-    name: `dsh-profile-${role}`, private: true, dependencies: { '@zxdvd/super-bot': `link:${bundle}` },
+    name: `dsh-profile-${role}`, private: true, dependencies: { '@zxdvd/super-bot': `link:${bundleDir}` },
     dsh: { profile: { bundles: ['@deepseek-ai/dsh-base', '@deepseek-ai/dsh-web-app', '@zxdvd/super-bot'] } },
   }));
   await patch(role, options);
 }
-async function patch(role, { paired = false, mirrorDir = pairs, hmr = !skipHmr, limit = 2, data = roles[role].data } = {}) {
+async function patch(role, { paired = false, mirrorDir = pairs, hmr = !skipHmr, limit = 2, probeModule = '@zxdvd/super-bot/mirror-probe', data = roles[role].data } = {}) {
   const { profile } = roles[role];
   const path = join(profile, 'cordis.patch.yml');
   const temp = `${path}.tmp`;
   await writeFile(temp, JSON.stringify([
     ...(hmr ? [] : [{ id: 'hmr', disabled: true }]),
     { id: 'super-bot', config: { dataDir: data, fullAccess: false, maxRunningTasks: limit, ...(paired ? { mirrorDir } : {}) } },
-    { insert: [{ id: 'super-bot-contract-probe', name: '@zxdvd/super-bot/mirror-probe' }] },
+    { insert: [{ id: 'super-bot-contract-probe', name: probeModule }] },
   ]));
   await rename(temp, path);
 }
@@ -287,6 +287,9 @@ try {
   } else if (process.env.SUPER_BOT_TEST_CHAT_LINKS === '1') {
     const { smokeChatResultLinks } = await import('./smoke-chat-result-links.mjs');
     await smokeChatResultLinks({ base, configure, launch, stop, rpc, call, makeBot, probe, wait });
+  } else if (process.env.SUPER_BOT_TEST_DEVELOPER_RELOAD === '1') {
+    const { smokeDeveloperReload } = await import('./smoke-developer-reload.mjs');
+    await smokeDeveloperReload({ root, base, bundle, roles, configure, launch, rpc, call, makeBot, newTask, probe, wait });
   } else await smokeMirror();
 } finally {
   await Promise.all([...children.keys()].map(role => stop(role)));

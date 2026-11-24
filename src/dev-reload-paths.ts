@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { existsSync, lstatSync, readFileSync, readdirSync, realpathSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 
@@ -7,6 +8,17 @@ export const reloadId = /^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$/;
 export const reloadArtifacts = ['index.js.map', 'client.js.map', 'client.js', 'index.js'] as const;
 export const reloadDirectory = (profile: string) => join(profile, '.super-bot-reload');
 export const reloadStage = (root: string, id: string) => join(root, '.runtime', `dev-reload-${id}`);
+
+/** One physical output tree per checkout and canonical host profile. */
+export function profilePackage(source: string, dir: string): string {
+  const key = createHash('sha256').update(realpathSync(dir)).digest('hex');
+  return join(source, '.runtime', 'profile-packages', key);
+}
+
+export function profileSource(root: string, dir: string): string | undefined {
+  const source = resolve(root, '../../..');
+  return root === profilePackage(source, dir) ? source : undefined;
+}
 
 export interface ReloadEndpoint {
   protocol: number;

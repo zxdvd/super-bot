@@ -1,3 +1,4 @@
+import { DeveloperSettings } from './DeveloperSettings.tsx';
 import { useEffect, useId, useRef, useState } from 'react';
 import type { FeishuCheckResult, FeishuSelfTestView, FeishuSettingsView } from '../feishu-types.ts';
 import type { Bot } from '../model.ts';
@@ -263,6 +264,7 @@ export function FeishuSettings({ api, close, bots, openGroup, createBot }: {
       <h1>设置</h1>
       <button type="button" autoFocus disabled={!!pending} onClick={closeSettings}>← 我的 Bot</button>
     </header>
+    <DeveloperSettings api={api}/>
     <h2>飞书</h2>
     {readError ? <p className="notice error" role="alert">暂时无法读取当前 DSH profile 的设置，稍后会自动重试。</p>
       : !view && <p role="status" className="muted">正在读取飞书设置…</p>}

@@ -11,6 +11,7 @@ import type {} from '@deepseek-ai/dsh-client-ui-session/client';
 import type { UseSidebarRightTabInfo } from '@deepseek-ai/dsh-client-ui-sidebar-right/client';
 import { WorkButton, SessionOriginHint, SessionWork } from './ui/SessionWork.tsx';
 import { WORK_TAB, chatDeliveryLink, openBotConversation, openWorkLink, sameWorkHost, workLinkForUrl } from './ui/work-navigation.ts';
+import { returningToReloadSettings } from './ui/DeveloperSettings.tsx';
 import { BotHome } from './ui/BotHome.tsx';
 import { installBotSidebar } from './ui/BotSidebar.tsx';
 import { parseWorkLink, RESULT_FILE_PATH, workUrl } from './work-links.ts';
@@ -93,7 +94,11 @@ export function apply(context: Context): void {
       });
     };
     let disposed = false;
-    queueMicrotask(() => { if (!disposed) select(); });
+    queueMicrotask(() => {
+      if (disposed) return;
+      if (returningToReloadSettings()) ctx.layout.selectPanel(panel);
+      else select();
+    });
     const mouseEvents = ['click', 'auxclick', 'contextmenu'] as const;
     for (const name of mouseEvents) document.addEventListener(name, click, true);
     window.addEventListener('hashchange', hashChanged);

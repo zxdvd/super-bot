@@ -1,3 +1,4 @@
+import { ReloadAdmission } from './reload-admission.ts';
 import { createHash } from 'node:crypto';
 import { setTimeout as delay } from 'node:timers/promises';
 import type { Context } from '@deepseek-ai/cordis';
@@ -65,6 +66,7 @@ export class FeishuBridge {
     private readonly groups: Pick<FeishuGroups, 'get' | 'findByChat' | 'onUnbound'>,
     private readonly transport: FeishuTransport,
     private readonly config: FeishuIdentity,
+    private readonly admission = new ReloadAdmission(),
   ) {}
 
   start(): void {
@@ -86,7 +88,12 @@ export class FeishuBridge {
     for (const agent of this.ctx.agents.list()) this.seedInbox(agent);
     try {
       this.transport.start({
-        onMessage: message => { this.receive(message); },
+        onMessage: message => {
+          // Refuse new input before reserving its deduplication key; the SDK can retry.
+          const leave = this.admission.tryEnter('飞书群入站');
+          if (!leave) throw new AppError('reload-in-progress', '正在重载本端插件。');
+          try { this.receive(message); } finally { leave(); }
+        },
         onConnection: state => { this.setConnection(state); },
       });
     } catch {
@@ -105,6 +112,10 @@ export class FeishuBridge {
       try { this.transport.stop(); } catch { /* Local routing has already stopped. */ }
     }
     await Promise.allSettled(this.inFlight);
+  }
+
+  reloadBlockers(): string[] {
+    return this.inFlight.size ? ['飞书群消息收发中'] : [];
   }
 
   status(botId: string): FeishuBridgeStatus & { evidence: FeishuGroupEvidence | null } {
@@ -172,10 +183,16 @@ export class FeishuBridge {
   }
 
   private enqueue(queue: Map<string, Promise<void>>, route: BindingEpoch, work: () => Promise<void>): void {
+    const leave = this.admission.tryEnter('飞书群消息收发');
+    if (!leave) {
+      this.outboundErrors.set(route.binding.botId, { bindingId: route.binding.id, text: '本端重载中，本条消息尚未转发。' });
+      return;
+    }
     const key = route.binding.id;
     const task = (queue.get(key) ?? Promise.resolve()).then(work).finally(() => {
       if (queue.get(key) === task) queue.delete(key);
       this.inFlight.delete(task);
+      leave();
     });
     queue.set(key, task);
     this.inFlight.add(task);
@@ -204,9 +221,10 @@ export class FeishuBridge {
       this.lastMessageAt = receipt.acceptedAt;
       // The event and its deduplication receipt are already accepted. Identity verification never delays the chat.
       if (message.botMentionProof) {
+        const finish = this.admission.tryEnter('飞书群 @ 身份核对');
         void message.botMentionProof.then(verified => {
           if (verified && this.current(route)) recordGroupEvidence(this.store, route.binding.id, 'bot-mention', receipt.acceptedAt);
-        }).catch(() => { /* The optional proof remains missing when the lookup or its local write fails. */ });
+        }).catch(() => { /* The optional proof remains missing when the lookup or its local write fails. */ }).finally(finish);
       }
       if (!sessionId) {
         this.reject(route, message.messageId,

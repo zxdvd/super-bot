@@ -1,17 +1,19 @@
 /** Ask the current Super Bot instance before staging a development build. */
 import { spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
-import { existsSync, mkdirSync, realpathSync, rmSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, realpathSync, rmSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
+import { isDeepStrictEqual } from 'node:util';
 import { fileURLToPath } from 'node:url';
-import { liveReloadEndpoints, reloadId, reloadStage } from '../src/dev-reload-paths.ts';
+import { liveReloadEndpoints, profilePackage, reloadId, reloadStage } from '../src/dev-reload-paths.ts';
 
 const root = realpathSync(fileURLToPath(new URL('..', import.meta.url)));
 const profile = process.env.SUPER_BOT_PROFILE ?? process.env.DSH_PROFILE ?? 'web';
-const id = randomUUID();
-const stage = reloadStage(root, id);
+const fromSettings = !!process.send && !!process.env.SUPER_BOT_EXPECT_INSTANCE;
+const id = fromSettings && reloadId.test(process.env.SUPER_BOT_OPERATION_ID ?? '') ? process.env.SUPER_BOT_OPERATION_ID : randomUUID();
+let stage;
 const cancellation = new AbortController();
 const stop = () => cancellation.abort(Error('cancelled by signal'));
 process.on('SIGINT', stop);
@@ -55,6 +57,17 @@ function build(signal) {
   });
 }
 
+function checkPackageMetadata(target) {
+  if (target === root) return;
+  const manifest = dir => JSON.parse(readFileSync(join(dir, 'package.json'), 'utf8'));
+  const installed = manifest(target), source = manifest(root);
+  const keys = ['name', 'version', 'main', 'type', 'exports', 'dsh', 'engines', 'dependencies', 'peerDependencies'];
+  if (keys.some(key => !isDeepStrictEqual(installed[key], source[key]))
+    || !readFileSync(join(target, 'cordis.patch.yml')).equals(readFileSync(join(root, 'cordis.patch.yml')))) {
+    throw Error('包清单或 DSH 配置已更新，请等本端空闲后重新准备并安装独立开发包。');
+  }
+}
+
 const limited = (ms, signal = cancellation.signal) => AbortSignal.any([signal, AbortSignal.timeout(ms)]);
 
 try {
@@ -72,9 +85,14 @@ try {
   const home = process.env.DSH_HOME ?? join(homedir(), '.dsh');
   const dir = realpathSync(join(home, 'profiles', profile));
   const [owner, ...others] = liveReloadEndpoints(dir);
-  if (!owner || others.length || owner.profile !== profile || owner.root !== root) {
+  if (!owner || others.length || owner.profile !== profile || (owner.root !== root && owner.root !== profilePackage(root, dir))) {
     throw Error('live reload host unavailable or ambiguous for this profile/checkout. Use the existing install entry point for first enablement.');
   }
+  if (fromSettings && (owner.instance !== process.env.SUPER_BOT_EXPECT_INSTANCE || owner.root !== profilePackage(root, dir))) {
+    throw Error('当前宿主已变化，重新打开设置核对。');
+  }
+  checkPackageMetadata(owner.root);
+  stage = reloadStage(owner.root, id);
   endpoint = owner;
   const deadline = Date.now() + wait * 1000;
   let lease;
@@ -99,12 +117,13 @@ try {
   console.log(`Granted by ${profile} instance ${owner.instance}; building staged artifacts.`);
   const leaseSignal = limited(lease.expires - Date.now());
   leaseSignal.throwIfAborted();
-  mkdirSync(join(root, '.runtime'), { recursive: true, mode: 0o700 });
-  if (realpathSync(join(root, '.runtime')) !== join(root, '.runtime')) throw Error('build staging directory is a symlink');
+  mkdirSync(join(owner.root, '.runtime'), { recursive: true, mode: 0o700 });
+  if (realpathSync(join(owner.root, '.runtime')) !== join(owner.root, '.runtime')) throw Error('build staging directory is a symlink');
   mkdirSync(stage, { mode: 0o700 });
   building = true;
   await build(leaseSignal);
   leaseSignal.throwIfAborted();
+  checkPackageMetadata(owner.root);
   commitRequested = true;
   console.log(`Waiting for ${profile} to publish and confirm the new instance (${id}).`);
   const reply = await call('commit', limited(150_000));
@@ -116,6 +135,7 @@ try {
     throw Error('reload receipt does not match the expected successor');
   }
   console.log(`Applied ${profile} build ${id} in the same host (PID ${reply.pid}), instance ${owner.instance} → ${reply.to}.`);
+  process.send?.({ state: 'applied', build: id });
   if (resultId) {
     if (reply.resultId === resultId && reply.recordedResult === true) console.log(`Recorded the reload receipt for result ${resultId}.`);
     else console.warn(`The build applied, but its receipt for result ${resultId} was not recorded.`);
@@ -123,6 +143,7 @@ try {
 } catch (error) {
   const state = cancellation.signal.aborted ? 'cancelled' : 'stopped';
   const reason = cancellation.signal.aborted ? cancellation.signal.reason.message : error.message;
+  process.send?.({ state: commitRequested ? 'unconfirmed' : 'failed', message: reason });
   console.error(`dev:reload ${state} (${profile}): ${reason}${commitRequested ? ' Check native HMR logs and the active instance before retrying.' : ''}`);
   process.exitCode = cancellation.signal.aborted ? 130 : 1;
 } finally {

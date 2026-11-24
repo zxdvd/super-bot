@@ -3,7 +3,7 @@ import { existsSync, lstatSync, mkdirSync, readFileSync, realpathSync, renameSyn
 import { createServer, type ServerResponse } from 'node:http';
 import { join, resolve } from 'node:path';
 import {
-  isLinkedCheckout, liveReloadEndpoints, reloadArtifacts, reloadDirectory, reloadId, reloadProtocol, reloadStage,
+  isLinkedCheckout, liveReloadEndpoints, profileSource, reloadArtifacts, reloadDirectory, reloadId, reloadProtocol, reloadStage,
   type ReloadEndpoint,
 } from './dev-reload-paths.ts';
 import type { ReloadAdmission } from './reload-admission.ts';
@@ -22,7 +22,7 @@ interface Profile {
 export interface ReloadHmr {
   config: { root: string[] };
   watchConfig(filename: string, refresh: () => Promise<void>): Promise<() => Promise<void>>;
-  reconcileProfile(requiredIds: readonly string[]): Promise<{ restartReason?: string }>;
+  reconcileProfile(requiredIds: readonly string[]): Promise<{ restartReason?: string; pending?: readonly { reason: string }[] }>;
 }
 
 interface Handoff {
@@ -73,7 +73,7 @@ function verifyStagedResult(root: string, stage: string, files: Evidence[]): voi
   }
 }
 
-function publishBuild(root: string, id: string, evidence: Evidence[] | undefined, beforeWrite: () => void): void {
+function publishBuild(root: string, source: string, id: string, evidence: Evidence[] | undefined, beforeWrite: () => void): void {
   const stage = reloadStage(root, id);
   const lib = join(root, 'lib');
   for (const directory of [stage, lib]) {
@@ -84,7 +84,7 @@ function publishBuild(root: string, id: string, evidence: Evidence[] | undefined
     const destination = join(lib, file);
     if (existsSync(destination) && !lstatSync(destination).isFile()) throw Error(`unsafe build destination ${file}`);
   }
-  if (evidence) verifyStagedResult(root, stage, evidence);
+  if (evidence) verifyStagedResult(source, stage, evidence);
   beforeWrite();
   // Same filesystem renames. Publish the host module last, after its client and maps.
   for (const file of reloadArtifacts) renameSync(join(stage, file), join(lib, file));
@@ -98,6 +98,7 @@ export function startReloadHost(options: {
   build: string;
   admission: ReloadAdmission;
   blockers: () => string[];
+  checkLease?: (id: string) => string[];
   leaseMs?: number;
   reloadResult?: ReloadResult;
   log: (message: string) => void;
@@ -122,13 +123,13 @@ export function startReloadHost(options: {
   let closed = false;
   let outgoing: Handoff | undefined;
 
-  const inspect = () => {
+  const inspect = (id: string) => {
     try {
       const owners = liveReloadEndpoints(dir);
       if (owners.length !== 1 || owners[0]?.instance !== instance || !isLinkedCheckout(dir, root) || hmr.config.root.length !== 0) {
         throw Error('profile ownership or checkout link has changed');
       }
-      const work = [...admission.blockers(), ...blockers()];
+      const work = [...admission.blockers(), ...blockers(), ...(options.checkLease?.(id) ?? [])];
       return work.length ? { state: 'busy', blockers: work } : null;
     } catch (error) {
       return { state: 'unknown', blockers: [error instanceof Error ? error.message : 'host activity is unverifiable'] };
@@ -175,7 +176,7 @@ export function startReloadHost(options: {
     let result: CommitResult;
     try {
       if (readFileSync(trigger, 'utf8') !== candidate.id) return;
-      result = inspect() ?? await applyBuild(candidate);
+      result = inspect(candidate.id) ?? await applyBuild(candidate);
     } catch (error) {
       result = { state: candidate.publishing ? 'unconfirmed' : 'unavailable',
         blockers: [error instanceof Error ? error.message : 'native HMR operation failed'] };
@@ -195,7 +196,7 @@ export function startReloadHost(options: {
       try { evidence = options.reloadResult!.evidence(resultId); }
       catch (cause) { return { state: 'unavailable', blockers: [cause instanceof Error ? cause.message : 'Result could not be checked'] }; }
     }
-    publishBuild(root, id, evidence, () => {
+    publishBuild(root, profileSource(root, dir) ?? root, id, evidence, () => {
       candidate.publishing = true;
       clearTimeout(candidate.timer);
     });
@@ -204,7 +205,11 @@ export function startReloadHost(options: {
     handoffs.set(dir, handoff);
     const native = await hmr.reconcileProfile(['super-bot']);
     if (native.restartReason) return { state: 'unconfirmed', blockers: [`native HMR reports ${native.restartReason}`] };
-    if (!handoff.retired || !handoff.successor) return { state: 'unconfirmed', blockers: ['matching replacement did not mount'] };
+    if (!handoff.retired || !handoff.successor) {
+      const reasons = native.pending?.map(item => item.reason) ?? [];
+      return { state: 'unconfirmed', blockers: ['matching replacement did not mount',
+        handoff.retired ? 'old instance retired' : 'old instance still mounted', ...new Set(reasons)] };
+    }
     const successor = await handoff.successor;
     let recordedResult: boolean | undefined;
     if (resultId) {
@@ -248,7 +253,7 @@ export function startReloadHost(options: {
       return;
     }
     if (granted.has(id)) { reply({ state: 'expired-or-cancelled' }); return; }
-    const blocked = inspect();
+    const blocked = inspect(id);
     if (blocked) { reply(blocked); return; }
     if (handoffs.has(dir)) { reply({ state: 'reserved', blockers: ['native reload is still settling'] }); return; }
     const leaseMs = options.leaseMs ?? 120_000;
@@ -318,5 +323,5 @@ export function startReloadHost(options: {
     handoff.successor = ready;
     handoff.record = options.reloadResult?.record;
   }
-  return { ready, close, retired: () => { if (outgoing) outgoing.retired = true; } };
+  return { ready, close, available: () => !closed && !!stopWatching, retired: () => { if (outgoing) outgoing.retired = true; } };
 }

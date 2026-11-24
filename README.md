@@ -62,6 +62,8 @@ dsh --profile super-bot-trial --host 127.0.0.1 --no-open --port 3081
 
 ## 本地开发预览
 
+Web 与 macOS Desktop 可从同一源码分别发布。在各自的 Super Bot 设置开启「开发者模式」，点击「重载本端 Super Bot」即可在空闲时构建并更新当前端。首次使用需要为该 profile 建立独立包链接。见 [分端开发包与设置页重载](docs/development-hmr.md#从设置重载本端-super-bot)。
+
 开发时可用 `link:` 加载当前源码目录的构建产物。沿用前面的独立 `DSH_HOME` 和 `super-bot-trial` profile，首次创建 profile 时先执行上面的初始化命令。已有宿主链接到同一工作目录时，等 Bot、Worker 和后台活动空闲并停止对应宿主，再构建、首次链接或由 tgz 切换到链接。从源码根目录运行：
 
 ```sh

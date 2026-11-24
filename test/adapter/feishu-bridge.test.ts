@@ -1,3 +1,4 @@
+import { ReloadAdmission } from '../../src/reload-admission.ts';
 import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -169,11 +170,12 @@ async function fixture(t: TestContext) {
       await send(item);
     },
   };
+  const admission = new ReloadAdmission();
   const execution = {} as DshExecution;
   let managers = new Managers(ctx, store, execution, dir, () => '', { fullAccess: false });
   managers.install();
   let groups = new FeishuGroups(store, identity, transport);
-  let bridge = new FeishuBridge(ctx, store, managers, groups, transport, identity);
+  let bridge = new FeishuBridge(ctx, store, managers, groups, transport, identity, admission);
   bridge.start();
   const bind = async (botId: string, chatId: string) => {
     advance();
@@ -204,7 +206,7 @@ async function fixture(t: TestContext) {
     rmSync(dir, { force: true, recursive: true });
   });
   return {
-    a, b, aa, bb, sent, advance, connection, incoming, bind, web, runTool, receipt,
+    a, b, aa, bb, sent, advance, connection, incoming, bind, web, runTool, receipt, admission,
     emit, get store() { return store; }, get groups() { return groups; }, get bridge() { return bridge; },
     setSend(fn: typeof send) { send = fn; },
     setModel(enabled: boolean) { model = enabled ? { provider: 'synthetic', model: 'synthetic' } : null; },
@@ -229,7 +231,7 @@ async function fixture(t: TestContext) {
       managers = new Managers(ctx, store, execution, dir, () => '', { fullAccess: false });
       managers.install();
       groups = new FeishuGroups(store, identity, transport);
-      bridge = new FeishuBridge(ctx, store, managers, groups, transport, identity);
+      bridge = new FeishuBridge(ctx, store, managers, groups, transport, identity, admission);
       bridge.start();
       connection('ready');
     },
@@ -693,4 +695,21 @@ test('failed evidence persistence rolls back its receipt and allows the same del
   assert.equal(f.a.agent.inbox.nextTurn.length, 1);
   await f.a.agent.enter();
   await f.a.agent.endTurn();
+});
+
+test('protected reload and group intake exclude each other before the deduplication receipt', async t => {
+  const f = await fixture(t);
+  const resume = f.admission.pause();
+  assert.throws(() => f.incoming('retry-id', 'Synthetic incoming'), { code: 'reload-in-progress' });
+  assert.equal(f.receipt('retry-id'), undefined);
+  resume();
+  let release!: () => void;
+  f.delayResolve(new Promise<void>(resolve => { release = resolve; }));
+  try {
+    await f.incoming('retry-id', 'Synthetic incoming');
+    assert.ok(f.receipt('retry-id'));
+    assert.throws(() => f.admission.pause(), /occupied/);
+  } finally {
+    release();
+  }
 });

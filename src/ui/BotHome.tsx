@@ -6,6 +6,7 @@ import { styles } from './styles.ts';
 import { readTaskLink, workLinkForUrl } from './work-navigation.ts';
 import { workUrl, type WorkLink } from '../work-links.ts';
 import { inboxGroups } from './work/format.ts';
+import { reloadSettingsKey, returningToReloadSettings } from './DeveloperSettings.tsx';
 import { FeishuSettings } from './FeishuSettings.tsx';
 
 const DEFAULT_INSTRUCTIONS = '你是我的长期助手。自然地与我交流，理解我的目标，必要时澄清，主动安排已授权的工作，并回来交付结果。';
@@ -59,7 +60,7 @@ export function BotHome({ api }: { api: WorkspaceApi }) {
   const [catalog, setCatalog] = useState<MirrorCatalog>();
   const [error, setError] = useState(''), [busy, setBusy] = useState(false);
   const [work, setWork] = useState<Work | null>(null);
-  const [showSettings, setShowSettings] = useState(false);
+  const [showSettings, setShowSettings] = useState(returningToReloadSettings);
   const settingsEntry = useRef<HTMLButtonElement>(null);
   const [creating, setCreating] = useState(false), [name, setName] = useState(''), [instructions, setInstructions] = useState('');
   const request = useRef(crypto.randomUUID()), alive = useRef(true), locked = useRef(false);
@@ -132,6 +133,7 @@ export function BotHome({ api }: { api: WorkspaceApi }) {
   if (showSettings) return <FeishuSettings api={api} bots={loading ? undefined : bots} openGroup={botId => {
     api.beginNavigation(); setShowSettings(false); setWork({ botId, focusFeishu: true });
   }} createBot={() => { setShowSettings(false); setCreating(true); }} close={() => {
+    sessionStorage.removeItem(reloadSettingsKey);
     setShowSettings(false);
     requestAnimationFrame(() => settingsEntry.current?.focus());
   }}/>;

@@ -14,6 +14,8 @@ import { realpathSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { basename,extname,join,resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { checkDeveloperLease, developerSettings } from './developer-reload.ts';
+import { profileSource } from './dev-reload-paths.ts';
 import { startReloadHost } from './dev-reload-host.ts';
 import { ReloadAdmission } from './reload-admission.ts';
 import { readEvidence } from './evidence.ts';
@@ -76,6 +78,10 @@ export async function apply(ctx: Context, config: RuntimeOptions & {
   const managers=new Managers(ctx,store,execution,dataDir,()=>ctx.webServer.getOrigin(),config,reloadAdmission);
   const sidebar=new NativeSidebar(ctx,store);
   let reloadHost: ReturnType<typeof startReloadHost>;
+  const build = typeof __SUPER_BOT_RELOAD_BUILD__ === 'string' ? __SUPER_BOT_RELOAD_BUILD__ : '';
+  const root = realpathSync(checkout);
+  const source = (profile && profileSource(root, profile.dir)) ?? root;
+  const developer = developerSettings(profile, root, build, () => reloadHost?.available() ? reloadHost.ready : undefined);
   let feishuReady: ReturnType<typeof startFeishuHost> | undefined;
   ctx.effect(() => async () => {
     reloadHost?.close();
@@ -87,7 +93,7 @@ export async function apply(ctx: Context, config: RuntimeOptions & {
   const mirror = await mirrorReady;
   execution.install();
   managers.install();
-  const feishu = await (feishuReady = startFeishuHost(ctx, store, managers, config.feishu?.enabled === true, profile?.dir));
+  const feishu = await (feishuReady = startFeishuHost(ctx, store, managers, config.feishu?.enabled === true, profile?.dir, undefined, reloadAdmission));
   const require = createRequire(import.meta.url);
   const runtime = require('@deepseek-ai/dsh-agent/package.json').version as string;
   const startedAt = Date.now();
@@ -139,6 +145,7 @@ export async function apply(ctx: Context, config: RuntimeOptions & {
         return { ok: true, value: await mirror.read(query) };
       }
       if ('owner' in payload) throw new AppError('invalid-input', '此入口只操作本机原账本。');
+      if (endpoint.startsWith('developer.')) return { ok: true, value: await developer(endpoint, payload) };
       if (endpoint.startsWith('feishu.')) return { ok: true, value: await feishu.invoke(endpoint, payload) };
       if (endpoint === 'manager.notification.resolve') {
         const botId = requiredText(payload.botId, 'Bot 标识', 200);
@@ -176,7 +183,7 @@ export async function apply(ctx: Context, config: RuntimeOptions & {
         const model = await execution.modelPreview(task.botId, task.id);
         taskInScope(payload);
         const detail = { ...snapshot, recovery, model, childWaits,
-          reloadEligible: snapshot.binding?.cwd === realpathSync(checkout) };
+          reloadEligible: snapshot.binding?.cwd === source };
         if (payload.resultId === undefined) return { ok: true, value: detail };
         const result = store.resultById(requiredText(payload.resultId, '成果标识', 200));
         const linkedResult = result?.taskId === task.id ? result : null;
@@ -299,11 +306,10 @@ export async function apply(ctx: Context, config: RuntimeOptions & {
       const log=(message:string)=>ctx.logger.warn(`[super-bot] ${message}`);
       const unsubscribe=appReady.onReady(()=>{
         try {
-          const root=realpathSync(checkout);
           host=reloadHost=startReloadHost({profile,hmr,root,
-            build:typeof __SUPER_BOT_RELOAD_BUILD__==='string'?__SUPER_BOT_RELOAD_BUILD__:'',admission:reloadAdmission,
-            reloadResult:{evidence:id=>store.devReloadResult(id,root).result.evidence,record:receipt=>store.recordDevReload(root,receipt)},
-            blockers:()=>[...execution.reloadBlockers(),...managers.reloadBlockers()],log});
+            build,checkLease:id=>checkDeveloperLease(realpathSync(profile.dir),id),admission:reloadAdmission,
+            reloadResult:{evidence:id=>store.devReloadResult(id,source).result.evidence,record:receipt=>store.recordDevReload(source,receipt)},
+            blockers:()=>[...execution.reloadBlockers(),...managers.reloadBlockers(),...feishu.reloadBlockers()],log});
         } catch(error) { log(`Development reload unavailable: ${error instanceof Error?error.message:'unknown failure'}`); }
       });
       return ()=>{unsubscribe();host?.close();};

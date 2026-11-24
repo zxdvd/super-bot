@@ -6,12 +6,13 @@ const destination = process.env.SUPER_BOT_BUILD_OUTDIR ?? 'lib';
 const reloadBuild = process.env.SUPER_BOT_RELOAD_BUILD_ID ?? '';
 // Resolve source maps against their final location even when a reload stages the artifacts.
 const outdir = reloadBuild ? 'lib' : destination;
+const buildId = { __SUPER_BOT_RELOAD_BUILD__: JSON.stringify(reloadBuild) };
 const host = { entryPoints: ['src/index.ts'], outdir, bundle: true, format: 'esm',
   platform: 'node', target: 'es2022', packages: 'external', sourcemap: true,
-  define: { __SUPER_BOT_RELOAD_BUILD__: JSON.stringify(reloadBuild) } };
+  define: buildId };
 // DSH loads lazy client factories. Bundle Markdown support and keep host packages shared.
 const client = { entryPoints: ['src/client.tsx'], outdir, bundle: true, format: 'cjs',
-  platform: 'browser', target: 'es2022', external: ['react', '@deepseek-ai/*'], sourcemap: true, jsx: 'automatic',
+  define: buildId, platform: 'browser', target: 'es2022', external: ['react', '@deepseek-ai/*'], sourcemap: true, jsx: 'automatic',
   banner: { js: 'window.__ModuleLoader__.load({id:"@zxdvd/super-bot",factory:(require)=>{var module={exports:{}};var exports=module.exports;' },
   footer: { js: 'return module.exports;}});' } };
 

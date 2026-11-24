@@ -1,3 +1,4 @@
+import { ReloadAdmission } from './reload-admission.ts';
 import { randomUUID } from 'node:crypto';
 import type { Context } from '@deepseek-ai/cordis';
 import { FeishuBridge } from './feishu-bridge.ts';
@@ -80,7 +81,7 @@ function startTokenOf(payload: Record<string, unknown>): string {
 }
 
 export async function startFeishuHost(ctx: Context, store: Store, managers: Managers, legacyEnabled: boolean, profileDir?: string,
-  loadSdk: () => Promise<Sdk> = () => import('./feishu-sdk.ts')) {
+  loadSdk: () => Promise<Sdk> = () => import('./feishu-sdk.ts'), admission = new ReloadAdmission()) {
   let active = true;
   let { saved, error: issue } = loadFeishuSettings(profileDir, legacyEnabled);
   let runtime: Runtime | undefined;
@@ -102,7 +103,7 @@ export async function startFeishuHost(ctx: Context, store: Store, managers: Mana
     const identity = { appId, ownerOpenId };
     const groups = new FeishuGroups(store, identity, transport, () => active && runtime === next);
     const next: Runtime = {
-      kind: 'bound', appId, transport, groups, bridge: new FeishuBridge(ctx, store, managers, groups, transport, identity),
+      kind: 'bound', appId, transport, groups, bridge: new FeishuBridge(ctx, store, managers, groups, transport, identity, admission),
     };
     return next;
   }
@@ -389,6 +390,11 @@ export async function startFeishuHost(ctx: Context, store: Store, managers: Mana
   }
 
   return {
+    reloadBlockers(): string[] {
+      return [...(credentialCheck.pending ? ['飞书凭证核验中'] : []),
+        ...(!selfTest.startToken() ? ['飞书私聊自测进行中'] : []),
+        ...(runtime?.kind === 'bound' ? runtime.bridge.reloadBlockers() : [])];
+    },
     async close() {
       active = false;
       checks.abort();
@@ -399,7 +405,9 @@ export async function startFeishuHost(ctx: Context, store: Store, managers: Mana
       await Promise.allSettled(inFlight);
     },
     async invoke(action: string, payload: Record<string, unknown>) {
-      const pending = invoke(action, payload);
+      const read = ['feishu.status', 'feishu.settings.get', 'feishu.settings.test.status'].includes(action);
+      if (read) return invoke(action, payload);
+      const pending = admission.run('飞书请求 ' + action, () => invoke(action, payload));
       inFlight.add(pending);
       try { return await pending; } finally { inFlight.delete(pending); }
     },

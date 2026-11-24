@@ -1,5 +1,21 @@
 # 本地开发热加载验证
 
+## 从设置重载本端 Super Bot
+
+Web 和 macOS Desktop 可以共用一份源码。为每个本地 DSH profile 首次准备自己的开发包，源码目录需长期保留，构建依赖通过 `npm ci` 安装。以已有的 `web` profile 为例，在源码根目录、该 profile 的 `DSH_HOME` 环境中执行：
+
+```sh
+node scripts/dev-profile-package.mjs web
+```
+
+命令在源码目录下生成该 profile 专属的构建目录，输出一个完整的 `link:…`。再次运行会返回相同路径。等本端 Bot 和后台工作空闲，正常退出该端，运行 `dsh plugin --profile web add "link:上一步输出的绝对路径"`，然后启动原 profile。Desktop 使用相同源码，将两条命令的 profile 参数换成 `desktop`，使用 Desktop 对应的 DSH home。每个链接只供生成它的 profile 使用。
+
+进入「Super Bot → 设置」，勾选「启用本端插件开发」。开关写入当前 profile 的 `super-bot.json` 顶层 `developerMode`，默认关闭。修改本地源码后点击「重载本端 Super Bot」。本端会申请空闲许可、暂存构建、发布到本端目录，并在原设置页核对 Host 和当前窗口的构建号。Web 与 Desktop 可在不同时间试用同一修改。插件内未保存的表单可能在重新挂载时重置。
+
+有活动时，设置页显示阻塞项，等工作结束再点。后端已更新而窗口尚未加载时会显示等待状态。若显示「结果待核对」，可先打开 DSH 的 Plugins 和宿主日志检查。包版本、依赖声明或 Cordis 补丁变更时，先退出该端，将之前输出的包目录移到备份位置，再运行准备和安装命令。共享依赖升级前，两端都应空闲并退出。原有 `dev:reload` 命令可继续用于独立开发包或原 checkout 链接。
+
+## 原生重载机制与验证
+
 2026-11-08，DSH Web `0.2.2-rc.1`、Node `24.21.0`。
 
 DSH 已提供 [Host HMR](https://github.com/deepseek-ai/deepseek-harness/blob/master/packages/boot/hmr/README.md) 和 [Client HMR](https://github.com/deepseek-ai/deepseek-harness/blob/master/packages/client/hmr/README.md)。本项目复用这些机制，不实现另一套插件加载器。
