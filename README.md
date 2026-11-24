@@ -89,6 +89,7 @@ SUPER_BOT_PROFILE=super-bot-trial npm run dev:reload -- --wait 30
 - `npm run check` 包含行数检查、类型检查、核心账本测试、DSH 适配层测试和 Host/Client 构建。`npm test` 单独运行账本测试。
 - `npm run smoke:notifications`：自建全新隔离 home/profile/账本与确定性提供方，验证 Manager 未就绪、额度恢复、通知回执崩溃及重复重启；无真实模型费用、无生产连接。
 - `npm run smoke:chat`：在专用探针宿主上验证聊天接单、同对话交付、文件下载、提问回答、返工、Bot 直接 Shell 查询/noWait 拒绝与 Worker 原生 Shell 文件任务；仅确定性模型，不依赖外部服务。可传专用宿主日志：`npm run smoke:chat -- .runtime/permissions-host.log`。
+- `node scripts/smoke-manager-native-tools.mjs` 使用隔离 DSH Web、确定性模型和合成计数工具验证 Manager 的宿主工具执行边界。设置 `SUPER_BOT_TEST_PLAYWRIGHT` 和 `SUPER_BOT_TEST_BROWSER` 为本机 Playwright 模块与 Chromium 可执行文件的绝对路径。加 `--files` 验证 files 模式。
 - `npm run smoke:feishu`：启动两个独立 DSH profile，以合成飞书传输和确定性模型验证配置检测、保存、旧凭证导入、群绑定、双向文本、原生聊天交付、断线重连及重启。无需真实飞书或模型凭证。
   设置 `SUPER_BOT_TEST_PLAYWRIGHT` 和 `SUPER_BOT_TEST_BROWSER` 为 Playwright 模块、Chromium 可执行文件的绝对路径，还可通过 DSH Web 界面操作全局飞书设置、群绑定和原生聊天。
 - `node scripts/smoke-delivery-receipt.mjs <隔离宿主日志>`：使用确定性探针和每小时一次的唤醒限额，验证工具回包、原聊天链接回执、版本下载及人工验收状态。运行条件与证据见 [DF-14](specs/changes/2026-11-super-bot-mvp/evidence.md#2026-11-21-df-14--原聊天成果回执)。
@@ -136,7 +137,7 @@ Node 用 fnm 管理时，可用 `fnm exec --using=24.21.0 npm run dev`，无需�
 ```yaml
 - id: super-bot
   config:
-    fullAccess: true  # 默认开放 Bot 查询工具（含 Shell）及 Worker Full Access；false 用于隔离/兼容测试
+    fullAccess: true  # Bot 满足当前轮核验条件时继承宿主工具；Worker 使用原生 Full Access
     allowedRoots: [/absolute/path/projects]  # 任务目录只能落在这些根之下
     managerModel:
       provider: your-provider
@@ -323,9 +324,13 @@ SUPER_BOT_TEST_BOT_MEMORY=1 SUPER_BOT_TEST_BUILD_DIR="$PWD/.runtime/memory-build
 
 创建或打开 Bot 时自动准备当前对话；在原生界面选择模型。它可以通过聊天创建任务，也会接收新任务、回答、返工和执行结束的重要事件。仅完整且处于自动管理状态的任务可派发；默认由人最终验收。创建任务时明确授权的低风险任务可由 Bot 验收，记录不会伪装成人工接受。
 
-默认 Bot 开放 `skill`、`bash`、`read`、`read_image`、`job_output`、`job_list`、`job_kill`，外加已有的 `super_bot_manage` 任务/审查/交付工具；不给 `write`/`edit` 或原生 Worker/subagent 工具。工具列表和执行守卫共同约束可用工具。短只读查询（状态检查、git status、lark-cli 查询、需要 Shell 的 skill）直接在 Bot 中完成，不创建 Task；代码/文件修改、多步骤工作和长任务仍通过 Task 委派 Worker。项目查询使用明确的 workdir/file_path，Bot 自身目录不是 Worker 项目目录。Shell 仍有修改本机的能力：查询与修改的意图分工依靠指令，不把白名单或 noWait 宣称为只读沙箱。
+默认启用 Full Access。当前 Bot 的普通 DSH 宿主信任输入或核验过的绑定飞书 owner 输入进入本轮后，可执行 DSH 为当前步骤提供的原生工具，仍须通过宿主工具策略与审批。原生聊天 owner 与来源字段等同的可信本机 `sessionController.prompt` 输入都属于宿主信任输入，两者在 DSH 中无法据来源字段区分。这个权限范围对应宿主信任，无法证明输入由真人发出。
 
-Bot 的 bash **也受 `fullAccess` 控制**：默认/true 开放上述工具；显式 `fullAccess: false` 时只留 `super_bot_manage`，Worker 使用 files 模式。Shell/CLI 请求应直接说明“Bot Shell 与 Worker 完整权限未开启”，提示在当前 profile 的 `cordis.patch.yml` 中将 Super Bot 的 `config.fullAccess` 设为 `true`（或移除显式 `false`），待 Bot/Worker 及后台工作空闲后重载插件。不要要求用户“开启工具通道”；权限已开时应报告实际 CLI/登录错误。
+工具声明可能在输入入场前生成，执行守卫会核对当前 Manager、输入收据和轮次。自动通知、分享、混合或无法核验的输入沿用原有范围，包含 `skill`、`bash`、`read`、`read_image`、`job_output`、`job_list`、`job_kill` 和 `super_bot_manage`。迟到、取消和恢复的调用无法沿用此前的扩大权限。PTC 的虚拟运行器及嵌套调用仍不开放。
+
+短查询可以直接完成。明确要求的微小编辑若不改变实质行为，可以先读目标、按要求修改并回读核对。窄范围调查可使用当前宿主实际提供的调研子代理。实质改动、多步骤和完整验证要交给 Worker。已有任务先核对任务详情，使用 `respond` 回答开放问题，或使用 `rework` 提交返工。若 Worker 运行时没有接收新输入的入口，Bot 会说明当前状态。项目查询使用明确的 workdir/file_path。Shell 仍有修改本机的能力，查询与修改的意图分工依靠指令。
+
+显式设置 `fullAccess: false` 时，Bot 只留 `super_bot_manage`，Worker 使用 files 模式。收到 Shell/CLI 请求时，Bot 会说明“Bot Shell 与 Worker 完整权限未开启”，提示在当前 profile 的 `cordis.patch.yml` 中将 Super Bot 的 `config.fullAccess` 设为 `true`（或移除显式 `false`），待 Bot、Worker 及后台工作空闲后重载插件。权限已开时，Bot 会报告实际的工具、CLI 或授权错误。
 
 Bot 的 noWait 守卫拒绝常见 `sleep` 命令；bash 必须显式指定 `0 < timeoutMs <= 30000`，或 `run_in_background: true`（如同时给 timeoutMs，仍须不超过 30 秒）。所有 preset 都不依赖默认等待时间。`job_output` 默认读取快照；`wait: true` 必须显式给 `0 < timeout_ms <= 5000`。后台查询保留 job ID 后结束本轮，由原生事件通知；不要轮询或等待 Worker。job 工具用于自己的查询，Worker 控制仍走账本。仅补交付恢复期间仍禁止所有原生工具；撤销 Manager 身份后同样拒绝执行。
 

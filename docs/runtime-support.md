@@ -31,13 +31,13 @@
 | 同机 Web 与 macOS Desktop | 真实原生 Host 已验证，日常界面待验收 | Web rc.1、rc.5 与实际 Desktop rc.5 Host。各自原账本、原生聊天和验收可用，对端只读查阅。Desktop 动态端口、两端热载与断线重连通过。[启用说明](../README.md#同机-web-与-desktop-只读镜像) |
 | 真实模型质量、Token/费用 | 已有真实模型试用记录 | 日常 Web 已用真实模型委派 Full Access Worker 执行 Shell、子 Agent、测试，且验证了补充需求、原对话交付和同任务返工。真正有歧义时的澄清、个人首版验收及精确费用归因待用户试用 |
 
-Bot 默认（省略 `fullAccess` 或 true）开放 `skill`、`bash`、`read`、`read_image`、`job_output`、`job_list`、`job_kill` 与 `super_bot_manage`。工具列表和执行 guard 双重约束，无 write/edit 或原生 Worker/subagent 工具。轻量只读/状态查询、lark-cli 查询及 Shell skill 可在 Bot 直接执行；代码/文件修改、多步骤和长任务仍委派 Worker。Shell 不构成只读沙箱，程序不声称能识别任意命令的副作用，意图分工由指令引导。
+Bot Full Access 的工具执行核对当前 Manager、轮次、已入场的输入与宿主步骤的执行证据。正常 DSH 宿主信任输入包含原生聊天 owner 与来源字段等同的可信本机 `sessionController.prompt` 输入。已绑定的飞书 owner 输入还须经入站收据核验。工具可能在执行授权前出现在模型的声明中，实际执行须通过 Super Bot 守卫和 DSH 原有策略及审批。PTC 虚拟运行器与嵌套调用继续受限。
 
-Bot Bash 也受 fullAccess 控制。显式 `fullAccess: false` 时只开放管理工具，Bot 说明“Bot Shell 与 Worker 完整权限未开启”，提示将当前 profile 的 Super Bot `config.fullAccess` 设为 `true`，空闲后重载；Worker 保留 files 模式。默认/true 的 Worker 不受 Manager 工具白名单及 noWait 影响。
+自动、分享、混合和证据不足的普通轮保留 `skill`、`bash`、`read`、`read_image`、`job_output`、`job_list`、`job_kill` 和 `super_bot_manage` 的执行范围。会话恢复或取消会丢弃旧轮的扩大权限。显式 `fullAccess: false` 时，Bot 只开放管理工具，Worker 保留 files 模式。默认 Full Access 的 Worker 沿用 DSH 原生工具供给。
 
 noWait 拒绝常见 sleep 调用；所有 preset 的 Bot bash 都须显式正数 `timeoutMs <= 30000` 或 `run_in_background: true`，同时指定超限 timeoutMs 仍拒绝。`job_output` 可用默认非等待快照，`wait: true` 需显式正数 `timeout_ms <= 5000`；拒绝其原生默认 30 秒等待。后台查询靠原生 job 事件通知，Bot 返回后不轮询，不用 job 工具代替账本控制 Worker。sleep 正则不是完整 Shell 解析器，不能防止刻意伪装的等待；时限约束是工具参数门槛，不是外部进程已停止的证明。仅补交付阶段与撤权后的原生工具仍被禁止。
 
-复跑旧目录、scoped-tools、预算等 files 隔离 smoke 时，须在专用测试 profile 显式设置 `fullAccess: false`；`smoke:chat` 使用默认 Full Access，核对 Bot 精确八项工具列表、直接 Bash 查询零 Task、真实 noWait 拒绝及 Worker Shell 文件任务。
+复跑旧目录、scoped-tools、预算等 files 隔离 smoke 时，在专用测试 profile 显式设置 `fullAccess: false`。`smoke:chat` 核对 Bash 和管理工具声明、直接 Bash 查询零 Task、noWait 拒绝及 Worker Shell 文件任务。使用同 README 的浏览器路径环境变量运行 `node scripts/smoke-manager-native-tools.mjs`，或加 `--files` 复验 files 模式。
 
 仅补交付通知每成果最多 3 次自动唤醒，后两次退避 30/60 秒；次数、结束输入与期限落在原 outbox payload，重启不重置。到限 unknown 并停止唤醒；未知发送、缺失结束记录及补交付轮次用户中断不自动重放。回执核对同宿主的精确链接、归属匹配的原生持久最终回复和正常 turn/end。已用隔离 Desktop HTTP 载体验证换端口后从原聊天打开精确成果，附件由当前创建端校验并返回。成果或链接无法打开时，可从当前「工作」查看任务详情。日常原生 Desktop 窗口待实机验收。
 

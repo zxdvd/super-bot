@@ -105,7 +105,7 @@ export class FeishuInputs {
     return true;
   }
 
-  consume(sessionId: string, turn: number, event: SessionEvent<'user/message'>): ChatSource | undefined {
+  consume(sessionId: string, turn: number, event: SessionEvent<'user/message'>): { source: ChatSource; input: FeishuInput } | undefined {
     if (event.surfaceOp !== 'append') return;
     const pending = this.evidence(sessionId, event.data);
     if (!pending || pending.turn !== turn) return;
@@ -115,7 +115,10 @@ export class FeishuInputs {
     if (recorded.changes !== 1) return;
     pending.entered = true;
     pending.confirm();
-    return { sessionId, messageId: event.data.id, seq: event.seq, text: pending.input.received.text };
+    return {
+      source: { sessionId, messageId: event.data.id, seq: event.seq, text: pending.input.received.text },
+      input: pending.input,
+    };
   }
 
   hasProposedInput(sessionId: string, turn: number, messageId: string): boolean {

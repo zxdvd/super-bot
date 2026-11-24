@@ -238,7 +238,15 @@ for(const mode of [undefined,true,false])test(`Bot query tools and routing follo
     for(const name of ['write','edit','subagent','subagent_fork','Worker','super_bot_report','external_plugin_tool'])assert.match(String(f.guard(name)),mode===false?/fullAccess: false/:/not available.*Worker/);
     assert.match(f.prompt(),/lark-cli/);assert.match(f.prompt(),/Never ask the user to enable a tool channel/);
     if(mode===false){assert.match(f.prompt(),/Bot Shell 与 Worker 完整权限未开启/);assert.match(f.prompt(),/fullAccess: true.*cordis.patch.yml/);assert.match(f.prompt(),/BEFORE creating or dispatching/);}
-    else {assert.match(f.prompt(),/Run short read-only\/status queries directly/);assert.match(f.prompt(),/code\/file changes, multi-step work or long-running tasks, create and dispatch a Task/);assert.doesNotMatch(f.prompt(),/完整权限未开启/);}
+    else {
+      assert.match(f.prompt(),/Run short read-only\/status queries directly/);
+      assert.match(f.prompt(),/read the target, make only the requested edit, and read it back/);
+      assert.match(f.prompt(),/use a research subagent only if the host actually provides one/);
+      assert.match(f.prompt(),/Delegate substantive modifications, multi-step work, long-running work and full verification as Worker Tasks/);
+      assert.match(f.prompt(),/Use respond for an open question and rework for an eligible result/);
+      assert.match(f.prompt(),/If the Worker is running and there is no current input route, tell the user/);
+      assert.doesNotMatch(f.prompt(),/完整权限未开启/);
+    }
   }finally{await f.close();}
 });
 
