@@ -10,4 +10,4 @@
 - 不修改 DSH 安装包、上游源码或现有 `dsh-plugins`；兼容探针使用独立 profile/测试数据，不复用用户日常 Session。
 - 密钥与实际聊天正文不入仓库。数据库、日志、证据产物放运行数据目录；仓库仅保留合成夹具、脱敏结果和稳定引用。
 - 变更需有对应验收证据，尤其是重复投递、晚到事件、人工干预、停止与重启。实现阶段建立实际 build/typecheck/test 命令后同步 README。
-- PR 在修复和本地验证完成后默认 Ready for review；只有工作确实未完成才用 draft。Spec 的 draft/ready 与 PR 状态是两个概念。
+- Super Bot 默认直接交付到 `dev`。在工作分支完成改动后，先获取最新的 `origin/dev`，将提交 rebase 到它之上，再运行本地验证。验证通过后用 `git push origin HEAD:dev` 快进推送。
