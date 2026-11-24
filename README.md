@@ -116,7 +116,7 @@ Node 用 fnm 管理时，可用 `fnm exec --using=24.21.0 npm run dev`，无需�
 1. 在飞书开放平台创建企业自建应用，启用机器人能力，确保应用可用范围包含你的飞书账号。申请 `im:message.p2p_msg:readonly` 用于接收私聊测试消息，`im:message:send_as_bot` 用于机器人发言。群同步还需要 `im:message.group_at_msg:readonly` 和 `im:chat:read`。需要新建私有群时申请 `im:chat:create`。绑定由他人担任群主的群时，申请 `im:chat.members:read`。群内免 `@` 收消息可以另外申请敏感权限 `im:message.group_msg`。[飞书消息权限](https://open.feishu.cn/document/uAjLw4CM/ukTMukTMukTM/reference/im-v1)
 2. 在对应 DSH profile 的 Super Bot 首页打开「设置 → 飞书」，填写 App ID 和 App Secret。点击「保存并连接」。当前凭证向飞书成功换取令牌后，连接页显示「凭证有效」。如果事件长连接断开，页面会单独提示。
 3. 在飞书开发者后台「事件与回调 → 事件配置」选择**使用长连接接收事件**，添加「接收消息」`im.message.receive_v1`，发布包含权限和事件配置的应用版本，并完成租户要求的审批。如果控制台要求已连上的实例再保存，请先保持宿主运行。[飞书长连接事件配置](https://open.feishu.cn/document/ukTMukTMukTM/uYDNxYjL2QTM24iN0EjN/event-subscription-configure-)
-4. 长连接就绪后，点「测试并绑定」，在三分钟内私聊这个应用的机器人，发任意一句新文本。设置页收到消息且飞书确认机器人已回发后，显示「私聊收发通过」。核对消息并点击「确认这是本人」，此连接下的 Bot 共用该身份。跳过后页面保留「未测试」。旧配置中的本人身份仍然有效，私聊测试结果以实际收发记录为准。
+4. 长连接就绪后，点「测试并绑定」，再点「在飞书打开机器人」。链接按当前 App ID 打开私聊，在三分钟内发任意一句新文本。设置页收到消息且飞书确认机器人已回发后，显示「私聊收发通过」。核对消息并点击「确认这是本人」，此连接下的 Bot 共用该身份。跳过后页面保留「未测试」。旧配置中的本人身份仍然有效，私聊测试结果以实际收发记录为准。
 
 同一 profile 的所有 Bot 共用该 profile 目录下的 `super-bot.json`（例如 `~/.dsh/profiles/desktop/super-bot.json`），文件权限为 `0600`。编辑同一 App 时，Secret 留空可沿用已保存的值，已有本人身份继续生效。旧版的 `super-bot.feishu.json` 会一次性导入，迁移时保留原身份和原启用状态。后续设置以新文件为准，宿主的 `cordis.patch.yml` 由 DSH 继续管理。
 

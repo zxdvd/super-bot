@@ -64,6 +64,8 @@ function TestControls({ view, test, disabled, editing, retryStart, perform }: {
       </details>
     </div>}
     <div className="actions">
+      {test?.state === 'waiting' && <a target="_blank" rel="noopener noreferrer"
+        href={`https://applink.feishu.cn/client/bot/open?appId=${encodeURIComponent(view.appId)}`}>在飞书打开机器人</a>}
       {(!test || ended) && <button type="button" className="primary"
         disabled={disabled || editing || !ready || !(view.testStartToken || retryStart)}
         onClick={() => perform('test.start')}>{ended ? '重新开始测试' : '测试并绑定'}</button>}

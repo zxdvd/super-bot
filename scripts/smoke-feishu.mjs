@@ -424,6 +424,9 @@ try {
     const text = '合成私聊任意一句';
     await page.getByRole('button', { name: '测试并绑定', exact: true }).click();
     await page.getByText(/请在飞书私聊这个应用的机器人/).waitFor();
+    const openRobot = page.getByRole('link', { name: '在飞书打开机器人', exact: true });
+    assert.equal(await openRobot.getAttribute('href', { timeout: 2000 }),
+      `https://applink.feishu.cn/client/bot/open?appId=${fixtureCredentials.appId}`);
     await receivePrivate(host, '另一应用的私聊', { appId: alternateCredentials.appId });
     assert.equal((await transportStats(host)).sends, 0);
     await feishu(host, 'fail-send', { fail: true });
