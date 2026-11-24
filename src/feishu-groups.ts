@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { setTimeout as delay } from 'node:timers/promises';
 import { AppError, requiredText } from './model.ts';
 import type { Store } from './store.ts';
-import { isFeishuChatId, type FeishuBinding, type FeishuConfig, type FeishuGroup, type FeishuGroupPreview,
+import { isFeishuChatId, type FeishuBinding, type FeishuIdentity, type FeishuGroup, type FeishuGroupPreview,
   type FeishuTransport } from './feishu-types.ts';
 export type { FeishuBinding } from './feishu-types.ts';
 
@@ -13,7 +13,7 @@ const CREATED_GROUP_CHECK_DELAYS_MS = [0, 250, 750, 1500];
 const BINDING_FIELDS = 'id, botId, chatId, name, boundAt';
 const CREATION_FIELDS = 'id, botId, appId, ownerOpenId, name, startedAt, chatId, resolvedAt';
 
-type Creation = Pick<FeishuConfig,'appId'|'ownerOpenId'> & {
+type Creation = FeishuIdentity & {
   id: string;
   botId: string;
   name: string;
@@ -30,7 +30,7 @@ export class FeishuGroups {
   private readonly creating = new Map<string, Promise<FeishuBinding>>();
   private readonly unboundListeners = new Set<(bindingId: string) => void>();
 
-  constructor(private readonly store: Store, config: Pick<FeishuConfig,'appId'|'ownerOpenId'>,
+  constructor(private readonly store: Store, config: FeishuIdentity,
     private readonly transport: Pick<FeishuTransport,'inspectGroup'|'createGroup'>,
     private readonly isActive: () => boolean = () => true) {
     this.appId = config.appId;

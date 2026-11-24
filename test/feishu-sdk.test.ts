@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { setTimeout as delay } from 'node:timers/promises';
 import { test } from 'node:test';
 import { checkFeishuConfig, createFeishuTransport } from '../src/feishu-sdk.ts';
-import type { FeishuConnectionState, FeishuTextMessage } from '../src/feishu-types.ts';
+import type { FeishuConnectionState, FeishuPrivateTextMessage, FeishuTextMessage } from '../src/feishu-types.ts';
 
 const config = { appId: 'cli_fixture', appSecret: 'SYNTHETIC_PRIVATE_SECRET', ownerOpenId: 'ou_fixture' };
 const token = 'SYNTHETIC_PRIVATE_TOKEN';
@@ -130,6 +130,7 @@ function fixture(handler: (request: Request) => unknown = () => { throw Error('U
   const calls: Request[] = [];
   const sockets: Array<{ options: SocketOptions; event?: SocketStart; closed?: boolean }> = [];
   const messages: FeishuTextMessage[] = [];
+  const privateMessages: FeishuPrivateTextMessage[] = [];
   const states: FeishuConnectionState[] = [];
   const credentials = beforeToken ? { ...config, appId: 'cli_revocation_fixture' } : config;
   const transport = createFeishuTransport(credentials, {
@@ -149,9 +150,10 @@ function fixture(handler: (request: Request) => unknown = () => { throw Error('U
   });
   const handlers = {
     onMessage: (message: FeishuTextMessage) => { messages.push(message); },
+    onPrivateMessage: (message: FeishuPrivateTextMessage) => { privateMessages.push(message); },
     onConnection: (state: FeishuConnectionState) => { states.push(state); },
   };
-  return { transport, handlers, sockets, calls, messages, states };
+  return { transport, handlers, sockets, calls, messages, privateMessages, states };
 }
 
 const sender = { sender_type: 'user', sender_id: { open_id: config.ownerOpenId } };
@@ -230,6 +232,38 @@ test('official REST SDK creates a private owner group and sends chat text withou
   assert.equal(send.headers.Authorization, `Bearer ${token}`);
   await assert.rejects(f.transport.sendText('oc_created', '字'.repeat(50_000), 'too-long'), { code: 'feishu-text-too-long' });
   assert.equal(f.calls.filter(call => call.url?.endsWith('/im/v1/messages')).length, 1);
+});
+
+test('direct messages use the original WS application header and never go to group routing', async t => {
+  const f = fixture();
+  t.after(() => f.transport.stop());
+  f.transport.start(f.handlers);
+  const socket = f.sockets[0]!;
+  const emit = (changes: Record<string, unknown> = {}, appId: unknown = config.appId, needCheck = false) =>
+    socket.event!.eventDispatcher.invoke({ schema: '2.0', header: { event_type: eventKind, app_id: appId },
+      event: { sender: { ...sender, sender_id: { open_id: 'ou_candidate' } },
+        message: { ...message, chat_type: 'p2p' }, ...changes } }, { needCheck });
+  await emit();
+  socket.options.onReady?.();
+  await emit({ app_id: config.appId }, 'cli_other');
+  await emit({ app_id: config.appId }, null);
+  await emit({}, config.appId, true);
+  await emit({ sender: { ...sender, sender_type: 'app' } });
+  await emit({ sender: { ...sender, sender_id: { user_id: 'ou_candidate' } } });
+  await emit({ sender: { ...sender, sender_id: { open_id: 'untyped-id' } } });
+  await emit({ message: { ...message, chat_type: 'p2p', content: '{}' } });
+  await emit({ message: { ...message, chat_type: 'p2p', message_type: 'image' } });
+  assert.deepEqual(f.privateMessages, []);
+  await emit();
+  assert.deepEqual(f.privateMessages, [{ appId: config.appId, chatId: 'oc_one', messageId: 'om_exact',
+    senderOpenId: 'ou_candidate', createdAt: 1795427300123, text: '部署进度如何？' }]);
+  assert.deepEqual(f.messages, []);
+  socket.options.onReconnecting?.();
+  await emit();
+  f.transport.stop();
+  await emit();
+  assert.equal(f.privateMessages.length, 1);
+  assert.equal(f.calls.length, 0);
 });
 
 test('requires active group, robot membership, and owner on a paginated roster', async t => {

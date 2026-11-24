@@ -5,7 +5,7 @@ import type { SessionEvent } from '@deepseek-ai/dsh-session';
 import { isFeishuSource } from './dsh-chat-events.ts';
 import { AppError, type ChatSource } from './model.ts';
 import type { Store } from './store.ts';
-import type { FeishuConfig, FeishuTextMessage } from './feishu-types.ts';
+import type { FeishuIdentity, FeishuTextMessage } from './feishu-types.ts';
 
 declare module '@deepseek-ai/dsh-llm' {
   interface MessageSourceMap {
@@ -17,7 +17,7 @@ export type FeishuInput = {
   bindingId: string;
   botId: string;
   sessionId: string;
-  config: Pick<FeishuConfig, 'appId' | 'ownerOpenId'>;
+  config: FeishuIdentity;
   received: FeishuTextMessage;
   signal: AbortSignal;
   isCurrent: () => boolean;

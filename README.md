@@ -111,12 +111,12 @@ Node 用 fnm 管理时，可用 `fnm exec --using=24.21.0 npm run dev`，无需�
 
 ### 准备飞书应用和宿主
 
-1. 在飞书开放平台创建企业自建应用，启用机器人能力，确保应用可用范围包含你要授权的账号。默认申请 `im:message.group_at_msg:readonly` 接收群内 `@` 机器人的消息，`im:message:send_as_bot` 用于机器人发言，`im:chat:read` 用于群信息核验。需要新建私有群时再申请 `im:chat:create`。绑定由他人担任群主的已有群时，再申请 `im:chat.members:read` 核验授权账号的成员身份。免 `@` 收消息可以另外申请敏感权限 `im:message.group_msg`。[飞书消息权限](https://open.feishu.cn/document/uAjLw4CM/ukTMukTMukTM/reference/im-v1) [机器人所在群列表](https://open.feishu.cn/document/server-docs/group/chat/list)
-2. 获取应用的 App ID、App Secret 和授权账号在**这个应用下**的 `open_id`。可在同一应用的飞书 API 调试台通过手机号或邮箱查询，选择 `open_id` 类型。该查找操作需要 `contact:user.id:readonly`，Super Bot 运行时直接使用你提供的 ID。[通过手机号或邮箱获取用户 ID](https://open.feishu.cn/document/uAjLw4CM/ukTMukTMukTM/reference/contact-v3/user/batch_get_id)
-3. 在要接入飞书的 DSH profile 中打开 Super Bot 首页的「设置 → 飞书」，填写 App ID、App Secret 和 Open ID。用「检测配置」检查凭证能否取得令牌，并核对权限结果。无法确认的权限会显示「未验证」。点击「保存并连接」后，当前宿主开始连接飞书。各 Bot 仍需在自己的工作设置中选择要同步的群。
-4. 在飞书开发者后台「事件与回调 → 事件配置」选择**使用长连接接收事件**，添加「接收消息」`im.message.receive_v1`，发布包含权限和事件配置的应用版本，并完成租户要求的审批。如果控制台要求已连上的实例再保存，请先保持宿主运行。全局设置分别显示长连接状态和宿主最近一次收到授权账号在绑定群发送文本的时间。宿主向飞书发起 HTTPS 和 WebSocket 连接，无需对飞书开放回调端口。[飞书长连接事件配置](https://open.feishu.cn/document/ukTMukTMukTM/uYDNxYjL2QTM24iN0EjN/event-subscription-configure-)
+1. 在飞书开放平台创建企业自建应用，启用机器人能力，确保应用可用范围包含你的飞书账号。申请 `im:message.p2p_msg:readonly` 用于接收私聊测试消息，`im:message:send_as_bot` 用于机器人发言。群同步还需要 `im:message.group_at_msg:readonly` 和 `im:chat:read`。需要新建私有群时申请 `im:chat:create`。绑定由他人担任群主的群时，申请 `im:chat.members:read`。群内免 `@` 收消息可以另外申请敏感权限 `im:message.group_msg`。[飞书消息权限](https://open.feishu.cn/document/uAjLw4CM/ukTMukTMukTM/reference/im-v1)
+2. 在对应 DSH profile 的 Super Bot 首页打开「设置 → 飞书」，填写 App ID 和 App Secret。用「检测配置」检查凭证能否取得令牌，并核对已列出的权限。点击「保存并连接」后，当前宿主开始连接飞书。
+3. 在飞书开发者后台「事件与回调 → 事件配置」选择**使用长连接接收事件**，添加「接收消息」`im.message.receive_v1`，发布包含权限和事件配置的应用版本，并完成租户要求的审批。如果控制台要求已连上的实例再保存，请先保持宿主运行。[飞书长连接事件配置](https://open.feishu.cn/document/ukTMukTMukTM/uYDNxYjL2QTM24iN0EjN/event-subscription-configure-)
+4. 长连接就绪后，点「开启 1:1 收发测试」，在三分钟内私聊这个应用的机器人，发任意一句新文本。收到后，设置页会显示发件人的应用内 Open ID、收到时间和消息预览。机器人回到同一私聊，飞书接口成功后显示发送通过。核对消息并点击「确认这是本人」，连接下的所有 Bot 即可共用该身份。跳过测试仍可保留连接，群同步需先绑定本人身份。各 Bot 的群收发需要另外验证。
 
-同一 profile 的所有 Bot 共用该 profile 目录下的 `super-bot.json`（例如 `~/.dsh/profiles/desktop/super-bot.json`），文件权限为 `0600`。App Secret 保存后输入框会清空，留空会沿用已保存的 Secret。旧版的 `super-bot.feishu.json` 会一次性导入，迁移时只有旧配置显式启用的连接才会继续启用。后续设置以新文件为准，宿主的 `cordis.patch.yml` 由 DSH 继续管理。
+同一 profile 的所有 Bot 共用该 profile 目录下的 `super-bot.json`（例如 `~/.dsh/profiles/desktop/super-bot.json`），文件权限为 `0600`。编辑同一 App 时，Secret 留空可沿用已保存的值，已有本人身份继续生效。旧版的 `super-bot.feishu.json` 会一次性导入，迁移时保留原身份和原启用状态。后续设置以新文件为准，宿主的 `cordis.patch.yml` 由 DSH 继续管理。
 
 让运行飞书接入的宿主独占应用的事件长连接。如果 OpenClaw、Hermes、另一个 Super Bot 宿主或 `lark-cli event consume` 同时监听相同的 App ID，飞书只向其中一个连接分发每个事件，部分群消息可能在 Super Bot 中看不到。用 lark-cli 查询或发送消息可以照常进行。[飞书长连接分发说明](https://open.feishu.cn/document/uAjLw4CM/ukTMukTMukTM/event-subscription-guide/event-card-faq)
 
@@ -128,7 +128,7 @@ Node 用 fnm 管理时，可用 `fnm exec --using=24.21.0 npm run dev`，无需�
 
 可以在群里委派任务、回答追问或要求返工。暂停、恢复、停止、取消和最终验收请在 Web 完成。同步只覆盖长连接就绪后、绑定生效后的新文本，断线期间的消息和已有历史不会补发。图片、文件、卡片等内容不传输。可从 Web 下载成果附件，正文内已有的成果链接仍适用原宿主的访问权限。
 
-连接或投递异常会显示在「飞书群」设置。请核对应用版本、权限和机器人群成员资格，原对话会保留已有内容。建群结果待核对时，用原名称重试。若飞书已经建群，可以找到 `chat_id` 后预览绑定。「解绑」立即撤销后续同步，飞书内的群和已发送的消息会保留。更换应用或授权账号后，旧绑定仍归原应用和账号。要在下次启动时关闭整个 profile 的接入，请在宿主停止期间将当前 profile 的 `super-bot.json` 内的 `feishu.enabled` 设为 `false`，并保留文件的 `0600` 权限。
+连接或投递异常会显示在「飞书群」设置。请核对应用版本、权限和机器人群成员资格，原对话会保留已有内容。建群结果待核对时，用原名称重试。若飞书已经建群，可以找到 `chat_id` 后预览绑定。「解绑」立即撤销后续同步，飞书内的群和已发送的消息会保留。切换应用后，旧群绑定仍归原应用和账号。切回原应用并重新确认同一身份后，原群绑定可继续使用。要在下次启动时关闭整个 profile 的接入，请在宿主停止期间将当前 profile 的 `super-bot.json` 内的 `feishu.enabled` 设为 `false`，并保留文件的 `0600` 权限。
 
 ## 使用完整原生 Worker
 

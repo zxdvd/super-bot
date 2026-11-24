@@ -1,8 +1,8 @@
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { AppType, Client, DefaultCache, defaultHttpInstance, Domain, EventDispatcher, WSClient } from '@larksuiteoapi/node-sdk';
 import { AppError } from './model.ts';
-import { isFeishuChatId, type FeishuCheckResult, type FeishuConfig, type FeishuConnectionState, type FeishuGroup, type FeishuHandlers,
-  type FeishuTextMessage, type FeishuTransport } from './feishu-types.ts';
+import { isFeishuChatId, isFeishuOpenId, type FeishuCheckResult, type FeishuConfig, type FeishuConnectionState,
+  type FeishuCredentials, type FeishuGroup, type FeishuHandlers, type FeishuTextMessage, type FeishuTransport } from './feishu-types.ts';
 
 const MESSAGE_EVENT = 'im.message.receive_v1';
 const REQUEST_TIMEOUT_MS = 12_000;
@@ -54,7 +54,7 @@ function permissionResults(scopes?: Record<string, unknown>[]): FeishuCheckResul
 }
 
 /** Exchanges a fresh token, then reads the app's granted scopes when available. */
-export async function checkFeishuConfig(config: FeishuConfig, options: Pick<TransportOptions, 'httpAdapter' | 'requestTimeoutMs'>
+export async function checkFeishuConfig(config: FeishuCredentials, options: Pick<TransportOptions, 'httpAdapter' | 'requestTimeoutMs'>
   & { signal?: AbortSignal } = {}): Promise<FeishuCheckResult> {
   const timeout = options.requestTimeoutMs ?? REQUEST_TIMEOUT_MS;
   const deadline = AbortSignal.timeout(timeout);
@@ -103,15 +103,14 @@ function readableText(content: string, mentions: unknown): string {
   return value.replace(placeholder, key => keys.get(key) ?? key);
 }
 
-function ownerTextEvent(event: unknown, app: string, owner: string): FeishuTextMessage | null {
-  const { app_id: appId, sender, message } = object(event);
+function humanText(event: Record<string, unknown>): FeishuTextMessage | null {
+  const { sender, message } = event;
   const { sender_type: senderType, sender_id: senderId } = object(sender);
   const { open_id: senderOpenId } = object(senderId);
-  const { chat_type: chatType, chat_id: chatId, message_id: messageId, message_type: messageType,
+  const { chat_id: chatId, message_id: messageId, message_type: messageType,
     create_time: createTime, content, mentions } = object(message);
-  if (appId !== undefined && appId !== app) return null;
-  if (senderType !== 'user' || senderOpenId !== owner) return null;
-  if ((chatType !== 'group' && chatType !== 'topic_group' && chatType !== 'topic') || messageType !== 'text' || !isFeishuChatId(chatId)) return null;
+  if (senderType !== 'user' || !isFeishuOpenId(senderOpenId)) return null;
+  if (messageType !== 'text' || !isFeishuChatId(chatId)) return null;
   if (typeof messageId !== 'string' || !/^om_[A-Za-z0-9_]{1,125}$/.test(messageId) || typeof content !== 'string') return null;
   const createdAt = typeof createTime === 'string' && /^\d+$/.test(createTime) ? Number(createTime) : createTime;
   if (typeof createdAt !== 'number' || !Number.isSafeInteger(createdAt) || createdAt < 0) return null;
@@ -119,6 +118,23 @@ function ownerTextEvent(event: unknown, app: string, owner: string): FeishuTextM
   const text = readableText(content, mentions);
   if (!text) return null;
   return { chatId, messageId, senderOpenId, createdAt, text };
+}
+
+class FeishuEventDispatcher extends EventDispatcher {
+  constructor(cache: DefaultCache, private readonly onPrivate: (appId: unknown, payload: Record<string, unknown>) => void) {
+    super({ logger, cache });
+  }
+
+  override async invoke(data: unknown, options?: { needCheck?: boolean }) {
+    const { schema, header, event } = object(data);
+    const envelope = object(header), payload = object(event);
+    if (schema === '2.0' && envelope.event_type === MESSAGE_EVENT && object(payload.message).chat_type === 'p2p') {
+      // The SDK flattens header and body fields. Read App ID from the original header on trusted WS delivery.
+      if (options?.needCheck === false) this.onPrivate(envelope.app_id, payload);
+      return;
+    }
+    return super.invoke(data, options);
+  }
 }
 
 function stoppedError(): AppError {
@@ -239,10 +255,10 @@ export function createFeishuTransport(config: FeishuConfig, options: TransportOp
     return hasPageItem(pageToken => im.chat.list({ params: { page_size: 100, page_token: pageToken } }), item => item.chat_id === chatId);
   }
 
-  function ownerInGroup(chatId: string): Promise<boolean> {
+  function ownerInGroup(chatId: string, owner: string): Promise<boolean> {
     return hasPageItem(pageToken => im.chatMembers.get({
       path: { chat_id: chatId }, params: { member_id_type: 'open_id', page_size: 100, page_token: pageToken },
-    }), member => member.member_id === ownerOpenId);
+    }), member => member.member_id === owner);
   }
 
   function changeState(current: Connection, state: FeishuConnectionState): void {
@@ -272,11 +288,18 @@ export function createFeishuTransport(config: FeishuConfig, options: TransportOp
       handlers.onConnection('connecting');
       if (connection !== current) return;
       try {
-        const dispatcher = new EventDispatcher({ logger, cache }).register({
+        const dispatcher = new FeishuEventDispatcher(cache, (sourceAppId, payload) => {
+          if (connection !== current || !isReady(current) || sourceAppId !== appId || !handlers.onPrivateMessage) return;
+          const message = humanText(payload);
+          if (message) handlers.onPrivateMessage({ ...message, appId });
+        }).register({
           [MESSAGE_EVENT]: async event => {
-            if (connection !== current || !isReady(current)) return;
-            const message = ownerTextEvent(event, appId, ownerOpenId);
-            if (!message) return;
+            if (connection !== current || !isReady(current) || !ownerOpenId) return;
+            const payload = object(event), chatType = object(payload.message).chat_type;
+            if (payload.app_id !== undefined && payload.app_id !== appId) return;
+            if (chatType !== 'group' && chatType !== 'topic_group' && chatType !== 'topic') return;
+            const message = humanText(payload);
+            if (!message || message.senderOpenId !== ownerOpenId) return;
             try { await handlers.onMessage(message); }
             catch { throw new Error('Feishu message handoff failed'); }
           },
@@ -303,6 +326,7 @@ export function createFeishuTransport(config: FeishuConfig, options: TransportOp
     },
     inspectGroup(chatId): Promise<FeishuGroup> {
       return rest(async () => {
+        if (!ownerOpenId) throw new AppError('feishu-self-unbound', '请先在飞书连接设置中绑定本人身份。');
         assertChatId(chatId);
         const path = { chat_id: chatId };
         if (!await robotInGroup(chatId)) throw new AppError('feishu-bot-not-in-group', '请先将此飞书应用的机器人加入群聊。');
@@ -310,7 +334,7 @@ export function createFeishuTransport(config: FeishuConfig, options: TransportOp
         if ((group.chat_mode !== 'group' && group.chat_mode !== 'topic') || (group.chat_status && group.chat_status !== 'normal')) {
           throw new AppError('feishu-not-group', '该 chat_id 对应的会话不是可用的飞书群。');
         }
-        if (group.owner_id !== ownerOpenId && !await ownerInGroup(chatId)) {
+        if (group.owner_id !== ownerOpenId && !await ownerInGroup(chatId, ownerOpenId)) {
           throw new AppError('feishu-owner-not-in-group', '配置的飞书账号必须在群内，请加入后重新预览。');
         }
         return { chatId, name: displayName(group.name) };
@@ -319,6 +343,7 @@ export function createFeishuTransport(config: FeishuConfig, options: TransportOp
     createGroup(name, uuid): Promise<FeishuGroup> {
       const failure = () => new AppError('feishu-create-failed', '飞书建群结果待核对。请检查应用权限，或用原群名称重试。');
       return rest(async () => {
+        if (!ownerOpenId) throw new AppError('feishu-self-unbound', '请先在飞书连接设置中绑定本人身份。');
         assertUuid(uuid);
         const group = dataFrom(await im.chat.create({
           params: { user_id_type: 'open_id', uuid },

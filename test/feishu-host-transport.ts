@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import type { FeishuConfig, FeishuHandlers, FeishuTransport } from '../src/feishu-types.ts';
+import type { FeishuConfig, FeishuCredentials, FeishuHandlers, FeishuTransport } from '../src/feishu-types.ts';
 import type { checkFeishuConfig as CheckConfig } from '../src/feishu-sdk.ts';
 
 const ownerOpenId = 'ou_fixtureOwner';
@@ -7,8 +7,6 @@ export const fixtureCredentials = { appId: 'cli_fixtureApp', appSecret: 'synthet
 export const alternateCredentials = {
   appId: 'cli_fixtureOther', appSecret: 'another-synthetic-secret', ownerOpenId: 'ou_fixtureAlternate',
 };
-export const alternateOwnerCredentials = { ...fixtureCredentials, ownerOpenId: alternateCredentials.ownerOpenId };
-export const alternateAppCredentials = { ...fixtureCredentials, appId: alternateCredentials.appId };
 export const existingGroup = { chatId: 'oc_fixtureExisting', name: '飞书测试已有群' };
 export const sent: { chatId: string; text: string; uuid: string }[] = [];
 export let starts = 0, handlers: FeishuHandlers | undefined, failSend = false;
@@ -16,10 +14,9 @@ export let checks = 0, stops = 0, creations = 0, inspections = 0;
 
 export function setFailure(value: boolean) { failSend = value; }
 
-function valid(config: FeishuConfig): boolean {
-  const fixtures = [fixtureCredentials, alternateCredentials, alternateOwnerCredentials, alternateAppCredentials];
-  return fixtures.some(({ appId, appSecret, ownerOpenId }) =>
-    config.appId === appId && config.appSecret === appSecret && config.ownerOpenId === ownerOpenId);
+function valid(config: FeishuCredentials): boolean {
+  const fixtures = [fixtureCredentials, alternateCredentials];
+  return fixtures.some(({ appId, appSecret }) => config.appId === appId && config.appSecret === appSecret);
 }
 
 export const checkFeishuConfig: typeof CheckConfig = async config => {
@@ -37,7 +34,8 @@ export function createFeishuTransport(config: FeishuConfig): FeishuTransport {
   return {
     start(value) { starts++; handlers = value; value.onConnection('ready'); },
     stop() { stops++; handlers?.onConnection('stopped'); handlers = undefined; },
-    async sendText(chatId, text, uuid) {
+    async sendText(chatId, text, uuid, canDispatch) {
+      assert.notEqual(canDispatch?.(), false);
       if (failSend) throw Error(`Mock failure with a credential ${config.appSecret}`);
       sent.push({ chatId, text, uuid });
     },

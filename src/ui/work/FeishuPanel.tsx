@@ -66,12 +66,15 @@ export function FeishuPanel({ api, botId, botName, locked }: {
     setStatus(value); setReadError(false); changeForm(null); requestId.current = '';
   }
 
-  const disabled = locked || pending || readError, canConnect = !disabled && status?.connection === 'ready';
+  const disabled = locked || pending || readError;
+  const canConnect = !disabled && status?.connection === 'ready' && status.selfBinding === 'bound';
   const binding = status?.binding;
   return <Section title="飞书群">
     <p className="muted" role="status">{readError ? '暂时无法读取飞书群状态'
       : status ? feishuConnectionLabel[status.connection] : '正在读取连接状态…'}</p>
     {status?.connection === 'disabled' && <Hint>请从 Super Bot 首页的「设置 → 飞书」启用飞书连接。</Hint>}
+    {status && status.connection !== 'disabled' && status.selfBinding !== 'bound' &&
+      <Hint>请先在 Super Bot 首页的「设置 → 飞书」绑定本人身份，再设置群同步。</Hint>}
     {status?.error && <p className="notice slim" role="status">{status.error}</p>}
     {error && <p className="notice error" role="alert">{error}</p>}
     {binding ? <>
@@ -79,7 +82,7 @@ export function FeishuPanel({ api, botId, botName, locked }: {
       <div className="actions"><a href={binding.url} target="_blank" rel="noopener noreferrer">在飞书打开群</a></div>
       <ConfirmAction label="解绑" explanation="解绑后会立即停止同步。群和已经发出的消息仍保留在飞书中。"
         disabled={disabled} submit={() => perform<FeishuStatus>('feishu.unbind', { bindingId: binding.id }, record)}/>
-    </> : status?.connection === 'ready' && !form && <div className="actions">
+    </> : status?.connection === 'ready' && status.selfBinding === 'bound' && !form && <div className="actions">
       <button disabled={!canConnect} onClick={() => changeForm('create')}>新建私有群</button>
       <button disabled={!canConnect} onClick={() => changeForm('bind')}>绑定已有群</button>
     </div>}
@@ -118,6 +121,7 @@ export function FeishuPanel({ api, botId, botName, locked }: {
         }, record)}>确认绑定</button>
       </div>}
     </>}
-    {status && status.connection !== 'disabled' && !form && <Hint>绑定后同步新文本。只有授权账号能从群内向 Bot 发送消息。</Hint>}
+    {status?.selfBinding === 'bound' && status.connection !== 'disabled' && !form &&
+      <Hint>绑定后同步新文本。只有授权账号能从群内向 Bot 发送消息。</Hint>}
   </Section>;
 }

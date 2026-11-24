@@ -3,7 +3,7 @@ import { randomUUID } from 'node:crypto';
 import { closeSync, constants, fchmodSync, fstatSync, openSync, readSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { AppError } from './model.ts';
-import type { FeishuConfig } from './feishu-types.ts';
+import { isFeishuOpenId, type FeishuConfig, type FeishuCredentials } from './feishu-types.ts';
 
 const FILE = 'super-bot.json';
 const LEGACY_FILE = 'super-bot.feishu.json';
@@ -13,7 +13,7 @@ const STORAGE_ERROR = '无法读取或保存当前 profile 的 Super Bot 设置�
 const LEGACY_ERROR = '无法导入旧飞书设置。请在 Super Bot 的飞书设置中填写完整凭证。';
 
 type Document = Record<string, unknown>;
-export type SavedFeishuSettings = FeishuConfig & { enabled: boolean };
+export type SavedFeishuSettings = FeishuConfig & { enabled: boolean; selfTestSkipped?: true };
 
 function storageError(): AppError {
   return new AppError('feishu-settings-storage', STORAGE_ERROR);
@@ -58,7 +58,12 @@ function readSettings(document: Document): SavedFeishuSettings | undefined {
   if (!Object.hasOwn(document, 'feishu')) return;
   const { feishu } = document;
   if (!isDocument(feishu) || typeof feishu.enabled !== 'boolean') throw storageError();
-  return { ...feishuCredentials(feishu), enabled: feishu.enabled };
+  const ownerOpenId = typeof feishu.ownerOpenId === 'string' ? feishu.ownerOpenId.trim() : feishu.ownerOpenId;
+  if (ownerOpenId !== undefined && !isFeishuOpenId(ownerOpenId)) throw storageError();
+  if (feishu.selfTestSkipped !== undefined && feishu.selfTestSkipped !== true) throw storageError();
+  if (ownerOpenId && feishu.selfTestSkipped) throw storageError();
+  return { ...feishuCredentials(feishu), enabled: feishu.enabled,
+    ownerOpenId, selfTestSkipped: feishu.selfTestSkipped };
 }
 
 function publish(profileDir: string, document: Document): void {
@@ -80,21 +85,17 @@ function publish(profileDir: string, document: Document): void {
   }
 }
 
-export function feishuCredentials(fields: Document, saved?: FeishuConfig): FeishuConfig {
+export function feishuCredentials(fields: Document, saved?: FeishuCredentials): FeishuCredentials {
   const appId = typeof fields.appId === 'string' ? fields.appId.trim() : '';
-  const ownerOpenId = typeof fields.ownerOpenId === 'string' ? fields.ownerOpenId.trim() : '';
   let appSecret = fields.appSecret;
   if (!/^cli_[a-zA-Z0-9]{1,196}$/.test(appId)) {
     throw new AppError('feishu-settings-input', '请输入有效的飞书 App ID。');
   }
-  if (!/^ou_[a-zA-Z0-9]{1,197}$/.test(ownerOpenId)) {
-    throw new AppError('feishu-settings-input', '请输入此飞书应用下有效的个人 Open ID。');
-  }
-  if (appSecret === undefined || appSecret === '') appSecret = saved?.appSecret;
+  if ((appSecret === undefined || appSecret === '') && saved?.appId === appId) appSecret = saved.appSecret;
   if (typeof appSecret !== 'string' || !appSecret.trim() || appSecret.length > 2048) {
     throw new AppError('feishu-settings-input', '请填写此飞书应用的 App Secret。');
   }
-  return { appId, appSecret, ownerOpenId };
+  return { appId, appSecret };
 }
 
 export function loadFeishuSettings(profileDir: string | undefined, legacyEnabled: boolean): {
@@ -112,7 +113,9 @@ export function loadFeishuSettings(profileDir: string | undefined, legacyEnabled
   try {
     const legacy = readDocument(join(profileDir, LEGACY_FILE), true);
     if (!legacy) return legacyEnabled ? { error: LEGACY_ERROR } : {};
-    saved = { ...feishuCredentials(legacy), enabled: legacyEnabled };
+    const ownerOpenId = typeof legacy.ownerOpenId === 'string' ? legacy.ownerOpenId.trim() : undefined;
+    if (!isFeishuOpenId(ownerOpenId)) return { error: LEGACY_ERROR };
+    saved = { ...feishuCredentials(legacy), enabled: legacyEnabled, ownerOpenId };
   } catch {
     return { error: LEGACY_ERROR };
   }
@@ -130,7 +133,9 @@ export function saveFeishuSettings(profileDir: string | undefined, saved: SavedF
     const document = readDocument(join(profileDir, FILE)) ?? {};
     readSettings(document);
     const feishu = isDocument(document.feishu) ? document.feishu : {};
-    publish(profileDir, { ...document, feishu: { ...feishu, ...saved } });
+    publish(profileDir, { ...document, feishu: {
+      ...feishu, ...saved, ownerOpenId: saved.ownerOpenId, selfTestSkipped: saved.selfTestSkipped,
+    } });
   } catch {
     throw storageError();
   }

@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import type { Context } from '@deepseek-ai/cordis';
 import { SessionId } from '@deepseek-ai/dsh-session/types';
 import { apply as applyProduct } from '../src/index.ts';
-import type { FeishuConnectionState, FeishuTextMessage } from '../src/feishu-types.ts';
+import type { FeishuConnectionState, FeishuPrivateTextMessage, FeishuTextMessage } from '../src/feishu-types.ts';
 import { checks, creations, handlers, inspections, sent, setFailure, starts, stops } from './feishu-host-transport.ts';
 
 export { Config, inject, name } from '../src/index.ts';
@@ -14,9 +14,10 @@ export async function apply(ctx: Context, config: Parameters<typeof applyProduct
     path: '/api/super-bot-feishu-probe', methods: ['POST'], requestBody: 'buffered', fetch: async request => {
       try {
         const body = await request.json() as { action: string; connection?: FeishuConnectionState; message?: FeishuTextMessage;
-          sessionId?: string; fail?: boolean };
+          privateMessage?: FeishuPrivateTextMessage; sessionId?: string; fail?: boolean };
         if (body.action === 'connection') handlers?.onConnection(body.connection!);
         if (body.action === 'receive') await handlers?.onMessage(body.message!);
+        if (body.action === 'receive-private') handlers?.onPrivateMessage?.(body.privateMessage!);
         if (body.action === 'fail-send') setFailure(body.fail === true);
         if (body.action === 'events') {
           assert.ok(body.sessionId);

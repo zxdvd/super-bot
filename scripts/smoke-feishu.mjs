@@ -8,9 +8,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import { setTimeout as delay } from 'node:timers/promises';
 import { build } from 'esbuild';
 import { authenticateHost } from './host-client.mjs';
-import {
-  alternateAppCredentials, alternateCredentials, alternateOwnerCredentials, existingGroup, fixtureCredentials,
-} from '../test/feishu-host-transport.ts';
+import { alternateCredentials, existingGroup, fixtureCredentials } from '../test/feishu-host-transport.ts';
 
 const root = fileURLToPath(new URL('..', import.meta.url));
 await mkdir(join(root, '.runtime'), { recursive: true });
@@ -143,6 +141,36 @@ async function probe(client, path, action, payload) {
 const feishu = (client, action, payload) => probe(client, '/api/super-bot-feishu-probe', action, payload);
 const model = (client, action, payload) => probe(client, '/api/super-bot-probe', action, payload);
 const settings = (client, action = 'get', data) => call(client, `feishu.settings.${action}`, data);
+const settingsRpc = (client, action, data) => rpc(client, `feishu.settings.${action}`, data);
+const credentials = ({ appId, appSecret }) => ({ appId, appSecret });
+const beginFields = ({ configurationId, testStartToken }) => ({
+  configurationId, sessionId: randomUUID(), startToken: testStartToken,
+});
+const sessionFields = ({ configurationId, sessionId }) => ({ configurationId, sessionId });
+const privateChatId = 'oc_fixturePrivate';
+const receivePrivate = (client, text, overrides = {}) => feishu(client, 'receive-private', { privateMessage: {
+  appId: fixtureCredentials.appId, chatId: privateChatId, senderOpenId: fixtureCredentials.ownerOpenId,
+  messageId: `om_${randomUUID()}`, createdAt: Date.now(), text, ...overrides,
+} });
+async function bindSelf(client) {
+  const request = beginFields(await settings(client));
+  const opened = await settings(client, 'test.start', request);
+  assert.deepEqual(await settings(client, 'test.start', request), opened);
+  const competing = await settingsRpc(client, 'test.start', { ...request, sessionId: randomUUID() });
+  assert.equal(competing.error.code, 'feishu-test-busy');
+  const session = sessionFields(request);
+  await delay(5);
+  await receivePrivate(client, '合成本人消息');
+  const observed = await wait(async () => {
+    const test = await settings(client, 'test.status', session);
+    return test.state === 'sent' && test;
+  }, 'private test send result');
+  const confirmation = { ...session, confirmationToken: observed.candidate.confirmationToken };
+  const attempts = await Promise.all([settingsRpc(client, 'test.confirm', confirmation), settingsRpc(client, 'test.confirm', confirmation)]);
+  assert.equal(attempts.filter(result => result.ok).length, 1);
+  assert.equal(attempts.find(result => !result.ok).error.code, 'feishu-configuration-changed');
+  return attempts.find(result => result.ok).value;
+}
 async function transportStats(client) {
   const { starts, stops, inspections, creations, checks, sent } = await feishu(client, 'sent');
   return { starts, stops, inspections, creations, checks, sends: sent.length };
@@ -192,7 +220,6 @@ async function openSettings(page) {
   return {
     appId: page.getByLabel('App ID', { exact: true }),
     secret: page.getByLabel('App Secret', { exact: true }),
-    owner: page.getByLabel('Open ID', { exact: true }),
     check: page.getByRole('button', { name: '检测配置', exact: true }),
     save: page.getByRole('button', { name: '保存并连接', exact: true }),
   };
@@ -213,11 +240,14 @@ try {
   await Promise.all([configure(primary), configure(secondary)]);
   await writeLegacy(secondary, alternateCredentials);
   let [host, other] = await Promise.all([launch(primary, 'first'), launch(secondary, 'disabled')]);
-  assert.deepEqual(await settings(host), { appId: '', ownerOpenId: '', hasSecret: false, enabled: false,
-    connection: 'disabled', lastMessageAt: null });
+  assert.deepEqual({ ...await settings(host), configurationId: undefined }, {
+    appId: '', ownerOpenId: '', hasSecret: false, enabled: false, configurationId: undefined,
+    selfBinding: 'unbound', connection: 'disabled', lastMessageAt: null,
+  });
   const imported = await settings(other);
   assert.equal(imported.appId, alternateCredentials.appId);
   assert.equal(imported.ownerOpenId, alternateCredentials.ownerOpenId);
+  assert.equal(imported.selfBinding, 'bound');
   assert.equal(imported.hasSecret, true);
   assert.equal(imported.enabled, false);
   assert.equal((await stat(settingsFile(secondary))).mode & 0o777, 0o600);
@@ -235,13 +265,13 @@ try {
   if (ui) {
     await fields.appId.fill(fixtureCredentials.appId);
     await fields.secret.fill(fixtureCredentials.appSecret);
-    await fields.owner.fill(fixtureCredentials.ownerOpenId);
+    assert.equal(await ui.page.getByLabel('Open ID', { exact: true }).count(), 0);
     await fields.check.click();
     await ui.page.getByText(/凭证换取令牌/).waitFor();
     await ui.page.getByText('通过', { exact: true }).first().waitFor();
     await ui.page.getByText('未验证', { exact: true }).first().waitFor();
   } else {
-    const report = await settings(host, 'check', fixtureCredentials);
+    const report = await settings(host, 'check', credentials(fixtureCredentials));
     assert.equal(report.credentials, 'passed');
     assert.deepEqual(report.permissions, [{ scope: 'im:message.group_at_msg:readonly', status: 'unverified' }]);
   }
@@ -255,33 +285,89 @@ try {
     await ui.page.getByText('尚未收到消息', { exact: true }).waitFor();
     assert.equal(await fields.secret.inputValue(), '');
     assertNoSecret(await ui.page.locator('body').innerText());
-    await ui.page.getByRole('button', { name: '← 我的 Bot', exact: true }).click();
-    assert.equal(await ui.page.getByLabel('给它起个名字').inputValue(), '合成未保存草稿');
-    await ui.page.getByRole('button', { name: '取消', exact: true }).click();
-  } else await settings(host, 'save', fixtureCredentials);
+  } else await settings(host, 'save', { ...credentials(fixtureCredentials), configurationId: (await settings(host)).configurationId });
   const connected = await settings(host);
   assert.equal(connected.enabled, true);
   assert.equal(connected.connection, 'ready');
   assert.equal(connected.lastMessageAt, null);
-  const savedFile = await readFile(settingsFile(primary), 'utf8');
-  assert.ok(JSON.parse(savedFile).feishu.appSecret === fixtureCredentials.appSecret, 'The saved credential is in the local file');
+  assert.equal(connected.selfBinding, 'unbound');
+  const unboundFile = await readFile(settingsFile(primary), 'utf8');
+  assert.ok(JSON.parse(unboundFile).feishu.appSecret === fixtureCredentials.appSecret, 'The saved credential is in the local file');
+  assert.equal(JSON.parse(unboundFile).feishu.ownerOpenId, undefined);
   assert.equal((await stat(settingsFile(primary))).mode & 0o777, 0o600);
   assert.equal(await readFile(patchFile(primary), 'utf8'), patch);
   const started = await transportStats(host);
   assert.deepEqual(started, { starts: 1, stops: 0, checks: started.checks,
     creations: 0, inspections: 0, sends: 0 });
-  const candidate = await settings(host, 'check', alternateCredentials);
-  assert.equal(candidate.credentials, 'passed');
-  assert.equal((await settings(host, 'check', { ...fixtureCredentials, appSecret: '' })).credentials, 'passed');
-  assert.equal((await settings(host, 'check', { ...fixtureCredentials, appSecret: 'invalid-synthetic' })).credentials, 'failed');
+  const report = await settings(host, 'check', credentials(alternateCredentials));
+  assert.equal(report.credentials, 'passed');
+  assert.equal((await settings(host, 'check', { appId: fixtureCredentials.appId, appSecret: '' })).credentials, 'passed');
+  assert.equal((await settings(host, 'check', { appId: fixtureCredentials.appId, appSecret: 'invalid-synthetic' })).credentials, 'failed');
   assert.deepEqual(await transportStats(host), { ...started, checks: started.checks + 3 });
   assert.deepEqual(await settings(host), connected);
-  assert.ok(await readFile(settingsFile(primary), 'utf8') === savedFile, 'Detection leaves settings byte-for-byte intact');
+  assert.ok(await readFile(settingsFile(primary), 'utf8') === unboundFile, 'Detection leaves settings byte-for-byte intact');
   assert.deepEqual(await settings(other), imported);
   console.log('PASS first-time settings, detection isolation, private persistence and disabled legacy import');
 
   const aSession = await manager(host, a), bSession = await manager(host, b);
-  assert.equal((await feishu(host, 'sent')).starts, 1);
+  await receivePrivate(host, '未开启测试的私聊');
+  assert.equal((await transportStats(host)).sends, 0);
+  assert.equal((await status(host, a)).selfBinding, 'unbound');
+  assert.equal((await rpc(host, 'feishu.preview', { botId: a.id, chatId: existingGroup.chatId })).error.code, 'feishu-self-unbound');
+  const staleStart = beginFields(connected);
+  if (ui) {
+    await ui.page.getByRole('button', { name: '跳过测试', exact: true }).click();
+    await ui.page.getByText('已跳过测试，身份未绑定', { exact: true }).waitFor();
+  } else await settings(host, 'test.skip', { configurationId: connected.configurationId });
+  const skipped = await settings(host);
+  assert.equal(skipped.selfBinding, 'skipped');
+  assert.equal(skipped.ownerOpenId, '');
+  assert.equal(JSON.parse(await readFile(settingsFile(primary), 'utf8')).feishu.selfTestSkipped, true);
+  assert.equal((await settingsRpc(host, 'test.start', staleStart)).ok, false);
+  assert.equal((await rpc(host, 'feishu.create', { botId: a.id, name: '未绑定', requestId: randomUUID() })).error.code,
+    'feishu-self-unbound');
+  assert.equal((await transportStats(host)).creations, 0);
+
+  if (ui) {
+    const page = ui.page;
+    const text = '合成私聊任意一句';
+    await page.getByRole('button', { name: '开启 1:1 收发测试', exact: true }).click();
+    await page.getByText(/请在飞书私聊这个应用的机器人/).waitFor();
+    await receivePrivate(host, '另一应用的私聊', { appId: alternateCredentials.appId });
+    assert.equal((await transportStats(host)).sends, 0);
+    await feishu(host, 'fail-send', { fail: true });
+    await receivePrivate(host, text);
+    await page.getByText(text, { exact: false }).waitFor();
+    await page.getByText('未确认', { exact: true }).waitFor();
+    assert.equal(await page.getByRole('button', { name: '确认这是本人', exact: true }).count(), 0);
+    await feishu(host, 'fail-send', { fail: false });
+    await page.getByRole('button', { name: '重试发送', exact: true }).click();
+    await page.getByText('通过（飞书接口已确认）', { exact: true }).waitFor();
+    assert.equal((await settings(host)).ownerOpenId, '');
+    assert.equal(JSON.parse(await readFile(settingsFile(primary), 'utf8')).feishu.ownerOpenId, undefined);
+    await page.getByRole('button', { name: '确认这是本人', exact: true }).click();
+    await page.getByText('已绑定', { exact: true }).waitFor();
+    await page.getByRole('button', { name: '← 我的 Bot', exact: true }).click();
+    assert.equal(await page.getByLabel('给它起个名字').inputValue(), '合成未保存草稿');
+    await page.getByRole('button', { name: '取消', exact: true }).click();
+  } else await bindSelf(host);
+  const boundSelf = await settings(host);
+  assert.equal(boundSelf.selfBinding, 'bound');
+  assert.equal(boundSelf.ownerOpenId, fixtureCredentials.ownerOpenId);
+  assert.equal((await status(host, a)).selfBinding, 'bound');
+  assert.equal((await status(host, b)).selfBinding, 'bound');
+  assert.equal((await events(host, aSession)).filter(feishuInput).length, 0);
+  assert.equal((await events(host, bSession)).filter(feishuInput).length, 0);
+  const privateReplies = (await feishu(host, 'sent')).sent;
+  assert.equal(privateReplies.length, 1);
+  assert.equal(privateReplies[0].chatId, privateChatId);
+  assert.match(privateReplies[0].text, /已收到这条飞书私聊测试消息/);
+  const savedFile = await readFile(settingsFile(primary), 'utf8');
+  assert.equal(JSON.parse(savedFile).feishu.ownerOpenId, fixtureCredentials.ownerOpenId);
+  assert.equal(JSON.parse(savedFile).feishu.selfTestSkipped, undefined);
+  assert.equal((await feishu(host, 'sent')).starts, 2);
+  console.log(ui ? 'PASS explicit private test and skip, failed send and retry, confirmation, and Bot isolation'
+    : 'PASS explicit private test and skip, concurrent confirmation, and Bot isolation');
   assert.equal((await status(other, c)).connection, 'disabled');
   assert.equal((await feishu(other, 'sent')).starts, 0);
   assert.equal((await rpc(other, 'feishu.create', { botId: c.id, name: '未启用', requestId: randomUUID() })).ok, false);
@@ -294,7 +380,7 @@ try {
   await prompt(host, unboundSession, 'FEISHU_SMOKE_UNBOUND_WEB');
   await wait(async () => (await model(host, 'inspect-session', { sessionId: unboundSession })).assistantTexts
     .some(text => text.includes('FEISHU_SMOKE_UNBOUND_WEB')), 'unbound Web reply');
-  assert.equal((await transportStats(host)).sends, 0);
+  assert.equal((await transportStats(host)).sends, privateReplies.length);
   const create = { botId: a.id, name: '飞书合成私有群', requestId: randomUUID() };
   if (ui) {
     const section = await openFeishu(ui, a);
@@ -434,10 +520,10 @@ try {
   assert.ok(await readFile(settingsFile(primary), 'utf8') === savedFile, 'New settings take precedence over the legacy file');
   ui = await launchBrowser(host);
   if (ui) {
-    const { appId, secret, owner } = await openSettings(ui.page);
+    const { appId, secret } = await openSettings(ui.page);
     await ui.page.getByText('连接就绪', { exact: true }).waitFor();
     assert.equal(await appId.inputValue(), fixtureCredentials.appId);
-    assert.equal(await owner.inputValue(), fixtureCredentials.ownerOpenId);
+    assert.equal(await ui.page.getByText(fixtureCredentials.ownerOpenId, { exact: true }).count(), 1);
     assert.equal(await secret.inputValue(), '');
     assertNoSecret(await ui.page.locator('body').innerText());
     await ui.browser.close();
@@ -469,18 +555,42 @@ try {
   assert.equal((await sent(host, rebound, 'UNBOUND')).length, 0);
   assert.equal((await sent(host, rebound, 'OLD_BINDING')).length, 0);
 
-  for (const credentials of [alternateOwnerCredentials, alternateAppCredentials]) {
-    const before = await transportStats(host);
-    await settings(host, 'save', { ...credentials, appSecret: '' });
-    assert.equal((await settings(host)).connection, 'ready');
-    assert.equal((await status(host, a)).binding, null);
-    assert.equal((await status(host, b)).binding, null);
-    const after = await transportStats(host);
-    assert.deepEqual(after, { ...before, starts: before.starts + 1, stops: before.stops + 1, checks: after.checks });
-    await settings(host, 'save', { ...fixtureCredentials, appSecret: '' });
-    assert.equal((await status(host, a)).binding.id, groupA.id);
-    assert.equal((await status(host, b)).binding.id, rebound.id);
-  }
+  const current = await settings(host);
+  const beforeSwitch = await transportStats(host);
+  assert.equal((await settingsRpc(host, 'save', {
+    appId: current.appId, configurationId: current.configurationId, ownerOpenId: alternateCredentials.ownerOpenId,
+  })).error.code, 'feishu-settings-input');
+  assert.equal((await settingsRpc(host, 'save', {
+    appId: alternateCredentials.appId, configurationId: current.configurationId,
+  })).error.code, 'feishu-settings-input');
+  assert.deepEqual(await settings(host), current);
+  assert.deepEqual(await transportStats(host), beforeSwitch);
+  await settings(host, 'save', { appId: current.appId, configurationId: current.configurationId });
+  assert.equal((await status(host, a)).binding.id, groupA.id);
+
+  const switched = await settings(host, 'save', { ...credentials(alternateCredentials), configurationId: current.configurationId });
+  assert.equal(switched.connection, 'ready');
+  assert.equal(switched.selfBinding, 'unbound');
+  assert.equal(switched.ownerOpenId, '');
+  assert.equal((await status(host, a)).binding, null);
+  assert.equal((await status(host, b)).binding, null);
+  assert.deepEqual(await transportStats(host), { ...beforeSwitch, starts: beforeSwitch.starts + 1, stops: beforeSwitch.stops + 1 });
+  const alternateTest = beginFields(switched);
+  await settings(host, 'test.start', alternateTest);
+  await receivePrivate(host, '原应用的私聊');
+  assert.equal((await settings(host, 'test.status', sessionFields(alternateTest))).state, 'waiting');
+
+  const restored = await settings(host, 'save', {
+    ...credentials(fixtureCredentials), configurationId: switched.configurationId,
+  });
+  assert.equal(restored.selfBinding, 'unbound');
+  assert.equal((await settingsRpc(host, 'test.status', sessionFields(alternateTest))).error.code, 'feishu-configuration-changed');
+  assert.equal((await settingsRpc(host, 'save', {
+    ...credentials(alternateCredentials), configurationId: switched.configurationId,
+  })).error.code, 'feishu-configuration-changed');
+  await bindSelf(host);
+  assert.equal((await status(host, a)).binding.id, groupA.id);
+  assert.equal((await status(host, b)).binding.id, rebound.id);
   assert.equal(await readFile(patchFile(primary), 'utf8'), patch);
 
   // Re-create the pre-settings install in this isolated profile using its existing synthetic ledger.
@@ -498,7 +608,7 @@ try {
   await configurePatch(secondary, true);
   await writeLegacy(secondary, fixtureCredentials);
   other = await launch(secondary, 'disabled-legacy-restart');
-  assert.deepEqual(await settings(other), imported);
+  assert.deepEqual({ ...await settings(other), configurationId: imported.configurationId }, imported);
   assert.equal((await transportStats(other)).starts, 0);
   await stop(secondary);
   await chmod(settingsFile(secondary), 0o644);
@@ -507,7 +617,7 @@ try {
   assert.notEqual((await status(other, c)).connection, 'ready');
   assert.equal((await feishu(other, 'sent')).starts, 0);
   assert.equal((await status(host, b)).connection, 'ready');
-  console.log(`PASS profile isolation, both legacy modes, app/owner changes, group retention, reconnect, restart and rebind (evidence ${base})`);
+  console.log(`PASS profile isolation, both legacy modes, application isolation, group retention, reconnect, restart and rebind (evidence ${base})`);
 } finally {
   await ui?.browser.close();
   await Promise.all([...children.keys()].map(stop));

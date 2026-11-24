@@ -6,7 +6,7 @@ import type { Session, SessionEvent } from '@deepseek-ai/dsh-session';
 import { finalAssistantText, isNativeOwner, messageText } from './dsh-chat-events.ts';
 import type { FeishuGroups } from './feishu-groups.ts';
 import { reserveFeishuInput, untilFeishuAbort, type FeishuInput } from './feishu-inputs.ts';
-import type { FeishuBinding, FeishuConfig, FeishuConnectionState, FeishuTextMessage, FeishuTransport } from './feishu-types.ts';
+import type { FeishuBinding, FeishuConnectionState, FeishuIdentity, FeishuTextMessage, FeishuTransport } from './feishu-types.ts';
 import type { Managers } from './manager.ts';
 import { AppError } from './model.ts';
 import type { Store } from './store.ts';
@@ -63,7 +63,7 @@ export class FeishuBridge {
     private readonly managers: Pick<Managers, 'submitFeishu'>,
     private readonly groups: Pick<FeishuGroups, 'get' | 'findByChat' | 'onUnbound'>,
     private readonly transport: FeishuTransport,
-    private readonly config: Pick<FeishuConfig, 'appId' | 'ownerOpenId'>,
+    private readonly config: FeishuIdentity,
   ) {}
 
   start(): void {
