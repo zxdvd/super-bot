@@ -1,13 +1,16 @@
 /** Settings page: Bot definition, manager conversation, sidebar helpers and ledger maintenance. */
+import { useState } from 'react';
 import type { Bot } from '../../model.ts';
 import type { BackupInfo } from '../../backups.ts';
-import { Hint, Section } from '../kit.tsx';
+import { ConfirmAction, Hint, Section } from '../kit.tsx';
 import { FeishuPanel } from './FeishuPanel.tsx';
+import { forgetView, rememberBot, rememberedBot, rememberedView } from './storage.ts';
 import { managerOpener } from './SystemIssues.tsx';
 import type { WorkspaceState } from './useWorkspace.ts';
 
 const TIDY_HINT = '整理仅处理已加载且可确认由当前 Bot 自动创建的会话，不唤醒未加载历史。已有项目分组名请在原生侧栏菜单改名；'
   + '历史保留手动归档，不自动隐藏待验收或可返工的工作。';
+const DELETE_RETENTION = '任务历史、原生会话和工作文件会保留。已绑定的飞书群将停止同步，飞书群会保留。';
 
 function SidebarActions({ w, bot }: { w: WorkspaceState; bot: Bot }) {
   const sessionId = bot.managerSessionId;
@@ -63,7 +66,37 @@ function Maintenance({ w }: { w: WorkspaceState }) {
   </Section>;
 }
 
-export function BotPanel({ w, bot, focusFeishu }: { w: WorkspaceState; bot: Bot; focusFeishu?: boolean }) {
+function BotDeletion({ w, bot, onDeleted }: { w: WorkspaceState; bot: Bot; onDeleted: (bot: Bot) => void }) {
+  const [error, setError] = useState<{ message: string; code?: unknown }>();
+  const counts = w.page?.counts, unfinished = (counts?.open ?? 0) + (counts?.review ?? 0);
+  const unfinishedWork = unfinished > 0 || error?.code === 'bot-unfinished';
+  const force = unfinishedWork || error?.code === 'manager-busy';
+  const remaining = unfinished ? `当前有 ${unfinished} 项未结束任务。` : '当前有未结束或待核对的任务。';
+  const othersWithName = w.bots.some(item => item.id !== bot.id && item.name === bot.name);
+  const target = `「${bot.name}」${othersWithName ? `（${bot.id}）` : ''}`;
+  const changes = unfinishedWork ? `${remaining} 系统会取消待处理任务，并向运行中的 Worker 请求停止。`
+    : force ? '正在进行的 Bot 对话会收到停止请求。' : '';
+  const submit = () => w.mutate<{ botId: string }>('bot.delete', {
+    requestId: crypto.randomUUID(), id: bot.id, expectedRevision: bot.configRevision, confirmed: true,
+    ...(force && { force }), ...(w.sessionId && { sessionId: w.sessionId }),
+  }, value => {
+    if (rememberedBot() === value.botId) rememberBot('');
+    if (rememberedView()?.botId === value.botId) forgetView();
+    onDeleted(bot);
+  }, cause => setError(cause instanceof Error
+    ? { message: cause.message, code: 'code' in cause ? cause.code : undefined }
+    : { message: '暂时无法确认删除结果，请核对 Bot 列表后重试。' }));
+  return <div className="sb-section">
+    <ConfirmAction key={force ? 'force' : 'normal'} destructive disabled={w.locked || !counts}
+      label={force ? '强制删除 Bot' : '删除 Bot'} submit={submit}
+      explanation={`${force ? '强制删除' : '删除'}${target}？${changes} ${DELETE_RETENTION}`}/>
+    {error && <p className="notice error" role="alert">{error.message}</p>}
+  </div>;
+}
+
+export function BotPanel({ w, bot, focusFeishu, onBotDeleted }: {
+  w: WorkspaceState; bot: Bot; focusFeishu?: boolean; onBotDeleted?: (bot: Bot) => void;
+}) {
   return <div className="settings">
     {!w.sessionId && w.bots.length > 0 && <Section title="Bot">
       <div className="toolbar">
@@ -83,5 +116,6 @@ export function BotPanel({ w, bot, focusFeishu }: { w: WorkspaceState; bot: Bot;
     <FeishuPanel key={`feishu:${bot.id}`} api={w.api} botId={bot.id} botName={bot.name} locked={w.locked} focus={focusFeishu}/>
     <Section title="侧栏"><SidebarActions w={w} bot={bot}/></Section>
     <Maintenance w={w}/>
+    {onBotDeleted && <BotDeletion key={`delete:${bot.id}:${bot.configRevision}`} w={w} bot={bot} onDeleted={onBotDeleted}/>}
   </div>;
 }

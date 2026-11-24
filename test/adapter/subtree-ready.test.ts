@@ -3,6 +3,7 @@ import {test} from 'node:test';
 import assert from 'node:assert/strict';
 import {mkdtempSync,mkdirSync,realpathSync,writeFileSync,rmSync} from 'node:fs';
 import {resolve,join} from 'node:path';
+import {setTimeout as delay} from 'node:timers/promises';
 import {symbols,type Context} from '@deepseek-ai/cordis';
 import {scopeTarget} from '@deepseek-ai/dsh-scope';
 import {Store} from '../../src/store.ts';
@@ -26,9 +27,12 @@ async function fixture(version:'rc.1'|'rc.5'='rc.5') {
       on:(name:string,fn:Function)=>{agentListeners.set(name,[...(agentListeners.get(name)??[]),fn]);return ()=>{};}},
     followup:()=>{agent.status='running';},whenIdle:()=>idle.promise,cancel:()=>abort.abort()};
   const child:any={id:'native-child',session:{id:'native-child'},status:'running',inbox:{nextTurn:[],nextStep:[]}};
-  let childActive=false,childVisible=false,rootJobActive=false,treeCalls=0;
+  let childActive=false,childVisible=false,rootJobActive=false,treeCalls=0,rootJobId='worker-job';
+  const interruptedChildren:string[]=[],killedJobs:string[]=[];
   const wait=async(root:any)=>{treeCalls++;assert.equal(root,agent);return childActive?joined.promise:false;};
-  const tree={rootOf:(member:any)=>member===child?agent:member,
+  const tree={rootOf:(member:any)=>member===child?agent:member,interrupt:(id:string,authority:any)=>{
+    assert.equal(authority.kind,'ancestor');assert.equal(authority.agent,agent);interruptedChildren.push(id);
+  },
     ...(version==='rc.1'?{waitForChildren:wait}:{waitForTreeWork:wait})};
   let nativeService:object|undefined=tree;
   const carrier=scopeTarget(tree,agent);
@@ -41,8 +45,9 @@ async function fixture(version:'rc.1'|'rc.5'='rc.5') {
     sessions:{flush:async()=>true},sessionPersistence:{open:async()=>({header:{id:agent.id},read:async()=>({events:structuredClone(events)}),close:async()=>{}})},
     sessionController:{resolveAgent:async()=>({agent})},workingDirectory:{get:()=>directory},
     sessionProjections:{snapshot:()=>({values:{modelSelection:{next:{provider:'fake',model:'fake'}}}})},
-    jobs:{list:(owner:string)=>rootJobActive&&owner===agent.id?[{owner,status:'running'}]:[],kill:()=>{}},
-    agents:{list:()=>childVisible?[agent,child]:[agent],
+    jobs:{list:(owner:string)=>rootJobActive&&owner===agent.id?[{id:rootJobId,owner,status:'running'}]:[],
+      kill:(id:string,owner:string)=>{assert.equal(owner,agent.id);killedJobs.push(id);}},
+    agents:{list:()=>childVisible?[agent,child]:[agent],get:(id:string)=>id===agent.id?agent:childVisible&&id===child.id?child:undefined,
       ...(version==='rc.1'?{isOwnedBy:(id:string,owner:any)=>id===child.id&&owner===agent}:{})}} as unknown as Context;
   const execution=new DshExecution(ctx,store,directory,{fullAccess:true});execution.install();
   const emit=async(type:string,data:any,session=agent.session,durable=true)=>{
@@ -53,9 +58,11 @@ async function fixture(version:'rc.1'|'rc.5'='rc.5') {
   };
   const run=await execution.dispatch('dispatch',task.id,store.getTask(task.id).rowVersion);
   await emit('turn/start',{turn:1});await emit('user/message',JSON.parse(store.getRunInput(run.id).messageJson!));
-  return {directory,store,task,run,agent,child,order,emit,
+  return {directory,store,task,run,agent,child,order,emit,bot,execution,interruptedChildren,killedJobs,
     loseNativeService:()=>{nativeService=undefined;},
-    startRootJob:()=>{rootJobActive=true;},
+    startRootJob:(id='worker-job')=>{rootJobActive=true;rootJobId=id;},
+    finishRootJob:()=>{rootJobActive=false;},
+    cancelled:()=>abort.signal.aborted,
     enqueueChildResult:()=>{agent.inbox.nextStep.push({source:{kind:'subagent-settled'}});},
     consumeChildResult:()=>{agent.inbox.nextStep.shift();},
     startChild:(phase:'local'|'external'|'materializing'='local')=>{
@@ -76,6 +83,56 @@ async function fixture(version:'rc.1'|'rc.5'='rc.5') {
     stopping:async(subject=agent,turn=1)=>{for(const fn of agentListeners.get('agent/turn-stopping')??[])await fn({agent:subject,turn,signal:abort.signal});},
     close:async()=>{joined.resolve(true);agent.cancel();agent.status='idle';idle.resolve();await execution.dispose();store.close();assert.ok(directory.startsWith(resolve('.runtime/subtree-ready-')));rmSync(directory,{recursive:true,force:true});}};
 }
+
+test('force delete waits for the exact Worker child and Job before returning capacity', {timeout:3000},async()=>{
+  const f=await fixture();try {
+    f.store.maxRunningTasks=1;
+    const other=f.store.createBot('other',{name:'Unrelated bot',instructions:'Synthetic only'});
+    const next=f.store.createTask('other-task',{botId:other.id,goal:'Continue',scope:'Own work',acceptance:'Read',reviewPolicy:'human'});
+    f.startRootJob();f.startChild();
+    f.agent.inbox.nextTurn.push({id:'native-user',source:{kind:'user',rpcId:'native'}});
+    f.store.deleteBot('delete',f.bot.id,f.bot.configRevision,true);
+    f.execution.stopDeletedBot(f.bot.id);f.execution.stopDeletedBot(f.bot.id);
+    assert.equal(f.cancelled(),true);
+    assert.deepEqual(f.interruptedChildren,[f.child.id]);
+    assert.deepEqual(f.killedJobs,['worker-job']);
+    assert.equal(f.agent.inbox.nextTurn[0].id,'native-user');
+    assert.equal(f.store.getTask(f.task.id).lifecycle,'cancelled');
+    assert.equal(f.store.getRun(f.run.id).state,'cancelling');
+    assert.equal(f.store.dispatchBlocker(next.id),'capacity');
+    await f.emit('turn/end',{turn:1,reason:{kind:'aborted',reason:{kind:'user'}}});
+    await f.emit('turn/start',{turn:2});
+    await f.emit('user/message',{id:'native-user',source:{kind:'user',rpcId:'native'}});
+    f.finishRootJob();
+    await delay(300);
+    assert.equal(f.store.dispatchBlocker(next.id),'capacity','owned child remains live after parent and Job settle');
+    f.finishChild();
+    while(f.store.heldRuns().length)await delay(25);
+    assert.equal(f.store.dispatchBlocker(next.id),null);
+    assert.equal(f.store.getRun(f.run.id).state,'cancelled');
+    assert.deepEqual(f.killedJobs,['worker-job']);
+  }finally{await f.close();}
+});
+
+test('force delete neither stops nor charges a following native user turn or Job', {timeout:3000},async()=>{
+  const f=await fixture();try {
+    f.startRootJob('old-worker-job');
+    await f.emit('turn/end',{turn:1,reason:{kind:'aborted',reason:{kind:'user'}}});
+    f.finishRootJob();
+    await f.emit('turn/start',{turn:2});
+    await f.emit('user/message',{id:'native-user',source:{kind:'user',rpcId:'native'}});
+    f.startRootJob('native-user-job');
+    assert.equal(f.store.getRun(f.run.id).state,'interrupted');
+    f.store.deleteBot('delete',f.bot.id,f.bot.configRevision,true);
+    f.execution.stopDeletedBot(f.bot.id);
+    while(f.store.heldRuns().length)await delay(25);
+    assert.equal(f.agent.status,'running');
+    assert.equal(f.cancelled(),false);
+    assert.deepEqual(f.killedJobs,[]);
+    assert.equal(f.store.getRun(f.run.id).state,'interrupted');
+    assert.equal(f.store.db.prepare("SELECT json_extract(data,'$.confirmed') AS confirmed FROM events WHERE kind='run.delete-release'").get()?.confirmed,0);
+  }finally{await f.close();}
+});
 
 for(const version of ['rc.1','rc.5'] as const)test(`${version} early ready holds the execution slot and requires a fresh same-turn report`,async()=>{
   const f=await fixture(version);try {

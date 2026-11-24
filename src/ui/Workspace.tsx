@@ -88,8 +88,10 @@ function NewTask({ w }: { w: WorkspaceState }) {
       t => { w.setForm(null); w.select(t.id); })}/>;
 }
 
-function Body({ w, bot, onReturn, focusFeishu }: { w: WorkspaceState; bot: Bot; onReturn?: () => void; focusFeishu?: boolean }) {
-  if (w.view === 'settings') return <BotPanel w={w} bot={bot} focusFeishu={focusFeishu}/>;
+function Body({ w, bot, onReturn, focusFeishu, onBotDeleted }: {
+  w: WorkspaceState; bot: Bot; onReturn?: () => void; focusFeishu?: boolean; onBotDeleted?: WorkspaceProps['onBotDeleted'];
+}) {
+  if (w.view === 'settings') return <BotPanel w={w} bot={bot} focusFeishu={focusFeishu} onBotDeleted={onBotDeleted}/>;
   if (w.view === 'board') return <Board w={w}/>;
   if (w.view === 'list') return <><TaskFilters w={w}/><TaskList w={w}/></>;
   return <Inbox w={w} onReturn={onReturn}/>;
@@ -105,7 +107,8 @@ export function Workspace(props: WorkspaceProps) {
         {w.mirror ? w.online && <><TaskFilters w={w}/><TaskList w={w}/></> : <>
           <BotForms w={w}/>
           {w.online && w.bots.length === 0 && w.form !== 'bot' && <Welcome w={w}/>}
-          {bot && <><NewTask w={w}/><Body w={w} bot={bot} onReturn={props.onReturn} focusFeishu={props.focusFeishu}/></>}
+          {bot && <><NewTask w={w}/><Body w={w} bot={bot} onReturn={props.onReturn}
+            focusFeishu={props.focusFeishu} onBotDeleted={props.onBotDeleted}/></>}
         </>}
       </>}
     </div></div>

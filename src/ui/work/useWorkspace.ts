@@ -13,6 +13,7 @@ import {
 export interface WorkspaceProps {
   api: WorkspaceApi; initialBotId?: string; initialLink?: WorkLink; sessionId?: string; compact?: boolean; onReturn?: () => void;
   mirror?: MirrorSelection; focusFeishu?: boolean;
+  onBotDeleted?: (bot: Bot) => void;
 }
 export const PAGE_SIZE = 25;
 export type Page = TaskPage & { truncated?: boolean };
@@ -157,7 +158,7 @@ export function useWorkspace({ api, initialBotId, initialLink, sessionId, mirror
         if (view === 'list' && p && offset > 0 && offset >= p.total) {
           setOffset(Math.max(0, Math.floor((p.total - 1) / PAGE_SIZE) * PAGE_SIZE)); deselect(); closeEdit();
         }
-        if (botId && !b.some(bot => bot.id === botId)) switchToAvailableBot(b);
+        if (botId && !mutating.current && !b.some(bot => bot.id === botId)) switchToAvailableBot(b);
         if (!sessionId && !botId && b.length) adoptFirstBot(b);
       } catch {
         if (!current()) return;
@@ -168,7 +169,8 @@ export function useWorkspace({ api, initialBotId, initialLink, sessionId, mirror
     pull(); return () => { controller.abort(); clearTimeout(timer); if (unsubscribe) unsubscribe(); };
   }, [api, botId, selected, query, filter, offset, refresh, view, link, sessionId, mirror]);
 
-  async function mutate<T>(action: string, payload: Record<string, unknown>, done?: (value: T) => void): Promise<boolean> {
+  async function mutate<T>(action: string, payload: Record<string, unknown>, done?: (value: T) => void,
+    failed?: (error: unknown) => void): Promise<boolean> {
     if (mirror || !online || mutating.current || sessionId && api.currentSession?.() !== sessionId) return false;
     const navigation = api.beginNavigation(), scope = viewScope.current;
     const leaving = new AbortController();
@@ -188,7 +190,11 @@ export function useWorkspace({ api, initialBotId, initialLink, sessionId, mirror
       api.workFeed?.refresh();
       done?.(result); setRefresh(n => n + 1); return true;
     } catch (e) {
-      if (current()) { setError(e instanceof Error ? e.message : '操作未完成，请核对后重试。'); setRefresh(n => n + 1); }
+      if (current()) {
+        if (failed) failed(e);
+        else setError(e instanceof Error ? e.message : '操作未完成，请核对后重试。');
+        setRefresh(n => n + 1);
+      }
       return false;
     } finally {
       if (unsubscribe) unsubscribe();

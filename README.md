@@ -92,6 +92,7 @@ SUPER_BOT_PROFILE=super-bot-trial npm run dev:reload -- --wait 30
 - `npm run smoke:notifications`：自建全新隔离 home/profile/账本与确定性提供方，验证 Manager 未就绪、额度恢复、通知回执崩溃及重复重启；无真实模型费用、无生产连接。
 - `npm run smoke:chat`：在专用探针宿主上验证聊天接单、同对话交付、文件下载、提问回答、返工、Bot 直接 Shell 查询/noWait 拒绝与 Worker 原生 Shell 文件任务；仅确定性模型，不依赖外部服务。可传专用宿主日志：`npm run smoke:chat -- .runtime/permissions-host.log`。
 - `node scripts/smoke-manager-native-tools.mjs` 使用隔离 DSH Web、确定性模型和合成计数工具验证 Manager 的宿主工具执行边界。设置 `SUPER_BOT_TEST_PLAYWRIGHT` 和 `SUPER_BOT_TEST_BROWSER` 为本机 Playwright 模块与 Chromium 可执行文件的绝对路径。加 `--files` 验证 files 模式。
+- `node scripts/smoke-bot-delete.mjs <隔离宿主日志>` 在空账本的 DSH Web 测试 profile 验证普通删除、强制删除、取消确认和 Bot 切换。沿用上面的浏览器参数，宿主使用确定性模型探针。
 - `npm run smoke:feishu`：启动两个独立 DSH profile，以合成飞书传输和确定性模型验证配置检测、保存、旧凭证导入、群绑定、双向文本、原生聊天交付、断线重连及重启。无需真实飞书或模型凭证。
   设置 `SUPER_BOT_TEST_PLAYWRIGHT` 和 `SUPER_BOT_TEST_BROWSER` 为 Playwright 模块、Chromium 可执行文件的绝对路径，还可通过 DSH Web 界面操作全局飞书设置、群绑定和原生聊天。
 - `node scripts/smoke-delivery-receipt.mjs <隔离宿主日志>`：使用确定性探针和每小时一次的唤醒限额，验证工具回包、原聊天链接回执、版本下载及人工验收状态。运行条件与证据见 [DF-14](specs/changes/2026-11-super-bot-mvp/evidence.md#2026-11-21-df-14--原聊天成果回执)。
@@ -106,6 +107,10 @@ Node 用 fnm 管理时，可用 `fnm exec --using=24.21.0 npm run dev`，无需�
 ## 从 Bot 对话管理已有任务
 
 在原 Bot 对话中明确指出任务和动作，例如「暂停文档任务的自动管理」「恢复文档任务的自动管理」「停止文档任务当前这次执行」或「取消文档任务」。消息里的工作链接会限定本次操作对应的任务。暂停期间，已在执行的 Worker 可以继续。停止只请求结束当前这次执行并暂停自动管理，Bot 按回执报告正在停止、已停止或待核对。取消要求执行已收敛，保留历史和成果记录。需要先停止或核对时，Bot 会报告当前限制，由你决定下一步。
+
+## 删除 Bot
+
+在 Super Bot 首页找到目标 Bot，打开「工作 → 设置与维护（⋯）」，点击「删除 Bot」并核对名称后确认。有未结束任务时，可选择「强制删除 Bot」并确认。系统会取消待处理任务，并向运行中的 Worker 请求停止。任务历史、原生会话和工作文件均会保留。已绑定的飞书群会停止同步，群聊仍保留在飞书中。
 
 ## 在飞书群继续与 Bot 聊天
 

@@ -774,3 +774,10 @@ ELECTRON_RUN_AS_NODE=1 '/Applications/DeepSeek Harness.app/Contents/MacOS/DeepSe
 
 - 完整说明及提问、恢复核对文字、任务范围和验收条件、完整 Worker 报告及检查使用现有 `marked` 词法解析和 React 元素。折叠预览为纯文本，展开时隐藏相邻预览。链接仅支持无凭证且有效的绝对 HTTP(S) 地址，成果文件继续使用既有入口。HTML 和图片按纯文本显示，拒绝的链接保留标签文字。
 - Node `24.22.1` 下 26 项定向测试通过，覆盖普通字符和换行、列表、加粗、代码、可用链接、危险地址和 HTML，以及详情字段和折叠预览。`SUPER_BOT_BUILD_OUTDIR=.runtime/work-markdown/build npm run check` 通过行数、类型、87 项核心、299 项适配及 Host/Client 构建。合成模块加载检查确认客户端可从既有工厂加载。UI 验证限于合成 React 结构，浏览器和原生窗口留待验证。[定向日志](../../../.runtime/work-markdown/targeted.log) · [全量日志](../../../.runtime/work-markdown/check.log) · [客户端加载](../../../.runtime/work-markdown/client-factory.log)
+
+## 2026-11-24 · 删除 Bot 二次确认
+
+- 在隔离 DSH Web `0.2.2-rc.1` 和 Edge 中创建首个合成 Bot，在聊天旁打开设置并取消删除。两次轮询后确认提示仍在，飞书群设置只显示一次。从首页的工作设置切换 Bot 后，返回原 Bot 需要重新开始确认。
+- 确认普通删除前新建一项暂停任务，宿主拒绝本次请求。强制删除提示展示目标和未结束任务数，取消后任务仍开放，再确认后该任务取消，另一个 Bot 可继续打开。正常删除最后一个 Bot 后回到创建页面。停止探针宿主后核对原生会话仍存在，账本保留任务和两次删除审计。测试使用全新 profile 和合成数据。[浏览器验收](../../../scripts/smoke-bot-delete.mjs)
+- 在只允许一个 Worker 运行的隔离宿主里，强制删除仍在执行合成任务的 Bot。账本记录该次执行已取消并释放名额，另一个 Bot 随后使用同一名额完成任务。
+- 在含 Worker 并发设置的本地开发版中，聊天侧栏刷新 4 次累积出 4 份表单。区分相邻设置面板的 React key 后，连续刷新 8 次仍只有一份，未保存的输入值保持不变。关闭并重新进入设置后复核通过。

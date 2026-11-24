@@ -5,7 +5,8 @@ import { TEST_TASK_PREFIX, type WorkActivity, type BotWorkSummary } from './mode
 // a live run or a durable automatic next step belongs in the waiting group.
 const managers = `SELECT b.id, b.name, b.createdAt, m.sessionId FROM bots b
   LEFT JOIN managers m ON m.botId=b.id AND m.state='ready' AND m.configRevision=b.configRevision
-    AND m.sessionId=b.managerSessionId AND m.requestedSessionId=m.sessionId`;
+    AND m.sessionId=b.managerSessionId AND m.requestedSessionId=m.sessionId
+  WHERE b.deletedAt IS NULL`;
 
 function activities(scoped: boolean) {
   return `SELECT t.id, t.botId, t.goal, CASE

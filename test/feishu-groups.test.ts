@@ -103,6 +103,31 @@ test('concurrent confirmations cannot claim one chat twice and stale actions can
   assert.deepEqual(groups.get(first), rebound);
 });
 
+test('a Feishu group created remotely during Bot deletion persists without reviving its mapping', async t => {
+  const { store, groups, remote, first, second } = fixture(t);
+  const created = latch(), finish = latch();
+  const createGroup = remote.transport.createGroup;
+  remote.transport.createGroup = async (name, uuid) => {
+    const group = await createGroup(name, uuid);
+    created.release();
+    await finish.promise;
+    return group;
+  };
+  const creating = groups.create(first, '留在飞书的群', 'create');
+  await created.promise;
+  const receipt = store.deleteBot('delete', first, 1, false);
+  groups.revokeRouting(first, receipt.feishuBindingId);
+  finish.release();
+  await assert.rejects(creating, { code: 'not-found' });
+  const [group] = remote.creations.values();
+  assert.ok(group && remote.chats.has(group.chatId));
+  assert.equal(groups.get(first), null);
+  assert.equal(groups.findByChat(group.chatId), null);
+  assert.equal(store.db.prepare('SELECT chatId FROM feishu_group_creations WHERE botId=?').get(first)?.chatId, group.chatId);
+  const preview = await groups.preview(second, group.chatId);
+  assert.equal((await groups.bind(second, preview.confirmationToken)).botId, second);
+});
+
 test('app and owner changes isolate routes; only re-confirmed conflicts move to the new identity', async t => {
   const { store, groups, remote, first, second } = fixture(t);
   const prior = await groups.bind(first, (await groups.preview(first, existing.chatId)).confirmationToken);

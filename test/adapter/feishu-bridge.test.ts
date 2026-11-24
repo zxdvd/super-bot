@@ -62,6 +62,7 @@ async function fixture(t: TestContext) {
     on, effect: (start: Function) => start(),
     tools: { register: (item: any) => { tool = item; return () => {}; } },
     agents: { list: () => [...agents.values()], get: (id: string) => agents.get(id) },
+    jobs: { list: () => [] },
     sessionController: { resolveAgent: async (id: string) => {
       await delayedResolve;
       const agent = agents.get(id);
@@ -211,6 +212,10 @@ async function fixture(t: TestContext) {
     setSend(fn: typeof send) { send = fn; },
     setModel(enabled: boolean) { model = enabled ? { provider: 'synthetic', model: 'synthetic' } : null; },
     delayResolve(promise?: Promise<void>) { delayedResolve = promise; },
+    async deleteBot(botId: string, force: boolean) {
+      const receipt = managers.deleteBot(`deletion:${force}`, botId, 1, force, () => {});
+      groups.revokeRouting(botId, receipt.feishuBindingId);
+    },
     async replace(botId: string) {
       const old = store.activeManager(botId)!;
       advance();
@@ -573,6 +578,41 @@ test('unlink revokes a claimed group message while native model preparation is p
   await b.agent.endTurn();
   assert.equal(f.receipt('before-unlink')!.nativeSeq, null);
   assert.ok(typeof f.receipt('second-bot-retains-authority')!.nativeSeq === 'number');
+});
+
+test('deleting a busy Bot revokes in-flight Feishu routing and leaves queued human chat and other Bots intact', async t => {
+  const f = await fixture(t), { a, b } = f;
+  const human = f.web('Keep this queued human message');
+  a.agent.followup(human);
+  await assert.rejects(f.deleteBot(a.bot.id, false), { code: 'manager-busy' });
+  assert.equal(f.groups.get(a.bot.id)?.id, f.aa.id);
+
+  let resolveAgent!: () => void;
+  f.delayResolve(new Promise<void>(resolve => { resolveAgent = resolve; }));
+  f.incoming('before-delete', 'Never admit this former group message');
+  await tick();
+  assert.ok(f.receipt('before-delete'));
+  await f.deleteBot(a.bot.id, true);
+  resolveAgent();
+  f.delayResolve();
+  await tick();
+  assert.equal(a.agent.canceled, 1);
+  assert.deepEqual(a.agent.inbox.nextTurn.map(message => message.id), [human.id]);
+  assert.equal(a.agent.history.some(event => event.type === 'user/message'), false);
+  assert.equal(f.receipt('before-delete')?.nativeSeq, null);
+  assert.equal(f.groups.findByChat(f.aa.chatId), null);
+  await assert.rejects(f.runTool(a.agent, { action: 'list' }), { code: 'manager-scope' });
+  await f.reopen();
+
+  f.incoming('after-restart', 'Still no route');
+  f.incoming('unaffected-group', 'Beta can still chat', { chatId: f.bb.chatId });
+  await tick();
+  assert.equal(f.receipt('after-restart'), undefined);
+  await b.agent.enter();
+  await b.agent.endTurn();
+  assert.equal(typeof f.receipt('unaffected-group')?.nativeSeq, 'number');
+  const replacement = f.store.createBot('replacement', { name: 'Replacement', instructions: 'Synthetic' });
+  assert.equal((await f.bind(replacement.id, f.aa.chatId)).botId, replacement.id);
 });
 
 test('a bound group without an active Manager receives one request to reopen the local Bot', async t => {

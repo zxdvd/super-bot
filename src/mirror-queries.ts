@@ -41,6 +41,7 @@ export function readLocalMirror(store: Store, query: MirrorQuery) {
     const page = store.listTasks(query);
     return { ...page, items: page.items.map(task => taskRecord(task, false)) };
   }
+  store.getBot(query.botId);
   const task = store.getTask(query.id);
   if (task.botId !== query.botId) throw new AppError('not-found', '任务不属于此 Bot。');
   const detail = store.taskDetail(task.id), run = detail.run;

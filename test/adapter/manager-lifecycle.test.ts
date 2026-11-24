@@ -19,7 +19,8 @@ function fixture(options:RuntimeOptions={}){
   let agentCreated:((event:{agent:any})=>void)|undefined;
   const titles=new Map<any,any>();
   const ctx={
-    effect:(register:()=>void)=>register(),tools:{register:()=>()=>{}},agents:{list:()=>[]},
+    effect:(register:()=>void)=>register(),tools:{register:()=>()=>{}},
+    agents:{list:()=>[],get:(id:string)=>agents.get(id)},jobs:{list:()=>[]},
     on:(event:string,handler:typeof agentCreated)=>{if(event==='agent/created')agentCreated=handler;return ()=>{};},
     permissionPresets:{set:()=>{}},
     sessionTitle:{get:(session:any)=>titles.get(session),rename:(session:any,title:string)=>{const value={title,source:{kind:'user'}};titles.set(session,value);return value;}},
@@ -130,6 +131,21 @@ test('prepare retries return their own released generation after Bot configurati
     const other=f.store.createBot('other',{name:'Other',instructions:'Other'});
     await assert.rejects(f.managers.prepare('prepare',other.id),{code:'idempotency-conflict'});
   }finally{await f.close();}
+});
+
+test('deleting a Bot with an unloaded conversation does not resolve or start the native Agent', async () => {
+  const f = fixture({ fullAccess: false });
+  try {
+    const manager = await f.managers.prepare('prepare', f.bot.id);
+    f.agents.delete(manager.requestedSessionId);
+    const before = f.counts();
+    const deletion = await f.managers.deleteBot('delete', f.bot.id, 1, false, () => {});
+    assert.equal(deletion.managerSessionId, manager.requestedSessionId);
+    assert.equal(f.store.getManager(manager.id).state, 'released');
+    assert.deepEqual(f.counts(), before);
+    await assert.rejects(f.managers.prepare('prepare', f.bot.id), { code: 'not-found' });
+    assert.deepEqual(f.counts(), before);
+  } finally { await f.close(); }
 });
 test('completed replacement retry ignores old activity and cannot select a model for later generations',async()=>{
   const f=fixture();try{

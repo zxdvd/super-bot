@@ -15,7 +15,7 @@ const message = (error: unknown, fallback: string) => error instanceof Error ? e
 type Work = { botId: string; link?: WorkLink; revision?: number; mirror?: MirrorSelection; focusFeishu?: boolean };
 
 function WorkFrame({ api, work, error, setError, close }: {
-  api: WorkspaceApi; work: Work; error: string; setError: (text: string) => void; close: () => void;
+  api: WorkspaceApi; work: Work; error: string; setError: (text: string) => void; close: (deleted?: Bot) => void;
 }) {
   const clearHash = () => history.replaceState(history.state, '', location.pathname + location.search);
   const leave = () => { api.beginNavigation(); clearHash(); close(); };
@@ -29,7 +29,8 @@ function WorkFrame({ api, work, error, setError, close }: {
     </div>
     <div style={{ flex: 1, minHeight: 0 }}>
       <Workspace api={api} key={work.link ? `${workUrl(work.link)}:${work.revision}` : `${work.mirror?.owner ?? 'local'}:${work.botId}`}
-        initialBotId={work.botId} initialLink={work.link} mirror={work.mirror} focusFeishu={work.focusFeishu}/>
+        initialBotId={work.botId} initialLink={work.link} mirror={work.mirror} focusFeishu={work.focusFeishu}
+        onBotDeleted={bot => { api.beginNavigation(); clearHash(); close(bot); }}/>
     </div>
   </div>;
 }
@@ -40,6 +41,7 @@ export function BotHome({ api }: { api: WorkspaceApi }) {
   const [bots, setBots] = useState<Bot[]>([]), [loading, setLoading] = useState(true);
   const [catalog, setCatalog] = useState<MirrorCatalog>();
   const [error, setError] = useState(''), [busy, setBusy] = useState(false);
+  const [deletedName, setDeletedName] = useState('');
   const [work, setWork] = useState<Work | null>(null);
   const [showSettings, setShowSettings] = useState(returningToReloadSettings);
   const settingsEntry = useRef<HTMLButtonElement>(null);
@@ -107,9 +109,14 @@ export function BotHome({ api }: { api: WorkspaceApi }) {
     } catch (e) { if (alive.current) setError(message(e, '暂时无法创建，请重试。')); }
     finally { locked.current = false; if (alive.current) setBusy(false); }
   }
-  if (work !== null) return <WorkFrame api={api} work={work} error={error} setError={setError} close={() => {
+  if (work !== null) return <WorkFrame api={api} work={work} error={error} setError={setError} close={deleted => {
     setWork(null);
-    if (work.focusFeishu) setShowSettings(true);
+    if (deleted) {
+      setBots(current => current.filter(bot => bot.id !== deleted.id));
+      setDeletedName(deleted.name);
+      setCreating(false);
+      setError('');
+    } else if (work.focusFeishu) setShowSettings(true);
   }}/>;
   if (showSettings) return <FeishuSettings api={api} bots={loading ? undefined : bots} openGroup={botId => {
     api.beginNavigation(); setShowSettings(false); setWork({ botId, focusFeishu: true });
@@ -128,6 +135,7 @@ export function BotHome({ api }: { api: WorkspaceApi }) {
       </div>
     </header>
     {error && <p role="alert" className="notice error">{error}</p>}
+    {deletedName && <p className="notice slim" role="status">已删除「{deletedName}」。</p>}
     {loading ? <p className="muted">正在读取你的 Bot…</p> : <>
       {bots.map(bot => <article key={bot.id} className="bot-row">
         <button disabled={busy} className="bot-open" onClick={() => void chat(bot)}>
@@ -136,7 +144,9 @@ export function BotHome({ api }: { api: WorkspaceApi }) {
           {catalog && <div className="muted wrap">{ownerLabel[catalog.owner]} 创建 · {bot.id}</div>}
           <div className="muted">继续聊天 →</div>
         </button>
-        <button disabled={busy} onClick={() => { api.beginNavigation(); setWork({ botId: bot.id }); }}>工作</button>
+        <button disabled={busy} onClick={() => {
+          api.beginNavigation(); setDeletedName(''); setWork({ botId: bot.id });
+        }}>工作</button>
       </article>)}
       {catalog && catalog.state !== 'disabled' && <section aria-label={`${ownerLabel[catalog.peer]} 的 Bot`}>
         {catalog.state === 'offline' && <p role="status">{ownerLabel[catalog.peer]} 离线，暂时无法读取该端的 Bot。</p>}

@@ -28,6 +28,7 @@ function Icon({ size = 20 }: { size?: number }) {
 
 export function apply(context: Context): void {
   const ctx = context as unknown as ClientContext;
+  const panel = 'super-bot' as MainPanelId;
   const api: WorkspaceApi = {
     async call<T>(action: string, payload: Record<string, unknown> = {}, signal?: AbortSignal): Promise<T> {
       const result = await ctx.connection.rpc.call('/api', 'super-bot', { ...payload, action }, signal);
@@ -42,13 +43,13 @@ export function apply(context: Context): void {
     currentSession:()=>ctx.sidebarRight.mounted.getSnapshot(),
     watchCurrentSession: listener => ctx.sidebarRight.mounted.subscribe(listener),
     openBot:(botId,navigation=ctx.layout.beginNavigation())=>openBotConversation(api,botId,navigation),
+    openHome:()=>ctx.layout.selectPanel(panel),
   };
   api.workFeed = createWorkFeed(api);
   const row = 'sidebar.session.row.trailing';
   ctx.slots.inject(row, () => ctx.slots.register({ name: row, id: 'super-bot-work-state' },
     ({ sessionId }: { sessionId: SessionId }) => <SessionBadge api={api} sessionId={sessionId}/>));
   ctx.effect(()=>{
-    const panel = 'super-bot' as MainPanelId;
     let intent: AbortController | undefined, nativeHash: string | undefined;
     const replaceHash = (hash: string) => history.replaceState(history.state, '', location.pathname + location.search + hash);
     const select = () => {

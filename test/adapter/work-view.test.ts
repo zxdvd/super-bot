@@ -11,8 +11,8 @@ import { LinkedTaskContent, TaskDefinition, TaskDetailHeader } from '../../src/u
 import { ResultLinks, ResultLoadReceipt, ResultReport, ResultSummary } from '../../src/ui/work/ResultCard.tsx';
 import { SessionControls } from '../../src/ui/work/SessionControls.tsx';
 import { ReplyForm } from '../../src/ui/work/forms.tsx';
-import { BotPanel } from '../../src/ui/work/BotPanel.tsx';
 import { WorkMarkdown } from '../../src/ui/work/WorkMarkdown.tsx';
+import { BotPanel } from '../../src/ui/work/BotPanel.tsx';
 import type { WorkspaceState } from '../../src/ui/work/useWorkspace.ts';
 import { apply as applyClient, inject } from '../../src/client.tsx';
 import { SessionOriginHint, SessionWork, WorkButton } from '../../src/ui/SessionWork.tsx';
@@ -52,9 +52,10 @@ test('chat work settings give each Bot panel a distinct React key', () => {
   const f = fixture();
   try {
     const w = { sessionId: f.a.managerSessionId, locked: false } as WorkspaceState;
-    const { children } = BotPanel({ w, bot: f.a }).props;
+    const { children } = BotPanel({ w, bot: f.a, onBotDeleted: () => {} }).props;
     const keys = children.flat().flatMap((child: { key?: string | null } | undefined) => child?.key ?? []);
     assert.ok(keys.includes(`feishu:${f.a.id}`));
+    assert.ok(keys.includes(`delete:${f.a.id}:${f.a.configRevision}`));
     assert.equal(new Set(keys).size, keys.length);
   } finally { f.store.close(); }
 });

@@ -10,7 +10,7 @@ import { SessionId } from '@deepseek-ai/dsh-session/types';
 import { mkdir,realpath } from 'node:fs/promises';
 import { join } from 'node:path';
 import { AppError,requiredText,optionalText,type ChatSource,type ManagerBinding,type ManagerEvent,type NewBot,type Bot,type Task,type Run,type Result,botDraft } from './model.ts';
-import type { Store } from './store.ts';
+import type { BotDeletionReceipt, Store } from './store.ts';
 import { selectedModel,modelFailureNote,type DshExecution } from './dsh.ts';
 import { previewEvidence,verifyEvidence } from './evidence.ts';
 import {configureRole,fullAccessEnabled,runtimeLimits,type RuntimeOptions} from './runtime.ts';
@@ -607,6 +607,12 @@ export class Managers {
   private attachScope(agent:Agent):void {
     if(this.closed)return;
     this.quarantineNotificationInputs(agent);
+    if (this.store.isDeletedManagerSession(agent.id)) {
+      for (const message of [...agent.inbox.nextTurn, ...agent.inbox.nextStep]) {
+        if (message.source && isFeishuSource(message.source)) agent.inbox.remove(message.id);
+      }
+      return;
+    }
     const attached=this.scopes.get(agent.id);
     if(attached?.agent===agent)return;
     if(attached) {
@@ -648,14 +654,14 @@ export class Managers {
         if(context.scope===agent)nativeTurn.assemble(context.signal,context.toolSet);
         return next();
       }),
-      agent.ctx.on('tools/execute',(exec,next)=>{
-        if(retired)throw new AppError('manager-tool-scope','管理会话已失效，未执行宿主工具。');
-        if(!allow.includes(exec.name)&&!nativeTurn.authorize(exec,'dispatch')) {
-          throw new AppError('manager-tool-scope','本轮执行依据已失效，未执行该宿主工具。');
-        }
-        return next();
-      }),
     ]:[];
+    const dispatchGuard=agent.ctx.on('tools/execute',(exec,next)=>{
+      if(retired)throw new AppError('manager-tool-scope','管理会话已失效，未执行宿主工具。');
+      if(!allow.includes(exec.name)&&!nativeTurn?.authorize(exec,'dispatch')) {
+        throw new AppError('manager-tool-scope','本轮执行依据已失效，未执行该宿主工具。');
+      }
+      return next();
+    });
     const guard=agent.ctx.tools.guard(exec=>{
       if(retired)return 'This Bot session no longer has management authority.';
       try{this.authority(agent.id);}catch{return 'This Bot session no longer has management authority.';}
@@ -694,7 +700,7 @@ export class Managers {
     let released=false;this.scopes.set(agent.id,{agent,nativeTurn,retire,release:()=>{
       if(released)return;released=true;retire();
       for(const dispose of nativeHooks)dispose();
-      budget();prompt();guard();mask?.();
+      dispatchGuard();budget();prompt();guard();mask?.();
     }});
   }
   async prepare(requestId:string,botId:string):Promise<ManagerBinding> {
@@ -705,7 +711,16 @@ export class Managers {
     const canonical=receipt?.cwd??await realpath(cwd);
     if(this.closed)throw new AppError('manager-unavailable','管理器正在退出。');
     const manager=receipt??this.store.beginManager(requestId,botId,canonical);
-    const current=this.store.getManager(manager.id);if(current.state==='ready'||current.state==='released'){if(current.state==='ready'&&current.sessionId&&(this.options.managerModel||fullAccessEnabled(this.options))){const resolved=await this.ctx.sessionController.resolveAgent(SessionId(current.sessionId));if('agent' in resolved&&resolved.agent.status==='idle')configureRole(this.ctx,resolved.agent,'manager',this.options);}return current;}
+    const current=this.store.getManager(manager.id);
+    if (current.state==='ready'||current.state==='released') {
+      if (current.state==='ready'&&current.sessionId&&(this.options.managerModel||fullAccessEnabled(this.options))) {
+        const resolved=await this.ctx.sessionController.resolveAgent(SessionId(current.sessionId));
+        const latest=this.store.getManager(current.id);
+        if (latest.state==='ready'&&'agent' in resolved&&resolved.agent.status==='idle')configureRole(this.ctx,resolved.agent,'manager',this.options);
+        return latest;
+      }
+      return current;
+    }
     const active=this.creating.get(manager.id);if(active)return active;
     const promise=(async()=>{
       try {
@@ -717,9 +732,11 @@ export class Managers {
           sessionId=manager.requestedSessionId;
         }else {
           const workspace=await this.ctx.workspaceRegistry.create(manager.cwd,bot.name);
+          if(this.store.getManager(manager.id).state==='released')return this.store.getManager(manager.id);
           const created=await this.ctx.sessionController.create({workspaceId:workspace.id,sessionId:SessionId(manager.requestedSessionId)});
           sessionId=created.sessionId;
         }
+        if(this.store.getManager(manager.id).state==='released')return this.store.getManager(manager.id);
         if(sessionId!==manager.requestedSessionId){this.store.set(`native-create-mismatch:${manager.id}`,sessionId);throw new AppError('manager-recovery','宿主返回了不同会话，尚未命名或关联。');}
         const resolved=await this.ctx.sessionController.resolveAgent(SessionId(sessionId));
         if('error' in resolved||resolved.agent.session.id!==sessionId||resolved.agent.session.header.origin==='subagent'||resolved.agent.session.header.isSeeded||resolved.agent.session.header.cwd!==manager.cwd)throw new AppError('manager-recovery','管理会话归属待核对，尚未命名或关联 Workspace。');
@@ -769,6 +786,63 @@ export class Managers {
     if(before?.sessionId&&this.store.activeManager(botId)?.id!==before.id)this.scopes.get(before.sessionId)?.nativeTurn?.restrict();
     return updated;
     });
+  }
+  deleteBot(requestId: string, botId: string, expectedRevision: number, force: boolean,
+    authorize: (replay?: BotDeletionReceipt) => void): BotDeletionReceipt {
+    if (this.closed) throw new AppError('manager-unavailable', '管理器正在退出。');
+    const payload = { botId, expectedRevision, force };
+    const replay = this.store.commandReceipt<BotDeletionReceipt>(requestId, 'bot.delete', payload);
+    authorize(replay);
+    if (replay) return replay;
+    this.store.assertBotDeletable(botId, expectedRevision, force);
+    const manager = this.store.activeManager(botId);
+    if (!force && manager) {
+      const sessionId = manager.sessionId;
+      if (manager.state !== 'ready' || !sessionId) this.deleteBusy();
+      // Resolving an unloaded Agent can wake its Inbox. Only inspect live host state here.
+      const agent = this.ctx.agents.get(SessionId(sessionId));
+      if ((agent && (agent.status !== 'idle' || agent.inbox.nextTurn.length || agent.inbox.nextStep.length)) || this.waking.has(botId)
+        || this.finishing.has(sessionId) || this.activeManagerJobs(SessionId(sessionId)).length) this.deleteBusy();
+    }
+    const receipt = this.store.deleteBot(requestId, botId, expectedRevision, force);
+    if (receipt.managerSessionId) {
+      try { this.retireDeletedManager(receipt.managerSessionId, force); }
+      catch { this.ctx.logger.warn('[super-bot] 已撤销 Bot 管理权限，原生会话或后台工作停止请求待核对。'); }
+    }
+    this.retryAfter.delete(botId);
+    return receipt;
+  }
+  private deleteBusy(): never {
+    throw new AppError('manager-busy', '管理会话仍在工作或待核对，请先等待结束，或使用强制删除。');
+  }
+  private activeManagerJobs(sessionId: ReturnType<typeof SessionId>) {
+    return this.ctx.jobs.list(sessionId).filter(job => job.owner === sessionId && ['running', 'stopping'].includes(job.status));
+  }
+  private retireDeletedManager(sessionId: string, force: boolean): void {
+    const scope = this.scopes.get(sessionId);
+    if (scope) {
+      scope.retire();
+      this.quarantineNotificationInputs(scope.agent);
+      for (const message of [...scope.agent.inbox.nextTurn, ...scope.agent.inbox.nextStep]) {
+        if (message.source && isFeishuSource(message.source)) scope.agent.inbox.remove(message.id);
+      }
+      const release = () => {
+        if (this.scopes.get(sessionId) !== scope) return;
+        scope.release();
+        this.scopes.delete(sessionId);
+      };
+      // Cancellation requests and idle status do not prove that old tool calls have stopped.
+      void scope.agent.whenIdle().then(release, () => {});
+      if (force) scope.agent.cancel({ kind: 'user' }, { keepInbox: true });
+    }
+    if (force) {
+      const id = SessionId(sessionId);
+      for (const job of this.activeManagerJobs(id)) this.ctx.jobs.kill(job.id, id, 'Super Bot deleted');
+    }
+    this.userMessages.delete(sessionId);
+    this.ownerSources.delete(sessionId);
+    this.nativeTurns.delete(sessionId);
+    this.deliveryScopes.delete(sessionId);
   }
   async replace(requestId:string,botId:string,expectedGeneration:number):Promise<ManagerBinding> {
     if(this.closed)throw new AppError('manager-unavailable','管理器正在退出。');
@@ -825,7 +899,7 @@ export class Managers {
   private monitorWake(botId:string,eventId:string,agent:Agent,message:UserMessage):void {
     let timedOut=false;
     const timeout=setTimeout(()=>{
-      if(this.endedInputs.get(agent.id)===message.id)return;
+      if(this.closed||this.store.isBotDeleted(botId)||this.endedInputs.get(agent.id)===message.id)return;
       timedOut=true;
       agent.inbox.remove(message.id);agent.cancel({kind:'user'},{keepInbox:true});
       if(!this.closed)this.store.managerProblem(botId,`自动管理达到 ${runtimeLimits(this.options).managerTurnMinutes} 分钟上限，已请求停止；请检查最新账本。`);
@@ -903,7 +977,7 @@ export class Managers {
           throw new AppError('manager-delivery','管理通知回执未确认，已请求停止且不会重发该通知。请读取最新账本核对。');
         }
         this.monitorWake(bot.id,event.id,agent,message);
-        }catch(error){if(!this.closed){this.store.managerProblem(bot.id,error instanceof AppError?error.message:'自动管理暂不可用，请打开管理会话核对。',problemEventId);if(retryEventId)this.store.deferManagerEvent(retryEventId,error instanceof AppError?error.message:'管理会话暂不可用。',Date.now()+30000,true);this.retryAfter.set(bot.id,Date.now()+30000);}}
+        }catch(error){if(!this.closed&&!this.store.isBotDeleted(bot.id)){this.store.managerProblem(bot.id,error instanceof AppError?error.message:'自动管理暂不可用，请打开管理会话核对。',problemEventId);if(retryEventId)this.store.deferManagerEvent(retryEventId,error instanceof AppError?error.message:'管理会话暂不可用。',Date.now()+30000,true);this.retryAfter.set(bot.id,Date.now()+30000);}}
       }
     }catch { /* A ledger read failure cannot justify delivering any notification. */ }
     finally{this.pumping=false;leave();}

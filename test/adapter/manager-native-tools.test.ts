@@ -26,14 +26,15 @@ function fixture(t: TestContext, fullAccess = true) {
   const scoped = new Map<string, (...args: any[]) => any>();
   const global = new Map<string, (...args: any[]) => any>();
   let guard: (exec: any) => string | undefined = () => undefined;
+  let idle = Promise.resolve();
   const agent = {
-    id: session.id, session, status: 'idle', whenIdle: async () => {},
+    id: session.id, session, status: 'idle', whenIdle: () => idle,
     cancel: () => { agent.status = 'idle'; },
     inbox: { nextTurn: [], nextStep: [] },
     ctx: {
       tools: {
         restrict: () => () => {},
-        guard: (callback: typeof guard) => { guard = callback; return () => {}; },
+        guard: (callback: typeof guard) => { guard = callback; return () => { guard = () => undefined; }; },
       },
       on: (event: string, callback: (...args: any[]) => any) => { scoped.set(event, callback); return () => scoped.delete(event); },
       systemPrompt: { section: () => () => {} },
@@ -44,6 +45,7 @@ function fixture(t: TestContext, fullAccess = true) {
     effect: (callback: () => unknown) => callback(),
     on: (event: string, callback: (...args: any[]) => any) => { global.set(event, callback); return () => global.delete(event); },
     agents: { list: () => [agent], get: (id: string) => id === agent.id ? agent : undefined },
+    jobs: { list: () => [] },
     tools: { register: () => () => {} },
   } as unknown as Context;
   const managers = new Managers(ctx, store, {} as DshExecution, '/synthetic', undefined, { fullAccess });
@@ -131,6 +133,13 @@ function fixture(t: TestContext, fullAccess = true) {
   });
   return {
     bot, intent, inserted, start, admitStep, call, endStep, endTurn, prompt,
+    deleteBot: () => managers.deleteBot('delete', bot.id, bot.configRevision, true, () => {}),
+    holdIdle: () => {
+      let settle!: () => void;
+      idle = new Promise<void>(resolve => { settle = resolve; });
+      return settle;
+    },
+    hasDispatchGuard: () => scoped.has('tools/execute'),
     effects: () => effects, dispatches: () => dispatches,
   };
 }
@@ -151,6 +160,24 @@ test('Manager inherits a current host tool after a fresh trusted input is commit
   assert.equal(f.effects(), 2);
   f.endStep(next);
   f.endTurn(turn);
+});
+
+test('forced Manager retirement holds tool enforcement through native quiescence', async t => {
+  const f = fixture(t);
+  const owner = f.prompt();
+  f.inserted(owner);
+  const turn = f.start(1), step = await f.admitStep(turn, 1, [owner]);
+  const call = f.call(step);
+  assert.equal(call.prepare(), undefined);
+  const settle = f.holdIdle();
+  try {
+    await f.deleteBot();
+    assert.ok(call.prepare());
+    await assert.rejects(call.dispatch(), { code: 'manager-tool-scope' });
+    assert.equal(f.dispatches(), 0);
+  } finally { settle(); }
+  await Promise.resolve();
+  assert.equal(f.hasDispatchGuard(), false);
 });
 
 test('Manager keeps the restricted boundary when normal inbox input has no fresh admission evidence', async t => {

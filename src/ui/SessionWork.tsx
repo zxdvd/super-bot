@@ -81,5 +81,6 @@ export function SessionWork({ api, sessionId, sidebar, tabId, linkedWork, file }
     </section>;
   }
   return <Workspace key={`${sessionId}:${resolved.bot.id}:${target?.revision ?? ''}`} api={api} initialBotId={resolved.bot.id}
-    sessionId={sessionId} initialLink={target?.link} compact onReturn={back}/>;
+    sessionId={sessionId} initialLink={target?.link} compact onReturn={back}
+    onBotDeleted={api.openHome && (() => { back(); api.openHome?.(); })}/>;
 }

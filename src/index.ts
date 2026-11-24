@@ -101,11 +101,12 @@ export async function apply(ctx: Context, config: RuntimeOptions & {
   const status = (): WorkspaceStatus => ({ product: 'Super Bot', version: require('../package.json').version as string, runtime,
     ...store.sqliteInfo(), startedAt, configWarnings:execution.policy.warnings, mirrorIssue: pairingIssue ?? mirror?.configurationIssue() });
 
-  function taskInScope(payload: Record<string, unknown>) {
+  function taskInScope(payload: Record<string, unknown>, requireActiveBot = false) {
     const task = store.getTask(requiredText(payload.id, '任务标识', 200));
     if (payload.sessionId !== undefined && store.botForSession(requiredText(payload.sessionId, '会话标识', 200))?.id !== task.botId) {
       throw new AppError('not-found', '链接中的任务不属于当前 Bot 对话或已不可用。');
     }
+    if (requireActiveBot) store.getBot(task.botId);
     return task;
   }
 
@@ -169,9 +170,33 @@ export async function apply(ctx: Context, config: RuntimeOptions & {
       if (endpoint === 'manager.prepare') return {ok:true,value:await managers.prepare(requiredText(payload.requestId,'请求标识',200),requiredText(payload.botId,'Bot 标识',200))};
       if (endpoint === 'manager.replace') return {ok:true,value:await managers.replace(requiredText(payload.requestId,'请求标识',200),requiredText(payload.botId,'Bot 标识',200),payload.expectedGeneration as number)};
       if (endpoint === 'manager.status') return {ok:true,value:{...store.managerInfo(requiredText(payload.botId,'Bot 标识',200)),wakeLimit:runtimeLimits(config).managerWakesPerHour}};
-      if (endpoint === 'workdir.cleanup') return {ok:true,value:await execution.cleanupWorkdir(requiredText(payload.id,'任务标识',200))};
+      if (endpoint === 'workdir.cleanup') return {ok:true,value:await execution.cleanupWorkdir(taskInScope(payload,true).id)};
       if (endpoint === 'bot.create') return {ok:true,value:await managers.createBot(requiredText(payload.requestId,'请求标识',200),payload as unknown as NewBot)};
       if (endpoint === 'bot.update') return {ok:true,value:await managers.updateBot(requiredText(payload.requestId,'请求标识',200),requiredText(payload.id,'Bot 标识',200),payload.expectedRevision as number,payload as unknown as NewBot)};
+      if (endpoint === 'bot.delete') {
+        const requestId = requiredText(payload.requestId, '请求标识', 200);
+        const botId = requiredText(payload.id, 'Bot 标识', 200), expectedRevision = payload.expectedRevision as number;
+        if (payload.confirmed !== true) throw new AppError('confirmation-required', '请确认删除此 Bot。');
+        if (!Number.isSafeInteger(expectedRevision) || expectedRevision < 1
+          || (payload.force !== undefined && typeof payload.force !== 'boolean')) {
+          throw new AppError('invalid-input', '请使用当前 Bot 配置版本和有效的删除方式。');
+        }
+        if (payload.botId !== undefined && payload.botId !== botId) {
+          throw new AppError('not-found', '此 Bot 不属于当前工作区。');
+        }
+        const sessionId = payload.sessionId === undefined ? undefined : requiredText(payload.sessionId, '会话标识', 200);
+        const force = payload.force === true;
+        return await reloadAdmission.run(`删除 Bot ${botId}`, async () => {
+          const receipt = managers.deleteBot(requestId, botId, expectedRevision, force, replay => {
+            if (sessionId && (replay ? replay.managerSessionId !== sessionId : store.botForSession(sessionId)?.id !== botId)) {
+              throw new AppError('not-found', '此 Bot 不属于当前对话或已不可用。');
+            }
+          });
+          feishu.revokeBotRouting(botId, receipt.feishuBindingId);
+          if (force) execution.stopDeletedBot(botId);
+          return { ok: true, value: { botId } };
+        });
+      }
       if (endpoint === 'task.create') return { ok: true, value: store.createTask(requiredText(payload.requestId,'请求标识',200),payload as unknown as NewTask) };
       if (endpoint === 'task.inbox') return { ok: true, value: store.taskInbox(requiredText(payload.botId,'Bot 标识',200)) };
       if (endpoint === 'task.list') return { ok: true, value: store.listTasks({
@@ -202,14 +227,14 @@ export async function apply(ctx: Context, config: RuntimeOptions & {
         return { ok: true, value: { taskId: task.id, runs } };
       }
       if (endpoint === 'task.dispatch') {
-        const { id } = taskInScope(payload);
+        const { id } = taskInScope(payload,true);
         return {ok:true,value:await execution.dispatch(requiredText(payload.requestId,'请求标识',200),id,
-          payload.expectedRowVersion as number,()=>{taskInScope(payload);})};
+          payload.expectedRowVersion as number,()=>{taskInScope(payload,true);})};
       }
-      if (endpoint === 'task.stop') return {ok:true,value:await execution.stop(requiredText(payload.requestId,'请求标识',200),requiredText(payload.id,'任务标识',200),payload.expectedRowVersion as number)};
-      if (endpoint === 'task.cancel'||endpoint==='session.detach') return {ok:true,value:await execution.endTaskLink(endpoint,requiredText(payload.requestId,'请求标识',200),requiredText(payload.id,'任务标识',200),payload.expectedRowVersion as number)};
+      if (endpoint === 'task.stop') return {ok:true,value:await execution.stop(requiredText(payload.requestId,'请求标识',200),taskInScope(payload,true).id,payload.expectedRowVersion as number)};
+      if (endpoint === 'task.cancel'||endpoint==='session.detach') return {ok:true,value:await execution.endTaskLink(endpoint,requiredText(payload.requestId,'请求标识',200),taskInScope(payload,true).id,payload.expectedRowVersion as number)};
       if (endpoint === 'run.recover' || endpoint === 'run.recover-and-continue') {
-        const { id } = taskInScope(payload);
+        const { id } = taskInScope(payload,true);
         const continuation = endpoint === 'run.recover-and-continue' ? {
           attentionId: requiredText(payload.attentionId, '恢复事项标识', 200),
           bindingId: requiredText(payload.bindingId, '会话关联标识', 200),
@@ -219,19 +244,19 @@ export async function apply(ctx: Context, config: RuntimeOptions & {
           throw new AppError('invalid-input', '请刷新后使用当前会话关联版本核对。');
         }
         return {ok:true,value:await execution.recover(requiredText(payload.requestId,'请求标识',200),id,
-          payload.expectedRowVersion as number,payload.acknowledged,continuation,()=>{taskInScope(payload);})};
+          payload.expectedRowVersion as number,payload.acknowledged,continuation,()=>{taskInScope(payload,true);})};
       }
       if (endpoint === 'result.accept' || endpoint === 'result.reject') {
-        const args = [requiredText(payload.requestId,'请求标识',200), taskInScope(payload).id,
+        const args = [requiredText(payload.requestId,'请求标识',200), taskInScope(payload,true).id,
           payload.expectedRowVersion as number, requiredText(payload.resultId,'成果标识',200)] as const;
-        const authorize = payload.sessionId === undefined ? undefined : () => { taskInScope(payload); };
+        const authorize = () => { taskInScope(payload,true); };
         return {ok:true,value:endpoint === 'result.accept' ? await execution.accept(...args,authorize)
           : store.rejectResult(...args,requiredText(payload.text,'返工要求'))};
       }
       if (endpoint === 'attention.respond') {
         const attentionId = requiredText(payload.attentionId,'待办标识',200);
         if (payload.id !== undefined || payload.sessionId !== undefined) {
-          const task = taskInScope(payload);
+          const task = taskInScope(payload,true);
           if (!store.taskDetail(task.id).attentions.some(attention => attention.id === attentionId)) {
             throw new AppError('not-found', '问题不属于当前任务。');
           }
@@ -239,14 +264,14 @@ export async function apply(ctx: Context, config: RuntimeOptions & {
         return {ok:true,value:store.respondAttention(requiredText(payload.requestId,'请求标识',200),attentionId,
           payload.expectedRowVersion as number,requiredText(payload.text,'回答'))};
       }
-      if (endpoint === 'session.prepare') return {ok:true,value:await execution.prepareSession(requiredText(payload.requestId,'请求标识',200),requiredText(payload.id,'任务标识',200),payload.expectedRowVersion as number)};
+      if (endpoint === 'session.prepare') return {ok:true,value:await execution.prepareSession(requiredText(payload.requestId,'请求标识',200),taskInScope(payload,true).id,payload.expectedRowVersion as number)};
       if (endpoint === 'session.inspect') return {ok:true,value:await execution.inspectExistingSession(requiredText(payload.id,'任务标识',200),requiredText(payload.sessionId,'会话标识',200))};
       if (endpoint === 'session.attach') return {ok:true,value:await execution.attachExistingSession(requiredText(payload.requestId,'请求标识',200),{taskId:requiredText(payload.id,'任务标识',200),expectedRowVersion:payload.expectedRowVersion as number,sessionId:requiredText(payload.sessionId,'会话标识',200),cwd:requiredText(payload.cwd,'工作目录'),fullHistoryApproved:payload.fullHistoryApproved===true,directoryApproved:payload.directoryApproved===true})};
       if (endpoint === 'session.reconcile') return {ok:true,value:await execution.reconcileBinding(requiredText(payload.id,'会话关联标识',200))};
       if (endpoint === 'task.control') return { ok: true, value: store.controlTask(requiredText(payload.requestId,'请求标识',200),
-        requiredText(payload.id,'任务标识',200),payload.expectedRowVersion as number,payload.mode as ControlMode) };
+        taskInScope(payload,true).id,payload.expectedRowVersion as number,payload.mode as ControlMode) };
       if (endpoint === 'task.revise') return { ok: true, value: store.reviseTask(requiredText(payload.requestId,'请求标识',200),
-        requiredText(payload.id,'任务标识',200),payload.expectedRowVersion as number,payload as unknown as NewTask) };
+        taskInScope(payload,true).id,payload.expectedRowVersion as number,payload as unknown as NewTask) };
       throw new AppError('not-found', '未知操作。');
     } catch (error) {
       return { ok: false, error: { code: error instanceof AppError ? error.code : 'internal',

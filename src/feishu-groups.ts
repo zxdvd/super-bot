@@ -123,8 +123,12 @@ export class FeishuGroups {
         .run(botId, expectedBindingId, this.appId, this.ownerOpenId);
       this.store.db.prepare('DELETE FROM metadata WHERE key=?').run(GROUP_EVIDENCE_KEY_PREFIX + current.id);
     });
+    this.revokeRouting(botId, current.id);
+  }
+
+  revokeRouting(botId: string, bindingId: string | null): void {
     this.previews.delete(botId);
-    for (const listener of this.unboundListeners) listener(current.id);
+    if (bindingId) for (const listener of this.unboundListeners) listener(bindingId);
   }
 
   private previewExpired(): AppError {
@@ -140,6 +144,7 @@ export class FeishuGroups {
   }
 
   private assertAvailable(botId: string, chatId?: string): void {
+    this.store.getBot(botId);
     if (this.get(botId)) throw new AppError('feishu-bot-bound', '此 Bot 已绑定飞书群，请先解绑当前群。');
     if (chatId && this.findByChat(chatId)) {
       throw new AppError('feishu-chat-bound', '此飞书群已绑定其他 Bot。');

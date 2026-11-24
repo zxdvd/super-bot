@@ -29,6 +29,7 @@ const base = `
 .sb button:focus-visible,.sb input:focus,.sb textarea:focus,.sb select:focus{outline:2px solid var(--sb-accent);outline-offset:2px}
 .sb button.primary{background:var(--sb-primary);color:var(--sb-on-primary);border-color:var(--sb-primary)}
 .sb button.primary:hover:not(:disabled){background:var(--sb-primary-hover)}
+.sb button.destructive{color:var(--sb-error);border-color:color-mix(in srgb,var(--sb-error) 45%,transparent)}
 .sb button.small{padding:3px 8px;font-size:12px;border-radius:6px}
 .sb button.inline{margin-left:8px}
 .sb select,.sb input,.sb textarea{border:1px solid var(--sb-line);color:inherit;background:var(--sb-soft);border-radius:8px;

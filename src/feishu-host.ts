@@ -390,6 +390,9 @@ export async function startFeishuHost(ctx: Context, store: Store, managers: Mana
   }
 
   return {
+    revokeBotRouting(botId: string, bindingId: string | null): void {
+      if (runtime?.kind === 'bound') runtime.groups.revokeRouting(botId, bindingId);
+    },
     reloadBlockers(): string[] {
       return [...(credentialCheck.pending ? ['飞书凭证核验中'] : []),
         ...(!selfTest.startToken() ? ['飞书私聊自测进行中'] : []),

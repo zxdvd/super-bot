@@ -8,6 +8,7 @@ import type {} from '@deepseek-ai/dsh-user-approval';
 import type {} from '@deepseek-ai/dsh-working-directory';
 import type {} from '@deepseek-ai/dsh-session-projection';
 import type { Agent } from '@deepseek-ai/dsh-agent';
+import type { JobId } from '@deepseek-ai/dsh-jobs';
 import {carrierKeyOf} from '@deepseek-ai/dsh-scope';
 import {ChildWaitObservation,type NativeChildEdge} from './dsh-child-wait.ts';
 import { createUserMessage,freezeMessage,type UserMessage } from '@deepseek-ai/dsh-llm';
@@ -17,6 +18,7 @@ import {verifyRunTurn} from './run-proof.ts';
 import { SessionId } from '@deepseek-ai/dsh-session/types';
 import { realpath } from 'node:fs/promises';
 import { realpathSync } from 'node:fs';
+import { setTimeout as delay } from 'node:timers/promises';
 import { join,isAbsolute,basename } from 'node:path';
 import {cleanupWorkdir,provisionWorkdir,workdirPolicy,workdirSummary,type WorkdirPolicy,type WorkdirRequest} from './workdir.ts';
 import {nameAutomaticSession,workerTitle} from './sidebar.ts';
@@ -84,6 +86,7 @@ interface NativeSubagents {
   rootOf?(member:Agent):Agent;
   waitForTreeWork?(root:Agent):Promise<boolean>;
   waitForChildren?(parent:Agent):Promise<boolean>;
+  interrupt?(childId:Agent['id'],authority:{kind:'ancestor';agent:Agent}):void;
 }
 interface TreeCheck {
   agent:Agent;
@@ -95,6 +98,7 @@ interface TreeCheck {
   pendingWaits:number;
   service?:NativeSubagents;
   waitFailed?:boolean;
+  releaseEvents?:()=>void;
 }
 
 export class DshExecution {
@@ -106,6 +110,7 @@ export class DshExecution {
   private finishing=new Map<string,Promise<void>>();
   private pendingHuman=new Map<string,string[]>();
   private recoveryTreeChecks=new WeakMap<Agent,Promise<boolean>>();
+  private deletedRuns=new Map<string,AbortController>();
   private disposed=false;
   readonly policy:WorkdirPolicy;
   constructor(private ctx:Context,private store:Store,private dataDir:string,private options:RuntimeOptions={},
@@ -149,7 +154,8 @@ export class DshExecution {
         const assertCurrent=()=>{
           exec.signal.throwIfAborted();
           const current=this.store.getRun(run.id);
-          if(this.disposed||this.finishing.has(run.id)||current.finishedAt!==null||current.state==='cancelling') {
+          if(this.disposed||this.finishing.has(run.id)||current.finishedAt!==null||current.state==='cancelling'||
+            this.store.isBotDeleted(this.store.getTask(run.taskId).botId)) {
             throw new AppError('report-stale','当前执行授权已结束或正在停止。');
           }
         };
@@ -188,23 +194,19 @@ export class DshExecution {
         }
         return result;
       },
-    },{when:({agent})=>this.store.heldRuns().some(r=>r.sessionId===agent.id&&r.finishedAt===null)}));
+    },{when:({agent})=>this.store.heldRuns().some(r=>r.sessionId===agent.id&&r.finishedAt===null&&
+      !this.store.isBotDeleted(this.store.getTask(r.taskId).botId))}));
     this.ctx.on('agent/created',({agent})=>{
       if(this.disposed)return;
-      for(const run of this.store.heldRuns())if(run.sessionId===agent.id&&!this.running.has(run.id)) {
-        const input=this.store.getRunInput(run.id);
-        for(const message of [...agent.inbox.nextTurn,...agent.inbox.nextStep]) {
-          const source=message.source;
-          if(message.id===input.messageId&&source.kind==='super-bot'&&source.runId===run.id&&source.inputId===run.inputId&&source.taskId===run.taskId&&source.taskRevision===run.taskRevision&&source.generation===run.generation)agent.inbox.remove(message.id);
-        }
-      }
+      for(const run of this.store.heldRuns())if(run.sessionId===agent.id&&!this.running.has(run.id))this.withdrawWorkerInput(run,agent);
+      for(const run of this.store.deletedWorkerRunsForSession(agent.id))this.withdrawWorkerInput(run,agent);
     });
     this.ctx.on('session/event',(session,event)=>{
       if(this.disposed)return;
       if(event.type==='turn/start')this.turnStarts.set(session,{turn:event.data.turn,seq:event.seq});
       if(!fullAccessEnabled(this.options)&&event.type==='working-directory/change') {
         const run=this.store.heldRuns().find(r=>r.sessionId===session.id&&r.finishedAt===null);
-        if(run&&event.data.cwd!==this.store.getBinding(run.bindingId).cwd) {
+        if(run&&!this.store.isBotDeleted(this.store.getTask(run.taskId).botId)&&event.data.cwd!==this.store.getBinding(run.bindingId).cwd) {
           this.store.runRecovery(run.id,'原生会话工作目录已改变，当前执行授权停止。请核对文件和原生会话。');
           this.running.get(run.id)?.agent.cancel({kind:'user'},{keepInbox:true});
         }
@@ -249,11 +251,12 @@ export class DshExecution {
       }
     });
     // No Agent is resolved or woken. Only old-process certificates plus durable log facts may settle.
-    for(const run of this.store.heldRuns())if(run.finishedAt===null) {
+    for(const run of this.store.heldRuns())if(run.finishedAt===null&&!this.store.isBotDeleted(this.store.getTask(run.taskId).botId)) {
       const proof=this.store.runTurn(run.id);
       if(!proof?.quiet||proof.endSeq===null)this.store.runRecovery(run.id,proof?'重启后缺少原进程的归属结束/后台收敛证据，保留占用；没有自动重投。':'旧版 Run 没有持久轮次证据，请人工核对；没有自动重投。',false);
       else this.scheduleReconciliation(run.id);
     }
+    this.stopDeletedBot();
   }
   /** Useful to callers/tests before inspecting startup reconciliation; never executes model work. */
   async whenReconciled():Promise<void> {await Promise.all([...this.finishing.values()]);}
@@ -269,15 +272,9 @@ export class DshExecution {
   private async reconcileRun(runId:string,session?:Session):Promise<void> {
     const run=this.store.getRun(runId);if(run.finishedAt!==null||this.disposed)return;
     const proof=this.store.runTurn(runId);if(!proof)throw new AppError('run-proof','旧版执行没有可归属的持久证据。');
-    if(session&&!await (this.ctx.sessions as unknown as SessionStore).flush(session))throw new AppError('run-proof','宿主未确认轮次持久保存，保留占用。');
-    const handle=await this.ctx.sessionPersistence.open(SessionId(run.sessionId),'read');
-    let followups:string[];
-    try {
-      if(handle.header.id!==run.sessionId)throw new AppError('run-proof','持久会话身份不符。');
-      followups=verifyRunTurn(run,this.store.getRunInput(runId),proof,(await handle.read()).events);
-    }finally{await handle.close();}
+    const followups=verifyRunTurn(run,this.store.getRunInput(runId),proof,await this.readRunEvents(run,session));
     const current=this.store.getRun(runId);
-    if(this.disposed||current.finishedAt!==null)return;
+    if(this.disposed||current.finishedAt!==null||this.store.isBotDeleted(this.store.getTask(run.taskId).botId))return;
     if(current.state!=='cancelling'&&(!proof.reportId||this.store.finalReport(runId)?.id!==proof.reportId))throw new AppError('run-proof','没有绑定到结束边界的最终报告；不会推断完成。');
     const task=this.store.getTask(run.taskId),binding=this.store.activeBinding(run.taskId);
     if(task.taskRevision!==run.taskRevision||binding?.id!==run.bindingId||binding.generation!==run.generation||binding.sessionId!==run.sessionId)throw new AppError('run-proof','任务或会话绑定已改变，不能补结算。');
@@ -285,6 +282,14 @@ export class DshExecution {
     // become an automatic scheduling/review opportunity in between these writes.
     if(current.state==='cancelling')this.store.settleCancelled(runId,!!session);else this.store.settleRun(runId,!!session);
     for(const id of followups)this.store.nativeIntervention(run.sessionId,id);
+  }
+  private async readRunEvents(run:Run,session?:Session) {
+    if(session&&!await (this.ctx.sessions as unknown as SessionStore).flush(session))throw new AppError('run-proof','宿主未确认轮次持久保存，保留占用。');
+    const handle=await this.ctx.sessionPersistence.open(SessionId(run.sessionId),'read');
+    try {
+      if(handle.header.id!==run.sessionId)throw new AppError('run-proof','持久会话身份不符。');
+      return (await handle.read()).events;
+    }finally{await handle.close();}
   }
   private nativeSubagents():NativeSubagents|undefined {
     return this.ctx.get?.('subagents') as NativeSubagents|undefined;
@@ -528,7 +533,7 @@ export class DshExecution {
     }
     const releaseMask=fullAccessEnabled(this.options)?()=>{}:agent.ctx.tools.restrict({allow:['read','write','edit','super_bot_report']});
     const releaseGuard=agent.ctx.tools.guard(exec=>{
-      if(this.store.getRun(run.id).finishedAt!==null||this.store.getTask(taskId).controlMode==='manual')return 'This automatic run no longer has task authority.';
+      if(this.store.getRun(run.id).finishedAt!==null||this.store.getTask(taskId).controlMode==='manual'||this.store.isBotDeleted(task.botId))return 'This automatic run no longer has task authority.';
       if(exec.name!=='super_bot_report'&&this.store.finalReport(run.id))return 'A final report has been submitted; no new tool work is authorized in this run.';
       if(!fullAccessEnabled(this.options)&&!['read','write','edit','super_bot_report'].includes(exec.name))return 'Only task file tools and super_bot_report are authorized for this run.';
       if(fullAccessEnabled(this.options))return;
@@ -545,10 +550,11 @@ export class DshExecution {
     const release=()=>{
       if(released)return;
       released=true;clearTimeout(deadline);
-      releaseStatus();releaseStopping();releaseTreeStart();releaseTreeEnd();
+      releaseStatus();releaseStopping();
+      if(!this.deletedRuns.has(run.id))treeCheck.releaseEvents?.();
       for(const wait of treeCheck.waits.values())wait.finish('unknown',null);
       treeCheck.waits.clear();
-      this.treeChecks.delete(run.id);releaseBudget();releaseGuard();releaseMask();
+      releaseBudget();releaseGuard();releaseMask();
     };
     // The next queued human turn can start without an idle transition. Only
     // this run's turn/end can certify closure. Idle is the failure fallback.
@@ -561,6 +567,7 @@ export class DshExecution {
     const execution=this;
     const releaseTreeStart=treeEvents.on('subagent/start',function(info){execution.ownedChildEdge(run,treeCheck,this,info,false);});
     const releaseTreeEnd=treeEvents.on('subagent/end',function(info){execution.ownedChildEdge(run,treeCheck,this,info,true);});
+    treeCheck.releaseEvents=()=>{releaseTreeStart();releaseTreeEnd();this.treeChecks.delete(run.id);};
     const releaseStopping=agent.ctx.on('agent/turn-stopping',async({agent:subject,turn,signal})=>{
       // This scoped hook is awaited by the native loop BEFORE it rechecks nextStep.
       // Never hold an unrelated turn/driver, or repair an already ended Run here.
@@ -595,7 +602,7 @@ export class DshExecution {
           }
         }catch(error){quiet=false;note=error instanceof AppError?error.message:'后台效果尚未核对。';}
         if(endSeq!==undefined&&endKind)this.store.observeRunEnd(run.id,endSeq,endKind,quiet);
-        if(this.store.getRun(run.id).finishedAt!==null)return;
+        if(this.store.getRun(run.id).finishedAt!==null||this.store.isBotDeleted(task.botId))return;
         if(!quiet)throw new AppError('run-proof',note);
         if(endSeq===undefined)throw new AppError('run-proof','没有可归属的自动轮次结束事件；仅会话空闲不足以补成功。');
         this.scheduleReconciliation(run.id,agent.session);
@@ -688,13 +695,130 @@ export class DshExecution {
       const input=this.store.getRunInput(receipt.runId);
       if(input.messageId)active.agent.inbox.remove(input.messageId as UserMessage['id']);
       active.agent.cancel({kind:'user'},{keepInbox:true});
-      for(const job of this.ctx.jobs.list(active.agent.id))if(job.owner===active.agent.id&&['running','stopping'].includes(job.status))this.ctx.jobs.kill(job.id,active.agent.id,'Super Bot stop');
+      for(const job of this.liveWorkerJobs(active.agent.id))this.ctx.jobs.kill(job.id,active.agent.id,'Super Bot stop');
     }catch {
       this.store.runRecovery(receipt.runId,'停止请求已记录，但宿主停止操作未能确认，请核对原生会话与后台工作。');
       return receipt;
     }
     const timeout=setTimeout(()=>{if(!this.disposed&&this.store.getRun(receipt.runId).finishedAt===null)this.store.runRecovery(receipt.runId,'停止已请求，但 10 秒内未确认收敛。请核对原生会话与后台工作。');},10000);timeout.unref();
     void active.done.finally(()=>clearTimeout(timeout));return receipt;
+  }
+  private withdrawWorkerInput(run:Run,agent:Agent):boolean {
+    const id=this.store.getRunInput(run.id).messageId;
+    for(const message of [...agent.inbox.nextTurn,...agent.inbox.nextStep]) {
+      const source=message.source;
+      if(message.id===id&&source.kind==='super-bot'&&source.runId===run.id&&source.inputId===run.inputId&&
+        source.taskId===run.taskId&&source.taskRevision===run.taskRevision&&source.generation===run.generation) {
+        return agent.inbox.remove(message.id);
+      }
+    }
+    return false;
+  }
+  private liveWorkerJobs(id:Agent['id']) {
+    return this.ctx.jobs.list(id).filter(job=>job.owner===id&&(job.status==='running'||job.status==='stopping'));
+  }
+  /** The tombstone and dispatch withdrawal have already committed. */
+  stopDeletedBot(botId?:string):void {
+    for(const run of this.store.deletedBotRuns(botId)) {
+      if(this.disposed||this.deletedRuns.has(run.id))continue;
+      const controller=new AbortController();
+      this.deletedRuns.set(run.id,controller);
+      void this.stopDeletedWorker(run,controller.signal).catch(()=>{
+        if(!controller.signal.aborted)this.store.runRecovery(run.id,'强制删除已撤销 Bot，Worker 停止结果待核对。',false);
+      }).finally(()=>{
+        controller.abort();this.deletedRuns.delete(run.id);
+        if(!this.running.has(run.id))this.treeChecks.get(run.id)?.releaseEvents?.();
+      });
+    }
+  }
+  private async stopDeletedWorker(run:Run,signal:AbortSignal):Promise<void> {
+    const id=SessionId(run.sessionId),tracked=this.running.get(run.id),check=this.treeChecks.get(run.id);
+    const agent=tracked?.agent??this.ctx.agents.get?.(id);
+    const proof=this.store.runTurn(run.id),input=this.store.getRunInput(run.id);
+    const ownsTurn=()=>{
+      if(!agent||agent.status!=='running')return false;
+      const coordinates=this.turnStarts.get(agent.session),current=this.store.runTurn(run.id);
+      if(current?.turn!=null)return current.endSeq===null&&coordinates?.turn===current.turn&&coordinates.seq===current.startSeq;
+      // A Super Bot wake can be running pre-step before it durably enters a turn.
+      return this.running.get(run.id)===tracked&&!!tracked&&this.autoTurns.has(run.id);
+    };
+    const ownAtDeletion=ownsTurn(),withdrawn=agent&&this.withdrawWorkerInput(run,agent);
+    const stoppedJobs=new Set<JobId>(),knownJobs=new Map<JobId,Agent['id']>();
+    const interruptedChildren=new Set<Agent['id']>();
+    const treeCheck:{state:'not-observed'|'pending'|'quiet'|'unknown'}={state:'not-observed'};
+    const requestJobStops=(owner:Agent['id'],jobs:ReturnType<DshExecution['liveWorkerJobs']>)=>{
+      for(const job of jobs) {
+        knownJobs.set(job.id,owner);
+        if(stoppedJobs.has(job.id)||job.status==='stopping')continue;
+        try {this.ctx.jobs.kill(job.id,owner,'Super Bot force delete');stoppedJobs.add(job.id);}
+        catch { /* Keep capacity while the observed job is still live. */ }
+      }
+    };
+    const stopChildren=()=>{
+      let live=false;
+      const tree=this.nativeSubagents();
+      for(const {member,edge} of check?.active.values()??[]) {
+        if(!member||!agent)continue;
+        const childId=SessionId(edge.id);
+        const local=edge.local?this.loadedChild(childId):undefined;
+        live ||= local?.status==='running'||(treeCheck.state!=='quiet'&&Boolean(tree&&originalService(tree)===check?.service));
+        if(!interruptedChildren.has(childId)) {
+          try {
+            tree?.interrupt?.(childId,{kind:'ancestor',agent});
+            interruptedChildren.add(childId);
+          }catch { /* Retry while the exact child can still be observed. */ }
+        }
+        if(edge.local)requestJobStops(childId,this.liveWorkerJobs(childId));
+      }
+      return live;
+    };
+    if(ownAtDeletion&&agent) {
+      requestJobStops(id,this.liveWorkerJobs(id));stopChildren();
+      try {agent.cancel({kind:'user'},{keepInbox:true});}
+      catch { /* The running turn still has to converge before release. */ }
+      treeCheck.state='pending';
+      void this.waitForTreeWork(agent,signal).then(()=>{treeCheck.state='quiet';},()=>{treeCheck.state='unknown';});
+    }
+    // Recovery may have lost its process-local Run handle while leaving a known
+    // job executing. Only interrupt jobs whose registration was in this Run's turn.
+    let durableQuiet=false;
+    if(!ownAtDeletion&&proof?.inputSeq!=null) {
+      try {
+        const events=await this.readRunEvents(run,agent?.session);
+        signal.throwIfAborted();
+        const entered=events[proof.inputSeq],source=entered?.type==='user/message'?entered.data.source:undefined;
+        if(entered?.type==='user/message'&&entered.data.id===input.messageId&&source?.kind==='super-bot'&&
+          source.runId===run.id&&source.inputId===run.inputId&&source.taskId===run.taskId&&
+          source.taskRevision===run.taskRevision&&source.generation===run.generation) {
+          const tail=events.slice(proof.inputSeq+1),boundary=tail.findIndex(event=>event.type==='turn/end'||event.type==='turn/start');
+          const jobIds=new Set(tail.slice(0,boundary<0?undefined:boundary)
+            .flatMap(event=>event.type==='job/registered'&&event.data.owner===id?[event.data.jobId]:[]));
+          requestJobStops(id,this.liveWorkerJobs(id).filter(job=>jobIds.has(job.id)));
+        }
+        if(proof.quiet) {
+          verifyRunTurn({...run,state:'cancelling'},input,proof,events);
+          durableQuiet=true;
+        }
+      } catch { /* Missing durable evidence is recorded as unknown if no live observation can settle it. */ }
+    }
+    while(!signal.aborted) {
+      const parentLive=ownsTurn();
+      if(parentLive)requestJobStops(id,this.liveWorkerJobs(id));
+      const childLive=stopChildren();
+      const owners=new Set(knownJobs.values());
+      let jobsLive=false;
+      for(const owner of owners) {
+        const jobs=this.liveWorkerJobs(owner).filter(job=>knownJobs.has(job.id));
+        requestJobStops(owner,jobs);jobsLive ||= jobs.length>0;
+      }
+      const nextTurn=!parentLive&&agent?.status==='running'&&this.turnStarts.has(agent.session);
+      if(!parentLive&&!jobsLive&&!childLive&&(treeCheck.state!=='pending'||nextTurn))break;
+      await delay(250,undefined,{signal,ref:false});
+    }
+    signal.throwIfAborted();
+    const confirmed=durableQuiet||(ownAtDeletion?treeCheck.state==='quiet':withdrawn===true&&proof?.inputSeq==null);
+    this.store.finishDeletedRun(run.id,confirmed,confirmed?'已核对强制删除时撤销或结束的 Worker 执行。':
+      '强制删除已撤销执行授权并释放调度名额；历史执行或外部效果仍未核对。');
   }
   async modelPreview(botId:string,taskId?:string,managerAgent?:Agent):Promise<WorkerModelPreview> {
     const binding=taskId?this.store.activeBinding(taskId):null;
@@ -880,6 +1004,7 @@ export class DshExecution {
   }
   async dispose():Promise<void> {
     this.disposed=true;this.autoTurns.clear();
+    for(const controller of this.deletedRuns.values())controller.abort();
     for(const [id,{agent}]of this.running){this.store.runRecovery(id,'插件退出时执行尚未核对，重新启用后请核对原生会话。');const input=this.store.getRunInput(id);if(input.messageId)agent.inbox.remove(input.messageId as UserMessage['id']);agent.cancel({kind:'user'},{keepInbox:true});}
     await Promise.allSettled([...this.running.values()].map(r=>r.done));
     await this.whenReconciled();
@@ -892,6 +1017,10 @@ export class DshExecution {
   private async prepareWorker(requestId:string,taskId:string,rowVersion:number,workdir?:WorkdirRequest):Promise<Binding> {
     // Validate the ID through the ledger before using it as a directory segment.
     const task=this.store.getTask(taskId);
+    const assertLive=()=>{
+      if(this.store.isBotDeleted(task.botId))throw new AppError('not-found','Bot 已删除。');
+    };
+    assertLive();
     const bound=this.store.activeBinding(taskId);
     let cwd:string,info=bound?.workdir??undefined;
     if(bound)cwd=bound.cwd;
@@ -912,6 +1041,7 @@ export class DshExecution {
     const promise=(async()=>{
       try {
         const workspace=await this.ctx.workspaceRegistry.create(b.cwd,basename(b.cwd));
+        assertLive();
         const result=await this.ctx.sessionController.create({workspaceId:workspace.id,sessionId:SessionId(b.requestedSessionId)});
         if(result.sessionId!==b.requestedSessionId){this.store.set(`native-create-mismatch:${b.id}`,result.sessionId);throw new AppError('session-mismatch','宿主返回了不同会话，尚未命名或关联。');}
         return await this.reconcileBinding(b.id);
@@ -927,7 +1057,10 @@ export class DshExecution {
     if('error' in resolved){this.store.bindingRecovery(id);throw new AppError('session-recovery','尚未找到已申请的会话；保持待核对，没有重复创建。');}
     const header=resolved.agent.session.header;
     if(resolved.agent.session.id!==b.requestedSessionId||header.origin==='subagent'||header.isSeeded||!header.cwd||await realpath(header.cwd)!==b.cwd){this.store.bindingRecovery(id);throw new AppError('session-mismatch','会话目录或归属不一致，尚未关联。');}
-    const workspace=await this.ctx.workspaceRegistry.create(b.cwd,basename(b.cwd));await workspace.attachSession(SessionId(b.requestedSessionId));
+    if(this.store.getBinding(id).state==='released')return this.store.getBinding(id);
+    const workspace=await this.ctx.workspaceRegistry.create(b.cwd,basename(b.cwd));
+    if(this.store.getBinding(id).state==='released')return this.store.getBinding(id);
+    await workspace.attachSession(SessionId(b.requestedSessionId));
     if(this.store.getBinding(id).state==='released')return this.store.getBinding(id);
     if(this.store.getTask(b.taskId).taskRevision!==b.taskRevision)throw new AppError('binding-stale','任务版本已改变，尚未命名旧会话。');
     await nameAutomaticSession(this.ctx,resolved.agent.session,workerTitle(this.store.getTask(b.taskId)));

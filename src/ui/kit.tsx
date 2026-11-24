@@ -27,16 +27,19 @@ export function CopyButton({ text, label = '复制' }: { text: string; label?: s
 }
 
 /** Two-step button for actions that discard or remove something. */
-export function ConfirmAction({ label, explanation, disabled, submit }: {
-  label: string; explanation: string; disabled: boolean; submit: () => Promise<boolean>;
+export function ConfirmAction({ label, explanation, disabled, submit, destructive }: {
+  label: string; explanation: string; disabled: boolean; submit: () => Promise<boolean>; destructive?: boolean;
 }) {
   const [confirming, setConfirming] = useState(false);
-  if (!confirming) return <button disabled={disabled} onClick={() => setConfirming(true)}>{label}</button>;
+  const className = destructive ? 'destructive' : undefined;
+  if (!confirming) return <button type="button" className={className} disabled={disabled}
+    onClick={() => setConfirming(true)}>{label}</button>;
   return <div className="attention-box">
     <p>{explanation}</p>
     <div className="actions">
-      <button disabled={disabled} onClick={() => void submit().then(ok => { if (ok) setConfirming(false); })}>确认{label}</button>
-      <button disabled={disabled} onClick={() => setConfirming(false)}>返回</button>
+      <button type="button" className={className} disabled={disabled}
+        onClick={() => void submit().then(ok => { if (ok) setConfirming(false); })}>确认{label}</button>
+      <button type="button" disabled={disabled} onClick={() => setConfirming(false)}>返回</button>
     </div>
   </div>;
 }

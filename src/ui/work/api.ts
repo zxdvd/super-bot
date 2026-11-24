@@ -6,6 +6,7 @@ export interface WorkspaceApi {
   openChildSession?(parentId: string, childId: string): void;
   beginNavigation(): AbortSignal;
   openBot(id: string, navigation?: AbortSignal): Promise<void>;
+  openHome?(): void;
   currentSession?(): string | undefined;
   watchCurrentSession?(listener: () => void): () => void;
 }

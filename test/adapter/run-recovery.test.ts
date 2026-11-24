@@ -147,6 +147,38 @@ test('lazy restored Agent quarantines only the exact old automatic pending input
   }finally{store.close();}
 });
 
+test('restart of force-deleted Bot releases an unobservable reservation and quarantines its old input',async()=>{
+  const dir=mkdtempSync(join(tmpdir(),'sb-deleted-run-')),path=join(dir,'ledger.sqlite');
+  let store=new Store(path);
+  try {
+    const f=attempt(store);
+    store.db.exec("UPDATE inputs SET state='enqueued'; UPDATE run_turns SET turn=NULL,startSeq=NULL,inputSeq=NULL;");
+    store.deleteBot('delete',f.task.botId,store.getBot(f.task.botId).configRevision,true);
+    assert.equal(store.heldRuns().length,1);
+    store.close();store=new Store(path);
+    store.maxRunningTasks=1;
+    const a=adapter(store,[],f.run.sessionId);
+    await a.execution.whenReconciled();
+    assert.equal(a.reads(),0,'missing turn proof never reloads an old Session');
+    assert.equal(store.heldRuns().length,0);
+    assert.equal(store.getRun(f.run.id).state,'interrupted');
+    assert.equal(store.getRunInput(f.run.id).state,'unknown');
+    assert.equal(store.getTask(f.task.id).lifecycle,'cancelled');
+    const old=f.events[1].data,user={id:'new-human',source:{kind:'user',rpcId:'native'}};
+    const pending=[old,user],removed:string[]=[];
+    a.created({id:f.run.sessionId,inbox:{nextTurn:pending,nextStep:[],remove:(id:string)=>{
+      removed.push(id);pending.splice(pending.findIndex(message=>message.id===id),1);return true;
+    }}});
+    assert.deepEqual(removed,[old.id]);assert.deepEqual(pending,[user]);
+    const other=store.createBot('other',{name:'Other',instructions:'Synthetic only'});
+    const task=store.createTask('other-run',{botId:other.id,goal:'Continue',scope:'Own files',acceptance:'Read',reviewPolicy:'human'});
+    const binding=store.beginBinding('other-bind',task.id,task.rowVersion,'/tmp/sb-crash-proof');
+    store.confirmBinding(binding.id,binding.requestedSessionId);
+    assert.equal(store.reserveRun('other-dispatch',task.id,store.getTask(task.id).rowVersion).state,'queued');
+    await a.execution.dispose();
+  }finally{store.close();rmSync(dir,{recursive:true,force:true});}
+});
+
 test('durable cancelled budget Run reconciles idempotently without waking a Manager',async()=>{
   const store=new Store(':memory:');try {
     const f=attempt(store);store.recordRunBudget(f.run.id,'steps');
