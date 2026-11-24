@@ -1,3 +1,4 @@
+import { inboxActivity } from './work-activity.ts';
 import { DatabaseSync } from 'node:sqlite';
 import { mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
@@ -800,7 +801,16 @@ export class Store {
       const task=this.withDelivery(this.getTask(String(id)));
       if(task.blockingAttention || (task.deliveredAt ?? 0)>freshSince) visible.set(task.id,task);
     }
-    const items=[...visible.values()];
+    const activity = inboxActivity(this.db, botId);
+    for (const [id, state] of activity) {
+      if (state && !visible.has(id)) visible.set(id, this.withDelivery(this.getTask(id)));
+    }
+    const question = this.db.prepare(`SELECT question FROM attentions WHERE taskId=? AND taskRevision=?
+      AND kind='input' AND state='open' ORDER BY createdAt,id LIMIT 1`);
+    const items=[...visible.values()].map(task => ({
+      ...task, activity: activity.get(task.id) ?? null,
+      ...(task.blockingAttention === 'input' ? { activityQuestion: question.get(task.id, task.taskRevision)?.question as string } : {}),
+    }));
     return {...open,items,limit:items.length,truncated:open.total>open.items.length||review.total>review.items.length};
   }
   private toBinding(row:unknown):Binding {

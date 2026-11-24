@@ -15,6 +15,7 @@ export function TaskRow({ w, task, card = false }: { w: WorkspaceState; task: Ta
       <span className="task-goal">{task.goal}</span>
       {!card && <Tag tone={tone}>{state}</Tag>}
     </div>
+    {task.activityQuestion && <span className="muted clamp">{task.activityQuestion}</span>}
     <div className="task-meta">
       {card && <span>{state}</span>}
       {fresh && <Tag tone="info">新成果</Tag>}

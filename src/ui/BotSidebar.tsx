@@ -1,7 +1,7 @@
-import { useEffect, useState, useSyncExternalStore } from 'react';
+import { useState, useSyncExternalStore } from 'react';
 import type { Context } from '@deepseek-ai/cordis';
 import type { SidebarSectionOwnerProps, SidebarFooterActionOwnerProps } from '@deepseek-ai/dsh-client-ui-sidebar/client';
-import type { Bot } from '../model.ts';
+import { activityLabel, useWorkFeed, WorkBadge } from './work/activity.tsx';
 import type { WorkspaceApi } from './work/api.ts';
 
 const styles = `
@@ -19,30 +19,9 @@ const styles = `
 `;
 
 function BotList({ api, wide, lifetime }: { api: WorkspaceApi; wide: boolean; lifetime: AbortSignal }) {
-  const [bots, setBots] = useState<Pick<Bot, 'id' | 'name'>[]>();
-  const [loadFailed, setLoadFailed] = useState(false);
+  const { bots, failed: loadFailed } = useWorkFeed(api);
   const [error, setError] = useState('');
   const [opening, setOpening] = useState<{ id: string; navigation: AbortSignal }>();
-  useEffect(() => {
-    const controller = new AbortController();
-    const signal = AbortSignal.any([controller.signal, lifetime]);
-    let timer: ReturnType<typeof setTimeout>;
-    async function refresh() {
-      if (signal.aborted) return;
-      if (document.visibilityState !== 'hidden') {
-        try {
-          const list = await api.call<Bot[]>('bot.list', {}, signal);
-          if (!signal.aborted) { setBots(list); setLoadFailed(false); }
-        } catch {
-          if (!signal.aborted) setLoadFailed(true);
-        }
-      }
-      if (!signal.aborted) timer = setTimeout(() => void refresh(), 5000);
-    }
-    void refresh();
-    return () => { controller.abort(); clearTimeout(timer); };
-  }, [api, lifetime]);
-
   async function open(id: string) {
     if (lifetime.aborted) return;
     const navigation = AbortSignal.any([api.beginNavigation(), lifetime]);
@@ -57,10 +36,15 @@ function BotList({ api, wide, lifetime }: { api: WorkspaceApi; wide: boolean; li
 
   const status = loadFailed ? '暂时无法读取 Bot' : !bots ? '正在读取 Bot…' : !bots.length ? '暂无 Bot' : '';
   return <nav aria-label="Bot" className={wide ? 'sb-sidebar-bots' : 'sb-sidebar-bots sb-sidebar-rail'}>
-    {bots?.map(bot => <button key={bot.id} type="button" className="sb-sidebar-button" aria-label={bot.name} title={bot.name}
-      disabled={opening?.id === bot.id} onClick={() => void open(bot.id)}>
-      <span className="sb-sidebar-label">{wide ? bot.name : Array.from(bot.name)[0]}</span>
-    </button>)}
+    {bots?.map(bot => {
+      const label = loadFailed ? '' : activityLabel(bot);
+      const title = label ? bot.name + ' · ' + label : bot.name;
+      return <button key={bot.id} type="button" className="sb-sidebar-button" aria-label={title} title={title}
+        disabled={opening?.id === bot.id} onClick={() => void open(bot.id)}>
+        <span className="sb-sidebar-label">{wide ? bot.name : Array.from(bot.name)[0]}</span>
+        <WorkBadge label={label} compact={!wide}/>
+      </button>;
+    })}
     {status && (wide || loadFailed) && <p className="sb-sidebar-message" role="status" title={status}
       aria-label={status}>{wide ? status : '!'}</p>}
     {error && <p className="sb-sidebar-message" role="alert" title={error} aria-label={error}>{wide ? error : '!'}</p>}

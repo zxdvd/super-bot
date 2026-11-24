@@ -1,3 +1,4 @@
+import { botWorkSummaries } from './work-activity.ts';
 import type { Context } from '@deepseek-ai/cordis';
 import Schema from '@deepseek-ai/schemastery';
 import type {} from '@deepseek-ai/dsh-client-connection';
@@ -158,6 +159,7 @@ export async function apply(ctx: Context, config: RuntimeOptions & {
       }
       if (endpoint === 'status') return { ok: true, value: status() };
       if (endpoint === 'backup.create') return {ok:true,value:await createLedgerBackup(store,dataDir,requiredText(payload.requestId,'请求标识',200))};
+      if (endpoint === 'bot.work') return { ok: true, value: botWorkSummaries(store.db) };
       if (endpoint === 'bot.list') return { ok: true, value: store.listBots() };
       if (endpoint === 'bot.for-session') return { ok: true, value: store.botForSession(requiredText(payload.sessionId,'会话标识',200)) };
       if (endpoint === 'sidebar.tidy' || endpoint === 'sidebar.pin') {

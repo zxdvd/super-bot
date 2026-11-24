@@ -40,10 +40,10 @@ export function Inbox({ w, onReturn }: { w: WorkspaceState; onReturn?: () => voi
       <p>在聊天里把事情交给 Bot，例如“调研某个方案并写对比表”或“修复某个页面的样式问题”。它会在这里出现。</p>
       <button disabled={!w.online} onClick={() => w.setForm('task')}>或直接新建任务</button>
     </div> : <>
-      <Group w={w} title="需要你" tasks={groups.attention} folded={groups.blockedTests} empty="暂时没有需要你处理的阻塞事项。"/>
-      <Group w={w} title="待验收" tasks={groups.review}/>
-      <Group w={w} title="新成果" tasks={groups.fresh} aside={clear}/>
       <Group w={w} title="进行中" tasks={groups.active}/>
+      <Group w={w} title="等你处理" tasks={[...groups.attention, ...groups.review]} folded={groups.blockedTests}/>
+      <Group w={w} title="待安排或已暂停" tasks={groups.waiting}/>
+      <Group w={w} title="新成果" tasks={groups.fresh} aside={clear}/>
       <Group w={w} title="最近结束" tasks={groups.recent}/>
       <TestTasks w={w} tasks={groups.tests}/>
       {w.page?.truncated && <p className="muted hint">任务较多，这里只显示最近的未完成任务；完整记录请切换到“全部”。</p>}

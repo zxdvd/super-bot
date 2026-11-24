@@ -12,6 +12,7 @@ import type { UseSidebarRightTabInfo } from '@deepseek-ai/dsh-client-ui-sidebar-
 import { WorkButton, SessionOriginHint, SessionWork } from './ui/SessionWork.tsx';
 import { WORK_TAB, chatDeliveryLink, openBotConversation, openWorkLink, sameWorkHost, workLinkForUrl } from './ui/work-navigation.ts';
 import { returningToReloadSettings } from './ui/DeveloperSettings.tsx';
+import { createWorkFeed, SessionBadge } from './ui/work/activity.tsx';
 import { BotHome } from './ui/BotHome.tsx';
 import { installBotSidebar } from './ui/BotSidebar.tsx';
 import { parseWorkLink, RESULT_FILE_PATH, workUrl } from './work-links.ts';
@@ -42,6 +43,10 @@ export function apply(context: Context): void {
     watchCurrentSession: listener => ctx.sidebarRight.mounted.subscribe(listener),
     openBot:(botId,navigation=ctx.layout.beginNavigation())=>openBotConversation(api,botId,navigation),
   };
+  api.workFeed = createWorkFeed(api);
+  const row = 'sidebar.session.row.trailing';
+  ctx.slots.inject(row, () => ctx.slots.register({ name: row, id: 'super-bot-work-state' },
+    ({ sessionId }: { sessionId: SessionId }) => <SessionBadge api={api} sessionId={sessionId}/>));
   ctx.effect(()=>{
     const panel = 'super-bot' as MainPanelId;
     let intent: AbortController | undefined, nativeHash: string | undefined;

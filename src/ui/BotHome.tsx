@@ -1,11 +1,11 @@
 import { useEffect, useRef, useState, type FormEvent } from 'react';
-import type { Bot, TaskPage } from '../model.ts';
+import type { Bot } from '../model.ts';
 import { ownerLabel, type MirrorCatalog, type MirrorSelection } from '../mirror.ts';
 import { Workspace, type WorkspaceApi } from './Workspace.tsx';
 import { styles } from './styles.ts';
 import { readTaskLink, workLinkForUrl } from './work-navigation.ts';
 import { workUrl, type WorkLink } from '../work-links.ts';
-import { inboxGroups } from './work/format.ts';
+import { activityLabel, useWorkFeed, WorkBadge } from './work/activity.tsx';
 import { reloadSettingsKey, returningToReloadSettings } from './DeveloperSettings.tsx';
 import { FeishuSettings } from './FeishuSettings.tsx';
 
@@ -34,28 +34,9 @@ function WorkFrame({ api, work, error, setError, close }: {
   </div>;
 }
 
-/** One read per Bot on the home list: how many tasks need the user, wait for review, or are running. */
-function BotCounts({ api, botId }: { api: WorkspaceApi; botId: string }) {
-  const [counts, setCounts] = useState<{ needs: number; review: number; running: number }>();
-  useEffect(() => {
-    const controller = new AbortController();
-    api.call<TaskPage>('task.inbox', { botId }, controller.signal).then(page => {
-      if (controller.signal.aborted) return;
-      const groups = inboxGroups(page.items, {}, Date.now());
-      setCounts({ needs: groups.attentionCount, review: groups.review.length, running: groups.active.length });
-    }).catch(() => { /* Counts are a hint; the work view reports errors. */ });
-    return () => controller.abort();
-  }, [api, botId]);
-  if (!counts) return null;
-  return <span className="bot-counts">
-    {counts.needs > 0 && <span className="badge attention">需要你 {counts.needs}</span>}
-    {counts.review > 0 && <span className="badge info">待验收 {counts.review}</span>}
-    {counts.running > 0 && <span className="badge success">进行中 {counts.running}</span>}
-  </span>;
-}
-
 /** Native DSH owns the conversation, composer, model choice and history. */
 export function BotHome({ api }: { api: WorkspaceApi }) {
+  const feed = useWorkFeed(api);
   const [bots, setBots] = useState<Bot[]>([]), [loading, setLoading] = useState(true);
   const [catalog, setCatalog] = useState<MirrorCatalog>();
   const [error, setError] = useState(''), [busy, setBusy] = useState(false);
@@ -150,7 +131,8 @@ export function BotHome({ api }: { api: WorkspaceApi }) {
     {loading ? <p className="muted">正在读取你的 Bot…</p> : <>
       {bots.map(bot => <article key={bot.id} className="bot-row">
         <button disabled={busy} className="bot-open" onClick={() => void chat(bot)}>
-          <span className="bot-name"><strong>{bot.name}</strong><BotCounts api={api} botId={bot.id}/></span>
+          <span className="bot-name"><strong>{bot.name}</strong>
+            <WorkBadge label={activityLabel(!feed.failed ? feed.bots?.find(row => row.id === bot.id) : undefined)}/></span>
           {catalog && <div className="muted wrap">{ownerLabel[catalog.owner]} 创建 · {bot.id}</div>}
           <div className="muted">继续聊天 →</div>
         </button>

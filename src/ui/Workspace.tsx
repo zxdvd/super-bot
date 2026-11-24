@@ -21,8 +21,7 @@ function Summary({ w }: { w: WorkspaceState }) {
   if (w.view === 'list' || w.view === 'settings' || !w.page) return null;
   const groups = inboxGroups(w.page.items, w.seen, w.now);
   return <span className="summary">
-    需要你 <strong>{groups.attentionCount}</strong> · 待验收 <strong>{groups.review.length}</strong>
-    {' · '}进行中 <strong>{groups.active.length}</strong>
+    进行中 <strong>{groups.active.length}</strong> · 等你处理 <strong>{groups.attentionCount + groups.review.length}</strong>
   </span>;
 }
 

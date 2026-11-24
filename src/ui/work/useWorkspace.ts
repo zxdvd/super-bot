@@ -185,6 +185,7 @@ export function useWorkspace({ api, initialBotId, initialLink, sessionId, mirror
         'run.recover', 'run.recover-and-continue', 'manager.notification.resolve'].includes(action);
       const result = await api.call<T>(action, scoped ? { ...payload, sessionId } : payload);
       if (!current()) return false;
+      api.workFeed?.refresh();
       done?.(result); setRefresh(n => n + 1); return true;
     } catch (e) {
       if (current()) { setError(e instanceof Error ? e.message : '操作未完成，请核对后重试。'); setRefresh(n => n + 1); }

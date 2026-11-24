@@ -35,7 +35,7 @@ test('stages collapse twelve statuses into six and keep the concrete reason as t
   assert.equal(stageTone(task({ status: 'needs-input' })), 'attention');
 });
 
-test('inbox puts what needs the user first, ordered by urgency, then active work, then a short recent tail', () => {
+test('inbox separates active work from unscheduled work and orders blockers by urgency', () => {
   const review = task({ lifecycle: 'review', status: 'review', updatedAt: NOW - 10 });
   const input = task({ status: 'needs-input', updatedAt: NOW - 500 });
   const recovery = task({ status: 'recovery', updatedAt: NOW - 900 });
@@ -53,7 +53,8 @@ test('inbox puts what needs the user first, ordered by urgency, then active work
   assert.equal(groups.attentionCount, 4);
   assert.deepEqual(groups.blockedTests.map(t => t.id), [test.id]);
   assert.deepEqual(groups.tests, []);
-  assert.deepEqual(groups.active.map(t => t.id), [running.id, waiting.id]);
+  assert.deepEqual(groups.active.map(t => t.id), [running.id]);
+  assert.deepEqual(groups.waiting.map(t => t.id), [waiting.id]);
   assert.deepEqual(new Set(groups.recent.map(t => t.id)), new Set([old.id, cancelled.id]));
 });
 

@@ -284,6 +284,9 @@ try {
     assert.ok(prebuilt, 'Pass SUPER_BOT_TEST_BUILD_DIR from the isolated build');
     const { smokeResultAttachments } = await import('./smoke-result-attachments.mjs');
     await smokeResultAttachments({ root, base, bundle, ledger, configure, patch, launch, stop, rpc, call, makeBot, probe, wait, verifyClient });
+  } else if (process.env.SUPER_BOT_TEST_WORK_ACTIVITY === '1') {
+    const { smokeWorkActivity } = await import('./smoke-work-activity.mjs');
+    await smokeWorkActivity({ configure, launch, call, makeBot, probe, wait });
   } else if (process.env.SUPER_BOT_TEST_CHAT_LINKS === '1') {
     const { smokeChatResultLinks } = await import('./smoke-chat-result-links.mjs');
     await smokeChatResultLinks({ base, configure, launch, stop, rpc, call, makeBot, probe, wait });

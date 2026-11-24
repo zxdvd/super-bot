@@ -108,6 +108,10 @@ export function stage(task: Task): Stage {
 /** The short status a row shows: the stage, refined by the concrete reason where that helps. */
 export function stageText(task: Task, readOnly = false): string {
   const s = stage(task);
+  if (task.activity === 'attention' && !['review', 'needs-you'].includes(s)) return '通知待核对';
+  if (task.activity === 'working' && s === 'done') return 'Bot 正在交付';
+  if (task.activity === 'working' && s === 'review') return task.managerReviewed ? 'Bot 正在交付' : 'Bot 跟进中';
+  if (task.activity === 'working' && s === 'waiting') return '等待自动跟进';
   if (s === 'needs-you') {
     const status = blocker(task) ?? task.status;
     return status === 'needs-input' && readOnly ? '待补充' : labels[status];
@@ -135,19 +139,21 @@ const byUrgency = (a: Task, b: Task) => urgency(a) - urgency(b) || newest(a, b);
 
 export function inboxGroups(tasks: readonly Task[], seen: Record<string, number>, now: number, recentLimit = 8) {
   const groups = { attention: [] as Task[], review: [] as Task[], fresh: [] as Task[],
-    active: [] as Task[], recent: [] as Task[], tests: [] as Task[], blockedTests: [] as Task[] };
+    active: [] as Task[], waiting: [] as Task[], recent: [] as Task[], tests: [] as Task[], blockedTests: [] as Task[] };
   for (const task of tasks) {
     const s = stage(task);
-    if (isTestTask(task)) { (s === 'needs-you' ? groups.blockedTests : groups.tests).push(task); continue; }
+    const needs = task.activity === 'attention' || s === 'needs-you';
+    if (isTestTask(task)) { (needs ? groups.blockedTests : groups.tests).push(task); continue; }
     const fresh = unseenResult(task, seen[task.id], now);
     if (fresh) groups.fresh.push(task);
-    if (s === 'needs-you') groups.attention.push(task);
+    if (task.activity === 'working' || s === 'running') groups.active.push(task);
     else if (s === 'review') groups.review.push(task);
-    else if (s === 'running' || s === 'waiting') groups.active.push(task);
+    else if (needs) groups.attention.push(task);
+    else if (s === 'waiting') groups.waiting.push(task);
     else if (!fresh) groups.recent.push(task);
   }
   groups.attention.sort(byUrgency); groups.active.sort(byUrgency); groups.tests.sort(byUrgency); groups.review.sort(newest);
-  groups.blockedTests.sort(byUrgency);
+  groups.waiting.sort(newest); groups.blockedTests.sort(byUrgency);
   groups.fresh.sort((a, b) => (b.deliveredAt ?? 0) - (a.deliveredAt ?? 0));
   groups.recent = groups.recent.sort(newest).slice(0, recentLimit);
   return { ...groups, attentionCount: groups.attention.length + groups.blockedTests.length };

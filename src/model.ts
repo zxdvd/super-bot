@@ -34,6 +34,9 @@ export interface TaskBotContext {
 }
 export type Lifecycle = 'open' | 'review' | 'completed' | 'cancelled';
 export type ControlMode = 'auto' | 'paused' | 'manual';
+export type WorkActivity = 'working' | 'attention';
+export type BotWorkSummary = { id: string; name: string; sessionId: string | null; working: number; attention: number };
+
 export interface Task {
   id: string;
   botId: string;
@@ -49,6 +52,9 @@ export interface Task {
   createdAt: number;
   updatedAt: number;
   status: 'unscheduled' | 'needs-input' | 'approval' | 'paused' | 'manual' | 'completed' | 'cancelled' | 'review' | 'queued' | 'running' | 'stopping' | 'recovery';
+  /** Next actor from the local ledger, supplied by the inbox query. */
+  activity?: WorkActivity | null;
+  activityQuestion?: string;
   managerReviewed?:boolean;
   blockingAttention?: 'input' | 'approval' | 'recovery' | null;
   deliveredAt?: number;
