@@ -3,6 +3,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test, type TestContext } from 'node:test';
+import { GROUP_EVIDENCE_KEY_PREFIX } from '../src/feishu-group-evidence.ts';
 import { FeishuGroups } from '../src/feishu-groups.ts';
 import type { FeishuGroup, FeishuTransport } from '../src/feishu-types.ts';
 import { AppError } from '../src/model.ts';
@@ -106,6 +107,9 @@ test('app and owner changes isolate routes; only re-confirmed conflicts move to 
   const { store, groups, remote, first, second } = fixture(t);
   const prior = await groups.bind(first, (await groups.preview(first, existing.chatId)).confirmationToken);
   const unaffected = await groups.bind(second, (await groups.preview(second, 'oc_other')).confirmationToken);
+  const receipt = JSON.stringify({ plainTextAt: 100, botMentionAt: null });
+  store.set(GROUP_EVIDENCE_KEY_PREFIX + prior.id, receipt);
+  store.set(GROUP_EVIDENCE_KEY_PREFIX + unaffected.id, receipt);
   const third = createBot(store, '新账号的 Bot');
   const otherApp = new FeishuGroups(store, { ...config, appId: 'cli_other' }, remote.transport);
   const otherOwner = new FeishuGroups(store, { ...config, ownerOpenId: 'ou_other' }, remote.transport);
@@ -123,6 +127,9 @@ test('app and owner changes isolate routes; only re-confirmed conflicts move to 
   assert.deepEqual(groups.get(second), unaffected);
   assert.equal(groups.findByChat(existing.chatId), null);
   assert.deepEqual(otherOwner.findByChat(existing.chatId), moved);
+  assert.equal(store.get(GROUP_EVIDENCE_KEY_PREFIX + prior.id), null);
+  assert.equal(store.get(GROUP_EVIDENCE_KEY_PREFIX + moved.id), null);
+  assert.equal(store.get(GROUP_EVIDENCE_KEY_PREFIX + unaffected.id), receipt);
   assert.equal(store.db.prepare('SELECT count(*) AS total FROM feishu_group_bindings').get()?.total, 2);
 });
 

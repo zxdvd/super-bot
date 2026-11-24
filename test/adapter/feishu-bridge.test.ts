@@ -7,8 +7,9 @@ import type { Context } from '@deepseek-ai/cordis';
 import { createUserMessage, type UserMessage } from '@deepseek-ai/dsh-llm';
 import type { DshExecution } from '../../src/dsh.ts';
 import { FeishuBridge } from '../../src/feishu-bridge.ts';
+import { GROUP_EVIDENCE_KEY_PREFIX } from '../../src/feishu-group-evidence.ts';
 import { FeishuGroups } from '../../src/feishu-groups.ts';
-import type { FeishuConnectionState, FeishuHandlers, FeishuTextMessage, FeishuTransport } from '../../src/feishu-types.ts';
+import type { FeishuConnectionState, FeishuGroupTextMessage, FeishuHandlers, FeishuTransport } from '../../src/feishu-types.ts';
 import { Managers } from '../../src/manager.ts';
 import { AppError, type ManagerBinding } from '../../src/model.ts';
 import { Store } from '../../src/store.ts';
@@ -157,6 +158,7 @@ async function fixture(t: TestContext) {
   let handlers: FeishuHandlers;
   let send: (_: (typeof sent)[number]) => Promise<void> = async () => {};
   const transport: FeishuTransport = {
+    async diagnoseGroup() { return { ordinaryTextGrant: 'unknown', receiveSubscription: 'unknown' }; },
     start(next) { handlers = next; },
     stop() {},
     inspectGroup: async chatId => ({ chatId, name: chatId }),
@@ -181,8 +183,9 @@ async function fixture(t: TestContext) {
   const aa = await bind(a.bot.id, 'oc_alpha'), bb = await bind(b.bot.id, 'oc_beta');
   function connection(state: FeishuConnectionState) { advance(); handlers.onConnection(state); }
   connection('ready');
-  const incoming = (id: string, text: string, options: Partial<FeishuTextMessage> = {}) => handlers.onMessage({
-    chatId: 'oc_alpha', messageId: id, senderOpenId: identity.ownerOpenId, text, createdAt: advance(), ...options,
+  const incoming = (id: string, text: string, options: Partial<FeishuGroupTextMessage> = {}) => handlers.onMessage({
+    chatId: 'oc_alpha', messageId: id, senderOpenId: identity.ownerOpenId, text, receiptKind: 'unclassified',
+    createdAt: advance(), ...options,
   });
   function web(text: string, owner = true) {
     return createUserMessage({ source: { kind: 'user', rpcId: 'synthetic-browser-request' as never,
@@ -498,7 +501,8 @@ test('permanent delivery errors remain visible after a later success and expose 
   await tick();
   assert.equal(f.sent.length, 2);
   assert.deepEqual(f.bridge.status(f.a.bot.id), {
-    connection: 'ready', error: '飞书投递未确认，请检查绑定群和应用权限。原文保留在 Bot 对话。',
+    connection: 'ready', evidence: { plainTextAt: null, botMentionAt: null },
+    error: '飞书投递未确认，请检查绑定群和应用权限。原文保留在 Bot 对话。',
   });
 });
 
@@ -580,4 +584,113 @@ test('a bound group without an active Manager receives one request to reopen the
   assert.equal(f.sent.length, 1);
   assert.match(f.sent[0]!.text, /打开本机 Bot 管理对话/);
   assert.equal(f.bridge.status(f.a.bot.id).error, f.sent[0]!.text);
+});
+
+test('ordinary and bot-mention receipts persist per current binding without needing a model reply', async t => {
+  const f = await fixture(t);
+  const { a, b } = f;
+  const evidence = (botId = a.bot.id) => f.bridge.status(botId).evidence;
+  const empty = { plainTextAt: null, botMentionAt: null };
+  assert.deepEqual(evidence(), empty);
+  assert.deepEqual(evidence(b.bot.id), empty);
+  f.setModel(false);
+
+  f.incoming('not-the-owner', 'Unauthorized', { senderOpenId: 'ou_other', receiptKind: 'plain' });
+  f.incoming('old', 'Before binding', { createdAt: f.aa.boundAt - 1, receiptKind: 'plain' });
+  f.incoming('unknown', 'Structured mention not classified', { receiptKind: 'unclassified' });
+  assert.deepEqual(evidence(), empty);
+  assert.equal(f.receipt('not-the-owner'), undefined);
+  assert.equal(f.receipt('old'), undefined);
+  assert.ok(f.receipt('unknown'), 'unclassified text still routes normally');
+
+  f.incoming('plain-alpha', '普通文字', { receiptKind: 'plain' });
+  const alphaPlain = f.receipt('plain-alpha')!.acceptedAt;
+  assert.deepEqual(evidence(), { plainTextAt: alphaPlain, botMentionAt: null });
+  f.incoming('plain-alpha', 'Altered duplicate', { receiptKind: 'bot-mention' });
+  assert.deepEqual(evidence(), { plainTextAt: alphaPlain, botMentionAt: null });
+  f.incoming('mentioned-alpha', '@机器人 结构化提及', { receiptKind: 'bot-mention' });
+  const alphaMentioned = f.receipt('mentioned-alpha')!.acceptedAt;
+  f.incoming('beta-mention', 'Beta 独立', { chatId: f.bb.chatId, receiptKind: 'bot-mention' });
+  assert.deepEqual(evidence(), { plainTextAt: alphaPlain, botMentionAt: alphaMentioned });
+  assert.deepEqual(evidence(b.bot.id), { plainTextAt: null, botMentionAt: f.receipt('beta-mention')!.acceptedAt });
+  await tick();
+  assert.equal(f.receipt('plain-alpha')!.nativeSeq, null);
+
+  const offline = f.advance();
+  f.connection('reconnecting');
+  f.incoming('disconnected', 'Disconnected', { receiptKind: 'plain' });
+  f.connection('reconnected');
+  f.incoming('delayed-while-offline', 'Delayed while offline', { receiptKind: 'plain', createdAt: offline });
+  await f.reopen();
+  assert.deepEqual(evidence(), { plainTextAt: alphaPlain, botMentionAt: alphaMentioned });
+  const former = f.advance();
+  f.groups.unbind(a.bot.id, f.aa.id);
+  assert.equal(evidence(), null);
+  assert.equal(f.store.get(GROUP_EVIDENCE_KEY_PREFIX + f.aa.id), null);
+  const rebound = await f.bind(a.bot.id, f.aa.chatId);
+  assert.notEqual(rebound.id, f.aa.id);
+  f.incoming('plain-alpha', 'Replay of old message ID', { receiptKind: 'plain' });
+  f.incoming('late-for-former-binding', 'Old binding', { receiptKind: 'bot-mention', createdAt: former });
+  assert.deepEqual(evidence(), empty);
+  assert.ok(evidence(b.bot.id)?.botMentionAt, 'unbinding Alpha preserves Beta evidence');
+  f.incoming('new-mention', 'New binding', { receiptKind: 'bot-mention' });
+  assert.deepEqual(evidence(), { plainTextAt: null, botMentionAt: f.receipt('new-mention')!.acceptedAt });
+});
+
+test('a bot mention enters before subsequent plain text while its evidence lookup is still pending', async t => {
+  const f = await fixture(t);
+  const { a } = f;
+  let prove!: (value: boolean) => void;
+  const botMentionProof = new Promise<boolean>(resolve => { prove = resolve; });
+  f.incoming('mention-pending', 'First @ message', { botMentionProof });
+  f.incoming('plain-next', 'Second plain message', { receiptKind: 'plain' });
+  await tick();
+  const content = (message: UserMessage) => message.content.map(block => block.type === 'text' ? block.text : '').join('');
+  assert.equal(content(await a.agent.enter()), 'First @ message');
+  await a.agent.endTurn();
+  await tick();
+  assert.equal(content(await a.agent.enter()), 'Second plain message');
+  await a.agent.endTurn();
+
+  assert.equal(f.bridge.status(a.bot.id).evidence?.botMentionAt, null);
+  prove(true);
+  await tick();
+  assert.equal(f.bridge.status(a.bot.id).evidence?.botMentionAt, f.receipt('mention-pending')!.acceptedAt);
+  let disconnectedProof!: (value: boolean) => void;
+  f.incoming('mention-pending-disconnect', 'Old epoch', {
+    botMentionProof: new Promise(resolve => { disconnectedProof = resolve; }),
+  });
+  f.connection('reconnecting');
+  f.connection('reconnected');
+  disconnectedProof(true);
+  await tick();
+  assert.equal(f.bridge.status(a.bot.id).evidence?.botMentionAt, f.receipt('mention-pending')!.acceptedAt);
+
+  let staleProof!: (value: boolean) => void;
+  f.incoming('mention-pending-unbind', 'Old binding', { botMentionProof: new Promise(resolve => { staleProof = resolve; }) });
+  f.groups.unbind(a.bot.id, f.aa.id);
+  await f.bind(a.bot.id, f.aa.chatId);
+  staleProof(true);
+  await tick();
+  assert.equal(f.bridge.status(a.bot.id).evidence?.botMentionAt, null);
+  assert.equal(f.store.get(GROUP_EVIDENCE_KEY_PREFIX + f.aa.id), null);
+});
+
+test('failed evidence persistence rolls back its receipt and allows the same delivery to succeed later', async t => {
+  const f = await fixture(t);
+  f.store.db.exec(`
+    CREATE TRIGGER reject_synthetic_evidence BEFORE INSERT ON metadata
+    WHEN NEW.key LIKE 'feishu-group-evidence:%'
+    BEGIN SELECT RAISE(ABORT, 'Synthetic evidence persistence failure'); END;
+  `);
+  assert.throws(() => f.incoming('retry-receipt', 'Original', { receiptKind: 'plain' }), /Synthetic evidence persistence failure/);
+  assert.equal(f.receipt('retry-receipt'), undefined);
+  assert.equal(f.bridge.status(f.a.bot.id).evidence?.plainTextAt, null);
+  f.store.db.exec('DROP TRIGGER reject_synthetic_evidence');
+  f.incoming('retry-receipt', 'Original', { receiptKind: 'plain' });
+  assert.equal(f.bridge.status(f.a.bot.id).evidence?.plainTextAt, f.receipt('retry-receipt')!.acceptedAt);
+  await tick();
+  assert.equal(f.a.agent.inbox.nextTurn.length, 1);
+  await f.a.agent.enter();
+  await f.a.agent.endTurn();
 });

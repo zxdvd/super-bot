@@ -204,6 +204,7 @@ async function launchBrowser(host) {
     const context = await browser.newContext({ viewport: { width: 1280, height: 900 } });
     await context.route('**/*', route => new URL(route.request().url()).origin === host.base ? route.continue() : route.abort());
     const page = await context.newPage();
+    await page.clock.install();
     await page.goto(host.url, { waitUntil: 'domcontentloaded' });
     await page.getByRole('button', { name: 'Continue', exact: true }).click({ timeout: 1500 }).catch(() => {});
     return { browser, page };
@@ -233,6 +234,19 @@ async function openFeishu(panel, bot) {
   await section.getByText('连接就绪', { exact: true }).waitFor({ timeout: 10000 });
   return section;
 }
+async function openFeishuFromSettings(panel, bot) {
+  const { page } = panel;
+  await openSettings(page);
+  await page.getByRole('button', { name: '去验证群同步', exact: true }).click();
+  await page.getByLabel('选择要验证的 Bot', { exact: true }).selectOption({ label: bot.name });
+  await page.getByRole('button', { name: '打开飞书群设置', exact: true }).click();
+  await page.getByRole('heading', { name: bot.name, exact: true, level: 1 }).waitFor();
+  await page.getByRole('button', { name: '← 飞书设置', exact: true }).waitFor();
+  await page.getByRole('button', { name: '返回这个 Bot 聊天 →', exact: true }).waitFor();
+  const section = page.locator('.sb-section').filter({ has: page.getByRole('heading', { name: '飞书群', exact: true }) });
+  await section.getByText('连接就绪', { exact: true }).waitFor();
+  return section;
+}
 
 let ui;
 
@@ -242,12 +256,13 @@ try {
   let [host, other] = await Promise.all([launch(primary, 'first'), launch(secondary, 'disabled')]);
   assert.deepEqual({ ...await settings(host), configurationId: undefined }, {
     appId: '', ownerOpenId: '', hasSecret: false, enabled: false, configurationId: undefined,
-    selfBinding: 'unbound', connection: 'disabled', lastMessageAt: null,
+    selfBinding: 'unbound', connection: 'disabled', lastMessageAt: null, credentials: 'unverified', privateTest: 'untested',
   });
   const imported = await settings(other);
   assert.equal(imported.appId, alternateCredentials.appId);
   assert.equal(imported.ownerOpenId, alternateCredentials.ownerOpenId);
   assert.equal(imported.selfBinding, 'bound');
+  assert.equal(imported.privateTest, 'untested');
   assert.equal(imported.hasSecret, true);
   assert.equal(imported.enabled, false);
   assert.equal((await stat(settingsFile(secondary))).mode & 0o777, 0o600);
@@ -267,13 +282,12 @@ try {
     await fields.secret.fill(fixtureCredentials.appSecret);
     assert.equal(await ui.page.getByLabel('Open ID', { exact: true }).count(), 0);
     await fields.check.click();
-    await ui.page.getByText(/凭证换取令牌/).waitFor();
-    await ui.page.getByText('通过', { exact: true }).first().waitFor();
-    await ui.page.getByText('未验证', { exact: true }).first().waitFor();
+    await ui.page.getByText('凭证有效', { exact: true }).waitFor();
+    assert.equal(await ui.page.getByText(/im:message.group_at_msg|im:chat:create/).count(), 0);
   } else {
     const report = await settings(host, 'check', credentials(fixtureCredentials));
     assert.equal(report.credentials, 'passed');
-    assert.deepEqual(report.permissions, [{ scope: 'im:message.group_at_msg:readonly', status: 'unverified' }]);
+    assert.deepEqual(report, { credentials: 'passed' });
   }
   assert.equal((await settings(host)).enabled, false);
   await assert.rejects(stat(settingsFile(primary)), { code: 'ENOENT' });
@@ -282,11 +296,15 @@ try {
   if (ui) {
     await fields.save.click();
     await ui.page.getByText('连接就绪', { exact: true }).waitFor();
-    await ui.page.getByText('尚未收到消息', { exact: true }).waitFor();
-    assert.equal(await fields.secret.inputValue(), '');
+    await ui.page.getByText('凭证有效 · 本人未绑定', { exact: true }).waitFor();
+    await ui.page.getByText('私聊收发未测试', { exact: true }).waitFor();
+    assert.equal(await fields.secret.count(), 0);
     assertNoSecret(await ui.page.locator('body').innerText());
   } else await settings(host, 'save', { ...credentials(fixtureCredentials), configurationId: (await settings(host)).configurationId });
-  const connected = await settings(host);
+  const connected = await wait(async () => {
+    const value = await settings(host);
+    return value.credentials === 'passed' && value;
+  }, 'fresh verification of saved credentials');
   assert.equal(connected.enabled, true);
   assert.equal(connected.connection, 'ready');
   assert.equal(connected.lastMessageAt, null);
@@ -303,7 +321,8 @@ try {
   assert.equal(report.credentials, 'passed');
   assert.equal((await settings(host, 'check', { appId: fixtureCredentials.appId, appSecret: '' })).credentials, 'passed');
   assert.equal((await settings(host, 'check', { appId: fixtureCredentials.appId, appSecret: 'invalid-synthetic' })).credentials, 'failed');
-  assert.deepEqual(await transportStats(host), { ...started, checks: started.checks + 3 });
+  assert.equal((await settings(host, 'check', { appId: fixtureCredentials.appId, appSecret: 'unknown-synthetic' })).credentials, 'unverified');
+  assert.deepEqual(await transportStats(host), { ...started, checks: started.checks + 4 });
   assert.deepEqual(await settings(host), connected);
   assert.ok(await readFile(settingsFile(primary), 'utf8') === unboundFile, 'Detection leaves settings byte-for-byte intact');
   assert.deepEqual(await settings(other), imported);
@@ -317,10 +336,12 @@ try {
   const staleStart = beginFields(connected);
   if (ui) {
     await ui.page.getByRole('button', { name: '跳过测试', exact: true }).click();
-    await ui.page.getByText('已跳过测试，身份未绑定', { exact: true }).waitFor();
+    await ui.page.getByRole('button', { name: '跳过测试', exact: true }).waitFor({ state: 'hidden' });
+    await ui.page.getByText('私聊收发未测试', { exact: true }).waitFor();
   } else await settings(host, 'test.skip', { configurationId: connected.configurationId });
   const skipped = await settings(host);
   assert.equal(skipped.selfBinding, 'skipped');
+  assert.equal(skipped.privateTest, 'untested');
   assert.equal(skipped.ownerOpenId, '');
   assert.equal(JSON.parse(await readFile(settingsFile(primary), 'utf8')).feishu.selfTestSkipped, true);
   assert.equal((await settingsRpc(host, 'test.start', staleStart)).ok, false);
@@ -331,28 +352,37 @@ try {
   if (ui) {
     const page = ui.page;
     const text = '合成私聊任意一句';
-    await page.getByRole('button', { name: '开启 1:1 收发测试', exact: true }).click();
+    await page.getByRole('button', { name: '测试并绑定', exact: true }).click();
     await page.getByText(/请在飞书私聊这个应用的机器人/).waitFor();
     await receivePrivate(host, '另一应用的私聊', { appId: alternateCredentials.appId });
     assert.equal((await transportStats(host)).sends, 0);
     await feishu(host, 'fail-send', { fail: true });
     await receivePrivate(host, text);
     await page.getByText(text, { exact: false }).waitFor();
-    await page.getByText('未确认', { exact: true }).waitFor();
+    await page.getByText('已收到私聊，回发未确认', { exact: true }).waitFor();
+    assert.equal(await page.getByText('私聊收发通过', { exact: true }).count(), 0);
+    const candidateId = page.getByText(fixtureCredentials.ownerOpenId, { exact: true });
+    assert.equal(await candidateId.isVisible(), false);
+    await page.getByText('测试详情', { exact: true }).click();
+    await candidateId.waitFor();
     assert.equal(await page.getByRole('button', { name: '确认这是本人', exact: true }).count(), 0);
     await feishu(host, 'fail-send', { fail: false });
     await page.getByRole('button', { name: '重试发送', exact: true }).click();
-    await page.getByText('通过（飞书接口已确认）', { exact: true }).waitFor();
+    await page.getByText('私聊收发通过', { exact: true }).waitFor();
     assert.equal((await settings(host)).ownerOpenId, '');
     assert.equal(JSON.parse(await readFile(settingsFile(primary), 'utf8')).feishu.ownerOpenId, undefined);
     await page.getByRole('button', { name: '确认这是本人', exact: true }).click();
-    await page.getByText('已绑定', { exact: true }).waitFor();
+    await page.getByText('凭证有效 · 本人已绑定', { exact: true }).waitFor();
+    await page.getByText('此连接下的 Bot 共用本人身份', { exact: true }).waitFor();
+    await page.getByRole('button', { name: '去验证群同步', exact: true }).waitFor();
     await page.getByRole('button', { name: '← 我的 Bot', exact: true }).click();
     assert.equal(await page.getByLabel('给它起个名字').inputValue(), '合成未保存草稿');
     await page.getByRole('button', { name: '取消', exact: true }).click();
   } else await bindSelf(host);
   const boundSelf = await settings(host);
   assert.equal(boundSelf.selfBinding, 'bound');
+  assert.equal(boundSelf.privateTest, 'passed');
+  assert.ok(Number.isSafeInteger(boundSelf.privateTestAt));
   assert.equal(boundSelf.ownerOpenId, fixtureCredentials.ownerOpenId);
   assert.equal((await status(host, a)).selfBinding, 'bound');
   assert.equal((await status(host, b)).selfBinding, 'bound');
@@ -383,11 +413,14 @@ try {
   assert.equal((await transportStats(host)).sends, privateReplies.length);
   const create = { botId: a.id, name: '飞书合成私有群', requestId: randomUUID() };
   if (ui) {
-    const section = await openFeishu(ui, a);
+    const section = await openFeishuFromSettings(ui, a);
     await section.getByRole('button', { name: '新建私有群', exact: true }).click();
     await section.getByLabel('私有群名称').fill(create.name);
     await section.getByRole('button', { name: '创建并绑定', exact: true }).click();
     await section.getByRole('link', { name: '在飞书打开群', exact: true }).waitFor();
+    await section.getByText('请用本人账号在群里发送一条新文本，无需 @ 机器人。', { exact: true }).waitFor();
+    await ui.page.getByRole('button', { name: '← 飞书设置', exact: true }).click();
+    await ui.page.getByRole('button', { name: '去验证群同步', exact: true }).waitFor();
     await ui.page.getByRole('button', { name: '← 我的 Bot', exact: true }).click();
   }
   const groupA = (await call(host, 'feishu.create', create)).binding;
@@ -435,12 +468,13 @@ try {
   const detail = () => call(host, 'task.detail', { id: task.id, sessionId: aSession });
   const before = await detail();
   assert.equal(before.pendingQuestions.length, 1);
-  await receive(host, groupA, answer, { senderOpenId: 'ou_fixtureOther' });
-  await receive(host, groupA, answer, { createdAt: groupA.boundAt - 1 });
+  await receive(host, groupA, answer, { senderOpenId: 'ou_fixtureOther', receiptKind: 'plain' });
+  await receive(host, groupA, answer, { createdAt: groupA.boundAt - 1, receiptKind: 'plain' });
   assert.equal((await detail()).pendingQuestions[0].id, before.pendingQuestions[0].id);
+  assert.deepEqual((await status(host, a)).evidence, { plainTextAt: null, botMentionAt: null });
   const answerId = 'om_fixtureAnswer';
-  await receive(host, groupA, answer, { messageId: answerId });
-  await receive(host, groupA, answer, { messageId: answerId });
+  await receive(host, groupA, answer, { messageId: answerId, receiptKind: 'plain' });
+  await receive(host, groupA, answer, { messageId: answerId, receiptKind: 'bot-mention' });
   const ready = await wait(async () => {
     const value = await detail();
     return value.task.lifecycle === 'review' && value.task.managerReviewed && value;
@@ -461,7 +495,9 @@ try {
   assert.equal((await sent(host, groupA, request)).length, 1);
   assert.equal((await sent(host, groupA, question)).length, 1);
   assert.equal((await sent(host, groupA, answer)).length, 0, 'Feishu input has no echo');
-  assert.ok(Number.isSafeInteger((await settings(host)).lastMessageAt), 'Received message has its own observed timestamp');
+  const ordinary = (await status(host, a)).evidence;
+  assert.ok(Number.isSafeInteger(ordinary.plainTextAt), 'The bound group records a plain text receipt');
+  assert.equal(ordinary.botMentionAt, null, 'Duplicate redelivery cannot create a different evidence category');
   await wait(async () => (await model(host, 'inspect-session', { sessionId: aSession })).assistantTexts
     .some(text => text.includes(ready.result.id)), 'result linked from original native chat');
   if (ui) {
@@ -478,25 +514,64 @@ try {
   }
 
   const bMarker = 'FEISHU_SMOKE_GROUP_B';
-  await receive(host, groupB, bMarker);
+  let groupBPanel;
+  if (ui) {
+    const groupAPanel = await openFeishu(ui, a);
+    await groupAPanel.getByText('群消息接收通过（无需 @）', { exact: true }).waitFor();
+    assert.equal(await groupAPanel.getByText('已收到 @ 机器人的消息', { exact: true }).count(), 0);
+    await ui.page.getByRole('button', { name: '← 我的 Bot', exact: true }).click();
+    groupBPanel = await openFeishu(ui, b);
+    await groupBPanel.getByText('等待普通消息…', { exact: true }).waitFor();
+    await ui.page.clock.fastForward(46_000);
+    await groupBPanel.getByText('尚未收到普通消息', { exact: true }).waitFor();
+    assert.equal(await groupBPanel.getByText(/应用缺少|暂时无法确认原因/).count(), 0);
+    assert.equal((await feishu(host, 'sent')).diagnoses, 0, 'No automatic permission query when ordinary text times out');
+    await groupBPanel.getByRole('button', { name: '排查普通消息', exact: true }).click();
+    await groupBPanel.getByText(/应用缺少「接收群聊中所有消息」权限/).waitFor();
+    await groupBPanel.getByText(/应用缺少「接收消息」事件订阅/).waitFor();
+    assert.equal((await feishu(host, 'sent')).diagnoses, 1);
+    await groupBPanel.getByRole('button', { name: '改用 @ 机器人测试', exact: true }).click();
+    await groupBPanel.getByText('请在群里 @ 这个应用的机器人，再附上一句新文本。', { exact: true }).waitFor();
+  }
+  assert.deepEqual((await status(host, b)).evidence, { plainTextAt: null, botMentionAt: null });
+  await receive(host, groupB, bMarker, { receiptKind: 'bot-mention' });
   await hasSent(host, groupB, `已收到 ${bMarker}`);
   assert.equal((await sent(host, groupA, bMarker)).length, 0);
   assert.ok((await events(host, bSession)).some(item => item.type === 'user/message' && item.data.content[0].text === bMarker));
   assert.equal((await call(host, 'task.list', { botId: b.id })).total, 0);
+  assert.equal((await status(host, b)).evidence.plainTextAt, null);
+  assert.ok(Number.isSafeInteger((await status(host, b)).evidence.botMentionAt));
+  if (groupBPanel) {
+    await groupBPanel.getByText('@ 消息可用，普通消息仍未验证', { exact: true }).waitFor();
+    assert.equal(await groupBPanel.getByText(/群消息接收通过|双向通过/).count(), 0);
+    assert.equal(await groupBPanel.getByText(/应用缺少「接收消息」事件订阅/).count(), 0);
+    await groupBPanel.getByRole('button', { name: '排查普通消息', exact: true }).click();
+    await groupBPanel.getByText(/应用缺少「接收群聊中所有消息」权限/).waitFor();
+    assert.equal(await groupBPanel.getByText(/应用缺少「接收消息」事件订阅/).count(), 0);
+    assert.equal((await feishu(host, 'sent')).diagnoses, 2);
+    await feishu(host, 'unknown-diagnosis');
+    await groupBPanel.getByRole('button', { name: '排查普通消息', exact: true }).click();
+    await groupBPanel.getByText('暂时无法确认原因。请核对长连接、事件订阅和已发布的应用版本。', { exact: true }).waitFor();
+    assert.equal(await groupBPanel.getByText(/应用缺少/).count(), 0);
+    console.log('PASS browser connected settings navigation, scoped plain and mention evidence, and on-demand diagnosis');
+  }
   console.log('PASS Web task → Feishu question and answer → same Web result; native transcript, dedupe and two-group isolation');
 
   await feishu(host, 'fail-send', { fail: true });
   await prompt(host, bSession, 'FEISHU_SMOKE_DELIVERY_FAIL');
   const error = await wait(async () => (await status(host, b)).error, 'safe delivery error');
   assert.ok(error && !error.includes(fixtureCredentials.appSecret));
-  if (ui) {
-    const section = await openFeishu(ui, b);
-    await section.getByText(error, { exact: true }).waitFor({ timeout: 10000 });
-  }
+  await groupBPanel?.getByText(error, { exact: true }).waitFor({ timeout: 10000 });
   await feishu(host, 'fail-send', { fail: false });
   await feishu(host, 'connection', { connection: 'reconnecting' });
   assert.equal((await status(host, b)).connection, 'reconnecting');
-  if (ui) await ui.page.getByText('正在重连', { exact: true }).waitFor({ timeout: 10000 });
+  if (ui) {
+    await ui.page.getByText('正在重连', { exact: true }).waitFor({ timeout: 10000 });
+    await ui.page.getByRole('button', { name: '← 我的 Bot', exact: true }).click();
+    await openSettings(ui.page);
+    await ui.page.getByText('凭证有效 · 本人已绑定', { exact: true }).waitFor();
+    await ui.page.getByText('长连接 · 正在重连', { exact: true }).filter({ visible: true }).waitFor();
+  }
   await ui?.browser.close();
   ui = undefined;
   const missed = Date.now();
@@ -517,19 +592,31 @@ try {
   assert.equal(afterRestart.ownerOpenId, fixtureCredentials.ownerOpenId);
   assert.equal(afterRestart.hasSecret, true);
   assert.equal(afterRestart.connection, 'ready');
+  assert.equal(afterRestart.privateTest, 'passed');
   assert.ok(await readFile(settingsFile(primary), 'utf8') === savedFile, 'New settings take precedence over the legacy file');
   ui = await launchBrowser(host);
   if (ui) {
     const { appId, secret } = await openSettings(ui.page);
+    await ui.page.getByText('凭证有效 · 本人已绑定', { exact: true }).waitFor();
+    const owner = ui.page.getByText(fixtureCredentials.ownerOpenId, { exact: true });
+    const privateStatus = ui.page.getByText('私聊收发通过', { exact: true });
+    assert.equal(await owner.isVisible(), false);
+    assert.equal(await privateStatus.isVisible(), false);
+    await ui.page.getByText('连接详情', { exact: true }).click();
+    await owner.waitFor();
+    await privateStatus.waitFor();
     await ui.page.getByText('连接就绪', { exact: true }).waitFor();
+    await ui.page.getByText('连接详情', { exact: true }).click();
+    await ui.page.getByRole('button', { name: '编辑凭证', exact: true }).click();
     assert.equal(await appId.inputValue(), fixtureCredentials.appId);
-    assert.equal(await ui.page.getByText(fixtureCredentials.ownerOpenId, { exact: true }).count(), 1);
     assert.equal(await secret.inputValue(), '');
     assertNoSecret(await ui.page.locator('body').innerText());
-    await ui.browser.close();
-    ui = undefined;
+    await ui.page.getByRole('button', { name: '取消编辑', exact: true }).click();
+    await ui.page.getByRole('button', { name: '← 我的 Bot', exact: true }).click();
+    groupBPanel = await openFeishu(ui, b);
+    await groupBPanel.getByText('@ 消息可用，普通消息仍未验证', { exact: true }).waitFor();
     console.log('PASS browser homepage settings detection, save and reload without returning App Secret');
-  }
+  } else groupBPanel = undefined;
   assert.equal((await status(host, a)).binding.id, groupA.id);
   assert.equal((await status(host, b)).binding.id, groupB.id);
   await receive(host, groupA, answer, { messageId: answerId });
@@ -540,22 +627,49 @@ try {
   assert.equal((await events(host, aSession)).filter(feishuInput).length, 1);
 
   await feishu(host, 'connection', { connection: 'reconnecting' });
-  assert.equal((await call(host, 'feishu.unbind', { botId: b.id, bindingId: groupB.id })).binding, null);
+  if (groupBPanel) {
+    await groupBPanel.getByText('正在重连', { exact: true }).waitFor();
+    await groupBPanel.getByRole('button', { name: '解绑', exact: true }).click();
+    await groupBPanel.getByRole('button', { name: '确认解绑', exact: true }).click();
+    await groupBPanel.getByRole('link', { name: '在飞书打开群', exact: true }).waitFor({ state: 'hidden' });
+  } else await call(host, 'feishu.unbind', { botId: b.id, bindingId: groupB.id });
+  assert.equal((await status(host, b)).binding, null);
+  assert.equal((await status(host, b)).evidence, null);
   const stale = Date.now();
-  await receive(host, groupB, 'FEISHU_SMOKE_UNBOUND');
+  await receive(host, groupB, 'FEISHU_SMOKE_UNBOUND', { receiptKind: 'bot-mention' });
   await delay(50);
   await feishu(host, 'connection', { connection: 'reconnected' });
-  const next = await call(host, 'feishu.preview', { botId: b.id, chatId: groupB.chatId });
-  const rebound = (await call(host, 'feishu.bind', { botId: b.id, confirmationToken: next.confirmationToken })).binding;
+  if (groupBPanel) {
+    await groupBPanel.getByRole('button', { name: '绑定已有群', exact: true }).click();
+    await groupBPanel.getByLabel('已有群的群 ID').fill(groupB.chatId);
+    await groupBPanel.getByRole('button', { name: '预览群名称', exact: true }).click();
+    await groupBPanel.getByRole('button', { name: '确认绑定', exact: true }).click();
+    await groupBPanel.getByText('等待普通消息…', { exact: true }).waitFor();
+    assert.equal(await groupBPanel.getByText(/群消息接收通过|@ 消息可用|应用缺少|暂时无法确认原因/).count(), 0);
+  } else {
+    const next = await call(host, 'feishu.preview', { botId: b.id, chatId: groupB.chatId });
+    await call(host, 'feishu.bind', { botId: b.id, confirmationToken: next.confirmationToken });
+  }
+  const rebound = (await status(host, b)).binding;
   assert.notEqual(rebound.id, groupB.id);
   assert.equal((await rpc(host, 'feishu.unbind', { botId: b.id, bindingId: groupB.id })).ok, false);
-  await receive(host, rebound, 'FEISHU_SMOKE_OLD_BINDING', { createdAt: stale });
-  await receive(host, rebound, 'FEISHU_SMOKE_REBOUND');
+  await receive(host, rebound, 'FEISHU_SMOKE_OLD_BINDING', { createdAt: stale, receiptKind: 'bot-mention' });
+  assert.deepEqual((await status(host, b)).evidence, { plainTextAt: null, botMentionAt: null });
+  await receive(host, rebound, 'FEISHU_SMOKE_REBOUND', { receiptKind: 'plain' });
   await hasSent(host, rebound, '已收到 FEISHU_SMOKE_REBOUND');
   assert.equal((await sent(host, rebound, 'UNBOUND')).length, 0);
   assert.equal((await sent(host, rebound, 'OLD_BINDING')).length, 0);
+  if (groupBPanel) {
+    await groupBPanel.getByText('群消息接收通过（无需 @）', { exact: true }).waitFor();
+    assert.equal(await groupBPanel.getByText('已收到 @ 机器人的消息', { exact: true }).count(), 0);
+    await ui.browser.close();
+    ui = undefined;
+  }
 
-  const current = await settings(host);
+  const current = await wait(async () => {
+    const view = await settings(host);
+    return view.credentials === 'passed' && view;
+  }, 'existing credentials verified after restart');
   const beforeSwitch = await transportStats(host);
   assert.equal((await settingsRpc(host, 'save', {
     appId: current.appId, configurationId: current.configurationId, ownerOpenId: alternateCredentials.ownerOpenId,
@@ -567,14 +681,18 @@ try {
   assert.deepEqual(await transportStats(host), beforeSwitch);
   await settings(host, 'save', { appId: current.appId, configurationId: current.configurationId });
   assert.equal((await status(host, a)).binding.id, groupA.id);
+  assert.deepEqual(await transportStats(host), beforeSwitch, 'Saving the same credentials does not reconnect or request a new token');
 
   const switched = await settings(host, 'save', { ...credentials(alternateCredentials), configurationId: current.configurationId });
   assert.equal(switched.connection, 'ready');
   assert.equal(switched.selfBinding, 'unbound');
+  assert.equal(switched.privateTest, 'untested');
   assert.equal(switched.ownerOpenId, '');
   assert.equal((await status(host, a)).binding, null);
   assert.equal((await status(host, b)).binding, null);
-  assert.deepEqual(await transportStats(host), { ...beforeSwitch, starts: beforeSwitch.starts + 1, stops: beforeSwitch.stops + 1 });
+  await wait(async () => (await settings(host)).credentials === 'passed', 'fresh verification after switching apps');
+  assert.deepEqual(await transportStats(host), { ...beforeSwitch, starts: beforeSwitch.starts + 1,
+    stops: beforeSwitch.stops + 1, checks: beforeSwitch.checks + 1 });
   const alternateTest = beginFields(switched);
   await settings(host, 'test.start', alternateTest);
   await receivePrivate(host, '原应用的私聊');
@@ -617,7 +735,43 @@ try {
   assert.notEqual((await status(other, c)).connection, 'ready');
   assert.equal((await feishu(other, 'sent')).starts, 0);
   assert.equal((await status(host, b)).connection, 'ready');
+  if (process.env.SUPER_BOT_TEST_BROWSER) {
+    const emptyName = 'feishu-navigation';
+    await configure(emptyName);
+    await configurePatch(emptyName, true);
+    await writeLegacy(emptyName, fixtureCredentials);
+    const empty = await launch(emptyName, 'single-bot-navigation');
+    ui = await launchBrowser(empty);
+    const page = ui.page;
+    await openSettings(page);
+    await page.getByText('凭证有效 · 本人已绑定', { exact: true }).waitFor();
+    const privateStatus = page.getByText('私聊收发未测试', { exact: true });
+    assert.equal(await privateStatus.isVisible(), false);
+    await page.getByText('连接详情', { exact: true }).click();
+    await privateStatus.waitFor();
+    await page.getByRole('button', { name: '新建 Bot', exact: true }).click();
+    await page.getByRole('heading', { name: '创建你的第一个 Bot', exact: true }).waitFor();
+    const name = '合成验证入口 Bot';
+    await page.getByLabel('给它起个名字').fill(name);
+    await page.getByRole('button', { name: '创建并聊天', exact: true }).click();
+    await page.getByRole('button', { name: '打开或收起当前 Bot 的工作', exact: true }).waitFor();
+    await openSettings(page);
+    await page.getByRole('button', { name: '去验证群同步', exact: true }).click();
+    await page.getByRole('heading', { name, exact: true, level: 1 }).waitFor();
+    await page.getByRole('heading', { name: '飞书群', exact: true }).waitFor();
+    assert.equal(await page.getByLabel('选择要验证的 Bot', { exact: true }).count(), 0);
+    await ui.browser.close();
+    ui = undefined;
+    console.log('PASS browser first Bot creation, one-Bot direct navigation and legacy identity details');
+  }
   console.log(`PASS profile isolation, both legacy modes, application isolation, group retention, reconnect, restart and rebind (evidence ${base})`);
+} catch (error) {
+  if (ui) {
+    await writeFile(join(base, 'browser-visible.txt'), await ui.page.locator('body').innerText()).catch(() => {});
+    await ui.page.screenshot({ path: join(base, 'browser-failure.png') }).catch(() => {});
+  }
+  console.error(`Isolated smoke evidence: ${base}`);
+  throw error;
 } finally {
   await ui?.browser.close();
   await Promise.all([...children.keys()].map(stop));

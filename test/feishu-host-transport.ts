@@ -10,9 +10,11 @@ export const alternateCredentials = {
 export const existingGroup = { chatId: 'oc_fixtureExisting', name: '飞书测试已有群' };
 export const sent: { chatId: string; text: string; uuid: string }[] = [];
 export let starts = 0, handlers: FeishuHandlers | undefined, failSend = false;
-export let checks = 0, stops = 0, creations = 0, inspections = 0;
+export let checks = 0, stops = 0, creations = 0, inspections = 0, diagnoses = 0;
+let unknownDiagnosis = false;
 
 export function setFailure(value: boolean) { failSend = value; }
+export function setUnknownDiagnosis(value: boolean) { unknownDiagnosis = value; }
 
 function valid(config: FeishuCredentials): boolean {
   const fixtures = [fixtureCredentials, alternateCredentials];
@@ -21,10 +23,7 @@ function valid(config: FeishuCredentials): boolean {
 
 export const checkFeishuConfig: typeof CheckConfig = async config => {
   checks++;
-  return {
-    credentials: valid(config) ? 'passed' : 'failed',
-    permissions: [{ scope: 'im:message.group_at_msg:readonly', status: 'unverified' }],
-  };
+  return { credentials: valid(config) ? 'passed' : config.appSecret === 'unknown-synthetic' ? 'unverified' : 'failed' };
 };
 
 // esbuild substitutes this module for the official SDK only in the isolated test bundle.
@@ -32,6 +31,11 @@ export function createFeishuTransport(config: FeishuConfig): FeishuTransport {
   assert.ok(valid(config), 'Expected synthetic credentials');
   const created = new Map<string, { chatId: string; name: string }>();
   return {
+    async diagnoseGroup() {
+      diagnoses++;
+      if (unknownDiagnosis) return { ordinaryTextGrant: 'unknown', receiveSubscription: 'unknown' };
+      return { ordinaryTextGrant: 'missing', receiveSubscription: 'missing' };
+    },
     start(value) { starts++; handlers = value; value.onConnection('ready'); },
     stop() { stops++; handlers?.onConnection('stopped'); handlers = undefined; },
     async sendText(chatId, text, uuid, canDispatch) {

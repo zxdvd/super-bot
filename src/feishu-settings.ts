@@ -3,7 +3,7 @@ import { randomUUID } from 'node:crypto';
 import { closeSync, constants, fchmodSync, fstatSync, openSync, readSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { AppError } from './model.ts';
-import { isFeishuOpenId, type FeishuConfig, type FeishuCredentials } from './feishu-types.ts';
+import { isFeishuOpenId, type FeishuConfig, type FeishuCredentials, type FeishuIdentity } from './feishu-types.ts';
 
 const FILE = 'super-bot.json';
 const LEGACY_FILE = 'super-bot.feishu.json';
@@ -13,7 +13,8 @@ const STORAGE_ERROR = '无法读取或保存当前 profile 的 Super Bot 设置�
 const LEGACY_ERROR = '无法导入旧飞书设置。请在 Super Bot 的飞书设置中填写完整凭证。';
 
 type Document = Record<string, unknown>;
-export type SavedFeishuSettings = FeishuConfig & { enabled: boolean; selfTestSkipped?: true };
+type SelfTestEvidence = FeishuIdentity & { confirmedAt: number };
+export type SavedFeishuSettings = FeishuConfig & { enabled: boolean; selfTestSkipped?: true; selfTestEvidence?: SelfTestEvidence };
 
 function storageError(): AppError {
   return new AppError('feishu-settings-storage', STORAGE_ERROR);
@@ -62,8 +63,12 @@ function readSettings(document: Document): SavedFeishuSettings | undefined {
   if (ownerOpenId !== undefined && !isFeishuOpenId(ownerOpenId)) throw storageError();
   if (feishu.selfTestSkipped !== undefined && feishu.selfTestSkipped !== true) throw storageError();
   if (ownerOpenId && feishu.selfTestSkipped) throw storageError();
-  return { ...feishuCredentials(feishu), enabled: feishu.enabled,
-    ownerOpenId, selfTestSkipped: feishu.selfTestSkipped };
+  const credentials = feishuCredentials(feishu);
+  const evidence = feishu.selfTestEvidence;
+  const selfTestEvidence = ownerOpenId && isDocument(evidence) && evidence.appId === credentials.appId && evidence.ownerOpenId === ownerOpenId
+    && typeof evidence.confirmedAt === 'number' && Number.isSafeInteger(evidence.confirmedAt) && evidence.confirmedAt > 0
+    ? { appId: credentials.appId, ownerOpenId, confirmedAt: evidence.confirmedAt } : undefined;
+  return { ...credentials, enabled: feishu.enabled, ownerOpenId, selfTestSkipped: feishu.selfTestSkipped, selfTestEvidence };
 }
 
 function publish(profileDir: string, document: Document): void {
@@ -134,7 +139,7 @@ export function saveFeishuSettings(profileDir: string | undefined, saved: SavedF
     readSettings(document);
     const feishu = isDocument(document.feishu) ? document.feishu : {};
     publish(profileDir, { ...document, feishu: {
-      ...feishu, ...saved, ownerOpenId: saved.ownerOpenId, selfTestSkipped: saved.selfTestSkipped,
+      ...feishu, ...saved, ownerOpenId: saved.ownerOpenId, selfTestSkipped: saved.selfTestSkipped, selfTestEvidence: saved.selfTestEvidence,
     } });
   } catch {
     throw storageError();

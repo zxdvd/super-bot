@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { setTimeout as delay } from 'node:timers/promises';
 import { test } from 'node:test';
 import { checkFeishuConfig, createFeishuTransport } from '../src/feishu-sdk.ts';
-import type { FeishuConnectionState, FeishuPrivateTextMessage, FeishuTextMessage } from '../src/feishu-types.ts';
+import type { FeishuConnectionState, FeishuGroupTextMessage, FeishuPrivateTextMessage } from '../src/feishu-types.ts';
 
 const config = { appId: 'cli_fixture', appSecret: 'SYNTHETIC_PRIVATE_SECRET', ownerOpenId: 'ou_fixture' };
 const token = 'SYNTHETIC_PRIVATE_TOKEN';
@@ -15,80 +15,40 @@ type Adapter = Extract<Options['httpAdapter'], (...args: never[]) => unknown>;
 type Request = Parameters<Adapter>[0];
 
 const tokenUrl = 'https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal';
-const scopesUrl = `https://open.feishu.cn/open-apis/application/v6/applications/${config.appId}`;
+const applicationUrl = `https://open.feishu.cn/open-apis/application/v6/applications/${config.appId}`;
+const publishedVersionUrl = `${applicationUrl}/app_versions/versionOnline`;
 const issued = { code: 0, tenant_access_token: token, expire: 7200 };
 
-function configCheck(respond: (request: Request) => unknown) {
+function configCheck(respond: (request: Request) => unknown, status = 200) {
   const calls: Request[] = [];
   return { calls, run: () => checkFeishuConfig(config, {
     async httpAdapter(request) {
       calls.push(request);
-      return { config: request, data: await respond(request), status: 200, statusText: 'OK', headers: {} };
+      return { config: request, data: await respond(request), status, statusText: 'Fixture response', headers: {} };
     },
   }) };
 }
 
-test('configuration detection always requests a fresh token and only reads application scopes', async () => {
-  const f = configCheck(request => request.url === tokenUrl ? issued : {
-    code: 0, data: { app: { app_id: config.appId, scopes: [
-      { scope: 'im:message.group_at_msg:readonly', token_types: ['tenant'] },
-      { scope: 'im:message:send_as_bot', token_types: ['tenant'] },
-      { scope: 'im:chat:read', token_types: ['tenant'] },
-      { scope: 'im:chat.members:read', token_types: ['user'] },
-    ] } },
-  });
-  const result = await f.run();
-  assert.equal(result.credentials, 'passed');
-  const permissions = Object.fromEntries(result.permissions.map(({ scope, status }) => [scope, status]));
-  assert.ok(Object.hasOwn(permissions, 'im:message.group_at_msg:readonly'));
-  assert.equal(permissions['im:message:send_as_bot'], 'passed');
-  assert.equal(permissions['im:chat:read'], 'passed');
-  assert.equal(permissions['im:chat:create'], 'missing');
-  assert.equal(permissions['im:chat.members:read'], 'missing');
-  assert.equal(Object.hasOwn(permissions, 'im:message.group_msg'), false);
-  await f.run();
-  assert.deepEqual(f.calls.map(({ method, url }) => [method, url]), [
-    ['post', tokenUrl], ['get', scopesUrl], ['post', tokenUrl], ['get', scopesUrl],
-  ]);
-  assert.ok(JSON.parse(f.calls[0]!.data).app_secret === config.appSecret);
-  assert.ok(f.calls[1]!.headers.Authorization === `Bearer ${token}`);
-  assert.equal(f.calls[1]!.params.lang, 'zh_cn');
-  assert.doesNotMatch(JSON.stringify(result), /SYNTHETIC_PRIVATE_/);
-});
-
-test('configuration detection keeps scopes unverified when the read-only inquiry is unavailable', async () => {
-  for (const scopesResponse of [
-    { code: 99991672, msg: config.appSecret },
-    { code: 0, data: { app: {} } },
-    { code: 0, data: { app: { scopes: [] } } },
-    { code: 0, data: { app: { app_id: 'cli_other', scopes: [] } } },
-  ]) {
-    const f = configCheck(request => request.url === tokenUrl ? issued : scopesResponse);
-    const result = await f.run();
-    assert.equal(result.credentials, 'passed');
-    assert.ok(result.permissions.length > 0);
-    assert.ok(result.permissions.every(({ status }) => status === 'unverified'));
-    assert.doesNotMatch(JSON.stringify(result), /SYNTHETIC_PRIVATE_/);
-  }
-});
-
-test('configuration detection reports an unknown token type as unverified', async () => {
-  const f = configCheck(request => request.url === tokenUrl ? issued : {
-    code: 0, data: { app: { app_id: config.appId, scopes: [
-      { scope: 'im:message:send_as_bot', token_types: ['undocumented'] },
-    ] } },
-  });
-  const result = await f.run();
-  assert.equal(result.permissions.find(item => item.scope === 'im:message:send_as_bot')?.status, 'unverified');
+test('credential verification exchanges a fresh tenant token each time and performs no permission queries', async () => {
+  const f = configCheck(() => issued);
+  assert.deepEqual(await f.run(), { credentials: 'passed' });
+  assert.deepEqual(await f.run(), { credentials: 'passed' });
+  assert.deepEqual(f.calls.map(({ method, url }) => [method, url]), [['post', tokenUrl], ['post', tokenUrl]]);
+  assert.deepEqual(JSON.parse(f.calls[0]!.data), { app_id: config.appId, app_secret: config.appSecret });
+  assert.equal(f.calls[1]!.headers.Authorization, undefined);
 });
 
 test('configuration detection distinguishes invalid credentials from network uncertainty', async () => {
-  const invalid = configCheck(() => ({ code: 10014, msg: config.appSecret }));
+  const invalid = configCheck(() => ({ code: 10014, msg: config.appSecret }), 400);
+  const serverFailure = configCheck(() => ({ code: 10014, msg: config.appSecret }), 503);
+  const unknown = configCheck(() => ({ code: 99991672, msg: config.appSecret }));
+  const malformed = configCheck(() => ({ code: 0, tenant_access_token: '' }));
   const offline = configCheck(() => { throw Error(`${config.appSecret} ${token}`); });
-  for (const [probe, expected] of [[invalid, 'failed'], [offline, 'unverified']] as const) {
+  for (const [probe, expected] of [
+    [invalid, 'failed'], [serverFailure, 'unverified'], [unknown, 'unverified'], [malformed, 'unverified'], [offline, 'unverified'],
+  ] as const) {
     const result = await probe.run();
-    assert.equal(result.credentials, expected);
-    assert.ok(result.permissions.every(({ status }) => status === 'unverified'));
+    assert.deepEqual(result, { credentials: expected });
     assert.deepEqual(probe.calls.map(({ url }) => url), [tokenUrl]);
     assert.doesNotMatch(JSON.stringify(result), /SYNTHETIC_PRIVATE_/);
   }
@@ -129,7 +89,7 @@ function fixture(handler: (request: Request) => unknown = () => { throw Error('U
   beforeToken?: () => void) {
   const calls: Request[] = [];
   const sockets: Array<{ options: SocketOptions; event?: SocketStart; closed?: boolean }> = [];
-  const messages: FeishuTextMessage[] = [];
+  const messages: FeishuGroupTextMessage[] = [];
   const privateMessages: FeishuPrivateTextMessage[] = [];
   const states: FeishuConnectionState[] = [];
   const credentials = beforeToken ? { ...config, appId: 'cli_revocation_fixture' } : config;
@@ -149,7 +109,7 @@ function fixture(handler: (request: Request) => unknown = () => { throw Error('U
     },
   });
   const handlers = {
-    onMessage: (message: FeishuTextMessage) => { messages.push(message); },
+    onMessage: (message: FeishuGroupTextMessage) => { messages.push(message); },
     onPrivateMessage: (message: FeishuPrivateTextMessage) => { privateMessages.push(message); },
     onConnection: (state: FeishuConnectionState) => { states.push(state); },
   };
@@ -203,9 +163,9 @@ test('official dispatcher preserves nested message time, filters senders and for
   assert.equal(socket.closed, true);
   assert.deepEqual(f.states, ['connecting', 'ready', 'reconnecting', 'reconnected', 'stopped']);
   assert.deepEqual(f.messages, [
-    { chatId: 'oc_one', messageId: 'om_exact', senderOpenId: config.ownerOpenId, createdAt: 1795427300123, text: '部署进度如何？' },
-    { chatId: 'oc_one', messageId: 'om_topic', senderOpenId: config.ownerOpenId, createdAt: 1795427300123, text: '@助手 继续' },
-    { chatId: 'oc_one', messageId: 'om_new', senderOpenId: config.ownerOpenId, createdAt: 1795427300123, text: '  重连以后\n' },
+    { chatId: 'oc_one', messageId: 'om_exact', senderOpenId: config.ownerOpenId, createdAt: 1795427300123, text: '部署进度如何？', receiptKind: 'plain' },
+    { chatId: 'oc_one', messageId: 'om_topic', senderOpenId: config.ownerOpenId, createdAt: 1795427300123, text: '@助手 继续', receiptKind: 'unclassified' },
+    { chatId: 'oc_one', messageId: 'om_new', senderOpenId: config.ownerOpenId, createdAt: 1795427300123, text: '  重连以后\n', receiptKind: 'plain' },
   ]);
   assert.equal(f.calls.length, 0);
 });
@@ -341,12 +301,30 @@ test('joined groups cannot prove the configured user is a member when someone el
   });
   t.after(() => f.transport.stop());
   await assert.rejects(f.transport.inspectGroup('oc_target'), (error: unknown) => {
-    assert.equal((error as { code: string }).code, 'feishu-group-lookup');
+    assert.equal((error as { code: string }).code, 'feishu-chat-members-scope');
+    assert.match(String(error), /im:chat\.members:read/);
     assert.doesNotMatch(String(error), /SYNTHETIC_PRIVATE_/);
     return true;
   });
   assert.equal(f.calls.filter(call => call.url?.endsWith('/im/v1/chats')).length, 1);
   assert.equal(f.calls.filter(call => call.url?.endsWith('/members')).length, 1);
+});
+
+test('creating a group reports the scope only for an exact denial at the create endpoint', async t => {
+  let code = 99991672;
+  const f = fixture(request => {
+    assert.ok(request.url?.endsWith('/im/v1/chats'));
+    throw Object.assign(Error(config.appSecret), { config: request, response: { status: 403, data: { code } } });
+  });
+  t.after(() => f.transport.stop());
+  await assert.rejects(f.transport.createGroup('专用群', 'same-id'), (error: unknown) => {
+    assert.equal((error as { code: string }).code, 'feishu-chat-create-scope');
+    assert.match(String(error), /im:chat:create/);
+    assert.doesNotMatch(String(error), /SYNTHETIC_PRIVATE_/);
+    return true;
+  });
+  code = 99991679;
+  await assert.rejects(f.transport.createGroup('专用群', 'same-id'), { code: 'feishu-create-failed' });
 });
 
 test('joined groups rejects repeated tokens and observes the shared request deadline', async t => {
@@ -369,6 +347,68 @@ test('joined groups rejects repeated tokens and observes the shared request dead
     assert.rejects(f.transport.inspectGroup('oc_target'), { code: 'feishu-timeout' }), delay(deadline + 5),
   ]);
   assert.equal(f.calls.filter(call => call.url?.endsWith('/im/v1/chats')).length, 4);
+});
+
+test('group diagnosis reads only this app’s online version and recognizes modern and legacy tenant grants', async t => {
+  const scopeNames = ['im:message.group_msg', 'im:message.group_msg:readonly'];
+  let scopes: unknown[] = [{ scope: scopeNames[0], token_types: ['tenant'] }];
+  let events = ['接收消息'];
+  let eventInfos: unknown[] | undefined = [{ event_type: eventKind, event_name: '接收消息' }];
+  const f = fixture(request => {
+    assert.equal(request.method, 'get');
+    assert.equal(request.params.lang, 'zh_cn');
+    assert.equal(request.headers.Authorization, `Bearer ${token}`);
+    if (request.url === applicationUrl) return { code: 0, data: { app: {
+      app_id: config.appId, online_version_id: 'versionOnline', unaudit_version_id: 'versionDraft',
+      scopes: [{ scope: 'im:message.group_msg', token_types: ['tenant'] }], event: { subscribed_events: [eventKind] },
+    } } };
+    assert.equal(request.url, publishedVersionUrl);
+    return { code: 0, data: { app_version: { app_id: config.appId, version_id: 'versionOnline', status: 1,
+      scopes, events, event_infos: eventInfos } } };
+  });
+  t.after(() => f.transport.stop());
+  assert.equal(f.calls.length, 0);
+  assert.deepEqual(await f.transport.diagnoseGroup(), { ordinaryTextGrant: 'present', receiveSubscription: 'present' });
+  scopes = [scopeNames[1]];
+  eventInfos = undefined;
+  events = [eventKind];
+  assert.deepEqual(await f.transport.diagnoseGroup(), { ordinaryTextGrant: 'present', receiveSubscription: 'present' });
+  scopes = [{ scope: scopeNames[0], token_types: ['user'] }];
+  eventInfos = [{ event_type: 'contact.user.created_v3' }];
+  events = ['contact.user.created_v3'];
+  assert.deepEqual(await f.transport.diagnoseGroup(), { ordinaryTextGrant: 'missing', receiveSubscription: 'missing' });
+  const readUrls = f.calls.filter(call => call.method === 'get').map(call => call.url);
+  assert.deepEqual(readUrls, Array.from({ length: 3 }, () => [applicationUrl, publishedVersionUrl]).flat());
+});
+
+test('group diagnosis keeps missing data, mismatched version, API denial and network failure unknown', async t => {
+  let app: Record<string, unknown> = { app_id: config.appId, online_version_id: 'versionOnline' };
+  let version: Record<string, unknown> = { app_id: config.appId, version_id: 'versionOnline' };
+  let failure = 'none';
+  const f = fixture(request => {
+    if (request.url === applicationUrl) return { code: 0, data: { app } };
+    assert.equal(request.url, publishedVersionUrl);
+    if (failure === 'network') throw Error(config.appSecret);
+    if (failure === 'scope') return { code: 99991672, msg: config.appSecret };
+    return { code: 0, data: { app_version: version } };
+  });
+  t.after(() => f.transport.stop());
+  const unknown = { ordinaryTextGrant: 'unknown', receiveSubscription: 'unknown' };
+  assert.deepEqual(await f.transport.diagnoseGroup(), unknown);
+  version = { ...version, scopes: [{ scope: 'im:message.group_msg' }], events: ['显示名'] };
+  assert.deepEqual(await f.transport.diagnoseGroup(), unknown);
+  version = { ...version, scopes: ['显示名'] };
+  assert.deepEqual(await f.transport.diagnoseGroup(), unknown);
+  const complete = { ...version, scopes: [], events: [] };
+  for (const differs of [{ version_id: 'versionDraft' }, { app_id: 'cli_other' }, { status: 3 }]) {
+    version = { ...complete, ...differs };
+    assert.deepEqual(await f.transport.diagnoseGroup(), unknown);
+  }
+  for (failure of ['network', 'scope']) assert.deepEqual(await f.transport.diagnoseGroup(), unknown);
+  const prior = f.calls.length;
+  app = { ...app, app_id: 'cli_other' };
+  assert.deepEqual(await f.transport.diagnoseGroup(), unknown);
+  assert.deepEqual(f.calls.slice(prior).map(call => call.url), [applicationUrl]);
 });
 
 test('network and connection failures expose only fixed messages and HTTP work has a deadline', async t => {
@@ -413,4 +453,83 @@ test('a binding revoked while fetching the token blocks the HTTP send before dis
   await assert.rejects(f.transport.sendText('oc_target', '待发送', 'stable-id', () => bound), { code: 'feishu-binding-changed' });
   assert.equal(f.calls.length, 1);
   assert.match(f.calls[0]!.url!, /tenant_access_token\/internal$/);
+});
+
+test('group evidence uses structured mention targets for the authenticated app robot only', async t => {
+  const f = fixture(request => {
+    assert.ok(request.url?.endsWith('/open-apis/bot/v3/info'));
+    assert.equal(request.method, 'get');
+    return { code: 0, bot: { open_id: 'ou_thisrobot', app_name: 'Same name' } };
+  });
+  t.after(() => f.transport.stop());
+  f.transport.start(f.handlers);
+  const socket = f.sockets[0]!;
+  socket.options.onReady?.();
+  const emit = (id: string, text: string, mentions?: unknown, headerApp = config.appId) =>
+    socket.event!.eventDispatcher.invoke({ schema: '2.0', header: { event_type: eventKind, app_id: headerApp },
+      event: { app_id: config.appId, sender, message: { ...message, message_id: id,
+        content: JSON.stringify({ text }), mentions } } }, { needCheck: false });
+  await emit('om_literal', 'Typed by hand: @Same name');
+  await emit('om_empty', 'No mentions', []);
+  await emit('om_invalid', 'Invalid structured data', null);
+  await emit('om_all', '@_all hello', [{ key: '@_all', name: '所有人', id: { open_id: 'ou_thisrobot' } }]);
+  assert.equal(f.calls.length, 0);
+  const mention = { key: '@_user_1', name: 'Same name', id: { open_id: 'ou_thisrobot' } };
+  await emit('om_wrong_app', '@_user_1 hello', [mention], 'cli_other');
+  assert.equal(f.calls.length, 0);
+  await emit('om_other', '@_user_1 hello', [{ ...mention, id: { open_id: 'ou_someoneelse' } }]);
+  assert.equal(await f.messages.find(item => item.messageId === 'om_other')!.botMentionProof, false);
+  await emit('om_wrong_identity_format', '@_user_1 hello', [{ ...mention, id: { user_id: 'ou_thisrobot' } }]);
+  await emit('om_actual', '@_user_1 hello', [mention]);
+  assert.deepEqual(f.messages.map(item => [item.messageId, item.receiptKind]), [
+    ['om_literal', 'plain'], ['om_empty', 'plain'], ['om_invalid', 'unclassified'], ['om_all', 'unclassified'],
+    ['om_other', 'unclassified'], ['om_wrong_identity_format', 'unclassified'], ['om_actual', 'bot-mention'],
+  ]);
+  assert.equal(f.calls.filter(request => request.url?.endsWith('/open-apis/bot/v3/info')).length, 1);
+});
+
+test('failed robot identity lookup never stops a group message from reaching its handler', async t => {
+  const f = fixture(request => {
+    assert.ok(request.url?.endsWith('/open-apis/bot/v3/info'));
+    throw Error('Synthetic unavailable identity');
+  });
+  t.after(() => f.transport.stop());
+  f.transport.start(f.handlers);
+  const socket = f.sockets[0]!;
+  socket.options.onReady?.();
+  const emit = (id: string, mentioned: boolean) =>
+    socket.event!.eventDispatcher.invoke({ schema: '2.0', header: { event_type: eventKind, app_id: config.appId },
+      event: { sender, message: { ...message, message_id: id,
+        content: JSON.stringify({ text: mentioned ? '@_user_1 hello' : 'ordinary' }),
+        mentions: mentioned ? [{ key: '@_user_1', name: 'Unknown', id: { open_id: 'ou_candidate' } }] : [] } } },
+    { needCheck: false });
+  await emit('om_unknown_one', true);
+  await emit('om_unknown_two', true);
+  await emit('om_plain', false);
+  assert.deepEqual(await Promise.all(f.messages.slice(0, 2).map(item => item.botMentionProof)), [false, false]);
+  assert.deepEqual(f.messages.map(item => [item.text, item.receiptKind]), [
+    ['@Unknown hello', 'unclassified'], ['@Unknown hello', 'unclassified'], ['ordinary', 'plain'],
+  ]);
+  assert.equal(f.calls.filter(request => request.url?.endsWith('/open-apis/bot/v3/info')).length, 1);
+});
+
+test('pending robot identity does not delay the SDK handler for a real structured mention', async t => {
+  let prove!: (value: unknown) => void;
+  const identity = new Promise(resolve => { prove = resolve; });
+  const f = fixture(() => identity);
+  t.after(() => f.transport.stop());
+  f.transport.start(f.handlers);
+  const socket = f.sockets[0]!;
+  socket.options.onReady?.();
+  const emit = (id: string, text: string, mentions?: unknown) =>
+    socket.event!.eventDispatcher.invoke({ schema: '2.0', header: { event_type: eventKind, app_id: config.appId },
+      event: { sender, message: { ...message, message_id: id, content: JSON.stringify({ text }), mentions } } },
+    { needCheck: false });
+  await emit('om_first', '@_user_1 first', [{ key: '@_user_1', name: 'Robot', id: { open_id: 'ou_robot' } }]);
+  await emit('om_second', 'second');
+  assert.deepEqual(f.messages.map(item => item.messageId), ['om_first', 'om_second']);
+  assert.equal(f.messages[0]!.receiptKind, 'unclassified');
+  assert.equal(f.messages[1]!.receiptKind, 'plain');
+  prove({ code: 0, bot: { open_id: 'ou_robot' } });
+  assert.equal(await f.messages[0]!.botMentionProof, true);
 });

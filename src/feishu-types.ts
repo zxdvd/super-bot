@@ -13,12 +13,16 @@ export interface FeishuIdentity {
 }
 
 export type FeishuSelfBinding = 'unbound' | 'skipped' | 'bound';
+export type FeishuCredentialStatus = 'passed' | 'failed' | 'unverified';
 
 export interface FeishuSettingsView {
   appId: string;
   ownerOpenId: string;
   configurationId: string;
   selfBinding: FeishuSelfBinding;
+  credentials: FeishuCredentialStatus;
+  privateTest: 'passed' | 'untested';
+  privateTestAt?: number;
   testStartToken?: string;
   hasSecret: boolean;
   enabled: boolean;
@@ -28,8 +32,12 @@ export interface FeishuSettingsView {
 }
 
 export interface FeishuCheckResult {
-  credentials: 'passed' | 'failed' | 'unverified';
-  permissions: { scope: string; status: 'passed' | 'missing' | 'unverified' }[];
+  credentials: FeishuCredentialStatus;
+}
+
+export interface FeishuGroupDiagnosis {
+  ordinaryTextGrant: 'present' | 'missing' | 'unknown';
+  receiveSubscription: 'present' | 'missing' | 'unknown';
 }
 
 export interface FeishuTextMessage {
@@ -38,6 +46,17 @@ export interface FeishuTextMessage {
   readonly senderOpenId: string;
   readonly text: string;
   readonly createdAt: number;
+}
+
+export interface FeishuGroupTextMessage extends FeishuTextMessage {
+  readonly receiptKind: 'plain' | 'bot-mention' | 'unclassified';
+  /** The normal message enters the host while the SDK verifies the bot's identity. */
+  readonly botMentionProof?: Promise<boolean>;
+}
+
+export interface FeishuGroupEvidence {
+  plainTextAt: number | null;
+  botMentionAt: number | null;
 }
 
 export interface FeishuPrivateTextMessage extends FeishuTextMessage {
@@ -74,7 +93,7 @@ export interface FeishuGroupPreview extends FeishuGroup {
 }
 
 export interface FeishuHandlers {
-  onMessage(message: FeishuTextMessage): void | Promise<void>;
+  onMessage(message: FeishuGroupTextMessage): void | Promise<void>;
   onPrivateMessage?(message: FeishuPrivateTextMessage): void;
   onConnection(state: FeishuConnectionState): void;
 }
@@ -85,6 +104,7 @@ export interface FeishuTransport {
   sendText(chatId: string, text: string, uuid: string, canDispatch?: () => boolean): Promise<void>;
   inspectGroup(chatId: string): Promise<FeishuGroup>;
   createGroup(name: string, uuid: string): Promise<FeishuGroup>;
+  diagnoseGroup(): Promise<FeishuGroupDiagnosis>;
 }
 
 export function isFeishuChatId(value: unknown): value is string {

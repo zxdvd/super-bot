@@ -12,7 +12,7 @@ import {
 
 export interface WorkspaceProps {
   api: WorkspaceApi; initialBotId?: string; initialLink?: WorkLink; sessionId?: string; compact?: boolean; onReturn?: () => void;
-  mirror?: MirrorSelection;
+  mirror?: MirrorSelection; focusFeishu?: boolean;
 }
 export const PAGE_SIZE = 25;
 export type Page = TaskPage & { truncated?: boolean };
@@ -23,9 +23,9 @@ async function existing<T>(query: Promise<T>): Promise<T | undefined> {
   catch (error) { if (error instanceof Error && 'code' in error && error.code === 'not-found') return; throw error; }
 }
 
-export function useWorkspace({ api, initialBotId, initialLink, sessionId, mirror }: WorkspaceProps) {
+export function useWorkspace({ api, initialBotId, initialLink, sessionId, mirror, focusFeishu }: WorkspaceProps) {
   const preferredBot = useRef(initialBotId ?? rememberedBot());
-  const savedView = useRef(sessionId || mirror ? undefined : rememberedView());
+  const savedView = useRef(sessionId || mirror || focusFeishu ? undefined : rememberedView());
   const restoredView = useRef(!initialLink && savedView.current?.botId === initialBotId ? savedView.current : undefined);
   const pendingSelection = useRef(restoredView.current?.selected ?? '');
   const alive = useRef(true), viewScope = useRef(''), scroller = useRef<HTMLDivElement>(null);
@@ -36,7 +36,7 @@ export function useWorkspace({ api, initialBotId, initialLink, sessionId, mirror
   const [sidebarNotice, setSidebarNotice] = useState<{ botId: string; text: string }>();
   const [status, setStatus] = useState<WorkspaceStatus>(); const [bots, setBots] = useState<Bot[]>([]);
   const [botId, setBotId] = useState(mirror?.bot.id ?? initialBotId ?? ''); const [page, setPage] = useState<Page>();
-  const [view, setViewState] = useState<WorkView>(mirror ? 'list' : restoredView.current?.view ?? 'inbox');
+  const [view, setViewState] = useState<WorkView>(mirror ? 'list' : focusFeishu ? 'settings' : restoredView.current?.view ?? 'inbox');
   const [seen, setSeen] = useState(() => mirror ? {} : seenResults()); const [now, setNow] = useState(Date.now);
   const [selected, setSelected] = useState(initialLink?.taskId ?? ''); const [loaded, setDetail] = useState<Detail>();
   const [remoteDetail, setRemoteDetail] = useState<MirrorDetail>();
@@ -53,10 +53,10 @@ export function useWorkspace({ api, initialBotId, initialLink, sessionId, mirror
   useEffect(() => { if (backupInfo) backupNotice.current?.scrollIntoView({ block: 'nearest' }); }, [backupInfo]);
   viewScope.current = `${botId}:${selected}`;
   useEffect(() => {
-    if (botId && !sessionId && !mirror) {
+    if (botId && !sessionId && !mirror && (!focusFeishu || view !== 'settings')) {
       rememberView({ botId, selected, query, filter, offset, view: view === 'settings' ? 'inbox' : view });
     }
-  }, [botId, selected, query, filter, offset, sessionId, view, mirror]);
+  }, [botId, selected, query, filter, offset, sessionId, view, mirror, focusFeishu]);
   const showingCurrentResult = !link || link.kind === 'task' || link.kind === 'result' && link.resultId === detail?.result?.id;
   const openedResult = showingCurrentResult ? detail?.task : undefined;
   useEffect(() => {

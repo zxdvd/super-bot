@@ -259,7 +259,7 @@ export function apply(ctx: Context) {
         if (plan.action === 'feishu') {
           assert.ok(handlers);
           await handlers.onMessage({ chatId: existingGroup.chatId, messageId: randomUUID(), senderOpenId: fixtureCredentials.ownerOpenId,
-            text: marker, createdAt: Date.now() });
+            receiptKind: 'plain', text: marker, createdAt: Date.now() });
         }
         if (plan.action === 'cancel') ctx.sessionController.cancel({ sessionId: current.id });
         if (plan.action === 'release') { assert.ok(releasePendingTool); releasePendingTool(); }

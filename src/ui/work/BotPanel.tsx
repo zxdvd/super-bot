@@ -63,7 +63,7 @@ function Maintenance({ w }: { w: WorkspaceState }) {
   </Section>;
 }
 
-export function BotPanel({ w, bot }: { w: WorkspaceState; bot: Bot }) {
+export function BotPanel({ w, bot, focusFeishu }: { w: WorkspaceState; bot: Bot; focusFeishu?: boolean }) {
   return <div className="settings">
     {!w.sessionId && w.bots.length > 0 && <Section title="Bot">
       <div className="toolbar">
@@ -80,7 +80,7 @@ export function BotPanel({ w, bot }: { w: WorkspaceState; bot: Bot }) {
       {bot.materials.map(material => <p key={material.path} className="wrap caption">{material.path} · {material.bytes} 字节</p>)}
     </Section>
     <ManagerSection w={w} bot={bot}/>
-    <FeishuPanel key={bot.id} api={w.api} botId={bot.id} botName={bot.name} locked={w.locked}/>
+    <FeishuPanel key={bot.id} api={w.api} botId={bot.id} botName={bot.name} locked={w.locked} focus={focusFeishu}/>
     <Section title="侧栏"><SidebarActions w={w} bot={bot}/></Section>
     <Maintenance w={w}/>
   </div>;

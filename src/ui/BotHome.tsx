@@ -11,7 +11,7 @@ import { FeishuSettings } from './FeishuSettings.tsx';
 const DEFAULT_INSTRUCTIONS = '你是我的长期助手。自然地与我交流，理解我的目标，必要时澄清，主动安排已授权的工作，并回来交付结果。';
 const message = (error: unknown, fallback: string) => error instanceof Error ? error.message : fallback;
 
-type Work = { botId: string; link?: WorkLink; revision?: number; mirror?: MirrorSelection };
+type Work = { botId: string; link?: WorkLink; revision?: number; mirror?: MirrorSelection; focusFeishu?: boolean };
 
 function WorkFrame({ api, work, error, setError, close }: {
   api: WorkspaceApi; work: Work; error: string; setError: (text: string) => void; close: () => void;
@@ -20,7 +20,7 @@ function WorkFrame({ api, work, error, setError, close }: {
   const leave = () => { api.beginNavigation(); clearHash(); close(); };
   return <div style={{ height: '100%', display: 'flex', flexDirection: 'column' }}>
     <div className="sb" style={{ height: 'auto', flexShrink: 0, padding: 12 }}><style>{styles}</style>
-      <button onClick={leave}>← 我的 Bot</button>{' '}
+      <button onClick={leave}>{work.focusFeishu ? '← 飞书设置' : '← 我的 Bot'}</button>{' '}
       {!work.mirror && <button onClick={() => {
         clearHash(); void api.openBot(work.botId).catch(e => setError(e.message));
       }}>返回这个 Bot 聊天 →</button>}
@@ -28,7 +28,7 @@ function WorkFrame({ api, work, error, setError, close }: {
     </div>
     <div style={{ flex: 1, minHeight: 0 }}>
       <Workspace api={api} key={work.link ? `${workUrl(work.link)}:${work.revision}` : `${work.mirror?.owner ?? 'local'}:${work.botId}`}
-        initialBotId={work.botId} initialLink={work.link} mirror={work.mirror}/>
+        initialBotId={work.botId} initialLink={work.link} mirror={work.mirror} focusFeishu={work.focusFeishu}/>
     </div>
   </div>;
 }
@@ -125,8 +125,13 @@ export function BotHome({ api }: { api: WorkspaceApi }) {
     } catch (e) { if (alive.current) setError(message(e, '暂时无法创建，请重试。')); }
     finally { locked.current = false; if (alive.current) setBusy(false); }
   }
-  if (work !== null) return <WorkFrame api={api} work={work} error={error} setError={setError} close={() => setWork(null)}/>;
-  if (showSettings) return <FeishuSettings api={api} close={() => {
+  if (work !== null) return <WorkFrame api={api} work={work} error={error} setError={setError} close={() => {
+    setWork(null);
+    if (work.focusFeishu) setShowSettings(true);
+  }}/>;
+  if (showSettings) return <FeishuSettings api={api} bots={loading ? undefined : bots} openGroup={botId => {
+    api.beginNavigation(); setShowSettings(false); setWork({ botId, focusFeishu: true });
+  }} createBot={() => { setShowSettings(false); setCreating(true); }} close={() => {
     setShowSettings(false);
     requestAnimationFrame(() => settingsEntry.current?.focus());
   }}/>;

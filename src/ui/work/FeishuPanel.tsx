@@ -1,14 +1,56 @@
 import { useEffect, useId, useRef, useState } from 'react';
 import type { FeishuStatus } from '../../feishu-host.ts';
+import type { FeishuGroupDiagnosis } from '../../feishu-types.ts';
 import { feishuConnectionLabel } from '../feishu-format.ts';
 import { ConfirmAction, Hint, Section } from '../kit.tsx';
 import type { WorkspaceApi } from './api.ts';
 
 type Preview = { chatId: string; name: string; confirmationToken: string };
 type Form = 'create' | 'bind' | null;
+const PLAIN_TEXT_WAIT_MS = 45_000;
 
-export function FeishuPanel({ api, botId, botName, locked }: {
-  api: WorkspaceApi; botId: string; botName: string; locked: boolean;
+function GroupVerification({ binding, evidence, ready, disabled, diagnose }: {
+  binding: NonNullable<FeishuStatus['binding']>; evidence: FeishuStatus['evidence']; ready: boolean; disabled: boolean;
+  diagnose: (record: (result: FeishuGroupDiagnosis) => void) => void;
+}) {
+  const deadline = binding.boundAt + PLAIN_TEXT_WAIT_MS;
+  const [timedOut, setTimedOut] = useState(() => Date.now() >= deadline);
+  const [showMention, setShowMention] = useState(false);
+  const [diagnosis, setDiagnosis] = useState<FeishuGroupDiagnosis>();
+  const receivedPlain = evidence?.plainTextAt != null;
+  const receivedMention = evidence?.botMentionAt != null;
+  const missingGrant = diagnosis?.ordinaryTextGrant === 'missing';
+  const missingEvent = !receivedMention && diagnosis?.receiveSubscription === 'missing';
+  useEffect(() => {
+    if (timedOut || receivedPlain) return;
+    const timer = setTimeout(() => setTimedOut(true), Math.max(0, deadline - Date.now()));
+    return () => clearTimeout(timer);
+  }, [deadline, timedOut, receivedPlain]);
+  return <div className={`attention-box${receivedPlain || receivedMention ? ' result' : ''}`}>
+    <strong>验证群同步</strong>
+    {receivedPlain ? <p role="status">群消息接收通过（无需 @）</p> : <>
+      {ready && !receivedMention && <p>请用本人账号在群里发送一条新文本，无需 @ 机器人。</p>}
+      {!receivedMention && <p role="status">{timedOut ? '尚未收到普通消息' : '等待普通消息…'}</p>}
+      {ready && (timedOut || receivedMention) && <div className="actions">
+        {!showMention && !receivedMention &&
+          <button type="button" disabled={disabled} onClick={() => setShowMention(true)}>改用 @ 机器人测试</button>}
+        <button type="button" disabled={disabled} onClick={() => { setDiagnosis(undefined); diagnose(setDiagnosis); }}>
+          排查普通消息
+        </button>
+      </div>}
+      {diagnosis && <div role="status">
+        {missingGrant && <p>应用缺少「接收群聊中所有消息」权限 · <code>im:message.group_msg</code></p>}
+        {missingEvent && <p>应用缺少「接收消息」事件订阅 · <code>im.message.receive_v1</code></p>}
+        {!missingGrant && !missingEvent && <p>暂时无法确认原因。请核对长连接、事件订阅和已发布的应用版本。</p>}
+      </div>}
+    </>}
+    {ready && showMention && !receivedMention && <p>请在群里 @ 这个应用的机器人，再附上一句新文本。</p>}
+    {receivedMention && <p role="status">{receivedPlain ? '已收到 @ 机器人的消息' : '@ 消息可用，普通消息仍未验证'}</p>}
+  </div>;
+}
+
+export function FeishuPanel({ api, botId, botName, locked, focus }: {
+  api: WorkspaceApi; botId: string; botName: string; locked: boolean; focus?: boolean;
 }) {
   const [status, setStatus] = useState<FeishuStatus>();
   const [readError, setReadError] = useState(false), [error, setError] = useState('');
@@ -18,6 +60,13 @@ export function FeishuPanel({ api, botId, botName, locked }: {
   const [pending, setPending] = useState(false);
   const generation = useRef(0), busy = useRef(false), requestId = useRef('');
   const lifetime = useRef<AbortSignal>(), fieldId = useId();
+  const title = useRef<HTMLSpanElement>(null);
+
+  useEffect(() => {
+    if (!focus) return;
+    title.current?.focus({ preventScroll: true });
+    title.current?.scrollIntoView({ block: 'start' });
+  }, [focus]);
 
   useEffect(() => {
     const controller = new AbortController();
@@ -69,7 +118,7 @@ export function FeishuPanel({ api, botId, botName, locked }: {
   const disabled = locked || pending || readError;
   const canConnect = !disabled && status?.connection === 'ready' && status.selfBinding === 'bound';
   const binding = status?.binding;
-  return <Section title="飞书群">
+  return <Section title={<span ref={title} tabIndex={-1}>飞书群</span>}>
     <p className="muted" role="status">{readError ? '暂时无法读取飞书群状态'
       : status ? feishuConnectionLabel[status.connection] : '正在读取连接状态…'}</p>
     {status?.connection === 'disabled' && <Hint>请从 Super Bot 首页的「设置 → 飞书」启用飞书连接。</Hint>}
@@ -80,6 +129,9 @@ export function FeishuPanel({ api, botId, botName, locked }: {
     {binding ? <>
       <p className="wrap"><strong>{binding.name}</strong><br/><span className="muted">{binding.chatId}</span></p>
       <div className="actions"><a href={binding.url} target="_blank" rel="noopener noreferrer">在飞书打开群</a></div>
+      <GroupVerification key={binding.id} binding={binding} evidence={status?.evidence ?? null}
+        ready={status?.connection === 'ready' && !readError} disabled={disabled}
+        diagnose={apply => void perform<FeishuGroupDiagnosis>('feishu.diagnose', { bindingId: binding.id }, apply)}/>
       <ConfirmAction label="解绑" explanation="解绑后会立即停止同步。群和已经发出的消息仍保留在飞书中。"
         disabled={disabled} submit={() => perform<FeishuStatus>('feishu.unbind', { bindingId: binding.id }, record)}/>
     </> : status?.connection === 'ready' && status.selfBinding === 'bound' && !form && <div className="actions">

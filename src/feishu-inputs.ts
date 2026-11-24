@@ -3,9 +3,10 @@ import { createUserMessage, type UserMessage } from '@deepseek-ai/dsh-llm';
 import type { Agent } from '@deepseek-ai/dsh-agent';
 import type { SessionEvent } from '@deepseek-ai/dsh-session';
 import { isFeishuSource } from './dsh-chat-events.ts';
+import { recordGroupEvidence } from './feishu-group-evidence.ts';
 import { AppError, type ChatSource } from './model.ts';
 import type { Store } from './store.ts';
-import type { FeishuIdentity, FeishuTextMessage } from './feishu-types.ts';
+import type { FeishuGroupTextMessage, FeishuIdentity } from './feishu-types.ts';
 
 declare module '@deepseek-ai/dsh-llm' {
   interface MessageSourceMap {
@@ -18,7 +19,7 @@ export type FeishuInput = {
   botId: string;
   sessionId: string;
   config: FeishuIdentity;
-  received: FeishuTextMessage;
+  received: FeishuGroupTextMessage;
   signal: AbortSignal;
   isCurrent: () => boolean;
 };
@@ -48,7 +49,7 @@ export async function untilFeishuAbort<T>(promise: Promise<T>, signal: AbortSign
   finally { signal.removeEventListener('abort', abort); }
 }
 
-export function reserveFeishuInput(store: Store, input: FeishuInput): UserMessage | undefined {
+export function reserveFeishuInput(store: Store, input: FeishuInput): { message: UserMessage; acceptedAt: number } | undefined {
   const { received, config } = input;
   if (input.signal.aborted || !input.isCurrent() || received.senderOpenId !== config.ownerOpenId) return;
   const message = createUserMessage({
@@ -56,13 +57,22 @@ export function reserveFeishuInput(store: Store, input: FeishuInput): UserMessag
     source: { kind: 'user', feishuMessageId: received.messageId },
     content: [{ type: 'text', text: received.text }],
   });
-  const receipt = store.db.prepare(`
-    INSERT INTO feishu_inbound_receipts (
-      messageId, nativeMessageId, bindingId, botId, sessionId, senderOpenId, appId, textDigest, acceptedAt
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(messageId) DO NOTHING
-  `).run(received.messageId, message.id, input.bindingId, input.botId, input.sessionId,
-    received.senderOpenId, config.appId, digest(received.text), Date.now());
-  if (receipt.changes === 1) return message;
+  const acceptedAt = Date.now();
+  store.db.exec('BEGIN IMMEDIATE');
+  try {
+    const receipt = store.db.prepare(`
+      INSERT INTO feishu_inbound_receipts (
+        messageId, nativeMessageId, bindingId, botId, sessionId, senderOpenId, appId, textDigest, acceptedAt
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(messageId) DO NOTHING
+    `).run(received.messageId, message.id, input.bindingId, input.botId, input.sessionId,
+      received.senderOpenId, config.appId, digest(received.text), acceptedAt);
+    if (receipt.changes === 1) recordGroupEvidence(store, input.bindingId, received.receiptKind, acceptedAt);
+    store.db.exec('COMMIT');
+    if (receipt.changes === 1) return { message, acceptedAt };
+  } catch (error) {
+    store.db.exec('ROLLBACK');
+    throw error;
+  }
 }
 
 /** A receipt survives restarts for deduplication. Only a live submission can authorize a turn. */

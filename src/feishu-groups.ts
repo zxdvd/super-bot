@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { setTimeout as delay } from 'node:timers/promises';
+import { GROUP_EVIDENCE_KEY_PREFIX } from './feishu-group-evidence.ts';
 import { AppError, requiredText } from './model.ts';
 import type { Store } from './store.ts';
 import { isFeishuChatId, type FeishuBinding, type FeishuIdentity, type FeishuGroup, type FeishuGroupPreview,
@@ -117,8 +118,11 @@ export class FeishuGroups {
     const current = this.get(botId);
     if (!current) return;
     if (current.id !== expectedBindingId) throw new AppError('feishu-binding-changed', '飞书群绑定已变更，请刷新后再解绑。');
-    this.store.db.prepare('DELETE FROM feishu_group_bindings WHERE botId=? AND id=? AND appId=? AND ownerOpenId=?')
-      .run(botId, expectedBindingId, this.appId, this.ownerOpenId);
+    this.transaction(() => {
+      this.store.db.prepare('DELETE FROM feishu_group_bindings WHERE botId=? AND id=? AND appId=? AND ownerOpenId=?')
+        .run(botId, expectedBindingId, this.appId, this.ownerOpenId);
+      this.store.db.prepare('DELETE FROM metadata WHERE key=?').run(GROUP_EVIDENCE_KEY_PREFIX + current.id);
+    });
     this.previews.delete(botId);
     for (const listener of this.unboundListeners) listener(current.id);
   }
@@ -234,7 +238,12 @@ export class FeishuGroups {
     const boundAt = Date.now();
     const result = this.transaction(() => {
       this.assertAvailable(botId, group.chatId);
-      // An explicit confirmation can replace a mapping hidden by a credential change.
+      // An explicit confirmation can replace mappings hidden by a credential change.
+      this.store.db.prepare(`
+        DELETE FROM metadata WHERE key IN (
+          SELECT ? || id FROM feishu_group_bindings WHERE botId=? OR (chatId=? AND (appId!=? OR ownerOpenId!=?))
+        )
+      `).run(GROUP_EVIDENCE_KEY_PREFIX, botId, group.chatId, this.appId, this.ownerOpenId);
       this.store.db.prepare('DELETE FROM feishu_group_bindings WHERE chatId=? AND (appId!=? OR ownerOpenId!=?)')
         .run(group.chatId, this.appId, this.ownerOpenId);
       this.store.db.prepare(`INSERT INTO feishu_group_bindings (id,botId,appId,ownerOpenId,chatId,name,boundAt) VALUES (?,?,?,?,?,?,?)

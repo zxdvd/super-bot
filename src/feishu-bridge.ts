@@ -4,9 +4,10 @@ import type { Context } from '@deepseek-ai/cordis';
 import type { Agent } from '@deepseek-ai/dsh-agent';
 import type { Session, SessionEvent } from '@deepseek-ai/dsh-session';
 import { finalAssistantText, isNativeOwner, messageText } from './dsh-chat-events.ts';
+import { groupEvidence, recordGroupEvidence } from './feishu-group-evidence.ts';
 import type { FeishuGroups } from './feishu-groups.ts';
 import { reserveFeishuInput, untilFeishuAbort, type FeishuInput } from './feishu-inputs.ts';
-import type { FeishuBinding, FeishuConnectionState, FeishuIdentity, FeishuTextMessage, FeishuTransport } from './feishu-types.ts';
+import type { FeishuBinding, FeishuConnectionState, FeishuGroupEvidence, FeishuGroupTextMessage, FeishuIdentity, FeishuTransport } from './feishu-types.ts';
 import type { Managers } from './manager.ts';
 import { AppError } from './model.ts';
 import type { Store } from './store.ts';
@@ -106,12 +107,13 @@ export class FeishuBridge {
     await Promise.allSettled(this.inFlight);
   }
 
-  status(botId: string): FeishuBridgeStatus {
+  status(botId: string): FeishuBridgeStatus & { evidence: FeishuGroupEvidence | null } {
     const binding = this.running ? this.groups.get(botId) : null;
     const outbound = this.outboundErrors.get(botId), inbound = this.inboundErrors.get(botId);
     const error = this.connectionError ?? (outbound?.bindingId === binding?.id ? outbound?.text : undefined)
       ?? (inbound?.bindingId === binding?.id ? inbound?.text : undefined);
-    return { connection: this.connection, ...(error ? { error } : {}) };
+    return { connection: this.connection, evidence: binding ? groupEvidence(this.store, binding.id) : null,
+      ...(error ? { error } : {}) };
   }
 
   connectionStatus(): FeishuBridgeStatus & { lastMessageAt: number | null } {
@@ -179,7 +181,7 @@ export class FeishuBridge {
     this.inFlight.add(task);
   }
 
-  private receive(message: FeishuTextMessage): void {
+  private receive(message: FeishuGroupTextMessage): void {
     const epoch = this.epoch;
     if (!epoch || message.senderOpenId !== this.config.ownerOpenId) return;
     let binding: FeishuBinding | null = null;
@@ -197,9 +199,15 @@ export class FeishuBridge {
         received: message, signal: route.signal, isCurrent: () => this.current(route),
       };
       // Commit deduplication before the SDK acknowledges the event, even when Manager is unavailable.
-      const prompt = reserveFeishuInput(this.store, input);
-      if (!prompt) return;
-      this.lastMessageAt = Date.now();
+      const receipt = reserveFeishuInput(this.store, input);
+      if (!receipt) return;
+      this.lastMessageAt = receipt.acceptedAt;
+      // The event and its deduplication receipt are already accepted. Identity verification never delays the chat.
+      if (message.botMentionProof) {
+        void message.botMentionProof.then(verified => {
+          if (verified && this.current(route)) recordGroupEvidence(this.store, route.binding.id, 'bot-mention', receipt.acceptedAt);
+        }).catch(() => { /* The optional proof remains missing when the lookup or its local write fails. */ });
+      }
       if (!sessionId) {
         this.reject(route, message.messageId,
           '飞书消息未进入对话。请在宿主打开本机 Bot 管理对话，再发送新消息。');
@@ -208,7 +216,7 @@ export class FeishuBridge {
       this.enqueue(this.incoming, route, async () => {
         try {
           if (!this.current(route)) return;
-          if (await this.managers.submitFeishu(input, prompt) && this.current(route)) {
+          if (await this.managers.submitFeishu(input, receipt.message) && this.current(route)) {
             this.inboundErrors.delete(route.binding.botId);
           }
         } catch (error) {
