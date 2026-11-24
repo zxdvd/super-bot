@@ -5,7 +5,8 @@ import { mkdir, readFile, realpath, rename, writeFile } from 'node:fs/promises';
 import { basename, join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import {
-  artifactDeliveryText, artifactLinks, artifactPortProbeGoal, artifactReference, artifactRevision, supplementalDoc,
+  artifactDeliveryText, artifactLinks, artifactPortProbeGoal, artifactPortProbeTail,
+  artifactReference, artifactRevision, supplementalDoc,
 } from '../test/delivery-link-fixture.ts';
 
 const workPath = (taskId, resultId) => `/#super-bot-task=${taskId}&resultId=${resultId}`;
@@ -13,6 +14,12 @@ const filePath = (resultId, sessionId) => `/api/super-bot-file?${new URLSearchPa
 const sha256 = bytes => createHash('sha256').update(bytes).digest('hex');
 const receipts = detail => detail.events.filter(event => event.kind === 'manager.delivered' && JSON.parse(event.data).resultId);
 const runIds = detail => detail.events.filter(event => event.kind === 'run.queued').map(event => JSON.parse(event.data).runId).sort();
+
+async function assertVerticalOrder(...locators) {
+  const boxes = await Promise.all(locators.map(locator => locator.boundingBox()));
+  assert.ok(boxes.every((box, index) => box && (index === 0 || box.y > boxes[index - 1].y)),
+    `Expected visible elements in order ${locators.join(', ')}, got ${JSON.stringify(boxes)}`);
+}
 
 export async function smokeChatResultLinks({ base, configure, launch, stop, rpc, call, makeBot, probe, wait }) {
   const { SUPER_BOT_TEST_PLAYWRIGHT: playwright, SUPER_BOT_TEST_BROWSER: executablePath } = process.env;
@@ -109,10 +116,33 @@ export async function smokeChatResultLinks({ base, configure, launch, stop, rpc,
     const drawer = page.getByRole('dialog', { name: '任务详情' });
     const accept = drawer.getByRole('button', { name: '接受成果', exact: true });
     const rework = drawer.getByText('要求返工', { exact: true });
+    const expand = drawer.getByRole('button', { name: '展开交付说明', exact: true });
+    const collapse = drawer.getByRole('button', { name: '收起交付说明', exact: true });
     const close = () => drawer.getByRole('button', { name: '关闭任务详情' }).click();
     const resultCard = drawer.locator('.attention-box.result');
     const artifacts = resultCard.getByRole('group', { name: '交付物', exact: true });
     const workerReport = resultCard.getByText('完整 Worker 报告', { exact: true });
+    const workerSummary = resultCard.getByText('已核对合成交付物。', { exact: true });
+    const revisedDelivery = resultCard.locator('.delivery-description').getByText(artifactRevision.text, { exact: true });
+    const progress = drawer.getByRole('heading', { name: '任务进度', exact: true });
+    const firstChecks = '已回读合成证据。参考资料：';
+    const screenshot = async (name) => {
+      await drawer.evaluate(element => { element.scrollTop = 0; });
+      await drawer.screenshot({ path: join(base, name) });
+    };
+    const exactFile = (card, resultId) => card.locator(`a[href="${filePath(resultId, bot.managerId)}"]`);
+    const assertReview = async (card, resultId, checksText, links) => {
+      const checks = card.getByText(checksText, { exact: false });
+      const file = exactFile(card, resultId);
+      const actions = card.locator('.result-actions');
+      await checks.waitFor();
+      await actions.getByRole('button', { name: '接受成果', exact: true }).waitFor();
+      await actions.getByText('要求返工', { exact: true }).waitFor();
+      assert.equal(await accept.count(), 1);
+      assert.equal(await rework.count(), 1);
+      assert.equal(await drawer.locator('header').getByRole('button', { name: '接受成果', exact: true }).count(), 0);
+      await assertVerticalOrder(...(links ? [links] : []), file, checks, actions);
+    };
     const openWorkTask = async () => {
       const row = page.locator('.sb-compact button.task').filter({ hasText: task.goal }).first();
       if (!await row.isVisible()) await page.getByRole('button', { name: '打开或收起当前 Bot 的工作' }).click();
@@ -146,28 +176,49 @@ export async function smokeChatResultLinks({ base, configure, launch, stop, rpc,
     await openWorkTask();
     await artifacts.waitFor();
     await assertArtifacts(artifactLinks);
+    await assertReview(resultCard, id, firstChecks, artifacts);
+    await assertVerticalOrder(drawer.getByText('请验收成果', { exact: true }), resultCard, progress);
     const resize = page.locator('[data-side="rightbar"]');
-    await resize.waitFor();
-    const handle = await resize.boundingBox(), initialWidth = (await drawer.boundingBox()).width;
-    const x = handle.x + handle.width / 2, y = handle.y + handle.height / 2;
-    await page.mouse.move(x, y);
-    await page.mouse.down();
-    await page.mouse.move(x + initialWidth - 328, y, { steps: 8 });
-    await page.mouse.up();
-    await page.waitForFunction(() => document.querySelector('aside.sb-drawer')?.clientWidth <= 345);
+    const resizeDrawer = async (width) => {
+      await resize.waitFor();
+      const handle = await resize.boundingBox(), currentWidth = (await drawer.boundingBox()).width;
+      const x = handle.x + handle.width / 2, y = handle.y + handle.height / 2;
+      await page.mouse.move(x, y);
+      await page.mouse.down();
+      await page.mouse.move(x + currentWidth - width, y, { steps: 8 });
+      await page.mouse.up();
+      await page.waitForFunction(expected => {
+        const actual = document.querySelector('aside.sb-drawer')?.clientWidth;
+        return actual && Math.abs(actual - expected) <= 17;
+      }, width);
+    };
+    await resizeDrawer(328);
     const layout = await artifacts.evaluate(group => {
-      const summary = group.previousElementSibling, drawer = group.closest('[role="dialog"]');
+      const drawer = group.closest('[role="dialog"]');
       return {
         compact: drawer.classList.contains('sb-compact'),
         width: drawer.clientWidth,
         overflow: drawer.scrollWidth - drawer.clientWidth,
         lines: new Set([...group.querySelectorAll('li')].map(item => Math.round(item.getBoundingClientRect().top))).size,
-        order: summary.textContent.includes('等待你确认') && group.nextElementSibling.matches('p, details'),
-        duplicate: summary.querySelectorAll('a[href]').length,
       };
     });
     assert.ok(layout.compact && layout.width <= 345 && layout.overflow <= 1 && layout.lines >= 2, JSON.stringify(layout));
-    assert.ok(layout.order && !layout.duplicate, 'artifact links follow summary with no duplicated Markdown link');
+    await expand.waitFor();
+    const summaryId = await expand.getAttribute('aria-controls');
+    assert.ok(summaryId);
+    const summary = resultCard.locator(`[id="${summaryId}"]`);
+    const summaryIsClipped = () => summary.evaluate(element => element.scrollHeight - element.clientHeight > 1);
+    assert.equal(await expand.getAttribute('aria-expanded'), 'false');
+    assert.ok(await summaryIsClipped(), 'the long delivery exceeds its initial preview');
+    assert.equal(await summary.getByRole('link').count(), 0, 'no Markdown link duplicates an artifact');
+    await assertVerticalOrder(summary, artifacts);
+    await screenshot('delivery-links-collapsed.png');
+    await expand.click();
+    assert.equal(await collapse.getAttribute('aria-expanded'), 'true');
+    assert.equal(await collapse.getAttribute('aria-controls'), summaryId);
+    assert.equal(await summaryIsClipped(), false);
+    assert.ok(await summary.getByText(artifactPortProbeTail, { exact: true }).isVisible());
+    assert.equal(await workerSummary.isVisible(), false);
     for (const [name, url] of Object.entries(artifactLinks)) {
       await context.route(url, route => route.fulfill({ status: 200, body: 'Synthetic artifact destination' }));
       const clicked = page.waitForEvent('popup', { timeout: 5000 });
@@ -184,16 +235,32 @@ export async function smokeChatResultLinks({ base, configure, launch, stop, rpc,
     await artifacts.getByRole('link', { name: '飞书文档 · 联调纪要' }).waitFor({ timeout: 10000 });
     await assertArtifacts(patched);
     assert.equal(await card.evaluate(element => element.isConnected), true);
+    assert.equal(await collapse.getAttribute('aria-expanded'), 'true');
+    assert.equal(await collapse.getAttribute('aria-controls'), summaryId);
+    assert.equal(await summaryIsClipped(), false);
+    await workerReport.click();
+    await workerSummary.waitFor();
+    assert.equal(await collapse.getAttribute('aria-expanded'), 'true');
+    await workerReport.click();
+    await workerSummary.waitFor({ state: 'hidden' });
     const updated = await detail();
     assert.equal(updated.deliveredResult.deliveredAt, delivered.deliveredResult.deliveredAt);
     assert.equal(updated.deliveredResult.deliveryText, delivered.deliveredResult.deliveryText);
     assert.equal(updated.result.humanAcceptedAt, null);
     assert.deepEqual(receipts(updated), [receipt]);
-    await drawer.screenshot({ path: join(base, 'delivery-links-narrow.png') });
+    await screenshot('delivery-links-narrow.png');
+    await resizeDrawer(500);
+    assert.equal(await collapse.getAttribute('aria-expanded'), 'true');
+    assert.equal(await summaryIsClipped(), false);
+    await collapse.click();
+    assert.equal(await expand.getAttribute('aria-expanded'), 'false');
+    assert.ok(await summaryIsClipped());
+    await resizeDrawer(328);
     await close();
 
     await openResult(link(oldOrigin + fragment), id);
-    await accept.waitFor();
+    await assertReview(resultCard, id, firstChecks, artifacts);
+    await assertVerticalOrder(resultCard, progress);
     const preview = page.getByRole('region', { name: '成果文件预览' });
     let downloads = 0;
     page.on('download', () => downloads++);
@@ -210,49 +277,53 @@ export async function smokeChatResultLinks({ base, configure, launch, stop, rpc,
     await preview.getByRole('button', { name: '← 返回聊天' }).click();
     if (await drawer.isVisible()) await close();
 
-    await say('再加一句结论。');
+    await openWorkTask();
+    await resultCard.getByText('要求返工', { exact: true }).click();
+    await resultCard.getByRole('textbox', { name: '返工要求', exact: true }).fill('再加一句结论。');
+    await resultCard.getByRole('button', { name: '保存返工要求', exact: true }).click();
     const revised = await wait(async () => {
       const current = await detail();
       return current.task.managerReviewed && current.result && current.result.id !== id && current;
     }, 'second Worker Run on the same task');
+    const rejections = revised.events.filter(event => event.kind === 'result.rejected');
+    assert.deepEqual(rejections.map(event => JSON.parse(event.data).resultId), [id]);
     const nextId = revised.result.id;
     assert.notEqual(revised.result.summary, first.result.summary);
     assert.notEqual(revised.result.checks, first.result.checks);
     assert.notEqual(revised.result.evidence[0].sha256, first.result.evidence[0].sha256);
     assert.equal(revised.result.evidence[0].path, first.result.evidence[0].path);
     assert.equal(revised.deliveredResult.id, id);
-    await openWorkTask();
     await drawer.getByRole('heading', { name: '交付 · 返工中' }).waitFor();
     await assertArtifacts(patched);
     assert.ok(await resultCard.getByText(artifactDeliveryText, { exact: false }).isVisible());
-    await workerReport.click();
-    await resultCard.getByText('已回读合成证据。参考资料：', { exact: false }).waitFor();
-    await workerReport.click();
-    assert.equal(await accept.count(), 0);
+    assert.equal(await accept.isVisible(), false);
     const pending = drawer.getByText('新成果待验收', { exact: true });
     await pending.click();
-    assert.ok(await accept.isVisible());
-    assert.equal(await resultCard.getByRole('button', { name: '接受成果', exact: true }).count(), 0);
-    assert.equal(await drawer.locator(`a[href="${filePath(nextId, bot.managerId)}"]`).count(), 1);
+    await assertReview(pending.locator('xpath=..'), nextId, artifactRevision.checks);
     await pending.click();
     await wait(async () => (await inspect()).status === 'idle', 'second candidate turn done');
     await say(`DF14_SHOW_RESULT:${task.id}`);
     await awaitReceipt(nextId);
     await artifacts.getByRole('link', { name: '飞书文档 · 修订版方案' }).waitFor();
     await assertArtifacts(artifactRevision.links);
-    assert.ok(await resultCard.locator('.clamp').getByText(artifactRevision.text, { exact: true }).isVisible());
+    await assertReview(resultCard, nextId, artifactRevision.checks, artifacts);
+    await assertVerticalOrder(resultCard, progress);
+    assert.ok(await revisedDelivery.isVisible());
+    assert.equal(await expand.count(), 0);
+    assert.equal(await collapse.count(), 0);
     assert.equal(await drawer.getByText('新成果待验收', { exact: true }).count(), 0);
     assert.equal(await drawer.getByText(/历史成果|查看当前交付/).count(), 0);
     assert.equal(await resultCard.getByText(artifactDeliveryText, { exact: false }).count(), 0);
-    await drawer.screenshot({ path: join(base, 'delivery-links-latest.png') });
+    await screenshot('delivery-links-latest.png');
     await close();
     const freshLink = host.base + workPath(task.id, nextId);
 
     await openResult(link(oldOrigin + fragment), id);
     await drawer.getByRole('heading', { name: '历史成果 · 只读' }).waitFor();
     await drawer.getByText('这份成果已被新版替代。', { exact: true }).waitFor();
-    await drawer.getByText('完整 Worker 报告', { exact: true }).click();
-    await resultCard.getByText('已回读合成证据。参考资料：', { exact: false }).waitFor();
+    await workerReport.click();
+    await workerSummary.waitFor();
+    await resultCard.getByText(firstChecks, { exact: false }).waitFor();
     assert.ok(await resultCard.getByText(artifactDeliveryText, { exact: false }).isVisible());
     await assertArtifacts(patched);
     assert.equal(await accept.count(), 0);
@@ -282,16 +353,21 @@ export async function smokeChatResultLinks({ base, configure, launch, stop, rpc,
     assert.equal(sha256(await readFile(path)), sha256(nextBytes));
     await close();
     await openResult(link(freshLink), nextId);
-    await accept.waitFor(); await rework.waitFor();
-    assert.ok(await resultCard.locator('.clamp').getByText(artifactRevision.text, { exact: true }).isVisible());
+    await assertReview(resultCard, nextId, artifactRevision.checks, artifacts);
+    assert.ok(await revisedDelivery.isVisible());
+    assert.equal(await expand.count(), 0);
     await assertArtifacts(artifactRevision.links);
     const newFile = await host.get(filePath(nextId, bot.managerId));
     assert.equal(newFile.status, 200);
     assert.equal(sha256(Buffer.from(await newFile.arrayBuffer())), revised.result.evidence[0].sha256);
     assert.equal((await rpc(host, 'result.accept', { requestId: randomUUID(), id: task.id, resultId: id,
-      expectedRowVersion: revised.task.rowVersion, sessionId: bot.managerId })).error.code, 'result-stale');
+      expectedRowVersion: (await detail()).task.rowVersion, sessionId: bot.managerId })).error.code, 'result-stale');
+    await resultCard.getByRole('button', { name: '接受成果', exact: true }).click();
+    await resultCard.getByText('已由你接受。', { exact: true }).waitFor();
+    assert.equal(await accept.count(), 0);
+    assert.equal(await rework.count(), 0);
     await close();
-    console.log(`PASS two versions: ${id} read-only with original report and checked download; ${nextId} retains review controls`);
+    console.log(`PASS in-card rework and acceptance: ${id} remains read-only with original report and download; ${nextId} accepted`);
 
     await say('请写一份说明，先确认读者。');
     const question = await wait(async () => {
@@ -350,7 +426,9 @@ export async function smokeChatResultLinks({ base, configure, launch, stop, rpc,
     assert.deepEqual(runIds(after), [first.run.id, revised.run.id].sort());
     assert.deepEqual(receipts(after).map(event => JSON.parse(event.data).resultId).sort(), [id, nextId].sort());
     assert.ok((await inspect()).assistantTexts.includes(original));
-    assert.equal(after.result.humanAcceptedAt, null);
+    assert.equal(after.task.lifecycle, 'completed');
+    assert.ok(after.result.humanAcceptedAt > 0);
+    assert.deepEqual(after.events.filter(event => event.kind === 'result.accepted').map(event => JSON.parse(event.data).resultId), [nextId]);
     assert.equal((await call(host, 'task.detail', { id: task.id, resultId: id, sessionId: bot.managerId })).linkedResult.humanAcceptedAt, null);
     const runtime = { desktop: (await call(host, 'status')).runtime, web: (await call(web, 'status')).runtime };
     await writeFile(join(base, 'chat-result-proof.json'), JSON.stringify({

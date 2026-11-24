@@ -111,6 +111,8 @@ const parts = `
 .sb .delivery-links ul{display:flex;flex-wrap:wrap;gap:4px 12px;min-width:0;max-width:100%;list-style:none;margin:0;padding:0}
 .sb .delivery-links li{min-width:0;max-width:100%;overflow-wrap:anywhere}
 .sb .delivery-links a{text-decoration:underline;text-underline-offset:2px}
+.sb .result-actions{align-items:center;margin-top:8px}
+.sb .result-actions .rework[open]{flex-basis:100%}
 .sb .sb-section{margin:16px 0;padding:12px 14px;border:1px solid var(--sb-line);border-radius:10px;background:var(--sb-raised)}
 .sb .sb-section>header{display:flex;align-items:center;gap:8px;margin-bottom:6px}
 .sb .sb-section h3{margin:0;font-size:13px;font-weight:600}
@@ -123,7 +125,9 @@ const parts = `
 .sb .clamp{display:-webkit-box;-webkit-box-orient:vertical;-webkit-line-clamp:3;overflow:hidden;overflow-wrap:anywhere}
 .sb .full-text{white-space:pre-wrap;overflow-wrap:anywhere;line-height:1.8}
 .sb .prose-preview:has(~ .prose-details[open]){display:none}
-.sb .work-markdown{white-space:pre-wrap;overflow-wrap:anywhere;line-height:1.8}
+.sb .delivery-description,.sb .work-markdown{white-space:pre-wrap;overflow-wrap:anywhere;line-height:1.8}
+.sb .delivery-description[data-clipped]{max-height:3lh;overflow:clip}
+.sb .delivery-toggle{margin-top:6px}
 .sb .work-markdown :where(p,ul,ol,pre,blockquote){margin:0 0 .5em}
 .sb .work-markdown :where(p,ul,ol,pre,blockquote):last-child{margin-bottom:0}
 .sb .work-markdown :where(ul,ol){padding-inline-start:1.5em}

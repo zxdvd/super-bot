@@ -9,9 +9,7 @@ import { ReplyForm, TaskForm } from './forms.tsx';
 import { ChildWaitHistory, CurrentChildWaits } from './ChildWaits.tsx';
 import { ModelHistory, ModelPreview } from './ModelDetails.tsx';
 import { RecoveryPanel } from './RecoveryPanel.tsx';
-import {
-  AcceptResult, PendingResultReview, ResultCard, ResultFiles, ResultLinks, ResultLoadReceipt, ResultReport, ResultSummary,
-} from './ResultCard.tsx';
+import { ResultCard, ResultFiles, ResultLinks, ResultLoadReceipt, ResultReport, ResultSummary } from './ResultCard.tsx';
 import { deliveryLabels, ResultDeliveryCheck } from './SystemIssues.tsx';
 import { SessionControls } from './SessionControls.tsx';
 import type { Detail } from './types.ts';
@@ -47,9 +45,8 @@ function Attentions({ w, detail }: { w: WorkspaceState; detail: Detail }) {
     <AttentionBox key={attention.id} w={w} detail={detail} attention={attention}/>)}</>;
 }
 
-function PrimaryAction({ w, detail, reviewAction }: { w: WorkspaceState; detail: Detail; reviewAction: boolean }) {
-  const { task, run, result } = detail, version = { id: task.id, expectedRowVersion: task.rowVersion };
-  if (reviewAction && result && canReviewResult(task)) return <AcceptResult w={w} detail={detail}/>;
+function PrimaryAction({ w, detail }: { w: WorkspaceState; detail: Detail }) {
+  const { task, run } = detail, version = { id: task.id, expectedRowVersion: task.rowVersion };
   if (run && ['running', 'queued', 'cancelling'].includes(run.state)) return <button disabled={w.locked || run.state === 'cancelling'}
     onClick={() => w.mutate('task.stop', { requestId: `stop:${run.id}:${task.rowVersion}`, ...version })}>
     {run.state === 'cancelling' ? '正在核对停止…' : '停止执行'}</button>;
@@ -63,9 +60,8 @@ function PrimaryAction({ w, detail, reviewAction }: { w: WorkspaceState; detail:
   return null;
 }
 
-export function TaskDetailHeader({ w, detail, close, controls = true, onReturn, recoveryPanel = false, reviewAction = true }: {
+export function TaskDetailHeader({ w, detail, close, controls = true, onReturn, recoveryPanel = false }: {
   w: WorkspaceState; detail: Detail; close: () => void; controls?: boolean; onReturn?: () => void; recoveryPanel?: boolean;
-  reviewAction?: boolean;
 }) {
   const { task, binding, wait, autoDispatchPending } = detail;
   const queued = wait || autoDispatchPending;
@@ -91,7 +87,7 @@ export function TaskDetailHeader({ w, detail, close, controls = true, onReturn, 
         : '资源就绪后可手动开始。'}
     </p>}
     {controls && <div className="actions">
-      <PrimaryAction w={w} detail={detail} reviewAction={reviewAction}/>
+      <PrimaryAction w={w} detail={detail}/>
       {binding?.sessionId && !recoveryPanel && <button onClick={() => w.api.openSession(binding.sessionId!)}>打开 Worker 会话</button>}
     </div>}
   </header>;
@@ -170,7 +166,7 @@ export function LinkedTaskContent({ w, detail, link, close, onReturn }: {
     ? deliveredResult : undefined;
   return <>
     <TaskDetailHeader w={w} detail={detail} close={close} controls={current && task.lifecycle === 'review'} onReturn={onReturn}/>
-    {current ? <ResultCard w={w} detail={detail} onReturn={onReturn} exact/> : linked ? <div className="attention-box result">
+    {current ? <ResultCard w={w} detail={detail} onReturn={onReturn} view="exact"/> : linked ? <div className="attention-box result">
       <h3>历史成果 · 只读</h3>
       <p role="status">{newer ? '这份成果已被新版替代。' : '这份成果当前不可验收。'}</p>
       <ResultSummary result={linked}/>
@@ -254,6 +250,7 @@ export function TaskDrawer({ w, compact, onReturn }: { w: WorkspaceState; compac
   const detail = w.detail, close = () => { w.deselect(); w.setForm(null); w.setError(''); };
   const linked = w.link?.kind === 'task' ? undefined : w.link;
   const separateReview = !!detail?.deliveredResult && detail.deliveredResult.id !== detail.result?.id;
+  const resultBeforeProgress = !!detail?.result && !separateReview && canReviewResult(detail.task);
   const linkedContent = useRef<HTMLDivElement>(null);
   useEffect(() => {
     if (linked && detail) linkedContent.current?.focus({ preventScroll: true });
@@ -282,15 +279,15 @@ export function TaskDrawer({ w, compact, onReturn }: { w: WorkspaceState; compac
         {linked ? <div ref={linkedContent} tabIndex={-1}>
           <LinkedTaskContent w={w} detail={detail} link={linked} close={close} onReturn={onReturn}/>
         </div> : <>
-        <TaskDetailHeader w={w} detail={detail} close={close} onReturn={onReturn} recoveryPanel={!!detail.recovery?.worker}
-          reviewAction={!separateReview}/>
+        <TaskDetailHeader w={w} detail={detail} close={close} onReturn={onReturn} recoveryPanel={!!detail.recovery?.worker}/>
         {detail.recovery && <RecoveryPanel w={w} detail={detail} recovery={detail.recovery}
           key={`${detail.task.id}:${detail.task.rowVersion}:${detail.recovery.attentionId}:${detail.binding?.generation}`}/>}
         <Attentions w={w} detail={detail}/>
         <CurrentChildWaits detail={detail} api={w.api} online={w.online}/>
-        <Progress detail={detail}/>
+        {!resultBeforeProgress && <Progress detail={detail}/>}
         <ResultCard w={w} detail={detail} onReturn={onReturn}/>
-        {separateReview && <PendingResultReview w={w} detail={detail} onReturn={onReturn}/>}
+        {resultBeforeProgress && <Progress detail={detail}/>}
+        {separateReview && <ResultCard w={w} detail={detail} onReturn={onReturn} view="pending-review"/>}
         <ChildWaitHistory detail={detail} api={w.api}/>
         {detail.model && detail.run && <ModelHistory key={`${w.sessionId}:${detail.task.id}:${detail.run.id}`} api={w.api}
           sessionId={w.sessionId} taskId={detail.task.id} runId={detail.run.id}/>}

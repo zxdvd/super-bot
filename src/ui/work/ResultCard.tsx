@@ -1,7 +1,7 @@
 /** The current result: summary, evidence, and accept or rework controls. */
-import { useState } from 'react';
+import { useId, useLayoutEffect, useRef, useState } from 'react';
 import { deliveryArtifactUrl } from '../../delivery-artifacts.ts';
-import type { ReloadReceipt, Result } from '../../model.ts';
+import type { ReloadReceipt, Result, Task } from '../../model.ts';
 import { resultFileUrl } from '../../work-links.ts';
 import { canReviewResult, resultHeading, time } from './format.ts';
 import { ReplyForm } from './forms.tsx';
@@ -11,8 +11,10 @@ import { ResultDeliveryCheck } from './SystemIssues.tsx';
 import { ResultFilePreview } from './ResultFilePreview.tsx';
 import { WorkMarkdown } from './WorkMarkdown.tsx';
 
-function Review({ w, detail }: { w: WorkspaceState; detail: Detail }) {
-  const { task } = detail, result = detail.result!;
+function Review({ w, task, result }: { w: WorkspaceState; task: Task; result: Result }) {
+  const accept = () => w.mutate('result.accept', {
+    requestId: `accept:${result.id}:${task.rowVersion}`, id: task.id, expectedRowVersion: task.rowVersion, resultId: result.id,
+  });
   const reject = (text: string, requestId: string) => w.mutate('result.reject', {
     requestId, id: task.id, expectedRowVersion: task.rowVersion, resultId: result.id, text,
   });
@@ -20,40 +22,47 @@ function Review({ w, detail }: { w: WorkspaceState; detail: Detail }) {
     <p className="muted">
       接受前会重新核对文件是否改变。{task.controlMode === 'paused' && '当前暂停的是自动管理，你仍可检查并接受成果。'}
     </p>
-    <details className="rework"><summary>要求返工</summary>
-      <ReplyForm key={result.id} label="返工要求" busy={w.locked} submit={reject}/>
-    </details>
+    <div className="actions result-actions">
+      {canReviewResult(task) && <button className="primary" disabled={w.locked} onClick={accept}>接受成果</button>}
+      <details className="rework"><summary>要求返工</summary>
+        <ReplyForm key={result.id} label="返工要求" busy={w.locked} submit={reject}/>
+      </details>
+    </div>
   </>;
 }
 
-export function AcceptResult({ w, detail }: { w: WorkspaceState; detail: Detail }) {
-  const { task, result } = detail;
-  if (!result || !canReviewResult(task)) return null;
-  return <button className="primary" disabled={w.locked} onClick={() => w.mutate('result.accept', {
-    requestId: `accept:${result.id}:${task.rowVersion}`, id: task.id, expectedRowVersion: task.rowVersion, resultId: result.id,
-  })}>接受成果</button>;
+function DeliveryDescription({ text, omitLinks }: { text: string; omitLinks: string[] }) {
+  const id = useId(), viewport = useRef<HTMLDivElement>(null);
+  const [overflowing, setOverflowing] = useState(false), [expanded, setExpanded] = useState(false);
+  const clipped = overflowing && !expanded;
+  useLayoutEffect(() => {
+    const element = viewport.current!, content = element.firstElementChild!;
+    const measure = () => {
+      const lineHeight = Number.parseFloat(getComputedStyle(element).lineHeight);
+      setOverflowing(content.getBoundingClientRect().height > 3 * lineHeight + 0.5);
+    };
+    measure();
+    const observer = new ResizeObserver(measure);
+    observer.observe(content);
+    return () => observer.disconnect();
+  }, [text]);
+  return <>
+    <div id={id} ref={viewport} className="delivery-description" data-clipped={clipped || undefined} onFocus={event => {
+      if (clipped && event.target.getBoundingClientRect().bottom > event.currentTarget.getBoundingClientRect().bottom) {
+        setExpanded(true);
+      }
+    }}><WorkMarkdown text={text} omitLinks={omitLinks}/></div>
+    {overflowing && <button type="button" className="small delivery-toggle" aria-expanded={expanded} aria-controls={id}
+      onClick={() => setExpanded(!expanded)}>{expanded ? '收起交付说明' : '展开交付说明'}</button>}
+  </>;
 }
 
-export function PendingResultReview({ w, detail, onReturn }: { w: WorkspaceState; detail: Detail; onReturn?: () => void }) {
-  const { result, task } = detail;
-  if (!result || task.lifecycle !== 'review') return null;
-  return <details className="advanced">
-    <summary>新成果待验收</summary>
-    <ResultDeliveryCheck w={w} result={result} status={detail.chatDelivery} onReturn={onReturn}/>
-    <ResultReport summary={result.summary} checks={result.checks}/>
-    <ResultFiles result={result} sessionId={w.sessionId}/>
-    {canReviewResult(task) && <div className="actions"><AcceptResult w={w} detail={detail}/></div>}
-    <Review w={w} detail={detail}/>
-  </details>;
-}
-
-type ResultSummaryFields = Pick<VisibleResult, 'summary' | 'deliveryText' | 'links'>;
+type ResultSummaryFields = Pick<VisibleResult, 'id' | 'summary' | 'deliveryText' | 'links'>;
 export function ResultSummary({ result }: { result: ResultSummaryFields }) {
-  const text = result.deliveryText ?? result.summary;
-  const className = result.deliveryText ? 'clamp' : 'clamp prose-preview';
   const urls = Object.values(result.links ?? {});
-  if (!urls.length && result.deliveryText === undefined) return <p className={className}>{text}</p>;
-  return <div className={className}><WorkMarkdown text={text} omitLinks={urls}/></div>;
+  if (result.deliveryText !== undefined) return <DeliveryDescription key={result.id} text={result.deliveryText} omitLinks={urls}/>;
+  if (!urls.length) return <p className="clamp prose-preview">{result.summary}</p>;
+  return <div className="clamp prose-preview"><WorkMarkdown text={result.summary} omitLinks={urls}/></div>;
 }
 
 export function ResultLinks({ links }: { links?: VisibleResult['links'] }) {
@@ -67,7 +76,7 @@ export function ResultLinks({ links }: { links?: VisibleResult['links'] }) {
   </div>;
 }
 
-export function ResultReport({ summary, checks }: { summary: string; checks: string }) {
+export function ResultReport({ summary, checks }: { summary: string; checks?: string }) {
   return <details className="prose-details"><summary>完整 Worker 报告</summary>
     <WorkMarkdown text={summary}/>
     {checks && <><p className="muted">Worker 自述的检查与未验证项</p><WorkMarkdown text={checks}/></>}
@@ -100,30 +109,41 @@ export function ResultFiles({ result, sessionId }: { result: Result; sessionId?:
   })}</ul>;
 }
 
-export function ResultCard({ w, detail, onReturn, exact = false }: {
-  w: WorkspaceState; detail: Detail; onReturn?: () => void; exact?: boolean;
+export function ResultCard({ w, detail, onReturn, view = 'delivery' }: {
+  w: WorkspaceState; detail: Detail; onReturn?: () => void; view?: 'delivery' | 'exact' | 'pending-review';
 }) {
   const { task, deliveredResult } = detail;
-  const result: VisibleResult | null | undefined = exact ? detail.linkedResult : deliveredResult ?? detail.result;
-  if (!result) return null;
+  const pending = view === 'pending-review';
+  const result: VisibleResult | null | undefined = view === 'exact' ? detail.linkedResult
+    : pending ? detail.result : deliveredResult ?? detail.result;
+  if (!result || (pending && task.lifecycle !== 'review')) return null;
   const current = detail.result?.id === result.id;
   const reworking = deliveredResult?.id === result.id && task.lifecycle !== 'cancelled'
     && (!current || task.lifecycle === 'open');
+  const reviewing = current && !reworking && task.lifecycle === 'review';
   const receipt = detail.progress?.reload;
   const matchingReceipt = receipt?.resultId === result.id ? receipt : undefined;
-  return <div className="attention-box result">
-    <h3>{reworking ? '交付 · 返工中' : resultHeading(task)}</h3>
+  const content = <>
     <ResultSummary result={result}/>
     <ResultLinks links={result.links}/>
-    {current && !reworking && <ResultDeliveryCheck w={w} result={result}
-      status={exact ? detail.linkedChatDelivery ?? detail.chatDelivery : detail.chatDelivery} onReturn={onReturn}/>}
-    <ResultReport summary={result.summary} checks={result.checks}/>
     <ResultFiles result={result} sessionId={w.sessionId}/>
+    {reviewing && result.checks && <div className="result-checks">
+      <strong>Worker 自述的检查与未验证项</strong>
+      <WorkMarkdown text={result.checks}/>
+    </div>}
+    {reviewing && <Review w={w} task={task} result={result}/>}
+    {current && !reworking && <ResultDeliveryCheck w={w} result={result}
+      status={view === 'exact' ? detail.linkedChatDelivery ?? detail.chatDelivery : detail.chatDelivery} onReturn={onReturn}/>}
+    <ResultReport summary={result.summary} checks={reviewing ? undefined : result.checks}/>
     {(matchingReceipt || current && detail.reloadEligible)
       && <ResultLoadReceipt host="本端宿主" resultId={result.id} receipt={matchingReceipt}/>}
-    {current && !reworking && (task.lifecycle === 'completed'
+    {current && !reworking && !reviewing && (task.lifecycle === 'completed'
       ? <p>{result.humanAcceptedAt ? '已由你接受。' : '已由 Bot 按授权接受。'}</p>
-      : task.lifecycle === 'review' ? <Review w={w} detail={detail}/>
-        : <p className="muted">这份结果尚不可验收，请查看当前任务状态。</p>)}
+      : <p className="muted">这份结果尚不可验收，请查看当前任务状态。</p>)}
+  </>;
+  if (pending) return <details className="advanced"><summary>新成果待验收</summary>{content}</details>;
+  return <div className="attention-box result">
+    <h3>{reworking ? '交付 · 返工中' : resultHeading(task)}</h3>
+    {content}
   </div>;
 }

@@ -11,7 +11,13 @@ export const supplementalDoc = 'https://example.feishu.cn/docx/synthetic-notes';
 export const replacementMr = 'https://gitlab.example.invalid/team/service/-/merge_requests/1092';
 export const artifactReference = 'https://reference.example.invalid/guide';
 export const artifactPortProbeGoal = '请联调并交付这项隔离任务的合成评审和方案。';
-export const artifactPortProbeText = `${artifactDeliveryText} [核对后端评审](${artifactLinks['后端 MR']})`;
+export const artifactPortProbeTail = '确认后可把本轮核对的结论作为下一次联调的起点。';
+export const artifactPortProbeText = [
+  `${artifactDeliveryText} [核对后端评审](${artifactLinks['后端 MR']})`,
+  '两条合并请求覆盖服务响应和网页提示。客户端评审核对了空结果、重试和错误提示。',
+  '联调方案记录了模拟输入、预期返回、测试顺序以及出错时应当保存的诊断信息。',
+  artifactPortProbeTail,
+].join('\n\n');
 export const artifactRevision = {
   text: '已完成返工并回读修订后的合成方案。',
   checks: '已核对修订版文件中的新增结论。',

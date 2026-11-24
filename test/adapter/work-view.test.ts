@@ -8,7 +8,7 @@ import { loadModelHistory, ModelPreview } from '../../src/ui/work/ModelDetails.t
 import { Store } from '../../src/store.ts';
 import { parseWorkLink, resultFileUrl, workUrl, type WorkLink } from '../../src/work-links.ts';
 import { LinkedTaskContent, TaskDefinition, TaskDetailHeader } from '../../src/ui/work/TaskDetail.tsx';
-import { ResultLinks, ResultLoadReceipt, ResultReport, ResultSummary } from '../../src/ui/work/ResultCard.tsx';
+import { ResultFiles, ResultLinks, ResultLoadReceipt, ResultReport, ResultSummary } from '../../src/ui/work/ResultCard.tsx';
 import { SessionControls } from '../../src/ui/work/SessionControls.tsx';
 import { ReplyForm } from '../../src/ui/work/forms.tsx';
 import { WorkMarkdown } from '../../src/ui/work/WorkMarkdown.tsx';
@@ -662,24 +662,46 @@ test('the linked task drawer offers only the exact answer or explicitly selected
     const oldSummary = '**Old** [reference](https://example.test/notes).';
     const old = ready('old', selfReported, oldSummary);
     assert.match(drawer(question)[1].props.children, /已回答/);
-    assert.equal(drawer(old)[0].props.controls, true);
+    const resultHeader = drawer(old)[0];
+    assert.equal(resultHeader.props.controls, true);
+    const [primary] = resultHeader.type(resultHeader.props).props.children.at(-1).props.children;
+    assert.equal(primary.type(primary.props), null);
     const cardChildren = (link: typeof old, eligible: boolean): any[] => {
       const card = drawer(link, eligible)[1];
-      return card.type(card.props).props.children;
+      return card.type(card.props).props.children[1].props.children;
     };
     const loadPanel = (link: typeof old, eligible: boolean) => {
       const entry = cardChildren(link, eligible).find(node => node?.type === ResultLoadReceipt);
       return entry?.type(entry.props).props.children;
     };
-    const reportView = cardChildren(old, true).find(node => node?.type === ResultReport);
-    const [reportLabel, fullSummary, checks] = reportView.type(reportView.props).props.children;
+    const [summaryView, linksView, fileView, verification, reviewView, , reportView] = cardChildren(old, true);
+    assert.equal(summaryView.type, ResultSummary);
+    assert.equal(linksView.type, ResultLinks);
+    assert.equal(fileView.type, ResultFiles);
+    assert.equal(fileView.props.result.id, old.resultId);
+    const [verificationLabel, checks] = verification.props.children;
+    assert.equal(verificationLabel.props.children, 'Worker 自述的检查与未验证项');
+    assert.equal(checks.type, WorkMarkdown);
+    assert.equal(checks.props.text, selfReported);
+    const [, reviewActions] = reviewView.type(reviewView.props).props.children;
+    const [accept, rework] = reviewActions.props.children;
+    assert.equal(accept.props.children, '接受成果');
+    assert.equal(rework.props.children[0].props.children, '要求返工');
+    const reviewVersion = {
+      id: old.taskId, expectedRowVersion: f.store.getTask(f.ta.id).rowVersion, resultId: old.resultId,
+    };
+    await accept.props.onClick();
+    await rework.props.children[1].props.submit('修正报告', 'review-rework');
+    assert.deepEqual(mutations.slice(1), [
+      ['result.accept', { requestId: `accept:${old.resultId}:${reviewVersion.expectedRowVersion}`, ...reviewVersion }],
+      ['result.reject', { requestId: 'review-rework', ...reviewVersion, text: '修正报告' }],
+    ]);
+    assert.equal(reportView.type, ResultReport);
+    const [reportLabel, fullSummary, repeatedChecks] = reportView.type(reportView.props).props.children;
     assert.equal(reportLabel.props.children, '完整 Worker 报告');
     assert.equal(fullSummary.type, WorkMarkdown);
     assert.equal(fullSummary.props.text, oldSummary);
-    const checkBlock = checks.props.children;
-    assert.equal(checkBlock[0].props.children, 'Worker 自述的检查与未验证项');
-    assert.equal(checkBlock[1].type, WorkMarkdown);
-    assert.equal(checkBlock[1].props.text, selfReported);
+    assert.equal(repeatedChecks, undefined);
     assert.match(loadPanel(old, true)[0].props.children.join(''), /本端宿主 · 暂无匹配/);
     f.store.recordDevReload(`/synthetic/${f.ta.id}`, { resultId: old.resultId, build: 'old-build', from: 'before', to: 'after', pid: 42 });
     const matched = loadPanel(old, true);
@@ -718,7 +740,7 @@ test('the linked task drawer offers only the exact answer or explicitly selected
 
 test('a legacy delivery keeps its plain preview and has no links group', () => {
   const summary = '**Worker report** with a [reference](https://example.test/reference).';
-  const preview = ResultSummary({ result: { summary, links: {} } });
+  const preview = ResultSummary({ result: { id: 'legacy', summary, links: {} } });
   assert.equal(preview.type, 'p');
   assert.equal(preview.props.className, 'clamp prose-preview');
   assert.equal(preview.props.children, summary);

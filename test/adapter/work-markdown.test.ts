@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { isValidElement, type ReactElement, type ReactNode } from 'react';
+import { ResultSummary } from '../../src/ui/work/ResultCard.tsx';
 import { WorkMarkdown } from '../../src/ui/work/WorkMarkdown.tsx';
 
 function elements(node: ReactNode): ReactElement[] {
@@ -48,4 +49,17 @@ test('work prose keeps unsafe destinations and raw HTML inert', () => {
   assert.match(textOf(view), /script encoded data\nfile relative schemeless\ncredentials attachment/);
   assert.match(textOf(view), /<img src="https:\/\/example\.test\/ignored\.png">/);
   assert.match(textOf(view), /<script type="text\/plain">synthetic markup<\/script>/);
+});
+
+test('a Bot delivery keeps Markdown and leaves named artifact actions to their links group', () => {
+  const artifact = 'https://example.test/result';
+  const reference = 'https://example.test/reference';
+  const result = { id: 'delivery', summary: 'Worker report', links: { 成果: artifact },
+    deliveryText: `**准备完成** [成果](${artifact}) [参考](${reference})` };
+  const description = ResultSummary({ result });
+  assert.equal(description.key, result.id);
+  const view = WorkMarkdown(description.props);
+  assert.equal(textOf(view), '准备完成 成果 参考');
+  assert.equal(textOf(elements(view).find(node => node.type === 'strong')), '准备完成');
+  assert.deepEqual(elements(view).filter(node => node.type === 'a').map(node => node.props.href), [reference]);
 });
