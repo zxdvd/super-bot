@@ -4,6 +4,10 @@ import {mkdirSync,mkdtempSync,rmSync,realpathSync} from 'node:fs';
 import {join} from 'node:path';
 import {Store} from '../src/store.ts';
 
+const mr = 'https://gitlab.example.test/team/app/-/merge_requests/1087';
+const cr = 'https://review.example.test/c/client/+/1842763';
+const doc = 'https://example.feishu.cn/docx/fixture';
+
 function fixture(store:Store) {
   const bot=store.createBot('bot',{name:'Delivery fixture',instructions:'Synthetic files'});
   const manager=store.beginManager('manager',bot.id,'/synthetic/manager');store.confirmManager(manager.id,manager.requestedSessionId);
@@ -15,6 +19,98 @@ function fixture(store:Store) {
   const event=store.pendingManagerEvents(bot.id).find(item=>item.id===`manager-event:settled:${run.id}`)!;
   return {bot,manager,task,run,result,event};
 }
+
+test('registered delivery links require a durable receipt and KV patches preserve delivery and acceptance',()=>{
+  const store=new Store(':memory:');
+  try {
+    const {bot,manager,task,result}=fixture(store),resultId=result.resultId!,sessionId=manager.requestedSessionId;
+    const delivery={taskId:task.id,resultId,text:'两项内容已检查'};
+    const initial={后端MR:mr,前端MR:`${mr}?variant=web`,客户端CR:cr,方案:doc};
+    const submit=(id:string,links:unknown)=>store.managerDeliver(id,bot.id,sessionId,id,delivery,{links});
+    const patch=(id:string,version:number,links:unknown,target=resultId)=>
+      store.managerUpdateDeliveryLinks(id,bot.id,sessionId,task.id,version,target,links);
+    for(const links of [null,[mr],{' ':mr},{MR:null},{MR:'javascript:alert(1)'},{MR:'/relative'},
+      {MR:'https://name:password@example.test/a'},{MR:'https://@example.test'},{MR:'https:////example.test/'}]) {
+      assert.throws(()=>submit('invalid',links),{code:'invalid-delivery-links'});
+    }
+    submit('first',initial);
+    const reverse=Object.fromEntries(Object.entries(initial).reverse());
+    assert.deepEqual(submit('first',reverse),delivery);
+    assert.deepEqual(submit('same-pending',reverse),delivery);
+    assert.throws(()=>submit('changed-pending',{MR:mr}),{code:'result-stale'});
+    assert.equal(store.taskDetail(task.id).deliveredResult,null);
+    assert.throws(()=>patch('pending',store.getTask(task.id).rowVersion,{MR:mr}),{code:'result-stale'});
+    const deliveryEvent=`manager-event:delivery:${resultId}`;
+    store.managerNotificationDelivered(deliveryEvent,sessionId,{turn:1,seq:2,endSeq:3,messageId:'first-visible'});
+    assert.equal(store.taskDetail(task.id).deliveredResult?.deliveryText,delivery.text);
+    assert.deepEqual(store.taskDetail(task.id).deliveredResult?.links,initial);
+    const accepted=store.acceptResult('accept',task.id,store.getTask(task.id).rowVersion,resultId);
+    const before=store.taskDetail(task.id),proofBefore=store.db.prepare('SELECT * FROM outbox WHERE id=?').get(deliveryEvent)!;
+    const version=accepted.rowVersion,updatedMR=`${mr}-updated`;
+    assert.throws(()=>patch('invalid-patch',version,{新方案:doc,坏链接:'https://'}),{code:'invalid-delivery-links'});
+    assert.deepEqual(store.taskDetail(task.id).deliveredResult?.links,initial);
+    const update={后端MR:updatedMR,方案:null,'联调文档':doc};
+    const afterFirst={后端MR:updatedMR,前端MR:initial.前端MR,客户端CR:cr,联调文档:doc};
+    assert.deepEqual(patch('changes',version,update),afterFirst);
+    assert.deepEqual(patch('changes',version,update),afterFirst,'same request replays without writing');
+    assert.throws(()=>patch('same-key-conflict',version,{后端MR:cr}),{code:'version-conflict'});
+    const extra={'其他文档':doc};
+    assert.throws(()=>patch('different-key',version,extra),{code:'version-conflict'});
+    assert.deepEqual(patch('different-key',version+1,extra),{...afterFirst,...extra});
+    assert.deepEqual(patch('no-op',version+2,{后端MR:updatedMR,missing:null}),{...afterFirst,...extra});
+    const after=store.taskDetail(task.id);
+    assert.deepEqual(after.task,{...before.task,rowVersion:version+2});
+    assert.deepEqual(after.result,before.result);
+    assert.deepEqual(after.run,before.run);
+    assert.deepEqual(after.attentions,before.attentions);
+    assert.deepEqual(after.events,before.events);
+    assert.deepEqual(after.progress,before.progress);
+    assert.deepEqual(after.deliveredResult,{...before.deliveredResult,links:{...afterFirst,...extra}});
+    const proofAfter=store.db.prepare('SELECT * FROM outbox WHERE id=?').get(deliveryEvent)!;
+    const {links:_,...payloadBefore}=JSON.parse(String(proofBefore.payload));
+    const {links:__,...payloadAfter}=JSON.parse(String(proofAfter.payload));
+    assert.deepEqual({...proofAfter,payload:payloadAfter},{...proofBefore,payload:payloadBefore});
+    assert.equal(store.db.prepare("SELECT count(*) AS n FROM outbox WHERE json_extract(payload,'$.deliveryOnly')=1").get()?.n,1);
+  }finally{store.close();}
+});
+
+test('latest formal delivery stays visible throughout rework, with no links inherited by the new version',()=>{
+  const store=new Store(':memory:');
+  try {
+    const {bot,manager,task,result}=fixture(store),firstId=result.resultId!,sessionId=manager.requestedSessionId;
+    const deliver=(id:string,resultId:string,text:string,links?:unknown)=>{
+      store.managerDeliver(id,bot.id,sessionId,id,{taskId:task.id,resultId,text},{links});
+    };
+    const prove=(resultId:string,turn:number)=>{
+      store.managerNotificationDelivered(`manager-event:delivery:${resultId}`,sessionId,
+        {turn,seq:turn*10,endSeq:turn*10+1,messageId:`visible-${turn}`});
+    };
+    deliver('first',firstId,'第一版',{MR:mr});prove(firstId,1);
+    store.rejectResult('rework',task.id,store.getTask(task.id).rowVersion,firstId,'补充事实');
+    assert.equal(store.taskDetail(task.id).deliveredResult?.id,firstId);
+    const patch=(resultId:string)=>store.managerUpdateDeliveryLinks('late',bot.id,sessionId,task.id,
+      store.getTask(task.id).rowVersion,resultId,{MR:cr});
+    assert.throws(()=>patch(firstId),{code:'result-stale'});
+    const run=store.reserveRun('dispatch-2',task.id,store.getTask(task.id).rowVersion);
+    store.saveRunMessage(run.id,'worker-2','{}');store.claimDispatch(run.id);store.inputEntered(run.id,'worker-2',1);
+    const second=store.workerReport(run.id,'report-2',{kind:'ready',summary:`See [reference](${doc})`,
+      checks:'Read the new facts',evidence:[{path:'/synthetic/work/result.md',sha256:'synthetic',bytes:21}]});
+    store.settleRun(run.id);
+    const secondId=second.resultId!;
+    const pending=store.taskDetail(task.id);
+    assert.equal(pending.result?.id,secondId);
+    assert.equal(pending.deliveredResult?.id,firstId);
+    assert.deepEqual(pending.deliveredResult?.links,{MR:mr});
+    assert.throws(()=>patch(firstId),{code:'result-stale'});
+    store.managerReview('legacy-review',bot.id,task.id,pending.task.rowVersion,secondId,'human','新版本已检查');
+    prove(secondId,2);
+    assert.equal(store.taskDetail(task.id).deliveredResult?.id,secondId);
+    assert.equal(store.taskDetail(task.id).deliveredResult?.deliveryText,undefined);
+    assert.deepEqual(store.taskDetail(task.id).deliveredResult?.links,{});
+    assert.deepEqual(patch(secondId),{MR:cr},'a legacy delivery without a link field can be patched explicitly');
+    assert.deepEqual(store.deliveredResult(store.getTask(task.id),store.resultById(firstId)!)?.links,{MR:mr});
+  }finally{store.close();}
+});
 
 test('notification entry and managerReview are not delivery; review-to-final crash recovers only notification',()=>{
   const root=realpathSync(process.cwd());mkdirSync(join(root,'.runtime'),{recursive:true});

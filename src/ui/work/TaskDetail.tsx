@@ -1,15 +1,17 @@
 /** One task in a drawer: header with the one main action, open questions, result, workdir, definition, session and audit. */
 import type { Attention } from '../../model.ts';
-import { ownerLabel, type MirrorDetail, type MirrorEvent, type ResultRecord } from '../../mirror.ts';
+import { ownerLabel, type MirrorDetail, type MirrorEvent } from '../../mirror.ts';
 import { useEffect, useRef } from 'react';
 import { workUrl, type WorkLink } from '../../work-links.ts';
 import { ConfirmAction, Section, Tag } from '../kit.tsx';
-import { canStartTask, eventTitle, reviewLabel, settling, stageText, stageTone, time } from './format.ts';
+import { canReviewResult, canStartTask, eventTitle, reviewLabel, settling, stageText, stageTone, time } from './format.ts';
 import { ReplyForm, TaskForm } from './forms.tsx';
 import { ChildWaitHistory, CurrentChildWaits } from './ChildWaits.tsx';
 import { ModelHistory, ModelPreview } from './ModelDetails.tsx';
 import { RecoveryPanel } from './RecoveryPanel.tsx';
-import { ResultCard, ResultFiles, ResultLoadReceipt, ResultReport } from './ResultCard.tsx';
+import {
+  AcceptResult, PendingResultReview, ResultCard, ResultFiles, ResultLinks, ResultLoadReceipt, ResultReport, ResultSummary,
+} from './ResultCard.tsx';
 import { deliveryLabels, ResultDeliveryCheck } from './SystemIssues.tsx';
 import { SessionControls } from './SessionControls.tsx';
 import type { Detail } from './types.ts';
@@ -45,13 +47,9 @@ function Attentions({ w, detail }: { w: WorkspaceState; detail: Detail }) {
     <AttentionBox key={attention.id} w={w} detail={detail} attention={attention}/>)}</>;
 }
 
-function PrimaryAction({ w, detail }: { w: WorkspaceState; detail: Detail }) {
+function PrimaryAction({ w, detail, reviewAction }: { w: WorkspaceState; detail: Detail; reviewAction: boolean }) {
   const { task, run, result } = detail, version = { id: task.id, expectedRowVersion: task.rowVersion };
-  if (!task.blockingAttention && task.status !== 'recovery' && task.lifecycle === 'review' && result) return <button className="primary"
-    disabled={w.locked}
-    onClick={() => w.mutate('result.accept', {
-    requestId: `accept:${result.id}:${task.rowVersion}`, ...version, resultId: result.id,
-  })}>接受成果</button>;
+  if (reviewAction && result && canReviewResult(task)) return <AcceptResult w={w} detail={detail}/>;
   if (run && ['running', 'queued', 'cancelling'].includes(run.state)) return <button disabled={w.locked || run.state === 'cancelling'}
     onClick={() => w.mutate('task.stop', { requestId: `stop:${run.id}:${task.rowVersion}`, ...version })}>
     {run.state === 'cancelling' ? '正在核对停止…' : '停止执行'}</button>;
@@ -65,8 +63,9 @@ function PrimaryAction({ w, detail }: { w: WorkspaceState; detail: Detail }) {
   return null;
 }
 
-export function TaskDetailHeader({ w, detail, close, controls = true, onReturn, recoveryPanel = false }: {
+export function TaskDetailHeader({ w, detail, close, controls = true, onReturn, recoveryPanel = false, reviewAction = true }: {
   w: WorkspaceState; detail: Detail; close: () => void; controls?: boolean; onReturn?: () => void; recoveryPanel?: boolean;
+  reviewAction?: boolean;
 }) {
   const { task, binding, wait, autoDispatchPending } = detail;
   const queued = wait || autoDispatchPending;
@@ -92,7 +91,7 @@ export function TaskDetailHeader({ w, detail, close, controls = true, onReturn, 
         : '资源就绪后可手动开始。'}
     </p>}
     {controls && <div className="actions">
-      <PrimaryAction w={w} detail={detail}/>
+      <PrimaryAction w={w} detail={detail} reviewAction={reviewAction}/>
       {binding?.sessionId && !recoveryPanel && <button onClick={() => w.api.openSession(binding.sessionId!)}>打开 Worker 会话</button>}
     </div>}
   </header>;
@@ -153,7 +152,7 @@ function Audit({ detail, readOnly = false }: { detail: Pick<Detail, 'task'> & { 
 export function LinkedTaskContent({ w, detail, link, close, onReturn }: {
   w: WorkspaceState; detail: Detail; link: Exclude<WorkLink, { kind: 'task' }>; close: () => void; onReturn?: () => void;
 }) {
-  const { task, result } = detail;
+  const { task, result, deliveredResult } = detail;
   if (link.kind === 'question') {
     const question = detail.attentions.find(a => a.id === link.attentionId && a.taskId === task.id && a.kind === 'input');
     const current = task.id === link.taskId && question?.taskRevision === task.taskRevision ? question : undefined;
@@ -167,17 +166,18 @@ export function LinkedTaskContent({ w, detail, link, close, onReturn }: {
   const linked = detail.linkedResult?.id === link.resultId && detail.linkedResult.taskId === link.taskId
     && task.id === link.taskId ? detail.linkedResult : undefined;
   const current = !!linked && result?.id === linked.id;
-  const newer = linked && result && !current ? result : undefined;
+  const newer = linked && deliveredResult && deliveredResult.id !== linked.id && deliveredResult.createdAt >= linked.createdAt
+    ? deliveredResult : undefined;
   return <>
     <TaskDetailHeader w={w} detail={detail} close={close} controls={current && task.lifecycle === 'review'} onReturn={onReturn}/>
-    {current ? <ResultCard w={w} detail={detail} onReturn={onReturn}/> : linked ? <div className="attention-box result">
+    {current ? <ResultCard w={w} detail={detail} onReturn={onReturn} exact/> : linked ? <div className="attention-box result">
       <h3>历史成果 · 只读</h3>
       <p role="status">{newer ? '这份成果已被新版替代。' : '这份成果当前不可验收。'}</p>
-      <p className="clamp prose-preview">{linked.summary}</p>
+      <ResultSummary result={linked}/>
+      <ResultLinks links={linked.links}/>
       <ResultReport summary={linked.summary} checks={linked.checks}/>
       <ResultFiles result={linked} sessionId={w.sessionId}/>
-      {newer && ['review', 'completed'].includes(task.lifecycle)
-        && <a href={workUrl({ kind: 'result', taskId: task.id, resultId: newer.id })}>查看新版成果</a>}
+      {newer && <a href={workUrl({ kind: 'result', taskId: task.id, resultId: newer.id })}>查看当前交付</a>}
       <ResultDeliveryCheck w={w} result={linked} status={detail.linkedChatDelivery} onReturn={onReturn} historical/>
     </div> : <p role="status">这个成果链接无效或不属于此任务。</p>}
     {current && <Progress detail={detail}/>}
@@ -215,24 +215,15 @@ function Progress({ detail }: { detail: Detail | MirrorDetail }) {
   </Section>;
 }
 
-const verdictLabels: Record<string, string> = {
-  accepted: '接受', accept: '接受', rejected: '要求返工', rework: '要求返工', human: '转人工验收',
-};
-
-function MirrorResult({ result }: { result: ResultRecord }) {
-  return <>
-    <p className="prose-preview">{result.summary}</p><ResultReport summary={result.summary} checks={result.checks}/>
-    <p className="muted">成果 {result.id} · {time(result.createdAt)}
-      {result.humanAcceptedAt !== null && ` · 人工接受于 ${time(result.humanAcceptedAt)}`}</p>
-    {result.fileCount > 0 && <p className="muted">已报告 {result.fileCount} 份文件，请在创建端打开或下载附件。</p>}
-  </>;
-}
-
 function MirrorTaskContent({ w, detail, owner, close }: {
   w: WorkspaceState; detail: MirrorDetail; owner: keyof typeof ownerLabel; close: () => void;
 }) {
-  const { task, result, records, chatDelivery } = detail;
-  const history = records.results.filter(record => record.id !== result?.id);
+  const { task, deliveredResult, chatDelivery } = detail;
+  const result = deliveredResult ?? detail.result;
+  const reworking = !!deliveredResult && task.lifecycle !== 'cancelled'
+    && (deliveredResult.id !== detail.result?.id || task.lifecycle === 'open');
+  const heading = reworking ? '交付 · 返工中' : task.lifecycle === 'review' ? '成果 · 待来源端验收'
+    : task.lifecycle === 'completed' ? '成果 · 已接受' : '成果记录';
   return <>
     <header className="drawer-head">
       <div className="drawer-title"><Tag tone={stageTone(task)}>{stageText(task, true)}</Tag><span className="spacer"/>
@@ -242,19 +233,18 @@ function MirrorTaskContent({ w, detail, owner, close }: {
     </header>
     <Progress detail={detail}/>
     {result && <div className="attention-box result">
-      <h3>{task.lifecycle === 'review' ? '成果 · 待来源端验收' : task.lifecycle === 'completed' ? '成果 · 已接受' : '成果记录'}</h3>
-      {chatDelivery && <p className="muted">{deliveryLabels[chatDelivery]}</p>}
-      <MirrorResult result={result}/>
-      {detail.progress?.reload && <ResultLoadReceipt host={`创建端 ${ownerLabel[owner]}`} resultId={result.id}
+      <h3>{heading}</h3>
+      <ResultSummary result={result}/>
+      <ResultLinks links={deliveredResult?.links}/>
+      {!reworking && result.id === detail.result?.id && chatDelivery && <p className="muted">{deliveryLabels[chatDelivery]}</p>}
+      <ResultReport summary={result.summary} checks={result.checks}/>
+      {result.humanAcceptedAt !== null && <p className="muted">人工接受于 {time(result.humanAcceptedAt)}</p>}
+      {result.fileCount > 0 && <p className="muted">已报告 {result.fileCount} 份文件，请在创建端打开或下载附件。</p>}
+      {result.id === detail.result?.id && detail.progress?.reload
+        && <ResultLoadReceipt host={`创建端 ${ownerLabel[owner]}`} resultId={result.id}
         receipt={detail.progress.reload}/>}
     </div>}
     <TaskDefinition w={w} detail={detail}/>
-    {(history.length > 0 || records.reviews.length > 0) && <details className="advanced"><summary>历史成果与验收记录</summary>
-      {records.reviews.map(review => <p key={review.id}>{time(review.createdAt)} · {review.actor === 'user' ? '用户' : 'Bot'}
-        {` · ${verdictLabels[review.verdict] ?? review.verdict} · 成果 ${review.resultId}`}</p>)}
-      {history.map(record => <div key={record.id} className="attention-box"><MirrorResult result={record}/></div>)}
-      {(records.moreResults || records.moreReviews) && <p className="muted">更多记录请在创建端核对。</p>}
-    </details>}
     <Audit detail={detail} readOnly/>
   </>;
 }
@@ -263,6 +253,7 @@ function MirrorTaskContent({ w, detail, owner, close }: {
 export function TaskDrawer({ w, compact, onReturn }: { w: WorkspaceState; compact: boolean; onReturn?: () => void }) {
   const detail = w.detail, close = () => { w.deselect(); w.setForm(null); w.setError(''); };
   const linked = w.link?.kind === 'task' ? undefined : w.link;
+  const separateReview = !!detail?.deliveredResult && detail.deliveredResult.id !== detail.result?.id;
   const linkedContent = useRef<HTMLDivElement>(null);
   useEffect(() => {
     if (linked && detail) linkedContent.current?.focus({ preventScroll: true });
@@ -291,13 +282,15 @@ export function TaskDrawer({ w, compact, onReturn }: { w: WorkspaceState; compac
         {linked ? <div ref={linkedContent} tabIndex={-1}>
           <LinkedTaskContent w={w} detail={detail} link={linked} close={close} onReturn={onReturn}/>
         </div> : <>
-        <TaskDetailHeader w={w} detail={detail} close={close} onReturn={onReturn} recoveryPanel={!!detail.recovery?.worker}/>
+        <TaskDetailHeader w={w} detail={detail} close={close} onReturn={onReturn} recoveryPanel={!!detail.recovery?.worker}
+          reviewAction={!separateReview}/>
         {detail.recovery && <RecoveryPanel w={w} detail={detail} recovery={detail.recovery}
           key={`${detail.task.id}:${detail.task.rowVersion}:${detail.recovery.attentionId}:${detail.binding?.generation}`}/>}
         <Attentions w={w} detail={detail}/>
         <CurrentChildWaits detail={detail} api={w.api} online={w.online}/>
         <Progress detail={detail}/>
         <ResultCard w={w} detail={detail} onReturn={onReturn}/>
+        {separateReview && <PendingResultReview w={w} detail={detail} onReturn={onReturn}/>}
         <ChildWaitHistory detail={detail} api={w.api}/>
         {detail.model && detail.run && <ModelHistory key={`${w.sessionId}:${detail.task.id}:${detail.run.id}`} api={w.api}
           sessionId={w.sessionId} taskId={detail.task.id} runId={detail.run.id}/>}

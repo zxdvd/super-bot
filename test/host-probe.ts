@@ -19,6 +19,8 @@ import { DshExecution } from '../src/dsh.ts';
 import { Managers } from '../src/manager.ts';
 import { SessionId } from '@deepseek-ai/dsh-session/types';
 import type {SessionStore} from '@deepseek-ai/dsh-session';
+import { artifactDeliveryText, artifactEditReply, artifactGoal, artifactLinks, artifactPortProbeGoal, artifactPortProbeText, artifactReference,
+  artifactRevision, replacementMr, supplementalDoc } from './delivery-link-fixture.ts';
 
 declare module '@deepseek-ai/dsh-llm' {
   interface MessageSourceMap {
@@ -93,6 +95,8 @@ class ProbeAdapter extends LlmAdapter {
       const workConvention=text.match(/^请核对这项任务的实际工作约定：([a-f0-9-]+)$/);
       const decision=text==='上次为什么选蓝色主题？'||text==='请查另一 Bot 的决策条目。';
       const convention=text==='现在默认工作约定是什么？';
+      const editTarget=trigger?.source?.kind==='user'&&text.startsWith('请更新这项交付 ')
+        ? text.match(/#super-bot-task=([a-f0-9-]+)&resultId=([a-f0-9-]+)/) : null;
       if(trigger?.source?.kind==='user'&&(remember||delegate||decision||convention||workConvention)) {
         if(!prior) {
           if(remember)plan={action:'memory-save-convention',text:remember[1]};
@@ -114,6 +118,8 @@ class ProbeAdapter extends LlmAdapter {
         if(foreign)plan={action:'detail',taskId:foreign};
         else if(trigger?.source?.kind==='user'&&text==='请用 Shell 运行本机命令，把合成检查结果保存成文件。')plan={action:'create',goal:'LOCAL_CLI_PROBE',scope:'只在任务目录运行合成 Shell 命令，不访问外部服务',acceptance:'result.md 内容为 LOCAL_CLI_OK'};
         else if(trigger?.source?.kind==='user'&&['DF14_RECEIPT_PROBE','MIRROR_PROGRESS_PROBE'].includes(text))plan={action:'create',goal:text,scope:'专用任务目录，不访问网络',acceptance:'result.md 包含两项合成事实并已回读'};
+        else if(trigger?.source?.kind==='user'&&[artifactGoal,artifactPortProbeGoal].includes(text))plan={action:'create',goal:text,scope:'隔离合成链接和本地证据',acceptance:'报告明确的交付物和回读记录'};
+        else if(editTarget)plan={action:'detail',taskId:editTarget[1]};
         else if(trigger?.source?.kind==='user'&&text.startsWith('DF14_SHOW_RESULT:'))plan={action:'detail',taskId:text.slice('DF14_SHOW_RESULT:'.length)};
         else if(trigger?.source?.kind==='user'&&(text.includes('MANAGER_PROBE')||text==='请写一份简短的说明，包含两项事实，完成后给我文件。'||text==='请写一份说明，先确认读者。'))plan={action:'create',goal:text.includes('先确认读者')?'ASK_PROBE':'Manager 生成合成说明',scope:'专用任务目录，不访问网络',acceptance:'result.md 包含两项事实并已回读'};
         else if(trigger?.source?.kind==='user'&&(text==='读者是新同事，保持简短。'||text==='再加一句结论。'))plan={action:'list'};
@@ -126,6 +132,11 @@ class ProbeAdapter extends LlmAdapter {
         const queued=tasks.find(t=>t.status==='unscheduled'&&t.controlMode==='auto');
         if(target)plan={action:'detail',taskId:target.id};else if(review)plan={action:'detail',taskId:review.id};else if(queued)plan={action:'dispatch',taskId:queued.id,expectedRowVersion:queued.rowVersion};
       }else if((['create','respond','rework'].includes(String(prior.action))||value?.prepared)&&value?.task&&!value?.run&&!value?.deferred)plan={action:'dispatch',taskId:value.task.id,expectedRowVersion:value.task.rowVersion};
+      else if(prior.action==='detail'&&editTarget&&value?.deliveredResult?.id===editTarget[2]) {
+        const links=text.includes(supplementalDoc)?{'飞书文档 · 联调纪要':supplementalDoc}:
+          text.includes(replacementMr)?{'后端 MR':replacementMr,'飞书文档 · 联调方案':null}:null;
+        if(links)plan={action:'update_delivery_links',taskId:value.task.id,resultId:editTarget[2],expectedRowVersion:value.task.rowVersion,links};
+      }
       else if(prior.action==='detail'&&value?.task?.controlMode==='auto') {
         if(trigger?.source?.kind==='user'&&text==='再加一句结论。'&&value.result)plan={action:'rework',taskId:value.task.id,expectedRowVersion:value.task.rowVersion,resultId:value.result.id};
         else if(trigger?.source?.kind==='user'&&text==='读者是新同事，保持简短。'&&value.pendingQuestions?.[0])plan={action:'respond',taskId:value.task.id,expectedRowVersion:value.task.rowVersion,attentionId:value.pendingQuestions[0].id};
@@ -136,6 +147,16 @@ class ProbeAdapter extends LlmAdapter {
       }
       if(prior?.action==='review'&&value?.task?.goal==='DF14_RECEIPT_PROBE') {
         plan={action:'deliver',taskId:prior.taskId,resultId:prior.resultId,text:'已写入并回读合成事实，待你确认。'};
+      }
+      if(prior?.action==='review'&&[artifactGoal,artifactPortProbeGoal].includes(value?.task?.goal)) {
+        const workerSummary=later.filter(m=>m.role==='tool').flatMap(m=>m.content).filter(b=>b.type==='text')
+          .map(b=>{try{return JSON.parse(b.text).result?.summary??'';}catch{return '';}}).find(Boolean);
+        const held=value?.task?.goal===artifactPortProbeGoal;
+        const revised=held&&workerSummary?.startsWith(artifactRevision.text);
+        const links=revised?artifactRevision.links:artifactLinks;
+        assert.ok(Object.values(links).every(url=>workerSummary?.includes(url)));
+        const text=revised?artifactRevision.text:held?artifactPortProbeText:artifactDeliveryText;
+        plan={action:'deliver',taskId:prior.taskId,resultId:prior.resultId,text,links};
       }
       if(plan) {
         if(options.sessionId){const attempts=this.managerAttempts.get(options.sessionId)??[];attempts.push(plan);this.managerAttempts.set(options.sessionId,attempts);}
@@ -149,6 +170,10 @@ class ProbeAdapter extends LlmAdapter {
       let reply='已核对当前状态。';
       if(trigger?.source?.kind==='user'&&text.startsWith('CHAT_LINK_MARKDOWN:'))reply=text.slice('CHAT_LINK_MARKDOWN:'.length);
       else if(trigger?.source?.kind==='user'&&text.startsWith('FEISHU_SMOKE_'))reply=`已收到 ${text}`;
+      else if(prior?.action==='deliver'&&prior.links&&prior.text!==artifactPortProbeText&&prior.text!==artifactRevision.text) {
+        reply=later.findLast(m=>m.role==='tool')?.content.filter(b=>b.type==='text').map(b=>b.text).join('\n')??'';
+      }
+      else if(prior?.action==='update_delivery_links'&&value?.links)reply=artifactEditReply;
       else if(prior?.action==='deliver')reply='请查看上面的交付卡片。';
       else if(detail?.delivery&&(prior?.action==='review'||text.startsWith('DF14_SHOW_RESULT:'))) {
         reply=`等待你确认。\n${detail.delivery.chatMarkdown}`;
@@ -200,6 +225,11 @@ class ProbeAdapter extends LlmAdapter {
       const needsAnswer=body.includes('Goal: ASK_PROBE')&&!hasAnswer;
       const localCli=body.includes('Goal: LOCAL_CLI_PROBE');
       const progressProbe=body.includes('Goal: MIRROR_PROGRESS_PROBE');
+      const revisedArtifact=body.includes(`Goal: ${artifactPortProbeGoal}`)&&body.includes('Additional user input (rework):');
+      const reportedArtifacts=body.includes(`Goal: ${artifactGoal}`)||body.includes(`Goal: ${artifactPortProbeGoal}`);
+      const artifactReport=reportedArtifacts
+        ? [revisedArtifact?artifactRevision.text:'已核对合成交付物。',
+          ...Object.entries(revisedArtifact?artifactRevision.links:artifactLinks).map(([name,url])=>`- [${name}](${url})`)].join('\n') : null;
       const revisedReceipt=body.includes('Goal: DF14_RECEIPT_PROBE')&&body.includes('Additional user input (rework):');
       const reports=progressProbe?later.flatMap(m=>m.content.flatMap(b=>b.type==='tool-call'&&b.name==='super_bot_report'?[JSON.parse(b.arguments).kind]:[])):[];
       const planned=progressProbe&&!reports.includes('progress')?{name:'super_bot_report',args:{kind:'progress',summary:'MIRROR_NATIVE_PROGRESS'}}:
@@ -208,7 +238,7 @@ class ProbeAdapter extends LlmAdapter {
         !localCli&&!calls.includes('write')?{name:'write',args:{file_path:body.includes('Goal: RELATIVE_PATH_PROBE')?'result.md':file,content:'# 合成成果\n\n事实一：这份文档由隔离测试模型生成。\n事实二：测试没有访问网络或使用模型凭证。\n'+(body.includes('Additional user input (rework):')?'\n修订：已按返工要求补充说明。\n':'')+(body.includes('Goal: LARGE_RESULT_PROBE')?'\n'+'x'.repeat(16000):'')+
            (body.includes('Goal: MEMORY_WORK_A')?'\n蓝色主题便于区分合成环境。\n合成归档按季度组织。\n':'')}}:
         !calls.includes('read')?{name:'read',args:{file_path:file}}:
-        (progressProbe?!reports.includes('ready'):!calls.includes('super_bot_report'))?{name:'super_bot_report',args:{kind:'ready',summary:localCli?'已执行本机 Shell 并生成合成结果。':revisedReceipt?'已提交合成说明的修订版。':'已生成并回读两项事实的说明文件。',checks:localCli?'原生 bash 执行后已 read 回读 LOCAL_CLI_OK。':revisedReceipt?'已回读修订版新增的结论。':'result.md 包含标题和两项事实；已用原生 read 工具回读核对。',files:[file]}}:null;
+        (progressProbe?!reports.includes('ready'):!calls.includes('super_bot_report'))?{name:'super_bot_report',args:{kind:'ready',summary:artifactReport??(localCli?'已执行本机 Shell 并生成合成结果。':revisedReceipt?'已提交合成说明的修订版。':'已生成并回读两项事实的说明文件。'),checks:revisedArtifact?artifactRevision.checks:artifactReport?`已回读合成证据。参考资料：[方案模板](${artifactReference})。`:localCli?'原生 bash 执行后已 read 回读 LOCAL_CLI_OK。':revisedReceipt?'已回读修订版新增的结论。':'result.md 包含标题和两项事实；已用原生 read 工具回读核对。',files:[file]}}:null;
       if(planned) {
         const id=ToolCallId(randomUUID()),args=JSON.stringify(planned.args);
         yield {type:'block-start',index:0,blockType:'tool-call'};

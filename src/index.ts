@@ -186,7 +186,7 @@ export async function apply(ctx: Context, config: RuntimeOptions & {
           reloadEligible: snapshot.binding?.cwd === source };
         if (payload.resultId === undefined) return { ok: true, value: detail };
         const result = store.resultById(requiredText(payload.resultId, '成果标识', 200));
-        const linkedResult = result?.taskId === task.id ? result : null;
+        const linkedResult = result?.taskId === task.id ? store.deliveredResult(task, result) ?? result : null;
         const linkedChatDelivery = linkedResult?.id === detail.result?.id ? detail.chatDelivery : store.chatDeliveryStatus(task, linkedResult, true);
         return { ok: true, value: { ...detail, linkedResult, linkedChatDelivery, linkedResultBelongs: linkedResult !== null } };
       }

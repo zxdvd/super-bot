@@ -9,6 +9,7 @@ import {Managers} from '../../src/manager.ts';
 import type {DshExecution} from '../../src/dsh.ts';
 import {collectEvidence} from '../../src/evidence.ts';
 import {readLocalMirror} from '../../src/mirror-queries.ts';
+import type {MirrorDetail} from '../../src/mirror.ts';
 
 async function fixture(t:TestContext,fullAccess?:boolean,extra:Record<string,unknown>={},fileName='result.md') {
   t.mock.timers.enable({apis:['Date','setInterval']});
@@ -602,15 +603,68 @@ test('automatic question notice and detail use the exact pending Worker question
 
 test('delivery-only recovery may call deliver for its own result only',async t=>{
   const f=await fixture(t);try {
-    await f.pulse();await f.enter(1);await f.review();await f.end(1,false);
+    await f.pulse();await f.enter(1);await f.review();
+    const args={action:'deliver',taskId:f.task.id,resultId:f.report.resultId,text:'写好两项事实'};
+    const artifactLinks={方案:'https://example.feishu.cn/docx/fixture'};
+    await f.call('first',{...args,links:artifactLinks});
+    await f.end(1,false);
     await f.reload();await f.pulse();assert.equal(f.counts().followups,2);await f.enter(2);
     await assert.rejects(f.call('wrong-result',{action:'deliver',taskId:f.task.id,resultId:'other',text:'x'}),{code:'delivery-only'});
-    const value=await f.call('scoped',{action:'deliver',taskId:f.task.id,resultId:f.report.resultId,text:'补交付'});
+    await assert.rejects(f.call('new-links',{...args,links:{坏替换:'https://example.test/wrong'}}),{code:'delivery-only'});
+    await assert.rejects(f.call('patch-links',{...args,action:'update_delivery_links',links:artifactLinks}),{code:'delivery-only'});
+    const value=await f.call('scoped',{...args,text:'补交付'});
     assert.equal(value.delivery.resultId,f.report.resultId);assert.equal(f.state()?.state,'entered');
     await f.assistant(2,[{type:'text',text:'已交付。'}]);await f.end(2);assert.equal(f.state()?.state,'pending');
     await f.pulse(30000);assert.equal(f.counts().followups,3);await f.enter(3);
     await f.assistant(3,[{type:'text',text:value.delivery.markdown}]);await f.end(3);
     assert.equal(f.state()?.state,'done');assert.equal(f.counts().dispatches,0);
+    const delivered=f.store.taskDetail(f.task.id).deliveredResult;
+    assert.deepEqual(delivered?.links,artifactLinks);
+    assert.equal(delivered?.deliveryText,args.text);
+  }finally{await f.close();}
+});
+
+test('only the current owner turn can patch its referenced formal result, and the mirror reads that result',async t=>{
+  const f=await fixture(t);try {
+    const resultId=f.report.resultId!,taskId=f.task.id;
+    const initial={MR:'https://git.example.test/team/project/-/merge_requests/7'};
+    const deliver={action:'deliver',taskId,resultId,text:'写好两项事实',links:initial};
+    await f.emit('turn/start',{turn:1});
+    await f.emit('user/message',{id:'external-source',source:{kind:'user',rpcId:'external',principal:{id:'external'}},
+      content:[{type:'text',text:'登记链接'}]},'append');
+    await assert.rejects(f.call('untrusted-deliver',deliver),{code:'manager-scope'});
+    await f.end(1);
+    await f.pulse();await f.enter(2);await f.review(2);
+    const version=f.store.getTask(taskId).rowVersion;
+    const {delivery}=await f.call('delivery',deliver);
+    const update={action:'update_delivery_links',taskId,resultId,expectedRowVersion:version,
+      links:{方案:'https://example.feishu.cn/docx/fixture'}};
+    assert.equal(f.store.taskDetail(taskId).deliveredResult,null);
+    await assert.rejects(f.call('notification',update),{code:'human-message-required'});
+    await f.assistant(2,[{type:'text',text:delivery.markdown}]);await f.end(2);
+
+    await f.emit('turn/start',{turn:3});
+    await f.emit('user/message',{id:'non-owner',source:{kind:'user',rpcId:'non-owner',principal:{id:'non-owner'}},
+      content:[{type:'text',text:'添加链接'}]},'append');
+    await assert.rejects(f.call('non-owner',update),{code:'human-message-required'});
+    await f.end(3);
+
+    await f.emit('turn/start',{turn:4});
+    const owner={kind:'user',rpcId:'owner'};
+    const workUrl=`https://example.test${delivery.workUrl}`;
+    await f.emit('user/message',{id:'wrong-source',source:owner,
+      content:[{type:'text',text:`更新这项交付 ${workUrl.replace(resultId,f.bot.id)}，添加链接`}]},'append');
+    await assert.rejects(f.call('wrong-source',update),{code:'result-stale'});
+    await f.emit('user/message',{id:'correct-source',source:owner,
+      content:[{type:'text',text:`更新这项交付 ${workUrl}，添加方案链接`}]},'append');
+    assert.deepEqual(await f.call('owner-update',update),{links:{...initial,...update.links}});
+    const mirror=readLocalMirror(f.store,{op:'detail',id:taskId,botId:f.bot.id}) as MirrorDetail;
+    assert.deepEqual(mirror.deliveredResult?.links,{...initial,...update.links});
+    assert.equal(mirror.deliveredResult?.deliveryText,'写好两项事实');
+    assert.equal(mirror.deliveredResult?.fileCount,1);
+    assert.ok(!Object.hasOwn(mirror.deliveredResult??{},'evidence'));
+    await f.end(4);
+    await assert.rejects(f.call('owner-update',update),{code:'human-message-required'});
   }finally{await f.close();}
 });
 

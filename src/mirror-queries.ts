@@ -1,6 +1,6 @@
-import { AppError, type Task } from './model.ts';
+import { AppError, type Result, type Task } from './model.ts';
 import type { MirrorQuery } from './mirror-host.ts';
-import type { MirrorDetail, MirrorEvent } from './mirror.ts';
+import type { MirrorDetail, MirrorEvent, ResultRecord } from './mirror.ts';
 import type { Store } from './store.ts';
 
 // Keep the wire projection explicit. The local queries can include Bot context, native session IDs and paths.
@@ -10,6 +10,10 @@ function taskRecord(task: Task, detail: boolean): Task {
   return { id, botId, goal, scope: detail ? scope : '', acceptance: detail ? acceptance : '', reviewPolicy, lifecycle,
     controlMode, taskRevision, rowVersion, sessionId: null, createdAt, updatedAt, status, managerReviewed, blockingAttention,
     deliveredAt, botConfigRevision };
+}
+
+function resultRecord({ id, runId, taskRevision, summary, checks, createdAt, humanAcceptedAt, evidence }: Result): ResultRecord {
+  return { id, runId, taskRevision, summary, checks, createdAt, humanAcceptedAt, fileCount: evidence.length };
 }
 
 function auditRecord({ id, kind, createdAt, data }: MirrorEvent): MirrorEvent {
@@ -40,13 +44,14 @@ export function readLocalMirror(store: Store, query: MirrorQuery) {
   const task = store.getTask(query.id);
   if (task.botId !== query.botId) throw new AppError('not-found', '任务不属于此 Bot。');
   const detail = store.taskDetail(task.id), run = detail.run;
-  const result = detail.result, { reload, ...progress } = detail.progress;
+  const { result, deliveredResult } = detail, { reload, ...progress } = detail.progress;
   return {
     task: taskRecord(detail.task, true), records: store.taskResultRecords(task.id),
     events: detail.events.map(auditRecord), chatDelivery: detail.chatDelivery?.state ?? null,
     progress: { ...progress, reload: reload && { build: reload.build, at: reload.at } },
     run: run && { id: run.id, state: run.state, createdAt: run.createdAt, finishedAt: run.finishedAt },
-    result: result && { id: result.id, runId: result.runId, taskRevision: result.taskRevision, summary: result.summary,
-      checks: result.checks, createdAt: result.createdAt, humanAcceptedAt: result.humanAcceptedAt, fileCount: result.evidence.length },
+    result: result && resultRecord(result),
+    deliveredResult: deliveredResult && { ...resultRecord(deliveredResult),
+      deliveredAt: deliveredResult.deliveredAt, deliveryText: deliveredResult.deliveryText, links: deliveredResult.links },
   } satisfies MirrorDetail;
 }

@@ -9,6 +9,8 @@ import { setTimeout as delay } from 'node:timers/promises';
 import { build } from 'esbuild';
 import { authenticateHost } from './host-client.mjs';
 import { alternateCredentials, existingGroup, fixtureCredentials } from '../test/feishu-host-transport.ts';
+import { artifactDeliveryText, artifactEditReply, artifactGoal, artifactLinks, artifactReference,
+  replacementMr, supplementalDoc } from '../test/delivery-link-fixture.ts';
 
 const root = fileURLToPath(new URL('..', import.meta.url));
 await mkdir(join(root, '.runtime'), { recursive: true });
@@ -193,6 +195,74 @@ const sent = async (client, group, marker) => (await feishu(client, 'sent')).sen
   item.chatId === group.chatId && item.text.includes(marker));
 const hasSent = (client, group, marker) => wait(async () => (await sent(client, group, marker)).length, `group text ${marker}`);
 const prompt = (client, sessionId, text) => model(client, 'native-prompt', { sessionId, text });
+
+async function smokeDeliveryLinks(host, ownerBot, group, sessionId) {
+  await prompt(host, sessionId, artifactGoal);
+  const { items: [task], total } = await call(host, 'task.list', { botId: ownerBot.id, q: artifactGoal });
+  assert.equal(total, 1);
+  const detail = () => call(host, 'task.detail', { id: task.id, sessionId });
+  const original = await wait(async () => {
+    const value = await detail();
+    return value.chatDelivery?.state === 'delivered' && value;
+  }, 'formal delivery with explicit artifacts in the native chat');
+  await hasSent(host, group, artifactDeliveryText);
+  const resultId = original.result.id;
+  const resultLink = `${host.base}/#super-bot-task=${task.id}&resultId=${resultId}`;
+  assert.equal(original.deliveredResult.id, resultId);
+  assert.equal(original.deliveredResult.deliveryText, artifactDeliveryText);
+  assert.equal(original.task.lifecycle, 'review');
+  assert.equal(original.result.humanAcceptedAt, null);
+  assert.deepEqual(original.deliveredResult.links, artifactLinks);
+  assert.ok(original.result.checks.includes(artifactReference));
+  const originalMessages = await sent(host, group, artifactDeliveryText);
+  assert.equal(originalMessages.length, 1);
+  assert.ok(originalMessages[0].text.includes(resultLink));
+  const receipts = original.events.filter(event => event.kind === 'manager.delivered' && JSON.parse(event.data).resultId);
+  assert.equal(receipts.length, 1);
+
+  const nonLinkState = async value => {
+    const { rowVersion, ...taskState } = value.task;
+    const { links, ...delivery } = value.deliveredResult;
+    const notifications = await call(host, 'manager.status', { botId: ownerBot.id });
+    return { task: taskState, run: value.run, result: value.result, delivery, attentions: value.attentions,
+      chatDelivery: value.chatDelivery, events: value.events, notifications };
+  };
+  const baseline = await nonLinkState(original);
+  const add = `请更新这项交付 ${resultLink}，新增交付物“飞书文档 · 联调纪要” ${supplementalDoc}。`;
+  const addedLinks = { ...artifactLinks, '飞书文档 · 联调纪要': supplementalDoc };
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    const beforeMessages = (await sent(host, group, '')).length;
+    await prompt(host, sessionId, add);
+    await wait(async () => (await sent(host, group, artifactEditReply)).length === attempt, `chat link patch ${attempt}`);
+    const patched = await detail();
+    assert.deepEqual(patched.deliveredResult.links, addedLinks);
+    assert.equal(patched.task.rowVersion, original.task.rowVersion + 1);
+    assert.deepEqual(await nonLinkState(patched), baseline);
+    assert.deepEqual((await sent(host, group, '')).slice(beforeMessages).map(row => row.text),
+      [`网页用户\n${add}`, artifactEditReply]);
+  }
+
+  await call(host, 'result.accept', { requestId: randomUUID(), id: task.id, resultId, sessionId,
+    expectedRowVersion: original.task.rowVersion + 1 });
+  const accepted = await detail();
+  assert.equal(accepted.task.lifecycle, 'completed');
+  assert.ok(accepted.result.humanAcceptedAt);
+  const acceptedBaseline = await nonLinkState(accepted);
+  const previousMessages = (await sent(host, group, '')).length;
+  const amend = `请更新这项交付 ${resultLink}，把“后端 MR”换成 ${replacementMr}，移除“飞书文档 · 联调方案”。`;
+  await receive(host, group, amend, { receiptKind: 'plain' });
+  await wait(async () => (await sent(host, group, artifactEditReply)).length === 3, 'accepted result patched in Feishu chat');
+  const updated = await detail();
+  const correctedLinks = { ...addedLinks, '后端 MR': replacementMr };
+  delete correctedLinks['飞书文档 · 联调方案'];
+  assert.deepEqual(updated.deliveredResult.links, correctedLinks);
+  assert.equal(updated.task.rowVersion, accepted.task.rowVersion + 1);
+  assert.deepEqual(await nonLinkState(updated), acceptedBaseline);
+  assert.deepEqual((await sent(host, group, '')).slice(previousMessages).map(row => row.text), [artifactEditReply]);
+  assert.deepEqual(await sent(host, group, artifactDeliveryText), originalMessages);
+  console.log('PASS four explicit artifacts, Web add and retry, Feishu correction after acceptance, unchanged receipt, notifications and Worker run');
+  return updated.deliveredResult;
+}
 
 async function launchBrowser(host) {
   const { SUPER_BOT_TEST_PLAYWRIGHT: playwright, SUPER_BOT_TEST_BROWSER: executablePath } = process.env;
@@ -500,6 +570,11 @@ try {
   assert.equal(ordinary.botMentionAt, null, 'Duplicate redelivery cannot create a different evidence category');
   await wait(async () => (await model(host, 'inspect-session', { sessionId: aSession })).assistantTexts
     .some(text => text.includes(ready.result.id)), 'result linked from original native chat');
+  const legacyDelivery = await wait(async () => {
+    const value = await detail();
+    return value.chatDelivery?.state === 'delivered' && value.deliveredResult?.id === ready.result.id && value;
+  }, 'untagged native delivery receipt');
+  assert.deepEqual(legacyDelivery.deliveredResult.links, {});
   if (ui) {
     const flow = ui.page.locator('[data-slot="conversation.chat.flow"]');
     try {
@@ -512,6 +587,7 @@ try {
     }
     console.log('PASS browser group creation, binding confirmation, and Feishu input in original native chat');
   }
+  const patchedDelivery = await smokeDeliveryLinks(host, a, groupA, aSession);
 
   const bMarker = 'FEISHU_SMOKE_GROUP_B';
   let groupBPanel;
@@ -624,7 +700,13 @@ try {
   await receive(host, groupB, 'FEISHU_SMOKE_RESTARTED');
   await hasSent(host, groupB, '已收到 FEISHU_SMOKE_RESTARTED');
   assert.equal((await sent(host, groupB, 'RESTART_BACKLOG')).length, 0);
-  assert.equal((await events(host, aSession)).filter(feishuInput).length, 1);
+  const afterReconnect = (await events(host, aSession)).filter(feishuInput);
+  assert.equal(afterReconnect.length, 2);
+  assert.equal(afterReconnect.filter(event => event.data.source.feishuMessageId === answerId).length, 1);
+  const restoredDetail = await call(host, 'task.detail', { id: patchedDelivery.taskId, sessionId: aSession });
+  assert.deepEqual(restoredDetail.deliveredResult, patchedDelivery);
+  assert.equal(restoredDetail.chatDelivery.state, 'delivered');
+  assert.equal((await sent(host, groupA, artifactDeliveryText)).length, 0);
 
   await feishu(host, 'connection', { connection: 'reconnecting' });
   if (groupBPanel) {

@@ -3,12 +3,12 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import type { Context } from '@deepseek-ai/cordis';
 import type { ISidebarRight } from '@deepseek-ai/dsh-client-ui-sidebar-right/client';
-import type { Bot, ManagerBinding, Task, TaskModelHistory, WorkerModelPreview } from '../../src/model.ts';
+import type { Bot, DeliveredResult, ManagerBinding, Task, TaskModelHistory, WorkerModelPreview } from '../../src/model.ts';
 import { loadModelHistory, ModelPreview } from '../../src/ui/work/ModelDetails.tsx';
 import { Store } from '../../src/store.ts';
 import { parseWorkLink, resultFileUrl, workUrl, type WorkLink } from '../../src/work-links.ts';
 import { LinkedTaskContent, TaskDefinition, TaskDetailHeader } from '../../src/ui/work/TaskDetail.tsx';
-import { ResultLoadReceipt, ResultReport } from '../../src/ui/work/ResultCard.tsx';
+import { ResultLinks, ResultLoadReceipt, ResultReport, ResultSummary } from '../../src/ui/work/ResultCard.tsx';
 import { SessionControls } from '../../src/ui/work/SessionControls.tsx';
 import { ReplyForm } from '../../src/ui/work/forms.tsx';
 import { WorkMarkdown } from '../../src/ui/work/WorkMarkdown.tsx';
@@ -603,9 +603,10 @@ test('the linked task drawer offers only the exact answer or explicitly selected
     f.store.saveRunMessage(run.id, `msg-${key}`, '{}'); f.store.claimDispatch(run.id); f.store.inputEntered(run.id, `msg-${key}`, 1);
     return run;
   };
-  const drawer = (link: Exclude<WorkLink, { kind: 'task' }>, reloadEligible = false): any[] => LinkedTaskContent({ w, close, link,
-    detail: { ...f.store.taskDetail(f.ta.id), reloadEligible,
-      linkedResult: link.kind === 'result' ? f.store.resultById(link.resultId) : null } }).props.children;
+  const drawer = (link: Exclude<WorkLink, { kind: 'task' }>, reloadEligible = false, deliveredResult: DeliveredResult | null = null): any[] =>
+    LinkedTaskContent({ w, close, link,
+      detail: { ...f.store.taskDetail(f.ta.id), reloadEligible, deliveredResult,
+        linkedResult: link.kind === 'result' ? f.store.resultById(link.resultId) : null } }).props.children;
   try {
     for (const task of [f.ta, f.tb]) {
       const binding = f.store.beginBinding(`binding-${task.id}`, task.id, task.rowVersion, `/synthetic/${task.id}`);
@@ -678,12 +679,16 @@ test('the linked task drawer offers only the exact answer or explicitly selected
     assert.equal(f.store.taskDetail(f.ta.id).progress.reload, null);
     assert.match(loadPanel(latest, true)[0].props.children.join(''), /暂无匹配/);
     assert.equal(loadPanel(latest, false), undefined, 'ordinary file results keep the existing compact card');
-    const [oldHead, oldNotice] = drawer(old);
+    assert.match(drawer(old)[1].props.children[1].props.children, /当前不可验收/);
+    const shipped = { ...f.store.resultById(latest.resultId)!, deliveredAt: Date.now(), links: {} };
+    const [oldHead, oldNotice] = drawer(old, false, shipped);
     assert.equal(oldHead.props.controls, false);
-    const [, replacement, summary, report, files, next] = oldNotice.props.children;
+    const [, replacement, summary, links, report, files, next] = oldNotice.props.children;
     assert.match(replacement.props.children, /已被新版替代/);
-    assert.equal(summary.props.className, 'clamp prose-preview');
-    assert.equal(summary.props.children, oldSummary);
+    assert.equal(summary.type, ResultSummary);
+    assert.equal(summary.props.result.summary, oldSummary);
+    assert.equal(links.type, ResultLinks);
+    assert.equal(links.type(links.props), null);
     assert.equal(report.props.checks, selfReported);
     assert.equal(files.props.result.id, old.resultId);
     assert.equal(next.props.href, workUrl(latest));
@@ -696,4 +701,13 @@ test('the linked task drawer offers only the exact answer or explicitly selected
     assert.throws(() => f.store.acceptResult('old-accept', old.taskId, f.store.getTask(f.ta.id).rowVersion, old.resultId), { code: 'result-stale' });
     assert.equal(f.store.resultById(latest.resultId)?.humanAcceptedAt, null);
   } finally { f.store.close(); }
+});
+
+test('a legacy delivery keeps its plain preview and has no links group', () => {
+  const summary = '**Worker report** with a [reference](https://example.test/reference).';
+  const preview = ResultSummary({ result: { summary, links: {} } });
+  assert.equal(preview.type, 'p');
+  assert.equal(preview.props.className, 'clamp prose-preview');
+  assert.equal(preview.props.children, summary);
+  assert.equal(ResultLinks({ links: {} }), null);
 });

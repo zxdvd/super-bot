@@ -53,6 +53,8 @@ export const reviewLabel = (task: Task, long = false) => task.lifecycle === 'rev
   ? long ? '本次需人工验收（原因见待办）' : '本次需人工验收'
   : task.reviewPolicy === 'human' ? long ? '由你确认' : '由你最终验收' : long ? '已授权 Bot 验收' : 'Bot 可最终验收';
 
+export const canReviewResult = (task: Task) => !task.blockingAttention && task.status !== 'recovery' && task.lifecycle === 'review';
+
 export function resultHeading(task: Task): string {
   if (task.lifecycle === 'completed') return '成果 · 已接受';
   if (task.lifecycle === 'cancelled') return '历史报告 · 任务已取消';

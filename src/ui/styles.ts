@@ -106,6 +106,10 @@ const parts = `
 .sb .attention-box{border-left:3px solid var(--sb-warn);background:color-mix(in srgb,var(--sb-warn) 6%,transparent);padding:11px 13px;
   line-height:1.7;margin:12px 0}
 .sb .attention-box.result{border-left-color:var(--sb-accent);background:color-mix(in srgb,var(--sb-accent) 5%,transparent)}
+.sb .delivery-links{display:flex;align-items:baseline;gap:4px 12px;flex-wrap:wrap;margin:8px 0;font-size:13px}
+.sb .delivery-links ul{display:flex;flex-wrap:wrap;gap:4px 12px;min-width:0;max-width:100%;list-style:none;margin:0;padding:0}
+.sb .delivery-links li{min-width:0;max-width:100%;overflow-wrap:anywhere}
+.sb .delivery-links a{text-decoration:underline;text-underline-offset:2px}
 .sb .sb-section{margin:16px 0;padding:12px 14px;border:1px solid var(--sb-line);border-radius:10px;background:var(--sb-raised)}
 .sb .sb-section>header{display:flex;align-items:center;gap:8px;margin-bottom:6px}
 .sb .sb-section h3{margin:0;font-size:13px;font-weight:600}
