@@ -47,6 +47,7 @@ export class FeishuBridge {
   private running = false;
   private connection: Connection = 'stopped';
   private connectionError?: string;
+  private lastMessageAt: number | null = null;
   private epoch?: Epoch;
   private disposers: Array<() => unknown> = [];
   private native = new WeakMap<Session, NativeMessages>();
@@ -70,19 +71,17 @@ export class FeishuBridge {
     this.running = true;
     this.connection = 'connecting';
     this.connectionError = undefined;
-    this.disposers.push(
-      this.groups.onUnbound(bindingId => this.revokeBinding(bindingId)),
-      this.ctx.on('session/event', (session, event) => this.observe(session, event)),
-      this.ctx.on('agent/created', ({ agent }) => { this.seedInbox(agent); }),
-      this.ctx.on('agent/inbox/discarded', ({ agent, message }) => {
-        // A steer moves the same message synchronously to another queue.
-        queueMicrotask(() => {
-          if (!this.running || !isNativeOwner(message)) return;
-          const queued = [...agent.inbox.nextTurn, ...agent.inbox.nextStep].some(item => item.id === message.id);
-          if (!queued) this.native.get(agent.session)?.web.delete(message.id);
-        });
-      }),
-    );
+    this.disposers.push(this.groups.onUnbound(bindingId => this.revokeBinding(bindingId)));
+    this.disposers.push(this.ctx.on('session/event', (session, event) => this.observe(session, event)));
+    this.disposers.push(this.ctx.on('agent/created', ({ agent }) => { this.seedInbox(agent); }));
+    this.disposers.push(this.ctx.on('agent/inbox/discarded', ({ agent, message }) => {
+      // A steer moves the same message synchronously to another queue.
+      queueMicrotask(() => {
+        if (!this.running || !isNativeOwner(message)) return;
+        const queued = [...agent.inbox.nextTurn, ...agent.inbox.nextStep].some(item => item.id === message.id);
+        if (!queued) this.native.get(agent.session)?.web.delete(message.id);
+      });
+    }));
     for (const agent of this.ctx.agents.list()) this.seedInbox(agent);
     try {
       this.transport.start({
@@ -99,7 +98,9 @@ export class FeishuBridge {
       this.running = false;
       this.connection = 'stopped';
       this.invalidateEpoch();
-      for (const stop of this.disposers.splice(0)) stop();
+      for (const stop of this.disposers.splice(0)) {
+        try { stop(); } catch { /* Bridge callbacks no longer have routing authority. */ }
+      }
       try { this.transport.stop(); } catch { /* Local routing has already stopped. */ }
     }
     await Promise.allSettled(this.inFlight);
@@ -111,6 +112,10 @@ export class FeishuBridge {
     const error = this.connectionError ?? (outbound?.bindingId === binding?.id ? outbound?.text : undefined)
       ?? (inbound?.bindingId === binding?.id ? inbound?.text : undefined);
     return { connection: this.connection, ...(error ? { error } : {}) };
+  }
+
+  connectionStatus(): FeishuBridgeStatus & { lastMessageAt: number | null } {
+    return { connection: this.connection, error: this.connectionError, lastMessageAt: this.lastMessageAt };
   }
 
   private invalidateEpoch(): void {
@@ -194,6 +199,7 @@ export class FeishuBridge {
       // Commit deduplication before the SDK acknowledges the event, even when Manager is unavailable.
       const prompt = reserveFeishuInput(this.store, input);
       if (!prompt) return;
+      this.lastMessageAt = Date.now();
       if (!sessionId) {
         this.reject(route, message.messageId,
           '飞书消息未进入对话。请在宿主打开本机 Bot 管理对话，再发送新消息。');

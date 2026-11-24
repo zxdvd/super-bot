@@ -6,6 +6,7 @@ import { styles } from './styles.ts';
 import { readTaskLink, workLinkForUrl } from './work-navigation.ts';
 import { workUrl, type WorkLink } from '../work-links.ts';
 import { inboxGroups } from './work/format.ts';
+import { FeishuSettings } from './FeishuSettings.tsx';
 
 const DEFAULT_INSTRUCTIONS = '你是我的长期助手。自然地与我交流，理解我的目标，必要时澄清，主动安排已授权的工作，并回来交付结果。';
 const message = (error: unknown, fallback: string) => error instanceof Error ? error.message : fallback;
@@ -58,6 +59,8 @@ export function BotHome({ api }: { api: WorkspaceApi }) {
   const [catalog, setCatalog] = useState<MirrorCatalog>();
   const [error, setError] = useState(''), [busy, setBusy] = useState(false);
   const [work, setWork] = useState<Work | null>(null);
+  const [showSettings, setShowSettings] = useState(false);
+  const settingsEntry = useRef<HTMLButtonElement>(null);
   const [creating, setCreating] = useState(false), [name, setName] = useState(''), [instructions, setInstructions] = useState('');
   const request = useRef(crypto.randomUUID()), alive = useRef(true), locked = useRef(false);
   useEffect(() => {
@@ -92,7 +95,7 @@ export function BotHome({ api }: { api: WorkspaceApi }) {
       controller?.abort(); controller = new AbortController(); const signal = controller.signal;
       const current = new URL(location.href), link = workLinkForUrl(current, current); if (!link) return;
       const navigation = api.beginNavigation(), opening = ++revision;
-      setWork(null); setError('');
+      setWork(null); setShowSettings(false); setError('');
       readTaskLink(api, link.taskId, signal, navigation).then(task => {
         if (task && !signal.aborted && !navigation.aborted) setWork({ botId: task.botId, link, revision: opening });
       })
@@ -123,11 +126,18 @@ export function BotHome({ api }: { api: WorkspaceApi }) {
     finally { locked.current = false; if (alive.current) setBusy(false); }
   }
   if (work !== null) return <WorkFrame api={api} work={work} error={error} setError={setError} close={() => setWork(null)}/>;
+  if (showSettings) return <FeishuSettings api={api} close={() => {
+    setShowSettings(false);
+    requestAnimationFrame(() => settingsEntry.current?.focus());
+  }}/>;
   return <div className="sb"><style>{styles}</style><main className="sb-wrap" style={{ maxWidth: 820 }}>
     <header className="sb-header">
       <div><div className="eyebrow">Super Bot</div><h1>你想一起做点什么？</h1>
         <p className="muted">和 Bot 聊聊，把事情交给它，完成后它会回来告诉你。</p></div>
-      {bots.length > 0 && <button disabled={busy} onClick={() => setCreating(true)}>新建 Bot</button>}
+      <div className="header-actions">
+        {bots.length > 0 && <button disabled={busy} onClick={() => setCreating(true)}>新建 Bot</button>}
+        <button ref={settingsEntry} disabled={busy} onClick={() => setShowSettings(true)}>设置</button>
+      </div>
     </header>
     {error && <p role="alert" className="notice error">{error}</p>}
     {loading ? <p className="muted">正在读取你的 Bot…</p> : <>

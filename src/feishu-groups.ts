@@ -66,6 +66,7 @@ export class FeishuGroups {
     this.previews.set(botId, preview);
     try {
       const group = await this.inspectGroup(target);
+      this.assertActive();
       this.assertPreview(botId, preview);
       this.assertAvailable(botId, target);
       return { chatId: group.chatId, name: group.name, confirmationToken: preview.token };
@@ -85,6 +86,7 @@ export class FeishuGroups {
     this.assertPreview(botId, preview);
     if (this.creating.has(botId)) throw new AppError('feishu-create-pending', '飞书建群仍在进行，请稍后再确认绑定。');
     const group = await this.inspectGroup(preview.chatId);
+    this.assertActive();
     const completed = this.get(botId);
     if (completed && completed.id === confirmationToken) return completed;
     this.assertPreview(botId, preview);
@@ -228,6 +230,7 @@ export class FeishuGroups {
   }
 
   private storeBinding(botId: string, group: FeishuGroup, id: string): FeishuBinding {
+    this.assertActive();
     const boundAt = Date.now();
     const result = this.transaction(() => {
       this.assertAvailable(botId, group.chatId);

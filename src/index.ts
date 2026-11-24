@@ -53,7 +53,7 @@ export const Config = Schema.object({ dataDir: Schema.string().description('Supe
   workspace:Schema.string().description('已弃用：等同 allowedRoots: [workspace]'),
   mirrorDir: Schema.string().description('可选。同机 Web 与 Desktop 只读镜像的私有配对目录，含 pair.json。'),
   feishu: Schema.union([Schema.const(undefined), Schema.object({ enabled: Schema.boolean().default(false) })])
-    .description('仅在当前 profile 启用飞书群。凭证从该 profile 的私有文件读取。'),
+    .description('仅用于导入当前 profile 的旧飞书设置。之后由 Super Bot 设置管理。'),
   maxRunningTasks:Schema.natural().min(1).default(2).description('全局同时执行的 Worker 任务数'),managerWakesPerHour:Schema.natural().min(1).default(20).description('每个 Bot 每小时自动唤醒上限；达到后记录问题并暂停自动唤醒'),managerConcurrentWakes:Schema.natural().min(1).default(2).description('同时自动唤醒的 Bot 数'),managerTurnMinutes:Schema.natural().min(1).default(5).description('单次自动 Bot 轮次上限（分钟）'),managerModel:roleModel,workerModel:roleModel });
 
 export async function apply(ctx: Context, config: RuntimeOptions & {

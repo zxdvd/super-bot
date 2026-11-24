@@ -4,6 +4,21 @@ export interface FeishuConfig {
   ownerOpenId: string;
 }
 
+export interface FeishuSettingsView {
+  appId: string;
+  ownerOpenId: string;
+  hasSecret: boolean;
+  enabled: boolean;
+  connection: Exclude<FeishuConnectionState, 'reconnected'> | 'disabled' | 'offline';
+  lastMessageAt: number | null;
+  error?: string;
+}
+
+export interface FeishuCheckResult {
+  credentials: 'passed' | 'failed' | 'unverified';
+  permissions: { scope: string; status: 'passed' | 'missing' | 'unverified' }[];
+}
+
 export interface FeishuTextMessage {
   readonly chatId: string;
   readonly messageId: string;

@@ -1,12 +1,13 @@
 import { AsyncLocalStorage } from 'node:async_hooks';
-import { AppType, Client, defaultHttpInstance, Domain, EventDispatcher, WSClient } from '@larksuiteoapi/node-sdk';
+import { AppType, Client, DefaultCache, defaultHttpInstance, Domain, EventDispatcher, WSClient } from '@larksuiteoapi/node-sdk';
 import { AppError } from './model.ts';
-import { isFeishuChatId, type FeishuConfig, type FeishuConnectionState, type FeishuGroup, type FeishuHandlers,
+import { isFeishuChatId, type FeishuCheckResult, type FeishuConfig, type FeishuConnectionState, type FeishuGroup, type FeishuHandlers,
   type FeishuTextMessage, type FeishuTransport } from './feishu-types.ts';
 
 const MESSAGE_EVENT = 'im.message.receive_v1';
 const REQUEST_TIMEOUT_MS = 12_000;
 const MAX_TEXT_BODY_BYTES = 150_000;
+const FEISHU_ORIGIN = 'https://open.feishu.cn';
 const MISSING_FEISHU_SCOPE = 99991672;
 const SEND_THROTTLED_CODES = new Set([230020, 99991400]);
 const MONTHLY_QUOTA_CODE = 99991403;
@@ -32,6 +33,57 @@ type PageResponse<T> = {
 
 function object(value: unknown): Record<string, unknown> {
   return value && typeof value === 'object' ? value as Record<string, unknown> : {};
+}
+
+const CHECK_SCOPES = [
+  'im:message.group_at_msg:readonly', 'im:message:send_as_bot',
+  'im:chat:read', 'im:chat:create', 'im:chat.members:read',
+];
+// Explicit parameter or credential rejections from the self-built token endpoint.
+const CREDENTIAL_REJECTIONS = new Set([10003, 10005, 10014, 10015, 99991543]);
+
+function permissionResults(scopes?: Record<string, unknown>[]): FeishuCheckResult['permissions'] {
+  return CHECK_SCOPES.map(scope => {
+    if (!scopes) return { scope, status: 'unverified' };
+    const tokenTypes = scopes.filter(entry => entry.scope === scope).map(({ token_types: types }) =>
+      Array.isArray(types) && types.length && types.every(type => type === 'tenant' || type === 'user') ? types : undefined);
+    if (tokenTypes.some(types => types?.includes('tenant'))) return { scope, status: 'passed' };
+    if (tokenTypes.some(types => types === undefined)) return { scope, status: 'unverified' };
+    return { scope, status: 'missing' };
+  });
+}
+
+/** Exchanges a fresh token, then reads the app's granted scopes when available. */
+export async function checkFeishuConfig(config: FeishuConfig, options: Pick<TransportOptions, 'httpAdapter' | 'requestTimeoutMs'>
+  & { signal?: AbortSignal } = {}): Promise<FeishuCheckResult> {
+  const timeout = options.requestTimeoutMs ?? REQUEST_TIMEOUT_MS;
+  const deadline = AbortSignal.timeout(timeout);
+  const signal = options.signal ? AbortSignal.any([options.signal, deadline]) : deadline;
+  const http = defaultHttpInstance.create({ adapter: options.httpAdapter, timeout, maxRedirects: 0 });
+  let credentials: FeishuCheckResult['credentials'] = 'unverified';
+  let scopes: Record<string, unknown>[] | undefined;
+  try {
+    const response = await http.post<unknown>(`${FEISHU_ORIGIN}/open-apis/auth/v3/tenant_access_token/internal`,
+      { app_id: config.appId, app_secret: config.appSecret }, { signal, validateStatus: status => status < 500 });
+    signal.throwIfAborted();
+    const { code, tenant_access_token: token } = object(response.data);
+    if ((response.status === 200 || [400, 401, 403].includes(response.status))
+      && typeof code === 'number' && CREDENTIAL_REJECTIONS.has(code)) credentials = 'failed';
+    if (response.status === 200 && code === 0 && typeof token === 'string' && /^\S+$/.test(token)) {
+      credentials = 'passed';
+      const path = `/open-apis/application/v6/applications/${encodeURIComponent(config.appId)}`;
+      const detail = await http.get<unknown>(FEISHU_ORIGIN + path, {
+        signal, params: { lang: 'zh_cn' }, headers: { Authorization: `Bearer ${token}` },
+      });
+      signal.throwIfAborted();
+      const result = object(detail.data), app = object(object(result.data).app);
+      if (detail.status === 200 && result.code === 0 && app.app_id === config.appId && Array.isArray(app.scopes)) {
+        const parsed = app.scopes.map(object);
+        if (parsed.every(entry => typeof entry.scope === 'string' && entry.scope.trim())) scopes = parsed;
+      }
+    }
+  } catch { /* Transport and lookup failures leave unavailable evidence unverified. */ }
+  return { credentials, permissions: permissionResults(scopes) };
 }
 
 function readableText(content: string, mentions: unknown): string {
@@ -129,6 +181,8 @@ function assertUuid(uuid: string): void {
 export function createFeishuTransport(config: FeishuConfig, options: TransportOptions = {}): FeishuTransport {
   const { appId, appSecret, ownerOpenId } = config;
   const credentials = { appId, appSecret, domain: Domain.Feishu, logger, source: 'super-bot' };
+  // A replacement connection must not reuse SDK tokens from the previous secret.
+  const cache = new DefaultCache();
   const requests = new AsyncLocalStorage<RequestBudget>();
   const requestTimeoutMs = options.requestTimeoutMs ?? REQUEST_TIMEOUT_MS;
   let lifetime = new AbortController();
@@ -150,7 +204,7 @@ export function createFeishuTransport(config: FeishuConfig, options: TransportOp
     return http as unknown as SDKHttp;
   }
 
-  const client = new Client({ ...credentials, appType: AppType.SelfBuild, httpInstance: boundedHttp() });
+  const client = new Client({ ...credentials, appType: AppType.SelfBuild, cache, httpInstance: boundedHttp() });
   const im = client.im.v1;
 
   async function rest<T>(operation: () => Promise<T>, failure: (error: unknown) => AppError, allowSend?: () => boolean): Promise<T> {
@@ -218,7 +272,7 @@ export function createFeishuTransport(config: FeishuConfig, options: TransportOp
       handlers.onConnection('connecting');
       if (connection !== current) return;
       try {
-        const dispatcher = new EventDispatcher({ logger }).register({
+        const dispatcher = new EventDispatcher({ logger, cache }).register({
           [MESSAGE_EVENT]: async event => {
             if (connection !== current || !isReady(current)) return;
             const message = ownerTextEvent(event, appId, ownerOpenId);

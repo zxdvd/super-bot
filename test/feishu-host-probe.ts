@@ -3,7 +3,7 @@ import type { Context } from '@deepseek-ai/cordis';
 import { SessionId } from '@deepseek-ai/dsh-session/types';
 import { apply as applyProduct } from '../src/index.ts';
 import type { FeishuConnectionState, FeishuTextMessage } from '../src/feishu-types.ts';
-import { handlers, sent, setFailure, starts } from './feishu-host-transport.ts';
+import { checks, creations, handlers, inspections, sent, setFailure, starts, stops } from './feishu-host-transport.ts';
 
 export { Config, inject, name } from '../src/index.ts';
 
@@ -24,7 +24,7 @@ export async function apply(ctx: Context, config: Parameters<typeof applyProduct
           const page = await ctx.sessionController.events({ address, maxMessages: 200 }, request.signal);
           return Response.json({ ok: true, page });
         }
-        return Response.json({ ok: true, starts, sent });
+        return Response.json({ ok: true, starts, stops, checks, creations, inspections, sent });
       } catch (error) {
         return Response.json({ ok: false, error: error instanceof Error ? error.message : 'Fixture failed' });
       }

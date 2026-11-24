@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { setTimeout as delay } from 'node:timers/promises';
 import { test } from 'node:test';
-import { createFeishuTransport } from '../src/feishu-sdk.ts';
+import { checkFeishuConfig, createFeishuTransport } from '../src/feishu-sdk.ts';
 import type { FeishuConnectionState, FeishuTextMessage } from '../src/feishu-types.ts';
 
 const config = { appId: 'cli_fixture', appSecret: 'SYNTHETIC_PRIVATE_SECRET', ownerOpenId: 'ou_fixture' };
@@ -13,6 +13,117 @@ type SocketOptions = Parameters<CreateSocket>[0];
 type SocketStart = Parameters<ReturnType<CreateSocket>['start']>[0];
 type Adapter = Extract<Options['httpAdapter'], (...args: never[]) => unknown>;
 type Request = Parameters<Adapter>[0];
+
+const tokenUrl = 'https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal';
+const scopesUrl = `https://open.feishu.cn/open-apis/application/v6/applications/${config.appId}`;
+const issued = { code: 0, tenant_access_token: token, expire: 7200 };
+
+function configCheck(respond: (request: Request) => unknown) {
+  const calls: Request[] = [];
+  return { calls, run: () => checkFeishuConfig(config, {
+    async httpAdapter(request) {
+      calls.push(request);
+      return { config: request, data: await respond(request), status: 200, statusText: 'OK', headers: {} };
+    },
+  }) };
+}
+
+test('configuration detection always requests a fresh token and only reads application scopes', async () => {
+  const f = configCheck(request => request.url === tokenUrl ? issued : {
+    code: 0, data: { app: { app_id: config.appId, scopes: [
+      { scope: 'im:message.group_at_msg:readonly', token_types: ['tenant'] },
+      { scope: 'im:message:send_as_bot', token_types: ['tenant'] },
+      { scope: 'im:chat:read', token_types: ['tenant'] },
+      { scope: 'im:chat.members:read', token_types: ['user'] },
+    ] } },
+  });
+  const result = await f.run();
+  assert.equal(result.credentials, 'passed');
+  const permissions = Object.fromEntries(result.permissions.map(({ scope, status }) => [scope, status]));
+  assert.ok(Object.hasOwn(permissions, 'im:message.group_at_msg:readonly'));
+  assert.equal(permissions['im:message:send_as_bot'], 'passed');
+  assert.equal(permissions['im:chat:read'], 'passed');
+  assert.equal(permissions['im:chat:create'], 'missing');
+  assert.equal(permissions['im:chat.members:read'], 'missing');
+  assert.equal(Object.hasOwn(permissions, 'im:message.group_msg'), false);
+  await f.run();
+  assert.deepEqual(f.calls.map(({ method, url }) => [method, url]), [
+    ['post', tokenUrl], ['get', scopesUrl], ['post', tokenUrl], ['get', scopesUrl],
+  ]);
+  assert.ok(JSON.parse(f.calls[0]!.data).app_secret === config.appSecret);
+  assert.ok(f.calls[1]!.headers.Authorization === `Bearer ${token}`);
+  assert.equal(f.calls[1]!.params.lang, 'zh_cn');
+  assert.doesNotMatch(JSON.stringify(result), /SYNTHETIC_PRIVATE_/);
+});
+
+test('configuration detection keeps scopes unverified when the read-only inquiry is unavailable', async () => {
+  for (const scopesResponse of [
+    { code: 99991672, msg: config.appSecret },
+    { code: 0, data: { app: {} } },
+    { code: 0, data: { app: { scopes: [] } } },
+    { code: 0, data: { app: { app_id: 'cli_other', scopes: [] } } },
+  ]) {
+    const f = configCheck(request => request.url === tokenUrl ? issued : scopesResponse);
+    const result = await f.run();
+    assert.equal(result.credentials, 'passed');
+    assert.ok(result.permissions.length > 0);
+    assert.ok(result.permissions.every(({ status }) => status === 'unverified'));
+    assert.doesNotMatch(JSON.stringify(result), /SYNTHETIC_PRIVATE_/);
+  }
+});
+
+test('configuration detection reports an unknown token type as unverified', async () => {
+  const f = configCheck(request => request.url === tokenUrl ? issued : {
+    code: 0, data: { app: { app_id: config.appId, scopes: [
+      { scope: 'im:message:send_as_bot', token_types: ['undocumented'] },
+    ] } },
+  });
+  const result = await f.run();
+  assert.equal(result.permissions.find(item => item.scope === 'im:message:send_as_bot')?.status, 'unverified');
+});
+
+test('configuration detection distinguishes invalid credentials from network uncertainty', async () => {
+  const invalid = configCheck(() => ({ code: 10014, msg: config.appSecret }));
+  const offline = configCheck(() => { throw Error(`${config.appSecret} ${token}`); });
+  for (const [probe, expected] of [[invalid, 'failed'], [offline, 'unverified']] as const) {
+    const result = await probe.run();
+    assert.equal(result.credentials, expected);
+    assert.ok(result.permissions.every(({ status }) => status === 'unverified'));
+    assert.deepEqual(probe.calls.map(({ url }) => url), [tokenUrl]);
+    assert.doesNotMatch(JSON.stringify(result), /SYNTHETIC_PRIVATE_/);
+  }
+});
+
+test('a new transport obtains its own token when the same application rotates its secret', async t => {
+  const appId = 'cli_secretRotation';
+  const requests: Array<{ secret?: string; authorization?: string }> = [];
+  for (const version of ['before', 'after']) {
+    const secret = `fixture-secret-${version}`;
+    const accessToken = `fixture-token-${version}`;
+    const transport = createFeishuTransport({ ...config, appId, appSecret: secret }, {
+      async httpAdapter(request) {
+        let data: unknown;
+        if (request.url === tokenUrl) {
+          requests.push({ secret: JSON.parse(request.data).app_secret });
+          data = { ...issued, tenant_access_token: accessToken };
+        } else {
+          assert.equal(request.method, 'get');
+          requests.push({ authorization: String(request.headers.Authorization) });
+          data = request.url?.endsWith('/members/is_in_chat') ? { code: 0, data: { is_in_chat: true } }
+            : { code: 0, data: { owner_id: config.ownerOpenId, chat_mode: 'group', name: '合成群' } };
+        }
+        return { config: request, data, status: 200, statusText: 'OK', headers: {} };
+      },
+    });
+    t.after(() => transport.stop());
+    assert.equal((await transport.inspectGroup('oc_rotated')).name, '合成群');
+    transport.stop();
+  }
+  assert.deepEqual(requests, [
+    { secret: 'fixture-secret-before' }, { authorization: 'Bearer fixture-token-before' }, { authorization: 'Bearer fixture-token-before' },
+    { secret: 'fixture-secret-after' }, { authorization: 'Bearer fixture-token-after' }, { authorization: 'Bearer fixture-token-after' },
+  ]);
+});
 
 function fixture(handler: (request: Request) => unknown = () => { throw Error('Unexpected API call'); }, timeout?: number,
   beforeToken?: () => void) {

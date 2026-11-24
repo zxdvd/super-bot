@@ -1,12 +1,8 @@
 import { useEffect, useId, useRef, useState } from 'react';
 import type { FeishuStatus } from '../../feishu-host.ts';
+import { feishuConnectionLabel } from '../feishu-format.ts';
 import { ConfirmAction, Hint, Section } from '../kit.tsx';
 import type { WorkspaceApi } from './api.ts';
-
-const connectionLabel: Record<FeishuStatus['connection'], string> = {
-  disabled: '当前宿主未启用', offline: '连接不可用', connecting: '正在连接', ready: '连接就绪',
-  reconnecting: '正在重连', stopped: '连接已停止',
-};
 
 type Preview = { chatId: string; name: string; confirmationToken: string };
 type Form = 'create' | 'bind' | null;
@@ -74,8 +70,8 @@ export function FeishuPanel({ api, botId, botName, locked }: {
   const binding = status?.binding;
   return <Section title="飞书群">
     <p className="muted" role="status">{readError ? '暂时无法读取飞书群状态'
-      : status ? connectionLabel[status.connection] : '正在读取连接状态…'}</p>
-    {status?.connection === 'disabled' && <Hint>管理员可在当前 DSH profile 的 Super Bot 配置中启用飞书群。</Hint>}
+      : status ? feishuConnectionLabel[status.connection] : '正在读取连接状态…'}</p>
+    {status?.connection === 'disabled' && <Hint>请从 Super Bot 首页的「设置 → 飞书」启用飞书连接。</Hint>}
     {status?.error && <p className="notice slim" role="status">{status.error}</p>}
     {error && <p className="notice error" role="alert">{error}</p>}
     {binding ? <>
