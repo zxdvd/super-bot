@@ -60,6 +60,7 @@ export function readLocalMirror(store: Store, query: MirrorQuery) {
     run: run && { id: run.id, state: run.state, createdAt: run.createdAt, finishedAt: run.finishedAt },
     result: result && resultRecord(result),
     deliveredResult: deliveredResult && { ...resultRecord(deliveredResult),
-      deliveredAt: deliveredResult.deliveredAt, deliveryText: deliveredResult.deliveryText, links: deliveredResult.links },
+      deliveredAt: deliveredResult.deliveredAt, deliveryText: deliveredResult.deliveryText, links: deliveredResult.links,
+      ...(deliveredResult.primaryLink?{primaryLink:deliveredResult.primaryLink}:{}) },
   } satisfies MirrorDetail;
 }

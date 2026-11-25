@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
-import {mkdtempSync,readFileSync,realpathSync,rmSync,writeFileSync} from 'node:fs';
+import {execFileSync} from 'node:child_process';
+import {existsSync,mkdtempSync,readFileSync,realpathSync,rmSync,writeFileSync} from 'node:fs';
 import {join} from 'node:path';
 import {tmpdir} from 'node:os';
 import {test,type TestContext} from 'node:test';
@@ -7,15 +8,21 @@ import type {Context} from '@deepseek-ai/cordis';
 import type {UserMessage} from '@deepseek-ai/dsh-llm';
 import {Store} from '../../src/store.ts';
 import {DshExecution} from '../../src/dsh.ts';
-import {inspectPriorTools,type ClusterProbe,type ProbeResult} from '../../src/read-only-recovery.ts';
+import {inspectPriorTools,type ClusterProbe,type ProbeResult,type ReadQueryReceipt} from '../../src/read-only-recovery.ts';
 import {parseClusterProbe,prepareClusterProbe} from '../../src/kubernetes-preflight.ts';
+import {GIT_STATUS_QUERY,WORKER_QUERY_TOOL,gitWorkingTreeStatus} from '../../src/git-status-query.ts';
 import type {RunEvent} from '../../src/run-proof.ts';
 
 const signal=new AbortController().signal;
 function fixture(t:TestContext,cluster?:{probe:ClusterProbe;auth:string;result:ProbeResult},state:'settled'|'interrupted'|'running'='settled') {
   const cwd=mkdtempSync(join(realpathSync(tmpdir()),'sb-verified-recovery-'));
-  const store=new Store(join(cwd,'ledger.sqlite'));
+  let store=new Store(join(cwd,'ledger.sqlite'));
   t.after(()=>{store.close();rmSync(cwd,{recursive:true,force:true});});
+  const reopen=()=>{
+    store.close();
+    store=new Store(join(cwd,'ledger.sqlite'));
+    return store;
+  };
   const bot=store.createBot('bot',{name:'Recovery',instructions:'Synthetic'});
   const manager=store.beginManager('manager',bot.id,cwd);
   store.confirmManager(manager.id,manager.requestedSessionId);
@@ -67,7 +74,7 @@ function fixture(t:TestContext,cluster?:{probe:ClusterProbe;auth:string;result:P
     followup:(message:UserMessage)=>{sent.push(message);},whenIdle:()=>new Promise(()=>{})};
   const options={nativeCode:'',beforeResolve:async()=>{},beforeRead:async()=>{}};
   let calls=0;
-  const execution=()=>new DshExecution({
+  const execution=(ledger=store)=>new DshExecution({
     workingDirectory:{get:()=>cwd},jobs:{list:()=>jobs},agents:{get:()=>agent,list:()=>[agent]},
     permissionPresets:{set:()=>{}},sessionProjections:{snapshot:()=>({values:{modelSelection:{next:{provider:'fixture',model:'fixture'}}}})},
     sessions:{flush:async()=>true},
@@ -86,9 +93,9 @@ function fixture(t:TestContext,cluster?:{probe:ClusterProbe;auth:string;result:P
         {isError:true,error:{info:{code:options.nativeCode}}}:
         {isError:false,value:{path,offset:3,lines:[{number:3,text:'evidence'}]},content:[{type:'text',text:'evidence'}]}}]};
     }},
-  } as unknown as Context,store,cwd,{fullAccess:!!cluster});
+  } as unknown as Context,ledger,cwd,{fullAccess:!!cluster});
   const id=task.id,version=store.getTask(id).rowVersion;
-  return {store,task,run,manager,version,args,events,jobs,inbox,options,calls:()=>calls,execution,sent,guards,
+  return {store,reopen,cwd,task,run,manager,version,args,events,jobs,inbox,options,calls:()=>calls,execution,sent,guards,
     inspect:(e=execution())=>e.inspectAutoRecovery(id,version,run.id,manager.id,()=>{}),
     perform:(e=execution())=>e.performAutoRecovery(id,version,run.id,manager.id,signal,()=>{}),
   };
@@ -446,4 +453,145 @@ test('concrete owner authorization permits newly scoped work only with proven cl
   assert.equal(store.recoveryWorkPlan(continued.run.id)?.context.mode,'authorized-work');
   assert.equal(f.guards[0]!({name:'write',arguments:{file_path:f.args.file_path}}),undefined);
   assert.equal(f.sent.length,1);
+});
+
+test('active-run directions survive a ledger reopen and enter the original task together in order',async t=>{
+  const f=fixture(t,undefined,'running'),{store,task,run,manager}=f;
+  const a={sessionId:manager.requestedSessionId,messageId:'staging2',seq:7,text:'另外读 staging2 回执。\n  保留原文。'};
+  const b={...a,messageId:'prod',seq:9,text:'也读 prod 回执。'};
+  const first=store.saveRecoveryInstruction(task.id,f.version,a,'read-only');
+  const waiting=await f.execution().continueRecovery(task.id,first.task.rowVersion,manager.id,()=>{});
+  assert.equal(waiting.status,'waiting');
+  assert.equal(store.recoveryDirectionStatus(first.instruction),'next-run');
+  const second=store.saveRecoveryInstruction(task.id,first.task.rowVersion,b,'read-only');
+  assert.deepEqual(second.instruction.directions?.map(item=>item.source),[a,b]);
+  assert.equal(store.recoveryDirectionStatus(second.instruction),'next-run');
+  assert.equal(store.managerEvent(`manager-event:continuation:${first.instruction.id}`)?.state,'done');
+  assert.equal(f.sent.length,0);
+  store.workerReport(run.id,'waiting',{kind:'waiting',summary:'Earlier question'});
+  store.observeRunEnd(run.id,5,'completed',true);
+  store.settleRun(run.id,false);
+
+  const reopened=f.reopen();
+  const resumed=f.execution(reopened),version=reopened.getTask(task.id).rowVersion;
+  const continued=await resumed.continueRecovery(task.id,version,manager.id,()=>{});
+  const sent=f.sent[0]!;
+  const body=sent.content[0];
+  assert.equal(continued.status,'started');
+  assert.equal(continued.run?.taskId,task.id);
+  assert.equal(continued.run?.sessionId,run.sessionId);
+  assert.ok(body?.type==='text');
+  assert.ok(body.text.indexOf(a.text)>=0&&body.text.indexOf(a.text)<body.text.indexOf(b.text));
+  assert.equal(body.text.split(a.text).length,2);
+  assert.equal(body.text.split(b.text).length,2);
+  assert.equal(sent.source.kind,'super-bot');
+  if(sent.source.kind==='super-bot')assert.deepEqual(sent.source.ownerDirectionIds,[first.instruction.id,second.instruction.id]);
+  const receipt=reopened.recoveryInstruction(task.id)!;
+  assert.equal(reopened.recoveryDirectionStatus(receipt),'queued');
+  reopened.inputEntered(continued.run!.id,sent.id,10);
+  assert.equal(reopened.recoveryDirectionStatus(receipt),'entered');
+  assert.equal((await resumed.continueRecovery(task.id,version,manager.id,()=>{})).status,'already-started');
+  assert.equal(f.sent.length,1);
+});
+
+test('legacy pending instructions are retained until explicitly replaced or revoked',async t=>{
+  const f=fixture(t,undefined,'running'),{store,task,run,manager}=f;
+  const legacy={sessionId:manager.requestedSessionId,messageId:'old-read',seq:6,text:'Only inspect staging'};
+  const first=store.saveRecoveryInstruction(task.id,f.version,legacy,'read-only');
+  const {id,source,mode,priorRunId,taskRevision}=first.instruction;
+  store.set(`recovery-instruction:${task.id}`,JSON.stringify({id,source,mode,priorRunId,taskRevision}));
+  const later={...legacy,messageId:'also-prepare',seq:7,text:'Also prepare the report'};
+  const added=store.saveRecoveryInstruction(task.id,first.task.rowVersion,later,'authorized-work');
+  assert.equal(added.instruction.mode,'read-only');
+  assert.deepEqual(added.instruction.directions?.map(item=>item.source),[legacy,later]);
+
+  const replacement={...legacy,messageId:'replace-read',seq:8,text:'Replace the staging inspection with a prod-only check'};
+  const replaced=store.saveRecoveryInstruction(task.id,added.task.rowVersion,replacement,'read-only',false,false,{kind:'replace',ids:[id]});
+  assert.deepEqual(replaced.instruction.directions?.map(item=>item.source),[later,replacement]);
+  assert.throws(()=>store.saveRecoveryInstruction(task.id,replaced.task.rowVersion,
+    {...legacy,messageId:'stale-revocation',seq:9,text:'Remove the first direction'},undefined,false,false,{kind:'revoke',ids:[id]}),
+  {code:'direction-stale'});
+  const withdrawal={...legacy,messageId:'remove-all',seq:10,text:'Clear both pending requests'};
+  const revoked=store.saveRecoveryInstruction(task.id,replaced.task.rowVersion,withdrawal,undefined,false,false,{kind:'revoke'});
+  assert.deepEqual(revoked.instruction.directions,[]);
+  assert.equal(store.recoveryDirectionStatus(revoked.instruction),'revoked');
+  assert.equal(store.managerEvent(`manager-event:continuation:${replaced.instruction.id}`)?.state,'done');
+  assert.equal(store.taskDetail(task.id).events.filter(event=>event.kind==='task.recovery-instruction').length,4);
+  assert.equal(store.getRun(run.id).state,'running');
+  assert.equal(f.sent.length,0);
+});
+
+test('a durable fixed Git query allows the authorized next step, while a successful legacy bash record remains unknown',async t=>{
+  const f=fixture(t),{store,task,run,manager}=f;
+  const source={sessionId:manager.requestedSessionId,messageId:'continue-work',seq:7,text:'Carry out the authorized next step'};
+  const saved=store.saveRecoveryInstruction(task.id,f.version,source,'authorized-work');
+  const call=f.events[3]!.data,result=f.events[4]!;
+  call.name='bash';
+  call.arguments=JSON.stringify({command:'git status --short'});
+  result.data={turn:1,step:2,message:{toolCallId:'read',isError:false,content:[{type:'text',text:'?? current.txt'}]}};
+  const continued=()=>f.execution().continueRecovery(task.id,saved.task.rowVersion,manager.id,()=>{});
+  const legacy=await continued();
+  assert.equal(legacy.status,'blocked');
+  assert.match(legacy.message,/bash 缺少可信的只读/);
+
+  call.name=WORKER_QUERY_TOOL;
+  call.arguments=JSON.stringify({kind:GIT_STATUS_QUERY});
+  const receipt:ReadQueryReceipt={kind:GIT_STATUS_QUERY,cwd:f.cwd,turn:1,inputSeq:1,
+    result:{status:'ok',message:'Verified Git status',porcelain:'?? current.txt\n'}};
+  result.data.message.content[0].text=JSON.stringify(receipt.result);
+  const missing=await continued();
+  assert.equal(missing.status,'blocked');
+  assert.match(missing.message,new RegExp(WORKER_QUERY_TOOL));
+  store.recordReadQueryReceipt(run.id,'read',receipt);
+  result.data.message.content[0].text=JSON.stringify({...receipt.result,porcelain:''});
+  assert.equal((await continued()).status,'blocked');
+  result.data.message.content[0].text=JSON.stringify(receipt.result);
+  call.arguments=JSON.stringify({kind:GIT_STATUS_QUERY,command:'touch guarded'});
+  assert.equal((await continued()).status,'blocked');
+  call.arguments=JSON.stringify({kind:GIT_STATUS_QUERY});
+  const reopened=f.reopen();
+  const success=await f.execution(reopened).continueRecovery(task.id,saved.task.rowVersion,manager.id,()=>{});
+  assert.equal(success.status,'started');
+  assert.equal(reopened.recoveryWorkPlan(success.run!.id)?.context.effectUncertain,false);
+  assert.equal(reopened.recoveryWorkPlan(success.run!.id)?.context.priorReadQueries?.[0]?.kind,GIT_STATUS_QUERY);
+  assert.equal(f.sent.length,1);
+});
+
+test('pinned sandboxed Git reads actual status and cannot execute repo-configured helpers',async t=>{
+  if(process.platform!=='darwin'||!existsSync('/usr/bin/sandbox-exec')||
+    !['/Library/Developer/CommandLineTools/usr/bin/git','/Applications/Xcode.app/Contents/Developer/usr/bin/git'].some(existsSync)) {
+    t.skip('Apple Git sandbox unavailable');
+    return;
+  }
+  const cwd=mkdtempSync(join(realpathSync(tmpdir()),'sb-query-git-'));
+  t.after(()=>rmSync(cwd,{recursive:true,force:true}));
+  const git=(...args:string[])=>execFileSync('/usr/bin/git',['-c','core.hooksPath=/dev/null',...args],{cwd,encoding:'utf8',
+    env:{GIT_CONFIG_GLOBAL:'/dev/null',GIT_CONFIG_NOSYSTEM:'1',LC_ALL:'C'}});
+  git('init','--quiet','--template=');
+  writeFileSync(join(cwd,'staged.txt'),'original');
+  writeFileSync(join(cwd,'modified.txt'),'original');
+  git('add','.');
+  git('-c','user.name=Fixture','-c','user.email=fixture@example.test','commit','-qm','fixture');
+  const head=git('rev-parse','HEAD').trim();
+  writeFileSync(join(cwd,'staged.txt'),'new staged');
+  git('add','staged.txt');
+  writeFileSync(join(cwd,'modified.txt'),'new unstaged');
+  writeFileSync(join(cwd,'new.txt'),'new untracked');
+  const index=readFileSync(join(cwd,'.git/index'));
+  const query=()=>gitWorkingTreeStatus(cwd,AbortSignal.timeout(12000),()=>{});
+  const status=await query();
+  assert.equal(status.status,'ok');
+  assert.equal(status.head,head);
+  assert.equal(status.porcelain,' M modified.txt\nM  staged.txt\n?? new.txt\n');
+  assert.deepEqual(readFileSync(join(cwd,'.git/index')),index);
+
+  const marker=join(cwd,'helper-ran.txt');
+  const helper=join(cwd,'helper.sh');
+  writeFileSync(helper,'#!/bin/sh\nprintf ran > "$1"\ncat\n',{mode:0o700});
+  git('config','core.fsmonitor',helper);
+  git('config','filter.query-fixture.clean',`"${helper}" "${marker}"`);
+  writeFileSync(join(cwd,'.gitattributes'),'modified.txt filter=query-fixture\n');
+  await query();
+  assert.equal(existsSync(marker),false);
+  assert.deepEqual(readFileSync(join(cwd,'.git/index')),index);
 });

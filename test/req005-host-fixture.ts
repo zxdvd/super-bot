@@ -37,7 +37,10 @@ export const baselineFile = 'fixture-baseline.txt';
 export const baselineValue = '合成同步基线存在';
 export const receiptFile = 'fixture-receipt.txt';
 export const receiptValue = '合成回执：同步检查尚缺下游确认';
+export const appendixScope = '同步校验也只读附录中的回执';
+export const appendixFile = 'fixture-appendix.txt';
+export const appendixValue = '附录记录：下游已签收';
 export const pendingInitial = '同步基线存在，仍需在本地核对回执。';
-export const pendingResult = `同步校验已按最新范围读取：${receiptValue}。`;
+export const pendingResult = `同步校验已读取两份回执：${receiptValue}。${appendixValue}。`;
 
 export const req005Goals = [preflightGoal, imageGoal, wiringGoal, startupGoal, pendingGoal];

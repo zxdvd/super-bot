@@ -5,6 +5,7 @@ import type {Context} from '@deepseek-ai/cordis';
 import {Managers} from '../../src/manager.ts';
 import {Store} from '../../src/store.ts';
 import type {DshExecution} from '../../src/dsh.ts';
+import {workUrl} from '../../src/work-links.ts';
 
 type Handler=(args:Record<string,unknown>,exec:any)=>Promise<any>;
 function fixture(execution={} as DshExecution){
@@ -80,6 +81,50 @@ test('native multi-message turns preserve ordered, deduplicated full sources for
     assert.deepEqual(f.source(created.task.id,'result.rejected'),{sessionId,messageId:'rework-last',seq:32,text:'再精简一些。\n\n再精简一些。',messages:[{messageId:'rework-first',seq:31,text:'再精简一些。'},{messageId:'rework-last',seq:32,text:'再精简一些。'}]});
     assert.deepEqual(await f.call('rework',reworkArgs),reworked);assert.equal(f.store.resultById(report.resultId!)?.humanAcceptedAt,null);
   }finally{await f.close();}
+});
+
+test('same-turn active Worker additions preserve exact same-task sources in order',async()=>{
+  const f=fixture({continueRecovery:async(_id:string,_version:number,_manager:string,authorize:()=>void)=>{
+    authorize();return {status:'waiting'};
+  }} as DshExecution);
+  try {
+    const create=(goal:string)=>f.store.createTask(goal,{botId:f.bot.id,goal,scope:'Read receipts',acceptance:'Report',reviewPolicy:'human'});
+    const task=create('Current release'),other=create('Separate release'),inactive=create('Inactive release');
+    f.enterRun(task.id,task.goal);f.enterRun(other.id,other.goal);
+    const old=f.enterRun(inactive.id,inactive.goal);
+    f.store.workerReport(old.id,'blocked',{kind:'blocked',summary:'Synthetic blocker'});f.store.settleRun(old.id);
+    const unrelated=`Check separate release ${workUrl({kind:'task',taskId:other.id})}`;
+    const staging='  Also read the staging2 receipt.\nRecord when it arrived.  ',prod='Also read the prod receipt.';
+    f.emit({type:'turn/start',data:{turn:1}});
+    f.native('different-task',4,unrelated);f.native('closed-run',5,'Inspect Inactive release.');
+    f.native('staging2',6,staging);f.native('prod',7,prod);
+    const args={action:'continue',taskId:task.id,expectedRowVersion:f.store.getTask(task.id).rowVersion,
+      userInstruction:prod,continuationMode:'authorized-work'};
+    const read=(text:string)=>({text,continuationMode:'read-only'});
+    await assert.rejects(f.call('unrelated',{...args,earlierDirections:[read(unrelated)]}),{code:'control-task-link'});
+    await assert.rejects(f.call('forged',{...args,earlierDirections:[read('Invented earlier instruction')]}),{code:'control-human-text'});
+    assert.equal(f.store.recoveryInstruction(task.id),null);
+    const additions={...args,earlierDirections:[read(staging.trim())]};
+    assert.equal((await f.call('confirm',additions)).directionStatus,'next-run');
+    const saved=f.store.recoveryInstruction(task.id)!;
+    assert.deepEqual(saved.directions?.map(({source})=>[source.messageId,source.text]),[['staging2',staging],['prod',prod]]);
+    assert.equal(saved.mode,'read-only');
+    assert.equal((await f.call('redelivery',additions)).directionStatus,'next-run');
+    assert.equal(f.store.taskDetail(task.id).events.filter(event=>event.kind==='task.recovery-instruction').length,2);
+    assert.equal(f.store.recoveryInstruction(other.id),null);
+    const separate={...args,taskId:other.id,expectedRowVersion:f.store.getTask(other.id).rowVersion,
+      userInstruction:unrelated,useEarlierDirection:true,continuationMode:'read-only'};
+    await assert.rejects(f.call('earlier-replace',{...separate,directionChange:'replace'}),{code:'direction-stale'});
+    await assert.rejects(f.call('earlier-inactive',{...separate,taskId:inactive.id,userInstruction:'Inspect Inactive release.',
+      expectedRowVersion:f.store.getTask(inactive.id).rowVersion}),{code:'direction-stale'});
+    await assert.rejects(f.call('earlier-unclear',{...separate,userInstruction:staging.trim()}),{code:'direction-target'});
+    const receipt=await f.call('separate-task',separate);
+    assert.equal(receipt.directionStatus,'next-run');
+    assert.deepEqual(await f.call('repeat-separate',separate),receipt);
+    assert.deepEqual(f.store.recoveryInstruction(other.id)?.directions?.map(({source})=>source.messageId),['different-task']);
+    assert.equal(f.store.recoveryInstruction(inactive.id),null);
+    assert.equal(f.store.taskDetail(other.id).events.filter(event=>event.kind==='task.recovery-instruction').length,1);
+  } finally {await f.close();}
 });
 
 test('turn boundaries clear human authority while automatic and other-session messages never grant it',async()=>{

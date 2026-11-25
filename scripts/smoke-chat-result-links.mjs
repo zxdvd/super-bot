@@ -5,7 +5,7 @@ import { mkdir, readFile, realpath, rename, writeFile } from 'node:fs/promises';
 import { basename, join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import {
-  artifactDeliveryText, artifactGoal, artifactLinks, artifactPortProbeGoal, artifactPortProbeTail,
+  artifactDeliveryText, artifactGoal, artifactLinks, artifactPrimary, artifactPortProbeGoal, artifactPortProbeTail,
   artifactReference, artifactRevision, supplementalDoc,
 } from '../test/delivery-link-fixture.ts';
 
@@ -54,6 +54,7 @@ export async function smokeChatResultLinks({ base, configure, launch, stop, rpc,
   await say(`DF14_SHOW_RESULT:${task.id}`);
   const delivered = await awaitReceipt(id);
   assert.deepEqual(delivered.deliveredResult.links, artifactLinks);
+  assert.equal(delivered.deliveredResult.primaryLink, artifactPrimary);
   const original = (await inspect()).assistantTexts.find(text => text.includes(oldOrigin + fragment));
   assert.ok(original);
   const [receipt] = receipts(delivered);
@@ -177,7 +178,11 @@ export async function smokeChatResultLinks({ base, configure, launch, stop, rpc,
     const replyItems = flow.getByRole('group', { name: '交付物', exact: true }).first();
     await replyItems.waitFor();
     const moreItems = replyItems.locator('summary');
-    if (await moreItems.count()) await moreItems.click();
+    const primary = replyItems.getByRole('link', { name: artifactPrimary, exact: true });
+    assert.ok(await primary.isVisible());
+    assert.equal(await primary.getAttribute('href'), artifactLinks[artifactPrimary]);
+    assert.equal(await replyItems.locator('details').getAttribute('open'), null);
+    await moreItems.click();
     for (const [name, href] of Object.entries(artifactLinks)) {
       assert.equal(await replyItems.getByRole('link', { name, exact: true }).getAttribute('href'), href);
     }
@@ -397,6 +402,7 @@ export async function smokeChatResultLinks({ base, configure, launch, stop, rpc,
     const webBrowser = await openBrowserChat(web, webBot.name);
     await probe(web, 'native-prompt', webBot.managerId, artifactGoal);
     const webLinks = webBrowser.flow.getByRole('group', { name: '交付物', exact: true });
+    await webLinks.getByRole('link', { name: artifactPrimary, exact: true }).waitFor();
     await webLinks.locator('summary').click({ timeout: 15000 });
     for (const [name, href] of Object.entries(artifactLinks)) {
       assert.equal(await webLinks.getByRole('link', { name, exact: true }).getAttribute('href'), href);

@@ -14,6 +14,7 @@ import {carrierKeyOf} from '@deepseek-ai/dsh-scope';
 import {ChildWaitObservation,type NativeChildEdge} from './dsh-child-wait.ts';
 import { randomUUID } from 'node:crypto';
 import { parseClusterProbe,prepareClusterProbe } from './kubernetes-preflight.ts';
+import {GIT_STATUS_QUERY,WORKER_QUERY_TOOL,gitWorkingTreeStatus,parseGitStatusQuery} from './git-status-query.ts';
 import { freezeMessage,ToolCallId,type UserMessage } from '@deepseek-ai/dsh-llm';
 import type {Session,SessionStore} from '@deepseek-ai/dsh-session';
 import type {} from '@deepseek-ai/dsh-session-persistence';
@@ -50,6 +51,21 @@ export function modelFailureNote(code:string):string {
 function originalService(tree:NativeSubagents|undefined):NativeSubagents|undefined {
   // Cordis traces each ctx.get through a new wrapper around the same service.
   return tree&&(Reflect.get(tree,symbols.original)??tree);
+}
+
+function unknownPriorEffects(checks:PriorTools|null,unboundCluster:boolean,inherited=false):string {
+  const notes:string[]=[];
+  if(!checks)notes.push('缺少可核对的原轮工具记录。');
+  else {
+    if(checks.incomplete)notes.push('原轮工具调用与结果记录不完整。');
+    if(checks.potentialEffects.length) {
+      const tools=[...new Set(checks.potentialEffects.map(item=>item.tool.replace(/[^a-zA-Z0-9_.-]/g,'').slice(0,80)))].slice(0,5).join('、');
+      notes.push(`原轮工具 ${tools||'（名称无法核实）'} 缺少可信的只读或外部操作回执。`);
+    }
+  }
+  if(unboundCluster)notes.push('原轮 Kubernetes 查询缺少匹配的宿主回执。');
+  if(inherited)notes.push('此前执行仍有待核对的外部效果。');
+  return notes.join(' ');
 }
 
 function recoveryInputs(agent:Agent):RecoveryInput[] {
@@ -103,6 +119,7 @@ export class DshExecution {
   private treeChecks=new Map<string,TreeCheck>();
   private turnStarts=new WeakMap<Session,{turn:number;seq:number}>();
   private finishing=new Map<string,Promise<void>>();
+  private closing=new Map<string,Promise<void>>();
   private pendingHuman=new Map<string,string[]>();
   private recoveryTreeChecks=new WeakMap<Agent,Promise<boolean>>();
   private deletedRuns=new Map<string,AbortController>();
@@ -134,17 +151,21 @@ export class DshExecution {
   }
 
   install():void {
-    this.ctx.effect(()=>this.ctx.tools.register({name:'super_bot_report',description:'Report progress, a question, a blockage, failure, or ready results to the task ledger. Ready requires files and acceptance checks. A ready report requests human review, it does not complete the task.',
-      parameters:{type:'object',properties:{kind:{type:'string',enum:['progress','waiting','ready','blocked','failed']},summary:{type:'string'},checks:{type:'string'},files:{type:'array',items:{type:'string'},maxItems:10},
+    this.ctx.effect(()=>this.ctx.tools.register({name:'super_bot_report',description:'Report progress, a completed stage, a question, a blockage, failure, or the overall ready result. Ready requires files and acceptance checks for the whole task. Stage requires a distinct name, stable evidenceRef, and checks.',
+      parameters:{type:'object',properties:{kind:{type:'string',enum:['progress','stage','waiting','ready','blocked','failed']},summary:{type:'string'},checks:{type:'string'},files:{type:'array',items:{type:'string'},maxItems:10},
+        stage:{type:'string',description:'Stage only. Specific milestone reached while another authorized step remains.'},
+        evidenceRef:{type:'string',description:'Stage only. Stable identifier for the new evidence, e.g. exact CI run URL, merge commit, or deployment receipt.'},
         links:{type:'object',additionalProperties:{type:'string'},description:'Ready only. Map a distinct display name to the full HTTP(S) URL of each actual external deliverable. Use files for local evidence and keep reference links in the report.'},
+        primaryLink:{type:'string',description:'Ready only. Exact display name in links of the one main deliverable the user should open next.'},
       },required:['kind','summary'],additionalProperties:false},
       output:{schema:{type:'object',properties:{accepted:{type:'boolean'},resultId:{type:'string'},reason:{type:'string'},next:{type:'string'}},required:['accepted'],additionalProperties:false},render:(_args,value)=>[{type:'text',text:JSON.stringify(value)}]},
       execute:async(args,exec)=>{
         const run=this.store.heldRuns().find(r=>r.sessionId===exec.agent?.id&&r.finishedAt===null);
         if(!run||this.finishing.has(run.id))throw new AppError('report-scope','当前会话没有可报告的执行。');
         const data=args as Record<string,unknown>;const binding=this.store.getBinding(run.bindingId);
-        const report:WorkReport={kind:data.kind as WorkReport['kind'],summary:requiredText(data.summary,'报告内容'),checks:optionalText(data.checks,'验收说明'),links:data.links as WorkReport['links']};
-        if(report.kind==='ready'&&this.store.recoveryWorkPlan(run.id)?.context.mode==='read-only') {
+        const report:WorkReport={kind:data.kind as WorkReport['kind'],summary:requiredText(data.summary,'报告内容'),checks:optionalText(data.checks,'验收说明'),links:data.links as WorkReport['links'],primaryLink:data.primaryLink as WorkReport['primaryLink'],
+          stage:data.stage as WorkReport['stage'],evidenceRef:data.evidenceRef as WorkReport['evidenceRef']};
+        if((report.kind==='ready'||report.kind==='stage')&&this.store.recoveryWorkPlan(run.id)?.context.mode==='read-only') {
           throw new AppError('continuation-scope','本次只读核对只覆盖指定的后续步骤。请用 blocked 或 waiting 报告实际观察及余下事项。');
         }
         if(report.kind==='ready')report.requestedFiles=evidencePaths(data.files);
@@ -160,13 +181,13 @@ export class DshExecution {
           }
         };
         let captured: CapturedEvidence[] | undefined;
-        if(report.kind==='ready') {
+        if(report.kind==='ready'||report.kind==='stage') {
           const agent=exec.agent!,revision=treeCheck?.revision;
           let joined=await this.waitForTreeWork(agent,exec.signal,treeCheck,this.childWait(run,agent,'ready'));
           assertCurrent();
           this.assertChildrenQuiet(agent);
           this.assertObservedTreeQuiet(treeCheck);
-          if(!joined&&treeCheck?.revision===revision&&!hasPendingChildResult(agent)&&!receipt) {
+          if(report.kind==='ready'&&!joined&&treeCheck?.revision===revision&&!hasPendingChildResult(agent)&&!receipt) {
             captured=await captureEvidence(binding.cwd,report.requestedFiles);
             // File I/O yields. Require a fresh native observation before using the evidence.
             joined=await this.waitForTreeWork(agent,exec.signal,treeCheck,this.childWait(run,agent,'ready'));
@@ -176,7 +197,7 @@ export class DshExecution {
           }
           if(joined||treeCheck?.revision!==revision||hasPendingChildResult(agent)) {
             if(receipt)throw new AppError('report-stale','已提交候选后又有子树活动，请核对，不能重用旧报告。');
-            return {accepted:false,reason:'subtree-joined',next:'已等待子 Agent 树收敛。本次未提交成果，父轮次继续占用执行名额。请核对子 Agent 结果、文件与测试，再在本轮重新调用 ready。'};
+            return {accepted:false,reason:'subtree-joined',next:`已等待子 Agent 树收敛。本次未提交报告，父轮次继续占用执行名额。请核对子 Agent 结果及证据，再在本轮重新调用 ${report.kind}。`};
           }
         }
         assertCurrent();
@@ -245,6 +266,46 @@ export class DshExecution {
       },
     },{when:({agent})=>this.store.heldRuns().some(run=>run.sessionId===agent.id&&run.finishedAt===null&&
       !this.store.isBotDeleted(this.store.getTask(run.taskId).botId))}));
+    if(fullAccessEnabled(this.options))this.ctx.effect(()=>this.ctx.tools.register({
+      name:WORKER_QUERY_TOOL,
+      description:'Read-only Git working tree status in the bound task directory. Reports available HEAD and staged, unstaged and untracked paths. Use for the opening Git baseline and working tree checks. No shell, path or flags.',
+      parameters:{type:'object',properties:{kind:{type:'string',enum:[GIT_STATUS_QUERY]}},required:['kind'],additionalProperties:false},
+      output:{schema:{type:'object',additionalProperties:true},render:(_args,value)=>[{type:'text',text:JSON.stringify(value)}]},
+      execute:async(args,exec)=>{
+        const agent=exec.agent;
+        const run=agent&&this.store.heldRuns().find(item=>item.sessionId===agent.id&&item.finishedAt===null&&item.state==='running');
+        const proof=run&&this.store.runTurn(run.id);
+        if(!agent||!run||!this.autoTurns.has(run.id)||proof?.turn==null||proof.inputSeq==null) {
+          throw new AppError('query-scope','没有绑定到此会话与轮次的任务授权。');
+        }
+        const {kind}=parseGitStatusQuery(args);
+        const binding=this.store.getBinding(run.bindingId);
+        const authorize=()=>{
+          exec.signal.throwIfAborted();
+          const current=this.store.getRun(run.id),task=this.store.getTask(run.taskId);
+          if(this.disposed||!this.autoTurns.has(run.id)||current.state!=='running'||current.finishedAt!==null||
+            task.taskRevision!==run.taskRevision||task.controlMode==='manual'||this.store.isBotDeleted(task.botId)||
+            this.store.activeBinding(task.id)?.id!==binding.id||this.store.finalReport(run.id)) {
+            throw new AppError('query-scope','原任务或当前工具授权已改变。');
+          }
+          this.assertDirectory(agent,binding.cwd);
+        };
+        authorize();
+        const identity={kind,cwd:binding.cwd,turn:proof.turn,inputSeq:proof.inputSeq};
+        const prior=this.store.readQueryReceipt(run.id,exec.callId);
+        if(prior) {
+          if(prior.kind!==kind||prior.cwd!==identity.cwd||prior.turn!==identity.turn||prior.inputSeq!==identity.inputSeq) {
+            throw new AppError('idempotency-conflict','此只读工具调用已绑定到其他执行坐标。');
+          }
+          return prior.result;
+        }
+        const result=await gitWorkingTreeStatus(binding.cwd,exec.signal,authorize);
+        authorize();
+        this.store.recordReadQueryReceipt(run.id,exec.callId,{...identity,result});
+        return result;
+      },
+    },{when:({agent})=>this.store.heldRuns().some(run=>run.sessionId===agent.id&&run.finishedAt===null&&
+      !this.store.isBotDeleted(this.store.getTask(run.taskId).botId))}));
     this.ctx.on('agent/created',({agent})=>{
       if(this.disposed)return;
       for(const run of this.store.heldRuns())if(run.sessionId===agent.id&&!this.running.has(run.id))this.withdrawWorkerInput(run,agent);
@@ -264,7 +325,11 @@ export class DshExecution {
         const run=this.store.heldRuns().find(r=>r.sessionId===session.id&&r.finishedAt===null);
         if(run)this.store.nativeApprovalAsked(run.id,event.data.id,event.data.toolName,event.data.reason??'');
       }
-      if(event.type==='approval/decided')this.store.nativeApprovalDecided(session.id,event.data.id,event.data.outcome);
+      if(event.type==='approval/decided') {
+        this.store.nativeApprovalDecided(session.id,event.data.id,event.data.outcome);
+        const taskId=this.store.workerTaskForSession(session.id);
+        if(taskId)void this.advanceClose(taskId,true);
+      }
       if(event.type==='user/message'&&event.data.source.kind==='super-bot') {
         const source=event.data.source;
         const run=this.store.heldRuns().find(r=>r.id===source.runId&&r.finishedAt===null);
@@ -305,16 +370,22 @@ export class DshExecution {
       if(!proof?.quiet||proof.endSeq===null)this.store.runRecovery(run.id,proof?'重启后缺少原进程的归属结束/后台收敛证据，保留占用；没有自动重投。':'旧版 Run 没有持久轮次证据，请人工核对；没有自动重投。',false);
       else this.scheduleReconciliation(run.id);
     }
+    for(const taskId of this.store.pendingTaskCloses()) {
+      const runId=this.store.taskClose(taskId)?.runId;
+      if(!runId||!this.finishing.has(runId))void this.advanceClose(taskId,true,true);
+    }
     this.stopDeletedBot();
   }
   /** Useful to callers/tests before inspecting startup reconciliation; never executes model work. */
-  async whenReconciled():Promise<void> {await Promise.all([...this.finishing.values()]);}
+  async whenReconciled():Promise<void> {await Promise.all([...this.finishing.values(),...this.closing.values()]);}
   private scheduleReconciliation(runId:string,session?:Session):void {
     const done=Promise.resolve().then(()=>this.reconcileRun(runId,session)).catch(error=>{
       if(!this.disposed)this.store.runRecovery(runId,error instanceof AppError?error.message:'持久执行证据无法读取，请人工核对；没有重投。',!!session);
-    }).finally(()=>{
+    }).finally(async()=>{
       if(!this.disposed)for(const id of this.pendingHuman.get(runId)??[])this.store.nativeIntervention(this.store.getRun(runId).sessionId,id);
       this.pendingHuman.delete(runId);this.finishing.delete(runId);
+      const agent=!this.disposed&&session&&this.ctx.agents.get?.(session.id);
+      if(!this.disposed&&(!agent||agent.status==='idle'))await this.advanceClose(this.store.getRun(runId).taskId,true);
     });
     this.finishing.set(runId,done);
   }
@@ -582,10 +653,12 @@ export class DshExecution {
       const message=createWorkerRunMessage(run,input,standing,prompt,recovery,work?.context);
       input=this.store.saveRunMessage(run.id,message.id,JSON.stringify(message));
     }
-    const allowed=readOnly?['read','super_bot_report',...(work.authorizedProbes.length?['super_bot_preflight']:[])]:['read','write','edit','super_bot_report'];
+    const allowed=readOnly?['read','super_bot_report',...(fullAccess?[WORKER_QUERY_TOOL]:[]),
+      ...(work.authorizedProbes.length?['super_bot_preflight']:[])]:['read','write','edit','super_bot_report'];
     const releaseMask=fullAccess&&!readOnly?()=>{}:agent.ctx.tools.restrict({allow:allowed});
     const releaseGuard=agent.ctx.tools.guard(exec=>{
-      if(this.store.getRun(run.id).finishedAt!==null||this.store.getTask(taskId).controlMode==='manual'||this.store.isBotDeleted(task.botId))return 'This automatic run no longer has task authority.';
+      const current=this.store.getRun(run.id);
+      if(current.finishedAt!==null||current.state==='cancelling'||this.store.getTask(taskId).controlMode==='manual'||this.store.isBotDeleted(task.botId))return 'This automatic run no longer has task authority.';
       if(exec.name!=='super_bot_report'&&this.store.finalReport(run.id))return 'A final report has been submitted; no new tool work is authorized in this run.';
       if(readOnly&&(this.store.getTask(taskId).controlMode!=='auto'||!allowed.includes(exec.name)))return 'This continuation authorizes only the available read-only checks and a report.';
       if(!fullAccess&&!allowed.includes(exec.name))return 'Only task file tools and super_bot_report are authorized for this run.';
@@ -684,7 +757,10 @@ export class DshExecution {
       const done=agent.whenIdle().then(()=>{
         if(this.disposed||finalized)return;
         this.assertQuiet(agent);finishTurn();
-      }).catch(error=>{if(!this.disposed&&!finalized)this.store.runRecovery(run.id,error instanceof AppError?error.message:'执行状态待核对，请打开原生会话检查。');}).finally(()=>{this.autoTurns.delete(run.id);release();this.running.delete(run.id);});
+      }).catch(error=>{if(!this.disposed&&!finalized)this.store.runRecovery(run.id,error instanceof AppError?error.message:'执行状态待核对，请打开原生会话检查。');}).finally(()=>{
+        this.autoTurns.delete(run.id);release();this.running.delete(run.id);
+        if(!this.disposed)void Promise.resolve(this.finishing.get(run.id)).then(()=>this.advanceClose(taskId,true));
+      });
       this.running.set(run.id,{agent,release,done,finishTurn});
       return this.store.getRun(run.id);
     }catch(error){
@@ -751,21 +827,29 @@ export class DshExecution {
     }
     const receipt=this.store.requestStop(requestId,taskId,rowVersion,expectedRunId);
     if(exact?.id===receipt.runId&&exact.state==='cancelling')return receipt;
-    if(this.store.getRun(receipt.runId).finishedAt!==null)return receipt;
-    if(this.finishing.has(receipt.runId))return receipt; // Do not cancel a following human driver while the old end is being verified.
-    const active=this.running.get(receipt.runId);
-    if(!active){if(this.store.getRun(receipt.runId).finishedAt===null)this.store.runRecovery(receipt.runId,'停止请求已记录，但当前宿主没有这个执行句柄，请核对原生会话。');return receipt;}
+    this.sendStop(receipt.runId);
+    return receipt;
+  }
+  private sendStop(runId:string):void {
+    const run=this.store.getRun(runId);
+    if(run.finishedAt!==null||this.finishing.has(runId))return;
+    const active=this.running.get(runId);
+    if(!active){this.store.runRecovery(runId,'停止请求已记录，但当前宿主没有这个执行句柄，请核对原生会话。');return;}
     try {
-      const input=this.store.getRunInput(receipt.runId);
+      const input=this.store.getRunInput(runId);
       if(input.messageId)active.agent.inbox.remove(input.messageId as UserMessage['id']);
       active.agent.cancel({kind:'user'},{keepInbox:true});
       for(const job of this.liveWorkerJobs(active.agent.id))this.ctx.jobs.kill(job.id,active.agent.id,'Super Bot stop');
     }catch {
-      this.store.runRecovery(receipt.runId,'停止请求已记录，但宿主停止操作未能确认，请核对原生会话与后台工作。');
-      return receipt;
+      this.store.runRecovery(runId,'停止请求已记录，但宿主停止操作未能确认，请核对原生会话与后台工作。');
+      return;
     }
-    const timeout=setTimeout(()=>{if(!this.disposed&&this.store.getRun(receipt.runId).finishedAt===null)this.store.runRecovery(receipt.runId,'停止已请求，但 10 秒内未确认收敛。请核对原生会话与后台工作。');},10000);timeout.unref();
-    void active.done.finally(()=>clearTimeout(timeout));return receipt;
+    const timeout=setTimeout(()=>{
+      if(this.disposed||this.store.getRun(runId).finishedAt!==null)return;
+      this.store.runRecovery(runId,'停止已请求，但 10 秒内未确认收敛。请核对原生会话与后台工作。');
+      void this.advanceClose(run.taskId,true);
+    },10000);timeout.unref();
+    void active.done.finally(()=>clearTimeout(timeout));
   }
   private withdrawWorkerInput(run:Run,agent:Agent):boolean {
     const id=this.store.getRunInput(run.id).messageId;
@@ -919,7 +1003,7 @@ export class DshExecution {
     try {
       const target=this.store.recoveryTarget(detail.task.id,detail.task.rowVersion);
       attentionId=target.attentions[0]!;
-      canContinue=!!target.binding&&target.task.lifecycle==='open'&&!!target.task.scope&&!!target.task.acceptance;
+      canContinue=!detail.closeRequest&&!!target.binding&&target.task.lifecycle==='open'&&!!target.task.scope&&!!target.task.acceptance;
     }catch(error){if(!(error instanceof AppError))throw error;}
     const b=detail.binding,task=detail.task;
     const sessionId=b?.state==='ready'&&b.taskRevision===task.taskRevision&&b.sessionId===task.sessionId?b.sessionId:null;
@@ -989,7 +1073,7 @@ export class DshExecution {
       new Promise<'unknown'>(resolve=>setImmediate(()=>resolve('unknown')))]);
     if(outcome!=='quiet')throw new AppError('child-unknown','原生子树仍在活动或无法确认，请核对后再试。');
   }
-  private async readRecoveryTools(run:Run,cwd:string,proof:RunTurn,agent?:Agent) {
+  private async readRecoveryTools(run:Run,cwd:string,proof:RunTurn,agent?:Agent,closing=false) {
     const events=await this.readRunEvents(run,agent?.session);
     const later=verifyRunTurn(run,this.store.getRunInput(run.id),proof,events,true);
     if(later.length||events.some(event=>event.seq>proof.endSeq!&&
@@ -998,7 +1082,7 @@ export class DshExecution {
     }
     const segment=events.slice(proof.startSeq!+1,proof.endSeq!);
     if(segment.some(event=>{
-      if(event.type==='working-directory/change'||event.type==='approval/asked')return true;
+      if(event.type==='working-directory/change'||!closing&&event.type==='approval/asked')return true;
       if(event.type!=='user/message'||event.seq===proof.inputSeq)return false;
       const source=event.data.source as {kind:string;form?:unknown};
       return !((source?.kind==='runtime-context'||source?.kind==='time-context')&&source.form==='snapshot'||
@@ -1006,7 +1090,21 @@ export class DshExecution {
     })) {
       throw new AppError('recovery-scope-changed','原轮包含额外输入、目录变化或审批，无法证明同一操作授权。');
     }
-    return inspectPriorTools(events,cwd,proof.turn!,proof.startSeq!,proof.endSeq!);
+    if(closing) {
+      const settledJobs=new Set(segment.flatMap(event=>event.type==='job/settled'&&event.data.status==='completed'&&
+        event.data.producerReported===true?[event.data.jobId]:[]));
+      const job=segment.find(event=>event.type==='job/registered'&&!settledJobs.has(event.data.jobId));
+      if(job)throw new AppError('effect-uncertain','原生后台作业已停止或缺少成功回执，其外部效果尚未确认。请检查 Worker 会话中的作业结果。');
+    }
+    return inspectPriorTools(events,cwd,proof.turn!,proof.startSeq!,proof.endSeq!,call=>{
+      const receipt=this.store.readQueryReceipt(run.id,call.callId);
+      if(!receipt||receipt.cwd!==cwd||receipt.turn!==proof.turn||receipt.inputSeq!==proof.inputSeq||call.callSeq<=proof.inputSeq!)return null;
+      try {
+        const {kind}=parseGitStatusQuery(JSON.parse(call.args));
+        if(receipt.kind===kind&&call.resultText===JSON.stringify(receipt.result))return receipt;
+      }catch{/* A host receipt must match the durable call and exact result. */}
+      return null;
+    });
   }
   private boundPreflightReceipts(runId:string,clusters:PriorTools['clusters']) {
     return clusters.map(call=>{
@@ -1060,8 +1158,9 @@ export class DshExecution {
       [JSON.stringify([call.receipt!.probe,call.receipt!.auth]),call])).values()];
     const observed=receipts.flatMap(call=>call.receipt&&call.receipt.auth&&call.receipt.result.status!=='unavailable'?
       [{probe:call.receipt.probe,result:call.receipt.result,callSeq:call.callSeq,resultSeq:call.resultSeq}]:[]);
-    const effectUncertain=checks.incomplete||checks.potentialEffects.length>0||
-      sessions.some(call=>!call.receipt)||this.store.recoveryWorkPlan(runId)?.context.effectUncertain===true;
+    const uncertainty=unknownPriorEffects(checks,sessions.some(call=>!call.receipt),
+      this.store.recoveryWorkPlan(runId)?.context.effectUncertain===true);
+    const effectUncertain=!!uncertainty;
     const candidates:{evidence:ProbeEvidence;known?:ProbeResult}[]=effectUncertain?[]:[...checks.files];
     if(fullAccessEnabled(this.options))for(const {receipt,callId,callSeq,resultSeq} of receipts)if(receipt?.auth) {
       const stateInquiry=receipt.probe.kind==='deployment-state'||receipt.probe.kind==='volume-state';
@@ -1072,7 +1171,7 @@ export class DshExecution {
           ...(receipt.result.status==='denied'?{known:receipt.result}:{})});
       }
     }
-    const blockers={observed,priorTools:checks.potentialEffects,priorReport:this.store.runFinalReport(runId),
+    const blockers={observed,priorTools:checks.potentialEffects,priorReadQueries:checks.queries,priorReport:this.store.runFinalReport(runId),
       ...(candidates.length>1?{competingChecks:candidates.map(({evidence,known})=>
         ({probe:evidence.probe,...(known?{result:known}:{})}))}:{})};
     if(candidates.length!==1) {
@@ -1081,7 +1180,7 @@ export class DshExecution {
           message:'上一轮执行已经结束。报告所列的前置仍需处理，账本没有可以自动继续的同范围核对。'};
       }
       return refused(effectUncertain?
-        '当前记录不足以确认外部动作及其结果。请对照已核实的目标状态或原操作回执，决定是否仍需行动。':
+        `${uncertainty} 请对照已核实的目标状态或原操作回执，决定是否仍需行动。`:
         '原轮没有单一可按同一授权核对的只读失败证据。请根据报告核对具体的前置条件或所需动作。',blockers);
     }
     const {evidence,known}=candidates[0]!;
@@ -1157,11 +1256,12 @@ export class DshExecution {
         const receipts=(checks?this.boundPreflightReceipts(run.id,checks.clusters):[]).map(call=>call.receipt);
         const priorCheck=this.store.recoveryCheck(run.id);
         const priorWork=this.store.recoveryWorkPlan(run.id);
-        const effectUncertain=!checks||checks.incomplete||checks.potentialEffects.length>0||
-          receipts.some(item=>!item)||priorCheck?.effectUncertain===true||priorWork?.context.effectUncertain===true;
+        const uncertainty=unknownPriorEffects(checks,receipts.some(item=>!item),
+          priorCheck?.effectUncertain===true||priorWork?.context.effectUncertain===true);
+        const effectUncertain=!!uncertainty;
         if(!this.store.verifiedBlocker(run)) {
           if(!checks||run.state!=='interrupted')throw new AppError('recovery-unproven','尚未找到可归属的旧轮结束或后台收敛证据，保留旧轮占用。');
-          if(effectUncertain)throw new AppError('effect-uncertain','原轮还有未确认的外部效果，保留旧轮占用。请核对操作回执或按现有授权查询目标状态。');
+          if(effectUncertain)throw new AppError('effect-uncertain',`原轮还有未确认的外部效果，保留旧轮占用。${uncertainty} 请核对操作回执或按现有授权查询目标状态。`);
           this.store.verifyInterruptedEnd(taskId,rowVersion,managerId);
           rowVersion=this.store.getTask(taskId).rowVersion;
           validate();
@@ -1179,16 +1279,19 @@ export class DshExecution {
         if(!mode||mode==='authorized-work'&&effectUncertain) {
           const detail=observations.at(-1)?.result.message;
           return {status:'blocked',message:[detail,effectUncertain?
-            '原轮外部效果仍需核对。现有记录只支持已有授权的具体只读核对。':
+            `${uncertainty} 现有记录只支持已有授权的具体只读核对。`:
             '旧轮已结束。请按已有证据核对缺失的前置或具体有授权的下一步。'].filter(Boolean).join(' ')};
         }
         if(this.store.dispatchBlocker(taskId)) {
           this.store.recordCapacityWait(`continuation:${instruction.id}:${rowVersion}`,taskId,rowVersion);
-          return {status:'waiting',message:'已保存最新指示，等待此 Bot 的 Worker 执行名额。'};
+          return {status:'waiting',message:'已保存用户指示，等待此 Bot 的 Worker 执行名额。'};
         }
         const work:RecoveryWorkContext={priorRunId:run.id,mode,priorReport:this.store.runFinalReport(run.id),
           priorCheck:priorCheck?.resolution??priorWork?.context.priorCheck,effectUncertain,
-          priorDirection:instruction.priorDirection?.text,probes:authorizedProbes.map(({probe})=>probe),observations};
+          priorDirections:instruction.directions?.filter(direction=>direction.id!==instruction.id)
+            .map(({id,source})=>({id,text:source.text})),
+          directionIds:instruction.directions?.map(direction=>direction.id),
+          priorReadQueries:checks?.queries,probes:authorizedProbes.map(({probe})=>probe),observations};
         const current=selectedModel(this.ctx,agent);
         const inherited=!this.options.workerModel&&!current&&manager&&this.store.botForSession(manager.id)?.id===task.botId
           ?selectedModel(this.ctx,manager):undefined;
@@ -1202,8 +1305,11 @@ export class DshExecution {
           configureRole(this.ctx,agent,'worker',this.options);
           if(inherited)agent.model.select(inherited);
           const launched=this.deliverRun(next,agent,binding);
-          if(launched.state!=='interrupted')return {status:'started',run:launched,message:mode==='read-only'?
-            '已在原任务开始限定范围的核对。':'已在原任务开始执行最新授权的步骤。'};
+          if(launched.state!=='interrupted') {
+            const entered=this.store.getRunInput(next.id).state==='entered';
+            return {status:'started',run:launched,message:entered?'已进入原任务的 Worker。':
+              '已排入原任务的下一轮，等待 Worker 读取指示。'};
+          }
         }catch {
           this.store.runRecovery(next.id,'后续执行的投递待核对，已保存原指示并保留占用。');
         }
@@ -1211,7 +1317,8 @@ export class DshExecution {
       }catch(error) {
         if(!(error instanceof AppError)||['manager-scope','recovery-scope'].includes(error.code))throw error;
         const waiting=['run-active','session-busy','job-active','child-active','capacity'].includes(error.code);
-        return {status:waiting?'waiting':'blocked',message:error.message};
+        return {status:waiting?'waiting':'blocked',message:error.code==='run-active'?
+          '已记下指示，将在原任务的下一轮处理。':error.message};
       }
     });
   }
@@ -1297,14 +1404,23 @@ export class DshExecution {
     if(acknowledged!==true)throw new AppError('confirmation-required','请先检查原生会话、文件和外部效果，再确认核对完成。');
     const action=continuation?'run.continue-recovery':'run.resolve-recovery';
     const payload={taskId,expectedRowVersion:rowVersion,...continuation};
-    const receipt=()=>this.store.commandReceipt<Task|Run>(requestId,action,payload);
+    const receipt=()=>{
+      const saved=this.store.commandReceipt<Task|Run>(requestId,action,payload);
+      if(!saved||'inputId' in saved)return saved;
+      const current=this.store.getTask(taskId);
+      return current.lifecycle==='cancelled'?current:saved;
+    };
     authorize();
     const prior=receipt();
     if(prior)return 'inputId' in prior?this.store.getRun(prior.id):prior;
     const target=this.store.recoveryTarget(taskId,rowVersion,continuation);
     return this.reloadAdmission.run(`Worker task ${taskId} recovery`,async()=>{
       const binding=target.binding;
-      if(!binding?.sessionId)return this.store.resolveRunRecovery(requestId,taskId,rowVersion);
+      if(!binding?.sessionId) {
+        this.store.resolveRunRecovery(requestId,taskId,rowVersion);
+        await this.advanceClose(taskId,true);
+        return this.store.getTask(taskId);
+      }
       const sessionId=SessionId(binding.sessionId);
       const validate=()=>{
         if(this.disposed)throw new AppError('unavailable','插件正在退出。');
@@ -1325,7 +1441,11 @@ export class DshExecution {
       const retry=validate();if(retry)return retry;
       if(tree!==originalService(this.nativeSubagents()))throw new AppError('child-unknown','原生子树服务已改变，请重新核对。');
       this.assertRecoveryQuiet(agent,target.run?.id);
-      if(!continuation)return this.store.resolveRunRecovery(requestId,taskId,rowVersion);
+      if(!continuation) {
+        this.store.resolveRunRecovery(requestId,taskId,rowVersion);
+        await this.advanceClose(taskId,true);
+        return this.store.getTask(taskId);
+      }
       this.assertDirectory(agent,binding.cwd);
       const modelRequired=()=>new AppError('model-required','请先在原生会话明确选择模型，再核对并继续。');
       const selected=selectedModel(this.ctx,agent);
@@ -1343,6 +1463,80 @@ export class DshExecution {
         return this.store.getRun(run.id);
       }
     });
+  }
+  async closeTask(requestId:string,taskId:string,rowVersion:number,authorize=()=>{}) {
+    authorize();
+    if(this.disposed)throw new AppError('unavailable','插件正在退出。');
+    const run=this.store.latestRun(taskId);
+    const previous=this.store.commandReceipt(requestId,'task.close',{taskId,expectedRowVersion:rowVersion});
+    if(!previous) {
+      const receipt=this.store.requestTaskClose(requestId,taskId,rowVersion,run&&this.finishing.has(run.id)?run.id:undefined);
+      if(receipt.stopRunId)this.sendStop(receipt.stopRunId);
+    }
+    await this.advanceClose(taskId,false,true);
+    return {task:this.store.getTask(taskId),run:this.store.latestRun(taskId),closeRequest:this.store.taskClose(taskId)};
+  }
+  private advanceClose(taskId:string,notify:boolean,resolve=false):Promise<void>|undefined {
+    if(this.disposed||!this.store.taskClose(taskId))return;
+    const inflight=this.closing.get(taskId);
+    if(inflight)return inflight;
+    const pending=this.verifyTaskClose(taskId,notify,resolve).finally(()=>this.closing.delete(taskId));
+    this.closing.set(taskId,pending);
+    return pending;
+  }
+  private async verifyTaskClose(taskId:string,notify:boolean,resolve:boolean):Promise<void> {
+    const intent=this.store.taskClose(taskId),task=this.store.getTask(taskId),run=this.store.latestRun(taskId);
+    if(!intent||run?.finishedAt===null||this.store.isBotDeleted(task.botId))return;
+    const binding=this.store.activeBinding(taskId);
+    try {
+      this.store.assertTaskSettled(taskId);
+      if((intent.runId!==null&&run?.id!==intent.runId)||intent.taskRevision!==task.taskRevision) {
+        throw new AppError('version-conflict','原任务或执行发生变化，请核对最新状态。');
+      }
+      if(binding?.sessionId) {
+        const sessionId=SessionId(binding.sessionId);
+        const tree=originalService(this.nativeSubagents());
+        let agent=this.ctx.agents.get?.(sessionId);
+        if(!agent&&resolve) {
+          const loaded=await this.ctx.sessionController.resolveAgent(sessionId);
+          if('error' in loaded||loaded.agent.id!==sessionId)throw new AppError('session-unavailable','无法核对原 Worker 会话。请打开原会话后重新核对。');
+          agent=loaded.agent;
+        }
+        const readback=run!==null&&run.id===intent.runId&&this.store.closeRunNeedsReadback(run,intent.activeRun);
+        if(agent) {
+          this.assertQuiet(agent);
+          await this.confirmRecoveryTree(agent);
+        } else if(!readback) {
+          throw new AppError('session-unavailable','原 Worker 会话尚未加载。请打开原会话后重新核对。');
+        }
+        if(run&&readback) {
+          const proof=this.store.runTurn(run.id);
+          if(!proof?.quiet||proof.endSeq===null)throw new AppError('run-proof','缺少旧轮结束或后台收敛的持久回执。请核对原 Worker 会话。');
+          const checks=await this.readRecoveryTools(run,binding.cwd,proof,agent,true);
+          const unknown=checks.potentialEffects[0];
+          if(unknown)throw new AppError('effect-uncertain',`原 Worker 的 ${unknown.tool} 调用可能留下外部效果。请核对该调用实际完成的操作和资源状态。`);
+          if(checks.incomplete)throw new AppError('effect-uncertain','旧轮工具记录不完整，无法确认其中的操作效果。请核对原 Worker 会话。');
+        }
+        if(this.disposed)return;
+        if(agent) {
+          if(this.ctx.agents.get?.(sessionId)!==agent||tree!==originalService(this.nativeSubagents())) {
+            throw new AppError('session-unavailable','核对期间原会话或后台服务发生变化。请重新核对。');
+          }
+          this.assertQuiet(agent);
+        }
+        const current=this.store.activeBinding(taskId);
+        if(current?.id!==binding.id||current.generation!==binding.generation||current.sessionId!==sessionId||current.state!==binding.state) {
+          throw new AppError('version-conflict','核对期间原会话关联发生变化。请重新核对。');
+        }
+      }
+      if(!this.disposed)this.store.confirmTaskClose(taskId,intent.id,task.rowVersion,notify);
+    }catch(error) {
+      if(this.disposed)return;
+      const code=error instanceof AppError?error.code:'close-unverified';
+      const message=code==='run-active'&&run?.note?run.note:error instanceof AppError?error.message:'关闭核对暂未完成。请重新核对 Worker 会话。';
+      if(code==='needs-attention'&&intent.blocker&&message.endsWith(intent.blocker.message))return;
+      this.store.recordCloseBlocker(taskId,intent.id,{code,message},notify);
+    }
   }
   async endTaskLink(action:'task.cancel'|'session.detach',requestId:string,taskId:string,rowVersion:number,authorize=()=>{}) {
     const receipt=()=>this.store.commandReceipt<Task>(requestId,action,{taskId,expectedRowVersion:rowVersion});

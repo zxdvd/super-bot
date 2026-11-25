@@ -21,6 +21,7 @@ import { startReloadHost } from './dev-reload-host.ts';
 import { ReloadAdmission } from './reload-admission.ts';
 import { readEvidence } from './evidence.ts';
 import { Store } from './store.ts';
+import { startStageObservation } from './gitlab-observer.ts';
 import { BotMemory } from './bot-memory.ts';
 import { DshExecution } from './dsh.ts';
 import {runtimeLimits,type RuntimeOptions} from './runtime.ts';
@@ -47,6 +48,7 @@ const workdirHook=Schema.object({
   argNames:Schema.array(Schema.string()).description('Bot 可以传入的参数名白名单'),
 });
 export const Config = Schema.object({ dataDir: Schema.string().description('Super Bot 本地数据目录'), fullAccess:Schema.boolean().default(true).description('默认开启 Bot 查询工具（含 Shell）及 Worker 原生 Full Access；false 关闭 Bot 原生工具并将 Worker 限为任务目录文件工具'),
+  gitLabObserverOrigin:Schema.string().description('可选。GitLab 阶段条件的可信 HTTPS 来源，例如 https://gitlab.example.com；只读令牌由宿主启动环境提供'),
   allowedRoots:Schema.array(Schema.string()).description('Bot 为任务选择工作目录时允许的根目录（绝对路径；不能是 HOME 或 /）'),
   defaultWorkdir:Schema.union([Schema.const('isolated'),Schema.const('worktree'),Schema.const('hook'),Schema.const('none')]).description('Bot 未指定 workdir 时的方式；未配置根目录时为 none（数据目录下的私有目录）'),
   defaultIsolatedDir:Schema.string().description('isolated / worktree 目录所在位置，相对第一个根目录（默认 .super-bot-workspaces）'),
@@ -83,8 +85,10 @@ export async function apply(ctx: Context, config: RuntimeOptions & {
   const source = (profile && profileSource(root, profile.dir)) ?? root;
   const developer = developerSettings(profile, root, build, () => reloadHost?.available() ? reloadHost.ready : undefined);
   let feishuReady: ReturnType<typeof startFeishuHost> | undefined;
+  let stopStageObservation: (()=>void)|undefined;
   ctx.effect(() => async () => {
     reloadHost?.close();
+    stopStageObservation?.();
     await (await feishuReady)?.close();
     await (await mirrorReady)?.close();
     await managers.dispose();await execution.dispose();store.close();
@@ -93,6 +97,7 @@ export async function apply(ctx: Context, config: RuntimeOptions & {
   const mirror = await mirrorReady;
   execution.install();
   managers.install();
+  stopStageObservation=startStageObservation(store,config.gitLabObserverOrigin);
   const feishu = await (feishuReady = startFeishuHost(ctx, store, managers, config.feishu?.enabled === true, profile?.dir, undefined, reloadAdmission));
   const require = createRequire(import.meta.url);
   const runtime = require('@deepseek-ai/dsh-agent/package.json').version as string;
@@ -252,6 +257,8 @@ export async function apply(ctx: Context, config: RuntimeOptions & {
           payload.expectedRowVersion as number,()=>{taskInScope(payload,true);})};
       }
       if (endpoint === 'task.stop') return {ok:true,value:await execution.stop(requiredText(payload.requestId,'请求标识',200),taskInScope(payload,true).id,payload.expectedRowVersion as number)};
+      if (endpoint === 'task.close') return {ok:true,value:await execution.closeTask(
+        requiredText(payload.requestId,'请求标识',200),taskInScope(payload,true).id,payload.expectedRowVersion as number)};
       if (endpoint === 'task.cancel'||endpoint==='session.detach') return {ok:true,value:await execution.endTaskLink(endpoint,requiredText(payload.requestId,'请求标识',200),taskInScope(payload,true).id,payload.expectedRowVersion as number)};
       if (endpoint === 'run.recover' || endpoint === 'run.recover-and-continue') {
         const { id } = taskInScope(payload,true);

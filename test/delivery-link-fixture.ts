@@ -7,6 +7,7 @@ export const artifactLinks = {
   '客户端 CR 1842763': 'https://review.example.invalid/c/client/+/1842763',
   '飞书文档 · 联调方案': 'https://example.feishu.cn/docx/synthetic-plan',
 };
+export const artifactPrimary = '客户端 CR 1842763';
 export const supplementalDoc = 'https://example.feishu.cn/docx/synthetic-notes';
 export const replacementMr = 'https://gitlab.example.invalid/team/service/-/merge_requests/1092';
 export const artifactReference = 'https://reference.example.invalid/guide';

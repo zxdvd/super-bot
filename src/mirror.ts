@@ -18,7 +18,7 @@ export type MirrorSelection = { owner: BotOwner; bot: MirrorBot };
 export type ResultRecord = Pick<Result, 'id' | 'runId' | 'taskRevision' | 'summary' | 'checks' | 'createdAt' | 'humanAcceptedAt'> & {
   fileCount: number;
 };
-export type DeliveredResultRecord = ResultRecord & Pick<DeliveredResult, 'deliveredAt' | 'deliveryText' | 'links'>;
+export type DeliveredResultRecord = ResultRecord & Pick<DeliveredResult, 'deliveredAt' | 'deliveryText' | 'links' | 'primaryLink'>;
 export type ReviewRecord = { id: string; resultId: string; actor: 'user' | 'bot'; verdict: string; createdAt: number };
 export type MirrorRecords = { results: ResultRecord[]; reviews: ReviewRecord[]; moreResults: boolean; moreReviews: boolean };
 export type MirrorEvent = {

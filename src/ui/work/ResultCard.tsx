@@ -1,6 +1,6 @@
 /** The current result: summary, evidence, and accept or rework controls. */
 import { useId, useLayoutEffect, useRef, useState } from 'react';
-import { deliveryArtifactUrl } from '../../delivery-artifacts.ts';
+import { deliveryArtifactUrl, orderedDeliveryLinks } from '../../delivery-artifacts.ts';
 import type { ReloadReceipt, Result, Task } from '../../model.ts';
 import { resultFileUrl } from '../../work-links.ts';
 import { canReviewResult, resultHeading, time } from './format.ts';
@@ -65,8 +65,8 @@ export function ResultSummary({ result }: { result: ResultSummaryFields }) {
   return <div className="clamp prose-preview"><WorkMarkdown text={result.summary} omitLinks={urls}/></div>;
 }
 
-export function ResultLinks({ links }: { links?: VisibleResult['links'] }) {
-  const entries = Object.entries(links ?? {}).filter(([, url]) => deliveryArtifactUrl(url));
+export function ResultLinks({ links, primaryLink }: { links?: VisibleResult['links']; primaryLink?: string }) {
+  const entries = orderedDeliveryLinks(links ?? {}, primaryLink).filter(([, url]) => deliveryArtifactUrl(url));
   if (!entries.length) return null;
   return <div className="delivery-links" role="group" aria-label="交付物">
     <strong>交付物</strong>
@@ -125,13 +125,13 @@ export function ResultCard({ w, detail, onReturn, view = 'delivery' }: {
   const matchingReceipt = receipt?.resultId === result.id ? receipt : undefined;
   const content = <>
     <ResultSummary result={result}/>
-    <ResultLinks links={result.links}/>
+    <ResultLinks links={result.links} primaryLink={result.primaryLink}/>
     <ResultFiles result={result} sessionId={w.sessionId}/>
     {reviewing && result.checks && <div className="result-checks">
       <strong>Worker 自述的检查与未验证项</strong>
       <WorkMarkdown text={result.checks}/>
     </div>}
-    {reviewing && <Review w={w} task={task} result={result}/>}
+    {reviewing && !detail.closeRequest && <Review w={w} task={task} result={result}/>}
     {current && !reworking && <ResultDeliveryCheck w={w} result={result}
       status={view === 'exact' ? detail.linkedChatDelivery ?? detail.chatDelivery : detail.chatDelivery} onReturn={onReturn}/>}
     <ResultReport summary={result.summary} checks={reviewing ? undefined : result.checks}/>

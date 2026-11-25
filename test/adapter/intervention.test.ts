@@ -8,7 +8,7 @@ import {Store} from '../../src/store.ts';
 import {DshExecution} from '../../src/dsh.ts';
 import {collectEvidence} from '../../src/evidence.ts';
 import {Managers} from '../../src/manager.ts';
-import type {Run,Task} from '../../src/model.ts';
+import type {Run,Task,TaskCloseRequest} from '../../src/model.ts';
 import {workUrl} from '../../src/work-links.ts';
 
 async function fixture() {
@@ -36,7 +36,8 @@ async function fixture() {
     sessionPersistence:{open:async()=>({header:{id:agent.id},read:async()=>({events:structuredClone(events)}),close:async()=>{}})},
     sessionController:{resolveAgent:async()=>{await beforeResolve();return {agent};}},
     sessionProjections:{snapshot:()=>({values:{modelSelection:{next:{provider:'fake',model:'fake'}}}})},
-    workingDirectory:{get:()=>directory},jobs:{list:()=>external==='job'?[{owner:agent.id,status:'running'}]:[]},agents:{list:()=>external==='child'?[{}]:[],isOwnedBy:()=>external==='child'}} as unknown as Context;
+    workingDirectory:{get:()=>directory},jobs:{list:()=>external==='job'?[{owner:agent.id,status:'running'}]:[]},
+    agents:{get:(id:string)=>id===agent.id?agent:undefined,list:()=>external==='child'?[{}]:[],isOwnedBy:()=>external==='child'}} as unknown as Context;
   const execution=new DshExecution(ctx,store,directory,{fullAccess:true});execution.install();
   const emit=async(type:string,data:any)=>{const event={type,data,seq:events.length,time:Date.now(),...(type==='user/message'?{surfaceOp:'append'}:{})};events.push(event);for(const fn of sessionEvents)await fn(agent.session,event);await execution.whenReconciled();};
   const run=await execution.dispatch('dispatch',task.id,store.getTask(task.id).rowVersion);
@@ -57,10 +58,11 @@ async function fixture() {
     const end=()=>event('turn/end',{turn,reason:{kind:'completed'}});
     const call=(callId:string,args:Record<string,unknown>,signal=new AbortController().signal)=>
       execute!({taskId:task.id,expectedRowVersion:store.getTask(task.id).rowVersion,...args},{agent:session,signal,callId}) as
-        Promise<{task:Task;run:Run|null;stop?:{runId:string;requested:true}}>;
+        Promise<{task:Task;run:Run|null;stop?:{runId:string;requested:true};closeRequest?:TaskCloseRequest|null}>;
     return {manager,event,human,end,call};
   }
-  return {directory,store,task,agent,run,emit,execution,bot,chat,deferStop:()=>{deferStop=true;},
+  return {ctx,directory,store,task,agent,run,emit,execution,bot,chat,deferStop:()=>{deferStop=true;},
+    recordEnd:()=>events.push({type:'turn/end',seq:events.length,data:{turn:1,reason:{kind:'aborted',reason:{kind:'user'}}}})-1,
     beforeResolve:(fn:()=>Promise<void>)=>{beforeResolve=fn;},setFlush:(fn:()=>Promise<boolean>)=>{flush=fn;},
     setExternal:(value:'job'|'child')=>{external=value;},cancels:()=>cancels,removed:()=>removed,released:()=>released,
     finishIdle:()=>{agent.status='idle';finish();},
@@ -68,6 +70,97 @@ async function fixture() {
 }
 
 const user=(id:string,text:string)=>({id,source:{kind:'user',rpcId:`rpc:${id}`},content:[{type:'text',text}]});
+
+test('one explicit owner message closes an active attempt after durable settlement',async()=>{
+  const f=await fixture();try {
+    const input=f.store.getRunInput(f.run.id);
+    await f.emit('user/message',JSON.parse(input.messageJson!));
+    f.deferStop();
+    const chat=f.chat(),text='不做了，关闭这个任务';
+    const args={action:'close',userInstruction:text,expectedRowVersion:f.store.getTask(f.task.id).rowVersion};
+    await assert.rejects(chat.call('automatic-close',args),{code:'human-message-required'});
+    await chat.human(text);
+    const started=await chat.call('close',args);
+    assert.equal(started.task.controlMode,'paused');
+    assert.equal(started.task.lifecycle,'open');
+    assert.equal(started.run?.state,'cancelling');
+    assert.equal(started.closeRequest?.runId,f.run.id);
+    assert.equal(f.cancels(),1);
+    assert.deepEqual(await chat.call('close',args),started);
+    assert.throws(()=>f.store.controlTask('resume',f.task.id,started.task.rowVersion,'auto'),{code:'task-closing'});
+    await chat.end();
+    f.finishIdle();
+    await f.emit('turn/end',{turn:1,reason:{kind:'aborted',reason:{kind:'user'}}});
+    await new Promise<void>(resolve=>setImmediate(resolve));
+    const detail=f.store.taskDetail(f.task.id);
+    assert.equal(detail.task.lifecycle,'cancelled');
+    assert.equal(detail.closeRequest,null);
+    assert.equal(detail.binding?.id,f.run.bindingId);
+    assert.equal(detail.run?.id,f.run.id);
+    assert.equal(detail.input?.id,input.id);
+    assert.equal(f.cancels(),1);
+    assert.equal(detail.events.filter(event=>event.kind==='task.cancelled').length,1);
+    assert.ok(f.store.pendingManagerEvents(f.bot.id).some(event=>event.id===`manager-event:task-closed:${started.closeRequest?.id}`));
+  }finally{await f.close();}
+});
+
+test('a stopped opaque CLI cannot resolve its own external effects even with a successful tool receipt',async()=>{
+  const f=await fixture();try {
+    const input=f.store.getRunInput(f.run.id);
+    await f.emit('user/message',JSON.parse(input.messageJson!));
+    await f.emit('tool/call',{turn:1,step:1,callId:'opaque',name:'bash',arguments:JSON.stringify({command:'synthetic-cli start'})});
+    await f.emit('tool/result',{turn:1,step:1,message:{toolCallId:'opaque',isError:false,content:[{type:'text',text:'Started'}]}});
+    f.deferStop();
+    const version=f.store.getTask(f.task.id).rowVersion;
+    const closing=await f.execution.closeTask('panel-close',f.task.id,version);
+    f.finishIdle();
+    await f.emit('turn/end',{turn:1,reason:{kind:'aborted',reason:{kind:'user'}}});
+    await new Promise<void>(resolve=>setImmediate(resolve));
+    const detail=f.store.taskDetail(f.task.id);
+    assert.equal(detail.run?.state,'cancelled');
+    assert.equal(detail.task.lifecycle,'open');
+    assert.equal(detail.task.controlMode,'paused');
+    assert.equal(detail.closeRequest?.id,closing.closeRequest?.id);
+    assert.equal(detail.closeRequest?.blocker?.code,'effect-uncertain');
+    assert.match(detail.closeRequest?.blocker?.message??'',/bash/);
+    assert.equal(f.execution.recoveryDetail(detail)?.canContinue,false);
+    assert.throws(()=>f.store.cancelTask('old-cancel',f.task.id,detail.task.rowVersion),{code:'task-closing'});
+    assert.equal((await f.execution.closeTask('retry',f.task.id,detail.task.rowVersion)).task.lifecycle,'open');
+    await assert.rejects(f.execution.recover('unchecked',f.task.id,detail.task.rowVersion,false),{code:'confirmation-required'});
+    const closed=await f.execution.recover('checked',f.task.id,detail.task.rowVersion,true);
+    assert.ok('lifecycle' in closed);
+    assert.equal(closed.lifecycle,'cancelled');
+    assert.ok(f.store.taskDetail(f.task.id).events.some(event=>event.kind==='task.close-blocked'));
+  }finally{await f.close();}
+});
+
+for(const durable of [true,false])test(`restart ${durable?'replays verified settlement':'keeps a concrete blocker'} for a pending close`,async()=>{
+  const f=await fixture();try {
+    await f.emit('user/message',JSON.parse(f.store.getRunInput(f.run.id).messageJson!));
+    f.deferStop();
+    const pending=await f.execution.closeTask('close-before-restart',f.task.id,f.store.getTask(f.task.id).rowVersion);
+    if(durable)f.store.observeRunEnd(f.run.id,f.recordEnd(),'aborted',true);
+    const path=resolve(f.directory,'close-restart.sqlite');
+    f.store.backupLedger(path);
+    const reopened=new Store(path),restarted=new DshExecution(f.ctx,reopened,f.directory);
+    try {
+      f.agent.status='idle';
+      restarted.install();await restarted.whenReconciled();
+      const detail=reopened.taskDetail(f.task.id);
+      assert.equal(f.cancels(),1,'startup does not signal cancellation again');
+      if(durable) {
+        assert.equal(detail.task.lifecycle,'cancelled');
+        assert.equal(detail.run?.state,'cancelled');
+        assert.equal(detail.closeRequest,null);
+      } else {
+        assert.equal(detail.task.lifecycle,'open');
+        assert.equal(detail.closeRequest?.id,pending.closeRequest?.id);
+        assert.match(detail.closeRequest?.blocker?.message??'',/重启后缺少/);
+        assert.equal(reopened.heldRuns()[0]?.id,f.run.id);
+      }
+    }finally{await restarted.dispose();reopened.close();}
+  }finally{await f.close();}
+});
 
 test('a queued next-turn message during an automatic run does not interrupt or cancel',async()=>{
   const f=await fixture();try {

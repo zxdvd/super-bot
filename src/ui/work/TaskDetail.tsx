@@ -1,11 +1,11 @@
 /** One task in a drawer: header with the one main action, open questions, result, workdir, definition, session and audit. */
-import type { Attention } from '../../model.ts';
+import type { Attention, RecoveryDirectionStatus } from '../../model.ts';
 import { ownerLabel, type MirrorDetail, type MirrorEvent } from '../../mirror.ts';
 import { useEffect, useRef } from 'react';
 import { workUrl, type WorkLink } from '../../work-links.ts';
 import { ConfirmAction, Section, Tag } from '../kit.tsx';
 import {
-  canReviewResult, canStartTask, eventTitle, recoveryEventMessage, reviewLabel, settling, stageText, stageTone, time,
+  canReviewResult, canStartTask, eventTitle, recoveryEventMessage, reviewLabel, stageText, stageTone, time,
 } from './format.ts';
 import { ReplyForm, TaskForm } from './forms.tsx';
 import { ChildWaitHistory, CurrentChildWaits } from './ChildWaits.tsx';
@@ -14,6 +14,7 @@ import { RecoveryPanel } from './RecoveryPanel.tsx';
 import { ResultCard, ResultFiles, ResultLinks, ResultLoadReceipt, ResultReport, ResultSummary } from './ResultCard.tsx';
 import { deliveryLabels, ResultDeliveryCheck } from './SystemIssues.tsx';
 import { SessionControls } from './SessionControls.tsx';
+import { TaskStages } from './TaskStage.tsx';
 import type { Detail } from './types.ts';
 import type { WorkspaceState } from './useWorkspace.ts';
 import { WorkdirCard } from './WorkdirCard.tsx';
@@ -24,6 +25,15 @@ const attentionTitles: Record<Attention['kind'], string> = {
 };
 const inputStates: Record<string, string> = {
   accepted: '已接收', enqueued: '已投递', entered: '已进入上下文', unknown: '送达状态待核对', discarded: '已撤回',
+};
+const directionStatusLabel: Partial<Record<RecoveryDirectionStatus, string>> = {
+  recorded: '已记下补充指示。',
+  'next-run': '已记下补充指示，将在原任务下一轮处理。',
+  queued: '补充指示已排入下一轮，等待 Worker 读取。',
+  entered: '补充指示已进入 Worker 上下文。',
+  'delivery-unknown': '补充指示的投递状态待核对。',
+  discarded: '未送出的补充指示已撤回。',
+  revoked: '已撤回待处理的补充指示。',
 };
 
 function AttentionBox({ w, detail, attention }: { w: WorkspaceState; detail: Detail; attention: Attention }) {
@@ -51,6 +61,7 @@ function Attentions({ w, detail }: { w: WorkspaceState; detail: Detail }) {
 
 function PrimaryAction({ w, detail }: { w: WorkspaceState; detail: Detail }) {
   const { task, run } = detail, version = { id: task.id, expectedRowVersion: task.rowVersion };
+  if (detail.closeRequest) return null;
   if (run && ['running', 'queued', 'cancelling'].includes(run.state)) return <button disabled={w.locked || run.state === 'cancelling'}
     onClick={() => w.mutate('task.stop', { requestId: `stop:${run.id}:${task.rowVersion}`, ...version })}>
     {run.state === 'cancelling' ? '正在核对停止…' : '停止执行'}</button>;
@@ -81,6 +92,12 @@ export function TaskDetailHeader({ w, detail, close, controls = true, onReturn, 
     </div>
     <h2 className="detail-goal clamp">{task.goal}</h2>
     <p className="caption">{w.bot?.name} · 创建 {time(task.createdAt)} · 更新 {time(task.updatedAt)} · {reviewLabel(task)}</p>
+    {detail.closeRequest && <p className="notice" role="status">
+      {detail.closeRequest.blocker ? `关闭请求已保存。${detail.closeRequest.blocker.message}`
+        : '已请求关闭任务，正在核对 Worker 是否已停止及外部效果。'}
+    </p>}
+    {controls && task.lifecycle === 'open' && detail.directionStatus && directionStatusLabel[detail.directionStatus] &&
+      <p className="caption" role="status">{directionStatusLabel[detail.directionStatus]}</p>}
     {controls && detail.model && <ModelPreview model={detail.model} showExpected={task.lifecycle === 'open'}
       canStartManually={canStartTask(detail)}/>}
     {controls && queued && <p className="notice" role="status">
@@ -97,8 +114,10 @@ export function TaskDetailHeader({ w, detail, close, controls = true, onReturn, 
   </header>;
 }
 
-export function TaskDefinition({ w, detail }: { w: WorkspaceState; detail: Pick<Detail, 'task'> & Partial<Pick<Detail, 'binding'>> }) {
-  const { task } = detail, editable = !w.mirror && !detail.binding && task.lifecycle === 'open';
+export function TaskDefinition({ w, detail }: {
+  w: WorkspaceState; detail: Pick<Detail, 'task'> & Partial<Pick<Detail, 'binding' | 'closeRequest'>>;
+}) {
+  const { task } = detail, editable = !w.mirror && !detail.binding && !detail.closeRequest && task.lifecycle === 'open';
   return <Section title="目标、范围与验收" aside={editable && <button className="small" disabled={w.locked}
     onClick={() => w.setForm('edit')}>修改</button>}>
     {task.goal.length > 120 && <details><summary className="muted">完整目标</summary><p className="full-text">{task.goal}</p></details>}
@@ -112,18 +131,22 @@ export function TaskDefinition({ w, detail }: { w: WorkspaceState; detail: Pick<
 }
 
 function MoreActions({ w, detail }: { w: WorkspaceState; detail: Detail }) {
-  const { task } = detail, version = { id: task.id, expectedRowVersion: task.rowVersion };
+  const { task, closeRequest, recovery } = detail;
+  const version = { id: task.id, expectedRowVersion: task.rowVersion };
   const toggle = () => w.mutate('task.control', {
     requestId: crypto.randomUUID(), ...version, mode: task.controlMode === 'auto' ? 'paused' : 'auto',
   });
-  const cancel = () => w.mutate('task.cancel', { requestId: `cancel:${task.id}:${task.rowVersion}`, ...version });
+  const closeTask = () => w.mutate('task.close', { requestId: `close:${task.id}:${task.rowVersion}`, ...version });
   if (['completed', 'cancelled'].includes(task.lifecycle)) return null;
+  if (closeRequest) return closeRequest.blocker && !recovery?.attentionId ? <div className="actions">
+    <button disabled={w.locked} onClick={closeTask}>重新核对关闭</button>
+  </div> : null;
   return <details className="advanced"><summary>更多操作</summary>
     <div className="actions">
       <button disabled={w.locked} onClick={toggle}>{task.controlMode === 'auto' ? '暂停自动管理' : '恢复自动管理'}</button>
     </div>
-    <ConfirmAction key={`cancel:${task.id}:${task.rowVersion}`} label="取消任务" disabled={w.locked || settling(task)} submit={cancel}
-      explanation="结束这个任务，未送出的回答与返工要求不再执行。会话、成果和文件保留；取消不会接受成果。执行中或待核对时，请先停止并完成核对。"/>
+    <ConfirmAction key={`close:${task.id}:${task.rowVersion}`} label="关闭任务" disabled={w.locked} submit={closeTask}
+      explanation="永久结束任务。系统会停止正在执行的 Worker 并核对状态。会话、成果和文件会保留。"/>
   </details>;
 }
 
@@ -191,7 +214,7 @@ export function LinkedTaskContent({ w, detail, link, close, onReturn }: {
       <h3>历史成果 · 只读</h3>
       <p role="status">{newer ? '这份成果已被新版替代。' : '这份成果当前不可验收。'}</p>
       <ResultSummary result={linked}/>
-      <ResultLinks links={linked.links}/>
+      <ResultLinks links={linked.links} primaryLink={linked.primaryLink}/>
       <ResultReport summary={linked.summary} checks={linked.checks}/>
       <ResultFiles result={linked} sessionId={w.sessionId}/>
       {newer && <a href={workUrl({ kind: 'result', taskId: task.id, resultId: newer.id })}>查看当前交付</a>}
@@ -252,7 +275,7 @@ function MirrorTaskContent({ w, detail, owner, close }: {
     {result && <div className="attention-box result">
       <h3>{heading}</h3>
       <ResultSummary result={result}/>
-      <ResultLinks links={deliveredResult?.links}/>
+      <ResultLinks links={deliveredResult?.links} primaryLink={deliveredResult?.primaryLink}/>
       {!reworking && result.id === detail.result?.id && chatDelivery && <p className="muted">{deliveryLabels[chatDelivery]}</p>}
       <ResultReport summary={result.summary} checks={result.checks}/>
       {result.humanAcceptedAt !== null && <p className="muted">人工接受于 {time(result.humanAcceptedAt)}</p>}
@@ -303,7 +326,8 @@ export function TaskDrawer({ w, compact, onReturn }: { w: WorkspaceState; compac
         <TaskDetailHeader w={w} detail={detail} close={close} onReturn={onReturn} recoveryPanel={!!detail.recovery?.worker}/>
         {detail.recovery && <RecoveryPanel w={w} detail={detail} recovery={detail.recovery}
           key={`${detail.task.id}:${detail.task.rowVersion}:${detail.recovery.attentionId}:${detail.binding?.generation}`}/>}
-        <RecoveryFinding detail={detail}/>
+        {!detail.stage && <RecoveryFinding detail={detail}/>}
+        <TaskStages task={detail.task} current={detail.stage} history={detail.stages ?? []}/>
         <Attentions w={w} detail={detail}/>
         <CurrentChildWaits detail={detail} api={w.api} online={w.online}/>
         {!resultBeforeProgress && <Progress detail={detail}/>}

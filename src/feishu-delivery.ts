@@ -1,8 +1,9 @@
 import { Lexer, walkTokens } from 'marked';
-import { deliveryArtifactUrl } from './delivery-artifacts.ts';
+import { deliveryArtifactUrl, orderedDeliveryLinks } from './delivery-artifacts.ts';
+import type { DeliveryArtifacts } from './model.ts';
 import { parseWorkLink, RESULT_FILE_PATH, workUrl } from './work-links.ts';
 
-type Delivered = { taskId: string; resultId: string; links: Record<string, string> };
+type Delivered = { taskId: string; resultId: string } & DeliveryArtifacts;
 
 function loopback(url: URL): boolean {
   const host = url.hostname.replace(/\.$/, '');
@@ -48,26 +49,31 @@ export function feishuDeliveryText(text: string, deliveries: readonly Delivered[
     return `${label}：${url.href}`;
   }) : ['完整成果请在原 Bot 对话中查看。'];
 
-  const shortcuts: string[] = [];
-  for (const [name, candidate] of deliveries.flatMap(({ links }) => Object.entries(links))) {
+  const shortcuts: string[] = [], primaryShortcuts: string[] = [];
+  const entries = deliveries.flatMap(({ links, primaryLink }) =>
+    orderedDeliveryLinks(links, primaryLink).map(([name, href]) => ({ name, href, primary: name === primaryLink })));
+  for (const { name, href: candidate, primary } of [...entries.filter(item => item.primary), ...entries.filter(item => !item.primary)]) {
     const href = deliveryArtifactUrl(candidate);
     if (!href) continue;
     const url = new URL(href);
     if (loopback(url) || url.pathname === RESULT_FILE_PATH || parseWorkLink(url.hash) || visibleUrls.has(url.href)) continue;
-    shortcuts.push(`${name.replace(/\s+/g, ' ').trim()}：${href}`);
+    (primary ? primaryShortcuts : shortcuts).push(`${name.replace(/\s+/g, ' ').trim()}：${href}`);
     visibleUrls.add(url.href);
   }
   const format = (lines: string[]) => [prose.trim(), [...resultLinks, ...lines].join('\n')].filter(Boolean).join('\n\n');
   const whole = format([]);
   if (!fits(whole)) return text;
   const direct: string[] = [];
-  if (local || shortcuts.length <= 2) {
+  for (const shortcut of primaryShortcuts) {
+    if (fits(format([...direct, shortcut]))) direct.push(shortcut);
+  }
+  if (local || shortcuts.length + primaryShortcuts.length <= 2) {
     for (const shortcut of shortcuts) {
+      if (direct.length >= 2) break;
       if (fits(format([...direct, shortcut]))) direct.push(shortcut);
-      if (direct.length === 2) break;
     }
   }
-  const remaining = shortcuts.length - direct.length;
+  const remaining = shortcuts.length + primaryShortcuts.length - direct.length;
   if (remaining) {
     const withCount = format([...direct, `另有 ${remaining} 项交付物见完整成果。`]);
     if (fits(withCount)) return withCount;

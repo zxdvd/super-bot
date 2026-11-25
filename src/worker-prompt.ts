@@ -18,6 +18,7 @@ declare module '@deepseek-ai/dsh-llm' {
       bindingId?: string;
       promptMode?: 'full' | 'delta';
       carriedInputIds?: string[];
+      ownerDirectionIds?: string[];
     };
   }
 }
@@ -26,7 +27,7 @@ const CODE_DELIVERY = `For code work, after reading the applicable project instr
 When preparing a change for review, assess whether reviewers can use it now. Keep pending merge checks in the report and preserve a reviewable change’s review status.
 In ready, use summary for what changed and checks for commands actually run, their outcomes, and what remains unverified. Make the opening HEAD, relevant existing changes, and this run's attributable diff visible in the summary or a concise attachment. Compare with the opening state, including for files you both found dirty and edited. Treat the full diff against HEAD as worktree context. If you cannot attribute a change, say so. Attach a scoped diff when useful and include actual changed source where available. For any relevant host, identify a matching native load receipt for this result and build, or say that loading there is unverified. Only reload when authorized.
 For ordinary non-code work, keep the report brief and use the checks and files relevant to that task.
-In super_bot_report ready, register each actual external deliverable in links as a distinct display name mapped to its full HTTP(S) URL. Register each URL once and use its display name in summary and checks. Keep reference links in the report. Omit links for local-only work. Include file evidence and checks even when a document is the only deliverable.`;
+In super_bot_report ready, register each actual external deliverable in links as a distinct display name mapped to its full HTTP(S) URL. Register each URL once and use its display name in summary and checks. When one deliverable is the user's main next action, set primaryLink to its exact registered display name. Keep references in the report. If a requested openable deliverable is missing, explain what is missing and why. Omit links for local-only work. Include file evidence and checks even when a document is the only deliverable.`;
 
 export function workerStandingPrompt(task:Task,binding:Binding,context:TaskBotContext,fullAccess:boolean):string {
   const convention = context.workConvention;
@@ -34,7 +35,7 @@ export function workerStandingPrompt(task:Task,binding:Binding,context:TaskBotCo
     ? `\nWork convention recorded for this task (${convention.source}). Follow it within the current task scope and authorization:\n${convention.text}`
     : '';
   const permissions = fullAccess
-    ? 'This Worker uses the native Full Access preset. Use native tools including shell to implement and test the requested work. Keep work scoped to this task. Do not modify unrelated projects or credentials. Change host configuration only when this task explicitly authorizes that change. Report actual changed source files and test results.'
+    ? 'This Worker uses the native Full Access preset. Use super_bot_query with kind git-working-tree-status for the opening Git HEAD and working tree status and later status checks. It provides a verified read receipt; report if it cannot read the worktree. Use native tools including shell to implement and test the requested work. Keep work scoped to this task. Do not modify unrelated projects or credentials. Change host configuration only when this task explicitly authorizes that change. Report actual changed source files and test results.'
     : 'Use only read/write/edit in this directory, always with absolute file_path values. Do not change working directories. Worker 完整权限未开启：当前 fullAccess: false。Shell and external CLI tools are unavailable in files mode; report this limitation, never ask for a tool channel. To enable them, set fullAccess: true in the Super Bot config of the active profile cordis.patch.yml and reload when idle.';
   return [
     `Bot configuration revision: ${task.botConfigRevision}`,
@@ -46,6 +47,7 @@ export function workerStandingPrompt(task:Task,binding:Binding,context:TaskBotCo
     'If task inputs conflict, follow the higher input order within the authorized scope.',
     permissions,
     CODE_DELIVERY,
+    'Use stage with a distinct stage name, a stable evidenceRef, and checks when you verified a new milestone but the overall goals are incomplete. Include actual evidence and the outstanding condition and authorized next step in summary. For GitLab waits, include the exact project and merge request IID or pipeline ID in the report. Do not wait in shell, treat acceptance failure as ready, or resubmit a prior milestone. Use blocked or failed for a business check that did not pass and waiting for a specific owner decision.',
     'Use super_bot_report(progress) at meaningful checkpoints, such as written changes or a focused failing or passing test. State what was actually observed. For reloads, report a matching host receipt when available. Use waiting to ask a necessary question. For ready provide files and checks explaining every acceptance criterion. Never claim the task is accepted; the user decides.',
   ].join('\n');
 }
@@ -53,8 +55,10 @@ export function workerStandingPrompt(task:Task,binding:Binding,context:TaskBotCo
 const runHeader = (id:string) => `You are executing a NEW attempt of one Super Bot task.\nCurrent run: ${id}.`;
 
 function previousInputText(input:WorkerPriorInput):string {
-  return `Restored task input order: ${input.order}.\nPreviously received task input (${input.kind}): ${input.content}`;
+  const earlier=input.priorDirections?.map(text=>`Previously received owner direction:\n${text}`).join('\n\n');
+  return `Restored task input order: ${input.order}.\n${earlier?`${earlier}\n\n`:''}Previously received task input (${input.kind}): ${input.content}`;
 }
+const inputLabel = (kind:string) => kind==='stage'?'Authorized stage continuation':'Additional user input';
 
 type WorkerPromptPlan = {mode:'full'|'delta';carried:readonly WorkerPriorInput[];inputOrder:number};
 
@@ -70,16 +74,21 @@ export function createWorkerRunMessage(
     if (recovery.note) sections.push(`Prior recovery reason: ${recovery.note}`);
   }
   if (context) {
-    sections.push(`Earlier attempt and observed facts (use as evidence): ${JSON.stringify(context)}`);
-    sections.push('Continue the current assignment from the latest applicable user instruction and verified state. If the latest user message only confirms proceeding or selects this task, retain their most recent substantive direction and limits. Treat the standing goal as background for this attempt. Read prior reports and receipts as evidence. Preserve observed effects and uncertainty. If a resource was created but is unready, report both facts. Use waiting for a specific decision or permission the owner must supply. Report a blocked external dependency with the responsible party or condition.');
+    const {priorDirections,priorDirection,directionIds,...facts}=context;
+    sections.push(`Earlier attempt and observed facts (use as evidence): ${JSON.stringify(facts)}`);
+    if(priorDirections)sections.push(...priorDirections.map(({text})=>`Retained owner direction:\n${text}`));
+    else if(priorDirection)sections.push(`Retained owner direction:\n${priorDirection}`);
+    sections.push('Continue the current assignment from all applicable owner directions in order and the verified state. Retain the substantive directions and limits when the latest message only confirms proceeding or selects this task. Treat the standing goal as background for this attempt. Read prior reports and receipts as evidence. Preserve observed effects and uncertainty. If a resource was created but is unready, report both facts. Use waiting for a specific decision or permission the owner must supply. Report a blocked external dependency with the responsible party or condition.');
     sections.push(context.mode==='read-only'?
       'Use only the read-only tools available for this continuation and report the actual observations.' :
       'Perform only the concrete next step the owner authorized within the standing scope. Check current facts first and stop before any action that could duplicate an observed effect.');
   }
-  if (input.kind === 'answer' || input.kind === 'rework' || input.kind === 'continuation') {
+  if (input.kind === 'answer' || input.kind === 'rework' || input.kind === 'continuation' || input.kind === 'stage') {
     sections.push(`Task input order: ${inputOrder}.`);
-    sections.push(`Additional user input (${input.kind}): ${input.content}`);
-    sections.push('Continue from the current state and apply this input within the existing authorized scope. Use waiting if the input requires clarification or exceeds that scope.');
+    sections.push(`${inputLabel(input.kind)} (${input.kind}): ${input.content}`);
+    sections.push(input.kind==='stage'
+      ? 'Perform only the recorded next step within the existing scope. Preserve earlier results and observed effects. Do not repeat completed work or broaden authorization. Recheck relevant facts before acting.'
+      : 'Continue from the current state and apply this input within the existing authorized scope. Use waiting if the input requires clarification or exceeds that scope.');
   } else {
     sections.push('Continue from the current verified state within the existing authorized scope.');
   }
@@ -87,6 +96,7 @@ export function createWorkerRunMessage(
   return createUserMessage({
     source:{kind:'super-bot',taskId:run.taskId,runId:run.id,inputId:run.inputId,taskRevision:run.taskRevision,
       generation:run.generation,bindingId:run.bindingId,promptMode:mode,
+      ...(context?.directionIds?.length?{ownerDirectionIds:context.directionIds}:{}),
       ...(carried.length?{carriedInputIds:carried.map(prior=>prior.id)}:{})},
     content:[{type:'text',text:sections.join('\n\n')}],
   });
@@ -114,7 +124,7 @@ function hasPreviousInput(messages:ReturnType<Session['deriveMessages']>,run:Run
     const block = message.content[0];
     if (block?.type !== 'text') return false;
     return (message.id === previous.messageId && source.inputId === previous.id
-      && block.text.includes(`\n\nAdditional user input (${previous.kind}): ${previous.content}\n\n`))
+      && block.text.includes(`\n\n${inputLabel(previous.kind)} (${previous.kind}): ${previous.content}\n\n`))
       || (source.carriedInputIds?.includes(previous.id) && block.text.includes(`\n\n${previousInputText(previous)}\n\n`));
   });
 }

@@ -9,6 +9,7 @@ export interface RuntimeOptions extends WorkdirConfig {
   fullAccess?:boolean;
   managerModel?:ModelSelection;
   workerModel?:ModelSelection;
+  gitLabObserverOrigin?:string;
   /** Automatic Bot wakes per Bot per rolling hour (default 20). */
   managerWakesPerHour?:number;
   /** Bots woken at the same time (default 2). */

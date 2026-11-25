@@ -2,19 +2,20 @@ import { useEffect, useRef, useState, useSyncExternalStore } from 'react';
 import { Lexer, walkTokens } from 'marked';
 import type { ChatSnapshot, ToolCallBlock, ToolChatData, TurnTailOwnerProps } from '@deepseek-ai/dsh-client-ui-chat/client';
 import type { ConversationSnapshot, UseConversation } from '@deepseek-ai/dsh-client-ui-conversation/client';
-import { deliveryArtifactUrl } from '../delivery-artifacts.ts';
+import { deliveryArtifactUrl, orderedDeliveryLinks } from '../delivery-artifacts.ts';
 import { managedSessionId } from '../mirror.ts';
+import type { DeliveryArtifacts } from '../model.ts';
 import type { WorkspaceApi } from './Workspace.tsx';
 import type { SessionSource } from './work-navigation.ts';
 
-type Delivery = { resultId: string; links: Record<string, string> };
+type Delivery = { resultId: string } & DeliveryArtifacts;
 const visibleLinks = 3;
 const linkStyle = { color: 'var(--dsw-alias-link, #328375)', textDecoration: 'underline', overflowWrap: 'anywhere' } as const;
 const listStyle = { display: 'flex', flexWrap: 'wrap', gap: '4px 12px' } as const;
 
-export function DeliveryItems({ links, replyLinks }: { links: Delivery['links']; replyLinks: ReadonlySet<string> }) {
+export function DeliveryItems({ links, primaryLink, replyLinks }: DeliveryArtifacts & { replyLinks: ReadonlySet<string> }) {
   const seen = new Set(replyLinks);
-  const items = Object.entries(links).flatMap(([label, candidate]) => {
+  const items = orderedDeliveryLinks(links, primaryLink).flatMap(([label, candidate]) => {
     if (!deliveryArtifactUrl(candidate)) return [];
     const url = new URL(candidate).href;
     if (seen.has(url)) return [];
@@ -22,11 +23,17 @@ export function DeliveryItems({ links, replyLinks }: { links: Delivery['links'];
     return <a key={label} href={candidate} target="_blank" rel="noopener noreferrer" style={linkStyle}>{label}</a>;
   });
   if (!items.length) return null;
+  const primary = primaryLink !== undefined && items[0]?.key === primaryLink ? items[0] : undefined;
+  const secondary = primary ? items.slice(1) : items;
+  const disclosure = <details>
+    <summary style={{ cursor: 'pointer' }}>{primary ? '其他交付物（' : '交付物（'}{secondary.length}）</summary>
+    <div style={listStyle}>{secondary}</div>
+  </details>;
   return <div role="group" aria-label="交付物" style={{ fontSize: '0.875em', marginBlock: 4 }}>
-    {items.length <= visibleLinks ? <div style={listStyle}>{items}</div> : <details>
-      <summary style={{ cursor: 'pointer' }}>交付物（{items.length}）</summary>
-      <div style={listStyle}>{items}</div>
-    </details>}
+    {items.length <= visibleLinks ? <div style={listStyle}>{items}</div> : primary ? <>
+      <div style={{ fontWeight: 600 }}>{primary}</div>
+      {disclosure}
+    </> : disclosure}
   </div>;
 }
 
@@ -79,7 +86,7 @@ function DeliveryLinks({ target, api, source, useConversation, replyBlocks }: {
       if (href) alreadyInReply.add(new URL(href).href);
     });
   }
-  return <>{deliveries.map(({ resultId, links }) => <DeliveryItems key={resultId} links={links} replyLinks={alreadyInReply}/>)}</>;
+  return <>{deliveries.map(({ resultId, ...artifacts }) => <DeliveryItems key={resultId} {...artifacts} replyLinks={alreadyInReply}/>)}</>;
 }
 
 export type ChatDeliverySlot = TurnTailOwnerProps & { sessionId: string; useConversation: UseConversation };

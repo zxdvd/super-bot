@@ -1,6 +1,7 @@
 /** Values crossing the product/host boundary; no DSH or UI types. */
 import type {WorkdirRequest,WorkdirInfo} from './workdir.ts';
-import type {ClusterProbe,ProbeResult} from './read-only-recovery.ts';
+import type {ClusterProbe,PriorTools,ProbeResult} from './read-only-recovery.ts';
+import type {WorkStage} from './work-stage.ts';
 export type {WorkdirRequest,WorkdirInfo};
 export interface WorkspaceStatus {
   product: 'Super Bot';
@@ -42,6 +43,13 @@ export interface TaskBotContext {
 }
 export type Lifecycle = 'open' | 'review' | 'completed' | 'cancelled';
 export type ControlMode = 'auto' | 'paused' | 'manual';
+export type TaskCloseRequest = {
+  id: string;
+  taskRevision: number;
+  runId: string | null;
+  activeRun: boolean;
+  blocker?: { code: string; message: string };
+};
 export type WorkActivity = 'working' | 'attention' | 'review';
 export type BotWorkSummary = { id: string; name: string; sessionId: string | null; working: number; attention: number; review: number };
 
@@ -67,6 +75,7 @@ export interface Task {
   blockingAttention?: 'input' | 'approval' | 'recovery' | null;
   /** The Worker ended with a blocker and no concrete action is assigned to the owner. */
   waitingForPrerequisite?: true;
+  stageState?: WorkStage['state'];
   deliveredAt?: number;
   botConfigRevision:number;
   /** What the Bot asked for when creating the task; null means the configured default. */
@@ -125,7 +134,9 @@ export interface Run {
   createdAt:number; finishedAt:number|null; note:string;
 }
 export interface RunInput {id:string; taskId:string; kind:string; content:string; state:string; messageId:string|null; messageJson:string|null; attentionId:string|null; createdAt:number}
-export type WorkerPriorInput = Pick<RunInput,'id'|'content'|'messageId'> & {kind:'answer'|'rework'|'continuation';order:number};
+export type WorkerPriorInput = Pick<RunInput,'id'|'content'|'messageId'> & {
+  kind:'answer'|'rework'|'continuation';order:number;priorDirections?:string[];
+};
 
 export interface ModelRoute {
   provider: string;
@@ -184,15 +195,16 @@ export type ChildWaitDetail = RunChildWait & { elapsedMs: number | null };
 
 export interface Evidence {path:string;sha256:string;bytes:number}
 export type DeliveryLinks = Record<string, string>;
+export type DeliveryArtifacts = { links: DeliveryLinks; primaryLink?: string };
 export interface WorkReport {
-  kind:'progress'|'waiting'|'ready'|'blocked'|'failed';summary:string;checks?:string;
-  evidence?:Evidence[];requestedFiles?:string[];links?:DeliveryLinks;
+  kind:'progress'|'stage'|'waiting'|'ready'|'blocked'|'failed';summary:string;checks?:string;
+  evidence?:Evidence[];requestedFiles?:string[];links?:DeliveryLinks;primaryLink?:string;
+  stage?:string;evidenceRef?:string;
 }
 export interface Result {id:string;runId:string;taskId:string;taskRevision:number;summary:string;checks:string;evidence:Evidence[];createdAt:number;humanAcceptedAt:number|null}
-export interface DeliveredResult extends Result {
+export interface DeliveredResult extends Result, DeliveryArtifacts {
   deliveredAt: number;
   deliveryText?: string;
-  links: DeliveryLinks;
 }
 export interface Attention {
   id: string; taskId: string; kind: 'input' | 'approval' | 'review' | 'recovery';
@@ -223,22 +235,34 @@ export function optionalText(value: unknown, label: string, max = 10000): string
  */
 export interface ChatSource { sessionId:string; messageId:string; seq:number; text:string; messages?:{messageId:string;seq:number;text:string}[] }
 
+export type RecoveryDirection = {
+  id: string;
+  source: ChatSource;
+  mode: 'read-only' | 'authorized-work';
+};
+export type RecoveryDirectionChange = {kind:'replace'|'revoke';ids?:string[]};
+export type RecoveryDirectionStatus = 'recorded'|'next-run'|'queued'|'entered'|'delivery-unknown'|'discarded'|'revoked'|'archived';
 export interface RecoveryInstruction {
   id: string;
   source: ChatSource;
   taskRevision: number;
   priorRunId: string;
-  mode?: 'read-only' | 'authorized-work';
+  mode?: RecoveryDirection['mode'];
   priorDirection?: ChatSource;
+  directions?: RecoveryDirection[];
+  change?: {kind:RecoveryDirectionChange['kind'];removedIds:string[]};
   runId?: string;
 }
 export interface RecoveryWorkContext {
   priorRunId: string;
   mode: NonNullable<RecoveryInstruction['mode']>;
   priorDirection?: string;
+  priorDirections?: {id:string;text:string}[];
+  directionIds?: string[];
   priorReport?: Pick<WorkReport,'kind'|'summary'|'checks'>;
   priorCheck?: ProbeResult;
   observations?: {probe:ClusterProbe;result:ProbeResult}[];
+  priorReadQueries?: PriorTools['queries'];
   effectUncertain: boolean;
   probes: ClusterProbe[];
 }

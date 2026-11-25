@@ -10,7 +10,7 @@ import { build } from 'esbuild';
 import { authenticateHost } from './host-client.mjs';
 import { smokeReq005 } from './smoke-req005.mjs';
 import { alternateCredentials, existingGroup, fixtureCredentials } from '../test/feishu-host-transport.ts';
-import { artifactDeliveryText, artifactEditReply, artifactGoal, artifactLinks, artifactReference,
+import { artifactDeliveryText, artifactEditReply, artifactGoal, artifactLinks, artifactPrimary, artifactReference,
   replacementMr, supplementalDoc } from '../test/delivery-link-fixture.ts';
 
 const root = fileURLToPath(new URL('..', import.meta.url));
@@ -227,7 +227,8 @@ async function smokeDeliveryLinks(host, ownerBot, group, sessionId) {
   assert.ok(!reply.includes('/api/super-bot-file'));
   assert.ok(Object.values(artifactLinks).every(url => !reply.includes(url)));
   const forwardedArtifacts = Object.values(artifactLinks).filter(url => originalMessages[0].text.includes(url));
-  assert.equal(forwardedArtifacts.length, 2);
+  assert.ok(forwardedArtifacts.includes(artifactLinks[artifactPrimary]));
+  assert.ok(forwardedArtifacts.length <= 2);
   const receipts = original.events.filter(event => event.kind === 'manager.delivered' && JSON.parse(event.data).resultId);
   assert.equal(receipts.length, 1);
 

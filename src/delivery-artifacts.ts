@@ -26,3 +26,16 @@ export function readDeliveryLinks(value: unknown, allowDeletion: boolean): Recor
   }
   return Object.fromEntries(entries);
 }
+
+export function readPrimaryDeliveryLink(links: DeliveryLinks, name: unknown): string {
+  if (typeof name !== 'string' || !Object.hasOwn(links, name) || !deliveryArtifactUrl(links[name])) {
+    throw new AppError('invalid-primary-link', '首要入口必须选择已登记的交付物显示名。');
+  }
+  return name;
+}
+
+export function orderedDeliveryLinks(links: DeliveryLinks, primaryLink?: string): [string, string][] {
+  const entries = Object.entries(links);
+  if (primaryLink === undefined || !Object.hasOwn(links, primaryLink)) return entries;
+  return [[primaryLink, links[primaryLink]!], ...entries.filter(([name]) => name !== primaryLink)];
+}

@@ -1,10 +1,11 @@
 // Exercises the original chat in isolated native Web and the synthetic Feishu SDK transport.
 import assert from 'node:assert/strict';
+import { execFileSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { readFile, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { fixtureCredentials } from '../test/feishu-host-transport.ts';
-import { ambiguous, baselineFile, baselineValue, cancelWiring, clarify, imageBlocked, imageGoal, imageRequest, imageResult, imageScope, imageVersion,
+import { ambiguous, appendixFile, appendixScope, appendixValue, baselineFile, baselineValue, cancelWiring, clarify, imageBlocked, imageGoal, imageRequest, imageResult, imageScope, imageVersion,
   pauseWiring, pendingContinue, pendingGoal, pendingInitial, pendingRequest, pendingResult, pendingScope,
   preflightFile, preflightGoal, preflightRequest, preflightResult, preflightValue, receiptFile, receiptValue,
   startupContinue, startupGoal, startupRequest, startupResult, versionFile,
@@ -182,9 +183,11 @@ export async function smokeReq005({ base, initialHost, restart, openChat, call, 
   // Save a general continue and then a narrower step while the original Worker still owns its Run.
   await chat.submit(pendingRequest);
   const pending = await heldWorker(pendingGoal);
+  if (process.platform === 'darwin') execFileSync('git', ['init', '-q', pending.binding.cwd]);
   await writeFile(join(pending.binding.cwd, baselineFile), baselineValue + '\n', { flag: 'wx' });
   await writeFile(join(pending.binding.cwd, receiptFile), receiptValue + '\n', { flag: 'wx' });
-  for (const instruction of [pendingContinue, pendingScope]) {
+  await writeFile(join(pending.binding.cwd, appendixFile), appendixValue + '\n', { flag: 'wx' });
+  for (const instruction of [pendingContinue, pendingScope, appendixScope]) {
     await chat.submit(instruction);
     const saved = await wait(async () => {
       const snapshot = await detail(pending.task.id);
@@ -203,18 +206,31 @@ export async function smokeReq005({ base, initialHost, restart, openChat, call, 
   assert.notEqual(pickedUp.run.id, pending.run.id);
   assert.equal(pickedUp.binding.sessionId, pending.binding.sessionId);
   assert.equal(pickedUpInputs.length, 2);
-  assert.ok(content(pickedUpInputs[1]).includes(pendingScope));
+  assert.ok(content(pickedUpInputs[1]).indexOf(pendingScope) >= 0);
+  assert.ok(content(pickedUpInputs[1]).indexOf(appendixScope) > content(pickedUpInputs[1]).indexOf(pendingScope));
   assert.ok(content(pickedUpInputs[1]).includes(pendingInitial));
+  if (process.platform === 'darwin') {
+    assert.equal(pickedUpWorker.executedTools.filter(name => name === 'super_bot_query').length, 1);
+    const reportBlock = pickedUpWorker.toolResults.flatMap(item => item.message.content)
+      .find(block => block.type === 'text' && block.text.includes('"porcelain"'));
+    assert.ok(reportBlock, 'the system Git query returned a structured receipt');
+    const readback = JSON.parse(reportBlock.text);
+    assert.equal(readback.status, 'ok');
+    assert.ok(readback.porcelain.includes(receiptFile));
+    const state = content(pickedUpInputs[1]).split('Earlier attempt and observed facts (use as evidence): ')[1];
+    assert.equal(JSON.parse(state.split('\n')[0]).effectUncertain, false, 'authenticated read is safe to continue');
+  }
   const successfulReads = pickedUpWorker.toolResults
     .filter(item => item.meta?.path && item.message.isError === false);
-  assert.deepEqual(successfulReads.map(item => item.meta.path), [join(pending.binding.cwd, baselineFile), join(pending.binding.cwd, receiptFile)],
+  assert.deepEqual(successfulReads.map(item => item.meta.path), [join(pending.binding.cwd, baselineFile), join(pending.binding.cwd, receiptFile), join(pending.binding.cwd, appendixFile)],
     'the newer instruction must read the receipt without replaying the original baseline action');
   assert.match(successfulReads[1].message.content[0].text, new RegExp(receiptValue));
+  assert.match(successfulReads[2].message.content[0].text, new RegExp(appendixValue));
   const managerTimeline = (await inspect(sessionId)).events;
   const requested = managerTimeline.find(event => event.type === 'user/message' && content(event) === pendingRequest);
   assert.ok(requested);
   assert.deepEqual(managerTimeline.filter(event => event.seq >= requested.seq && event.type === 'user/message' && event.data.source.kind === 'user')
-    .map(content), [pendingRequest, pendingContinue, pendingScope]);
+    .map(content), [pendingRequest, pendingContinue, pendingScope, appendixScope]);
   assert.equal((await page()).total, 5);
   await chat.close();
 
@@ -224,9 +240,9 @@ export async function smokeReq005({ base, initialHost, restart, openChat, call, 
     clarification: clarify, pausedAcrossRestart: true, lifecycle: cancelled.task.lifecycle }, preflight: {
     taskId: current.task.id, runs: runEvents(current), boundedChecks: 1, observedReadback: preflightResult, ownerMessages: userTexts.length },
     startup: { taskId: startup.task.id, runs: runEvents(startup), observed: observations[0].result.observed, startupWrites: 1 }, waitingContinuation: {
-      taskId: pending.task.id, runs: runEvents(pickedUp), savedWhileActive: [pendingContinue, pendingScope],
-      receipt: receiptValue, automaticAfterOldRun: true,
+      taskId: pending.task.id, runs: runEvents(pickedUp), savedWhileActive: [pendingContinue, pendingScope, appendixScope],
+      receipts: [receiptValue, appendixValue], automaticAfterOldRun: true,
     } };
   await writeFile(join(base, 'req005-proof.json'), JSON.stringify(proof, null, 2));
-  console.log(`PASS REQ-005 original ${chat.entry}, named clarification, bound Feishu owner, duplicate delivery through restart, pause/cancel, bounded read-only recovery, no repeated startup and automatic pickup of latest instruction (${base})`);
+  console.log(`PASS REQ-005 original ${chat.entry}, named clarification, bound Feishu owner, duplicate delivery through restart, pause/cancel, bounded read-only recovery, no repeated startup and automatic pickup of both additive instructions (${base})`);
 }

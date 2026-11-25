@@ -1,16 +1,18 @@
 import { inboxActivity } from './work-activity.ts';
 import { settledBlockerSql } from './settled-blocker.ts';
+import { readStageCondition, stageConditionText, type DueStage, type StageObservation, type WorkStage } from './work-stage.ts';
 import { DatabaseSync } from 'node:sqlite';
 import { mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
 import schemaVersion from '../schema-version.json' with {type:'json'};
 import { AppError, requiredText, optionalText, taskStatus, type ChatSource, type Bot, type Task, type NewBot, type NewTask, type TaskPage, type TaskInboxPage, type ControlMode, type Attention, type Binding, type Run, type RunInput, type WorkReport, type Result,type ManagerBinding,type ManagerEvent,type ExistingSessionGrant,type ReferenceMaterial,type TaskBotContext,type DispatchWait,type WorkdirInfo,type RunTurn,botDraft } from './model.ts';
-import { RESULT_FRESH_MS, type ChatDeliveryStatus, type DeliveredResult, type DeliveryLinks, type RecoveryContinuation, type ReloadReceipt, type RunChildWait,
+import { RESULT_FRESH_MS, type ChatDeliveryStatus, type DeliveredResult, type DeliveryArtifacts, type DeliveryLinks, type RecoveryContinuation, type ReloadReceipt, type RunChildWait, type TaskCloseRequest,
   DEFAULT_BOT_RUNNING_TASKS, type BotCapacity, type TaskProgress, type UncertainDelivery,
-  type WorkerModelPlan, type WorkerPriorInput, type RecoveryInstruction, type RecoveryWorkContext } from './model.ts';
-import type { ClusterProbe, ProbeEvidence, ProbeResult, RecoveryCheck } from './read-only-recovery.ts';
-import { readDeliveryLinks } from './delivery-artifacts.ts';
+  type WorkerModelPlan, type WorkerPriorInput, type RecoveryDirection, type RecoveryDirectionChange, type RecoveryDirectionStatus,
+  type RecoveryInstruction, type RecoveryWorkContext } from './model.ts';
+import type { ClusterProbe, ProbeEvidence, ProbeResult, ReadQueryReceipt, RecoveryCheck } from './read-only-recovery.ts';
+import { readDeliveryLinks, readPrimaryDeliveryLink } from './delivery-artifacts.ts';
 import {parseWorkdirRequest} from './workdir.ts';
 import type { CapturedEvidence } from './evidence.ts';
 import type { BotMemory } from './bot-memory.ts';
@@ -24,7 +26,12 @@ const DELIVERY_RETRIES_EXHAUSTED='成果补交付已达到 3 次上限，已停�
 const BOT_CAPACITY_KEY = 'bot-capacity:';
 type ManagerProblem = { message: string; at: number; eventId?: string };
 type RecoveryWorkPlan = { context: RecoveryWorkContext; authorizedProbes: {probe:ClusterProbe;auth:string}[] };
+type StoredRecoveryInstruction = RecoveryInstruction&{directionRefs?:Omit<RecoveryDirection,'source'>[]};
 export type BotDeletionReceipt = { botId: string; managerSessionId: string | null; feishuBindingId: string | null };
+
+function directionId(source:ChatSource):string {
+  return createHash('sha256').update(JSON.stringify([source.sessionId,source.messageId])).digest('hex');
+}
 
 function capacityOverride(value: unknown): number | null {
   if (value === null) return null;
@@ -42,11 +49,18 @@ function deliveryUncertainReason(payload:{deliveryUncertainReason?:string;delive
 
 function workerReportPayload(runId:string,callId:string,report:WorkReport,evidence:NonNullable<WorkReport['evidence']>) {
   const {kind,requestedFiles}=report;
-  if(!['progress','waiting','ready','blocked','failed'].includes(kind))throw new AppError('invalid-report','报告类型无效。');
-  if(report.links!==undefined&&kind!=='ready')throw new AppError('invalid-delivery-links','只有成果报告可以提供交付物链接。');
+  if(!['progress','stage','waiting','ready','blocked','failed'].includes(kind))throw new AppError('invalid-report','报告类型无效。');
+  if((report.links!==undefined||report.primaryLink!==undefined)&&kind!=='ready')throw new AppError('invalid-delivery-links','只有成果报告可以提供交付物链接。');
+  if(kind!=='stage'&&(report.stage!==undefined||report.evidenceRef!==undefined))throw new AppError('invalid-report','阶段字段仅用于阶段报告。');
+  const checkpoint=kind==='stage'?{
+    stage:requiredText(report.stage,'阶段名称',160),
+    evidenceRef:requiredText(report.evidenceRef,'稳定的阶段证据编号',500),
+  }:undefined;
   const links=report.links===undefined?undefined:readDeliveryLinks(report.links,false);
-  return {runId,callId,kind,summary:requiredText(report.summary,'报告内容'),checks:optionalText(report.checks,'验收说明'),
-    evidence,...(requestedFiles?{requestedFiles}:{}),...(links?{links}:{})};
+  const primaryLink=report.primaryLink===undefined?undefined:readPrimaryDeliveryLink(links??{},report.primaryLink);
+  const checks=kind==='stage'?requiredText(report.checks,'阶段依据'):optionalText(report.checks,'验收说明');
+  return {runId,callId,kind,summary:requiredText(report.summary,'报告内容'),checks,
+    evidence,...checkpoint,...(requestedFiles?{requestedFiles}:{}),...(links?{links}:{}),...(primaryLink?{primaryLink}:{})};
 }
 
 /** One local database. Business transactions will live here, not in the UI/adapter. */
@@ -109,6 +123,13 @@ export class Store {
         CREATE TABLE IF NOT EXISTS resources (runId TEXT PRIMARY KEY REFERENCES runs(id));
         CREATE TABLE IF NOT EXISTS reports (id TEXT PRIMARY KEY,runId TEXT NOT NULL REFERENCES runs(id),kind TEXT NOT NULL,data TEXT NOT NULL,createdAt INTEGER NOT NULL);
         CREATE INDEX IF NOT EXISTS reports_run ON reports(runId);
+        CREATE TABLE IF NOT EXISTS work_stages (
+          runId TEXT PRIMARY KEY REFERENCES runs(id), taskId TEXT NOT NULL REFERENCES tasks(id),
+          taskRevision INTEGER NOT NULL, state TEXT NOT NULL, details TEXT NOT NULL,
+          nextCheckAt INTEGER, failures INTEGER NOT NULL DEFAULT 0, observerOrigin TEXT
+        );
+        CREATE INDEX IF NOT EXISTS stages_task_revision ON work_stages(taskId,taskRevision);
+        CREATE INDEX IF NOT EXISTS stages_due ON work_stages(nextCheckAt) WHERE state='waiting';
         CREATE TABLE IF NOT EXISTS results (id TEXT PRIMARY KEY,runId TEXT NOT NULL UNIQUE REFERENCES runs(id),taskId TEXT NOT NULL REFERENCES tasks(id),taskRevision INTEGER NOT NULL,summary TEXT NOT NULL,checks TEXT NOT NULL,evidence TEXT NOT NULL,createdAt INTEGER NOT NULL,humanAcceptedAt INTEGER);
         CREATE TABLE IF NOT EXISTS result_attachments (
           resultId TEXT NOT NULL REFERENCES results(id) ON DELETE CASCADE,
@@ -404,7 +425,7 @@ export class Store {
   }):void {
     if (this.isBotDeleted(botId)) return;
     this.getBot(botId); // Readiness is a delivery gate, never permission to lose a durable notification.
-    this.db.prepare('INSERT OR IGNORE INTO outbox(id,kind,taskId,payload,createdAt) VALUES (?,?,?,?,?)').run(`manager-event:${key}`,'manager.notify',taskId,JSON.stringify({botId,reason,taskId,priority,notifyWhilePaused:/^(budget-stopped:|recovery:|approval:|settled:|delivery:)/.test(key),...(delivery?{deliveryOnly:true,exactResultLink:true,...delivery}:{})}),Date.now());
+    this.db.prepare('INSERT OR IGNORE INTO outbox(id,kind,taskId,payload,createdAt) VALUES (?,?,?,?,?)').run(`manager-event:${key}`,'manager.notify',taskId,JSON.stringify({botId,reason,taskId,priority,notifyWhilePaused:/^(budget-stopped:|recovery:|approval:|settled:|delivery:|task-closed:|close-blocked:)/.test(key),...(delivery?{deliveryOnly:true,exactResultLink:true,...delivery}:{})}),Date.now());
   }
   private dueManagerEvents(botId:string,limit:number):Iterable<ManagerEvent> {
     return this.db.prepare(`SELECT id,taskId,payload,state,createdAt FROM outbox
@@ -426,12 +447,21 @@ export class Store {
           !event.id.startsWith(`manager-event:continuation:${instruction.id}`))continue;
       }
       if(!canWake(event))continue;
+      const stageEvent=/^manager-event:stage-(settled|ready|blocked):([a-f0-9-]{36})(?::\d+)?$/.exec(event.id);
+      if(stageEvent&&event.taskId) {
+        const task=this.getTask(event.taskId),run=this.latestRun(task.id);
+        const stage=run?.id===stageEvent[2]&&run?this.currentStage(task,run):null;
+        const valid=task.lifecycle==='open'&&stage&&(
+          (stageEvent[1]==='settled'&&['awaiting-decision','blocked'].includes(stage.state))||stageEvent[1]===stage.state);
+        if(!valid) {this.settleManagerEvent(event.id);continue;}
+        if(this.stageOwnerFollowUp(task,run!)||stage.state==='ready'&&(task.status!=='unscheduled'||this.dispatchBlocker(task.id)))continue;
+      }
       if(!event.id.startsWith('manager-event:capacity:'))return event;
       const id=event.taskId;
       if(!id||blocked.has(id))continue;
       const {status}=this.getTask(id);
       const continuation=status==='blocked'?this.recoveryInstruction(id):null;
-      if((status==='unscheduled'||continuation&&!continuation.runId)&&this.activeBinding(id)?.state==='ready'&&!this.dispatchBlocker(id))return event;
+      if((status==='unscheduled'||continuation?.mode&&!continuation.runId)&&this.activeBinding(id)?.state==='ready'&&!this.dispatchBlocker(id))return event;
       blocked.add(id);
     }
   }
@@ -609,23 +639,29 @@ export class Store {
   }
   /** A tool result is prepared content. Only the native chat receipt settles its notification. */
   managerDeliver<T extends {taskId:string;resultId:string;text:string}>(requestId:string,botId:string,
-    sessionId:string,callId:string,delivery:T,initial?:{links?:unknown}):T {
+    sessionId:string,callId:string,delivery:T,initial?:{links?:unknown;primaryLink?:unknown}):T {
     if(this.activeManager(botId)?.sessionId!==sessionId)throw new AppError('manager-stale','交付会话已经改变。');
     const task=this.getTask(delivery.taskId),result=this.taskDetail(task.id).result;
     if(task.botId!==botId||result?.id!==delivery.resultId||result.taskRevision!==task.taskRevision||!['review','completed'].includes(task.lifecycle))throw new AppError('result-stale','交付成果已经改变。');
+    this.assertNoTaskClose(task.id);
     const links=initial?.links===undefined?undefined:readDeliveryLinks(initial.links,false);
-    return this.command(requestId,'manager.deliver',{botId,taskId:task.id,resultId:result.id,text:delivery.text,...(links?{links}:{})},()=>{
+    const primary=initial?.primaryLink;
+    const primaryLink=primary===undefined||primary===null?primary:readPrimaryDeliveryLink(links??this.reportedDeliveryArtifacts(result.runId).links,primary);
+    const artifacts={...(links?{links}:{}),...(primaryLink!==undefined?{primaryLink}:{})};
+    return this.command(requestId,'manager.deliver',{botId,taskId:task.id,resultId:result.id,text:delivery.text,...artifacts},()=>{
       this.enqueueManager(botId,`delivery:${result.id}`,RESULT_DELIVERY_REASON,task.id,5,
         {resultId:result.id,taskRevision:task.taskRevision,deliverSessionId:sessionId,deliverCallId:callId});
       if(initial) {
         const eventId=`manager-event:delivery:${result.id}`;
-        const content={deliveryText:delivery.text,...(links?{links}:{})};
         const saved=this.db.prepare(`UPDATE outbox SET payload=json_patch(payload,json(?))
           WHERE id=? AND state NOT IN ('done','handled','superseded') AND json_extract(payload,'$.deliveryText') IS NULL`)
-          .run(JSON.stringify(content),eventId).changes;
-        if(!saved&&links) {
-          const previous=this.db.prepare("SELECT state,json_extract(payload,'$.links') AS links FROM outbox WHERE id=?").get(eventId);
-          if(previous?.state!=='done'&&String(previous?.links)===JSON.stringify(links))return delivery;
+          .run(JSON.stringify({deliveryText:delivery.text,...artifacts}),eventId).changes;
+        if(saved&&primaryLink===null) {
+          this.db.prepare("UPDATE outbox SET payload=json_set(payload,'$.primaryLink',NULL) WHERE id=?").run(eventId);
+        }
+        if(!saved&&(links!==undefined||primaryLink!==undefined)) {
+          const previous=this.db.prepare("SELECT state,json_extract(payload,'$.links') AS links,json_extract(payload,'$.primaryLink') AS primaryLink FROM outbox WHERE id=?").get(eventId);
+          if(previous?.state!=='done'&&(previous?.links??undefined)===JSON.stringify(links)&&previous?.primaryLink===(primaryLink??null))return delivery;
           throw new AppError('result-stale','此版本的初始交付物已登记；交付确认后请用链接更新操作。');
         }
       }
@@ -633,10 +669,12 @@ export class Store {
     });
   }
   managerUpdateDeliveryLinks(requestId:string,botId:string,sessionId:string,taskId:string,expectedRowVersion:number,
-    resultId:string,changes:unknown):DeliveryLinks {
+    resultId:string,changes:unknown,primary:unknown=undefined):DeliveryLinks {
     if(this.activeManager(botId)?.sessionId!==sessionId)throw new AppError('manager-stale','交付会话已经改变。');
-    const patch=readDeliveryLinks(changes,true);
-    return this.command(requestId,'manager.update-delivery-links',{botId,taskId,expectedRowVersion,resultId,patch},()=>{
+    if(changes===undefined&&primary===undefined)throw new AppError('invalid-delivery-links','请提供变更的交付物或首要入口。');
+    const patch=changes===undefined?{}:readDeliveryLinks(changes,true);
+    return this.command(requestId,'manager.update-delivery-links',{botId,taskId,expectedRowVersion,resultId,patch,
+      ...(primary!==undefined?{primaryLink:primary}:{})},()=>{
       const task=this.getTask(taskId),run=this.latestRun(taskId);
       if(task.botId!==botId)throw new AppError('manager-scope','只能管理自己负责的任务。');
       if(task.rowVersion!==expectedRowVersion)throw new AppError('version-conflict','任务已经更新，请重新读取交付版本。');
@@ -652,9 +690,17 @@ export class Store {
         else if(links.get(name)!==url){links.set(name,url);modified=true;}
       }
       const updated=Object.fromEntries(links);
-      if(modified) {
-        this.db.prepare("UPDATE outbox SET payload=json_set(payload,'$.links',json(?)) WHERE id=?")
-          .run(JSON.stringify(updated),receipt.eventId);
+      const previous=receipt.primaryLink;
+      const primaryLink=primary===undefined?(previous&&links.has(previous)?previous:undefined)
+        :primary===null?undefined:readPrimaryDeliveryLink(updated,primary);
+      if(modified||primaryLink!==previous) {
+        const savedLinks=JSON.stringify(updated);
+        if(primaryLink||previous) {
+          this.db.prepare("UPDATE outbox SET payload=json_set(payload,'$.links',json(?),'$.primaryLink',?) WHERE id=?")
+            .run(savedLinks,primaryLink??null,receipt.eventId);
+        } else {
+          this.db.prepare("UPDATE outbox SET payload=json_set(payload,'$.links',json(?)) WHERE id=?").run(savedLinks,receipt.eventId);
+        }
         this.db.prepare('UPDATE tasks SET rowVersion=rowVersion+1 WHERE id=?').run(taskId);
       }
       return updated;
@@ -769,6 +815,7 @@ export class Store {
     const {botContext:_context,workdirRequest:rawWorkdir,...rest}=row as Omit<Task,'workdirRequest'>&{botContext?:string;workdirRequest?:string|null};
     const task:Task={...rest,workdirRequest:rawWorkdir?JSON.parse(rawWorkdir):null};
     let status=taskStatus(task);const run=this.latestRun(task.id);
+    const stage=run&&task.lifecycle==='open'?this.currentStage(task,run):null;
     let blockingAttention: Task['blockingAttention'] = null;
     if(task.lifecycle==='open'||task.lifecycle==='review') {
       const open=this.db.prepare(`SELECT id,kind,taskRevision FROM attentions WHERE taskId=? AND ${BLOCKING_ATTENTIONS}
@@ -786,15 +833,18 @@ export class Store {
       else if(has('input'))status='needs-input';
       else if(status==='unscheduled'&&run&&run.taskRevision===task.taskRevision) {
         const result=this.recoveryCheck(run.id)?.resolution;
-        if(settled||result&&(['denied','missing'].includes(result.status)||result.observed?.ready===false))status='blocked';
+        if(stage) {
+          if(stage.state!=='ready'||this.stageOwnerFollowUp(task,run))status='blocked';
+        }else if(settled||result&&(['denied','missing'].includes(result.status)||result.observed?.ready===false))status='blocked';
       }
     }
     const managerReviewed=!!(run&&this.db.prepare("SELECT 1 FROM reviews JOIN results ON results.id=reviews.resultId WHERE results.runId=? AND reviews.actor LIKE 'manager:%' LIMIT 1").get(run.id));
     const check=status==='blocked'&&run?this.recoveryCheck(run.id):null;
     const resolution=check?.resolution;
-    const needsDecision=check?.effectUncertain===true||(status==='blocked'&&!!run&&this.recoveryWorkPlan(run.id)?.context.effectUncertain===true)||!!resolution&&
+    const needsDecision=stage?.state==='blocked'||check?.effectUncertain===true||(status==='blocked'&&!!run&&this.recoveryWorkPlan(run.id)?.context.effectUncertain===true)||!!resolution&&
       (['denied','missing'].includes(resolution.status)||resolution.observed?.ready===false);
     return {...task,status,managerReviewed,blockingAttention,
+      ...(stage?{stageState:stage.state}:{}),
       ...(status==='blocked'&&!needsDecision?{waitingForPrerequisite:true as const}:{})};
   }
   private withDelivery(task: Task): Task {
@@ -804,10 +854,17 @@ export class Store {
     const receipt=this.deliveryReceipt(task);
     return receipt?.runId===run.id?{...task,deliveredAt:receipt.deliveredAt}:task;
   }
+  reportedDeliveryArtifacts(runId:string):DeliveryArtifacts {
+    const row=this.db.prepare("SELECT data FROM reports WHERE runId=? AND kind='ready'").get(runId);
+    const {links,primaryLink}=row?JSON.parse(String(row.data)) as WorkReport:{};
+    return {links:links??{},...(primaryLink?{primaryLink}:{})};
+  }
   private deliveryReceipt(task:Task,resultId?:string) {
     const receipt=this.db.prepare(`SELECT r.id AS resultId,r.runId,o.id AS eventId,e.createdAt AS deliveredAt,
       json_extract(o.payload,'$.deliveryText') AS deliveryText,
-      coalesce(json_extract(o.payload,'$.links'),json_extract(p.data,'$.links')) AS links
+      coalesce(json_extract(o.payload,'$.links'),json_extract(p.data,'$.links')) AS links,
+      CASE WHEN json_type(o.payload,'$.links') IS NOT NULL OR json_type(o.payload,'$.primaryLink') IS NOT NULL
+        THEN json_extract(o.payload,'$.primaryLink') ELSE json_extract(p.data,'$.primaryLink') END AS primaryLink
       FROM events e JOIN outbox o ON o.id=json_extract(e.data,'$.eventId') AND o.taskId=e.taskId
       JOIN results r ON r.taskId=e.taskId AND r.id=json_extract(e.data,'$.resultId')
       LEFT JOIN reports p ON p.runId=r.runId AND p.kind='ready'
@@ -819,17 +876,19 @@ export class Store {
       ORDER BY e.id DESC LIMIT 1`).get(task.id,task.botId,resultId??null,resultId??null);
     return receipt?{resultId:String(receipt.resultId),runId:String(receipt.runId),eventId:String(receipt.eventId),
       deliveredAt:Number(receipt.deliveredAt),deliveryText:typeof receipt.deliveryText==='string'?receipt.deliveryText:undefined,
-      linksJson:typeof receipt.links==='string'?receipt.links:'{}'}:null;
+      linksJson:typeof receipt.links==='string'?receipt.links:'{}',
+      primaryLink:typeof receipt.primaryLink==='string'?receipt.primaryLink:undefined}:null;
   }
   deliveredResult(task:Task,exact?:Result):DeliveredResult|null {
     const receipt=this.deliveryReceipt(task,exact?.id);
     if(!receipt)return null;
     const result=exact??this.resultById(receipt.resultId);
     return result&&{...result,deliveredAt:receipt.deliveredAt,
-      ...(receipt.deliveryText!==undefined?{deliveryText:receipt.deliveryText}:{}),links:JSON.parse(receipt.linksJson)};
+      ...(receipt.deliveryText!==undefined?{deliveryText:receipt.deliveryText}:{}),links:JSON.parse(receipt.linksJson),
+      ...(receipt.primaryLink?{primaryLink:receipt.primaryLink}:{})};
   }
   /** Return only artifacts for results proven delivered in this completed native turn. */
-  chatDeliveries(sessionId:string,turn:number,endSeq:number,messageId?:string):{taskId:string;resultId:string;links:DeliveryLinks}[] {
+  chatDeliveries(sessionId:string,turn:number,endSeq:number,messageId?:string):({taskId:string;resultId:string}&DeliveryArtifacts)[] {
     const bot=this.botForSession(sessionId);
     if(!bot)return [];
     const rows=this.db.prepare(`SELECT e.taskId,json_extract(e.data,'$.resultId') AS resultId
@@ -842,7 +901,7 @@ export class Store {
     return rows.flatMap(row=>{
       const taskId=String(row.taskId), resultId=String(row.resultId), result=this.resultById(resultId);
       const delivery=result?.taskId===taskId?this.deliveredResult(this.getTask(taskId),result):null;
-      return delivery?[{taskId,resultId,links:delivery.links}]:[];
+      return delivery?[{taskId,resultId,links:delivery.links,...(delivery.primaryLink?{primaryLink:delivery.primaryLink}:{})}]:[];
     });
   }
   chatDeliveryStatus(task:Task,result:Result|null,historical=false):ChatDeliveryStatus|null {
@@ -868,7 +927,7 @@ export class Store {
     const task=result&&result.id===deliveredResult?.id&&['review','completed'].includes(current.lifecycle)
       ?{...current,deliveredAt:deliveredResult.deliveredAt}:current;
     const recoveryInstruction=this.recoveryInstruction(id);
-    const canWait=binding?.state==='ready'&&(task.status==='unscheduled'||task.status==='blocked'&&recoveryInstruction&&!recoveryInstruction.runId);
+    const canWait=binding?.state==='ready'&&(task.status==='unscheduled'||task.status==='blocked'&&recoveryInstruction?.mode&&!recoveryInstruction.runId);
     const resourceNotice=canWait&&this.db.prepare(`SELECT 1 FROM outbox WHERE kind='manager.notify' AND taskId=?
       AND id GLOB 'manager-event:capacity:' || taskId || ':*' AND json_extract(payload,'$.botId')=?
       AND state IN ('pending','sending','entered') LIMIT 1`).get(id,task.botId);
@@ -877,7 +936,10 @@ export class Store {
     const wait=canWait&&(resourceNotice||this.db.prepare('SELECT 1 FROM waits WHERE taskId=?').get(id))?this.dispatchWait(id):null;
     const attentions=this.db.prepare('SELECT * FROM attentions WHERE taskId=? ORDER BY createdAt,id').all(id) as unknown as Attention[];
     const currentRun=run?.taskRevision===task.taskRevision&&run.bindingId===binding?.id?run:null;
-    return { task,wait,autoDispatchPending,runHeld:!!(run&&this.db.prepare('SELECT 1 FROM resources WHERE runId=?').get(run.id)),runTurn:run?this.runTurn(run.id):null,recoveryCheck:run?this.recoveryCheck(run.id):null,recoveryInstruction,
+    return { task,wait,autoDispatchPending,stage:currentRun?this.currentStage(task,currentRun):null,stages:this.stageHistory(task),
+      closeRequest:this.taskClose(id),
+      runHeld:!!(run&&this.db.prepare('SELECT 1 FROM resources WHERE runId=?').get(run.id)),runTurn:run?this.runTurn(run.id):null,recoveryCheck:run?this.recoveryCheck(run.id):null,recoveryInstruction,
+      directionStatus:recoveryInstruction?this.recoveryDirectionStatus(recoveryInstruction):null,
       settledBlocker:currentRun?this.verifiedBlocker(currentRun):null,
       binding,bindingHistory:this.db.prepare("SELECT * FROM bindings WHERE taskId=? AND state='released' ORDER BY generation DESC").all(id).map(row=>this.toBinding(row)),run,input:this.pendingInput(id)??(run?this.getRunInput(run.id):null),result,
       deliveredResult,chatDelivery:this.chatDeliveryStatus(task,result),progress:this.taskProgress(task,currentRun,result),
@@ -930,6 +992,7 @@ export class Store {
     return this.command(requestId,'task.revise',payload,() => {
       const task = this.getTask(id);
       if (task.rowVersion !== expectedRowVersion) throw new AppError('version-conflict','任务已经更新，请刷新后再修改。');
+      this.assertNoTaskClose(id);
       if (this.activeBinding(id)) throw new AppError('execution-attached','执行会话已关联，需要先核对执行状态才能修改目标。');
       if (task.lifecycle !== 'open') throw new AppError('task-ended','当前任务不接受目标修改。');
       if (task.goal === payload.goal && task.scope === payload.scope && task.acceptance === payload.acceptance) return task;
@@ -1026,6 +1089,7 @@ export class Store {
   nextBindingGeneration(taskId:string):number {return Number(this.db.prepare('SELECT coalesce(max(generation),0)+1 AS n FROM bindings WHERE taskId=?').get(taskId)?.n);}
   assertSessionAttachable(taskId:string,sessionId:string):void {
     const task=this.getTask(taskId);
+    this.assertNoTaskClose(taskId);
     if(task.lifecycle!=='open'||!task.scope||!task.acceptance)throw new AppError('not-ready','请先补全未完成任务的范围和验收条件。');
     if(this.activeBinding(taskId))throw new AppError('session-attached','任务已有执行会话，请先核对并解除关联。');
     if(this.db.prepare("SELECT 1 FROM attentions WHERE taskId=? AND kind='recovery' AND state='open'").get(taskId)||this.heldRuns().some(run=>run.taskId===taskId))throw new AppError('needs-recovery','请先完成旧执行的恢复核对。');
@@ -1072,6 +1136,7 @@ export class Store {
     return this.command(requestId,'session.prepare',{taskId,expectedRowVersion,cwd},()=>{
       const task=this.getTask(taskId);
       if(task.rowVersion!==expectedRowVersion)throw new AppError('version-conflict','任务已经更新，请刷新后再准备会话。');
+      this.assertNoTaskClose(taskId);
       if(task.lifecycle!=='open'||!task.scope||!task.acceptance)throw new AppError('not-ready','请先补全任务范围和验收条件。');
       const existing=this.activeBinding(taskId);if(existing)return existing;
       const generation=this.nextBindingGeneration(taskId);
@@ -1127,11 +1192,16 @@ export class Store {
   }
   /** Past entered inputs can inform a new run without changing their delivery state. */
   previousWorkerInputs(run:Run):WorkerPriorInput[] {
-    return this.db.prepare(`SELECT i.id,i.kind,i.content,i.messageId FROM runs r JOIN inputs i ON i.id=r.inputId
+    const inputs=this.db.prepare(`SELECT i.id,i.kind,i.content,i.messageId,r.id AS previousRunId FROM runs r JOIN inputs i ON i.id=r.inputId
       WHERE r.taskId=? AND r.taskRevision=? AND r.rowid<(SELECT rowid FROM runs WHERE id=?)
       AND i.id<>? AND i.kind IN ('answer','rework','continuation') AND i.state='entered'
-      GROUP BY i.id ORDER BY MAX(r.rowid)`).all(run.taskId,run.taskRevision,run.id,run.inputId)
-      .map((row,index)=>({...row,order:index+1})) as unknown as WorkerPriorInput[];
+      GROUP BY i.id ORDER BY MAX(r.rowid)`).all(run.taskId,run.taskRevision,run.id,run.inputId) as
+      unknown as (Omit<WorkerPriorInput,'order'>&{previousRunId:string})[];
+    return inputs.map(({previousRunId,...input},index)=>{
+      const context=input.kind==='continuation'?this.recoveryWorkPlan(previousRunId)?.context:undefined;
+      const priorDirections=context?.priorDirections?.map(direction=>direction.text)??(context?.priorDirection?[context.priorDirection]:[]);
+      return {...input,order:index+1,...(priorDirections.length?{priorDirections}:{})};
+    });
   }
   pendingInput(taskId:string):RunInput|null {
     const input=this.db.prepare("SELECT * FROM inputs WHERE taskId=? AND kind IN ('answer','rework') AND state='accepted' ORDER BY createdAt,id LIMIT 1").get(taskId) as unknown as RunInput|undefined;
@@ -1292,12 +1362,19 @@ export class Store {
   }
   private allocateRun(task:Task,b:Binding|null,recovering:boolean,expectedModel?:WorkerModelPlan,instruction?:RecoveryInstruction):Run {
     const taskId=task.id;
+    this.assertNoTaskClose(taskId);
     if(task.lifecycle!=='open'||task.controlMode!=='auto'||!task.scope||!task.acceptance)throw new AppError('not-ready','任务当前不能自动执行，请核对目标和管理方式。');
     if(!b||b.state!=='ready'||!b.sessionId)throw new AppError('not-ready','请先准备执行会话。');
     if(this.db.prepare("SELECT 1 FROM attentions WHERE taskId=? AND state='open'").get(taskId))throw new AppError('needs-attention','请先处理当前待办。');
     if(this.db.prepare('SELECT 1 FROM runs r JOIN resources q ON q.runId=r.id WHERE r.taskId=?').get(taskId))throw new AppError('run-active','这个任务的上次执行尚未收敛。');
     const wait=this.dispatchWaitForBot(taskId,task.botId);
     if(wait)throw new AppError(wait.code,'此 Bot 的执行名额已占用，请等待或核对已有执行。');
+    const previous=this.latestRun(taskId);
+    const previousStage=previous&&previous.bindingId===b.id?this.currentStage(task,previous):null;
+    const stage=recovering?null:previousStage;
+    if(stage&&(stage.state!=='ready'||this.stageOwnerFollowUp(task,previous!))) {
+      throw new AppError('stage-pending','请先核对阶段前置或待处理的用户指示。');
+    }
     const pending=this.pendingInput(taskId);
     if(recovering&&pending&&(pending.messageId!==null||pending.messageJson!==null||
       this.db.prepare("SELECT 1 FROM outbox WHERE id=? AND state!='pending'").get(`input:${pending.id}`))) {
@@ -1305,14 +1382,28 @@ export class Store {
     }
     this.db.prepare('DELETE FROM waits WHERE taskId=?').run(taskId);
     const id=randomUUID(),inputId=pending?.id??randomUUID(),now=Date.now();
+    if(stage&&pending)throw new AppError('needs-attention','有待处理的用户输入，请先核对阶段和用户指示。');
+    const stageEvidence=stage&&{
+      phase:stage.name, source:stage.evidenceRef, summary:stage.summary, checks:stage.checks, observation:stage.observation,
+    };
+    const stageInput=stage?`Continue the authorized next stage: ${stage.nextStep}\nAuthorized scope: ${task.scope}\nPrior stage evidence: ${JSON.stringify(stageEvidence)}`:null;
     if(!pending)this.db.prepare('INSERT INTO inputs(id,taskId,kind,content,createdAt) VALUES (?,?,?,?,?)')
-      .run(inputId,taskId,instruction?'continuation':'dispatch',instruction?.source.text??task.goal,now);
+      .run(inputId,taskId,stage?'stage':instruction?'continuation':'dispatch',stageInput??instruction?.source.text??task.goal,now);
     this.db.prepare('INSERT INTO runs(id,taskId,bindingId,sessionId,taskRevision,generation,inputId,state,createdAt) VALUES (?,?,?,?,?,?,?,?,?)').run(id,taskId,b.id,b.sessionId,task.taskRevision,b.generation,inputId,'queued',now);
     this.db.prepare('INSERT INTO run_turns(runId) VALUES (?)').run(id);
     if(expectedModel)this.set(`run-model-plan:${id}`,JSON.stringify(expectedModel));
     this.db.prepare('INSERT INTO resources(runId) VALUES (?)').run(id);
     this.db.prepare('INSERT INTO outbox(id,kind,taskId,payload,createdAt) VALUES (?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET payload=excluded.payload').run(`input:${inputId}`,'input.deliver',taskId,JSON.stringify({runId:id,inputId,dispatchRowVersion:task.rowVersion}),now);
     this.db.prepare('UPDATE tasks SET rowVersion=rowVersion+1,updatedAt=? WHERE id=?').run(now,taskId);
+    if(stage) {
+      this.db.prepare("UPDATE work_stages SET state='dispatched',details=json_set(details,'$.dispatchedRunId',?) WHERE runId=? AND state='ready'")
+        .run(id,stage.runId);
+      this.settleManagerEvent(`manager-event:stage-ready:${stage.runId}`);
+      this.event('stage.dispatched',task.id,{priorRunId:stage.runId,runId:id});
+    }else if(previousStage) {
+      this.db.prepare("UPDATE work_stages SET state='superseded',nextCheckAt=NULL WHERE runId=?").run(previousStage.runId);
+      this.settleManagerEvent(`manager-event:stage-ready:${previousStage.runId}`);
+    }
     this.event('run.queued',taskId,{runId:id,inputId});return this.getRun(id);
   }
   saveRunMessage(id:string,messageId:string,messageJson:string):RunInput {
@@ -1363,7 +1454,7 @@ export class Store {
       }
       this.db.prepare("UPDATE attentions SET state='stale' WHERE taskId=? AND kind='approval' AND state='open'").run(run.taskId);
       this.db.prepare('INSERT OR IGNORE INTO attentions(id,taskId,kind,question,taskRevision,createdAt) VALUES (?,?,?,?,?,?)').run(`run:${id}`,run.taskId,'recovery',note,run.taskRevision,Date.now());
-      if(notify)this.enqueueManager(this.getTask(run.taskId).botId,`recovery:${id}`,`执行待核对：${note} 不会自动重投旧任务。`,run.taskId,10);
+      if(notify&&!this.taskClose(run.taskId))this.enqueueManager(this.getTask(run.taskId).botId,`recovery:${id}`,`执行待核对：${note} 不会自动重投旧任务。`,run.taskId,10);
       this.event('run.recovery',run.taskId,{runId:id,note});return {};
     });
   }
@@ -1452,8 +1543,13 @@ export class Store {
         // Preserve the report and any candidate. A newer owner direction arrived before this attempt ended.
         this.set(`run-verified-end:${id}`,JSON.stringify({supersededBy:direction.id}));
         this.db.prepare("UPDATE tasks SET lifecycle='open',rowVersion=rowVersion+1,updatedAt=? WHERE id=?").run(Date.now(),task.id);
-        this.enqueueManager(task.botId,`continuation:${direction.id}:settled`,'上一轮已结束，请处理已保存的最新用户指示。',task.id,10);
+        this.enqueueManager(task.botId,`continuation:${direction.id}:settled`,'上一轮已结束，请处理已保存的用户指示。',task.id,10);
         this.event('run.settled',task.id,{runId:id,kind:last.kind,supersededBy:direction.id});
+        return {};
+      }
+      if(last.kind==='stage') {
+        this.settleStage(run,task,report);
+        this.event('run.settled',task.id,{runId:id,kind:last.kind});
         return {};
       }
       const kind=last.kind==='ready'?'review':last.kind==='waiting'?'input':'recovery';
@@ -1471,10 +1567,138 @@ export class Store {
       this.event('run.settled',run.taskId,{runId:id,kind:last.kind});return {};
     });
   }
+  private currentStage(task:Task,run:Run):WorkStage|null {
+    if(run.taskRevision!==task.taskRevision||run.sessionId!==task.sessionId||run.finishedAt===null)return null;
+    const row=this.db.prepare('SELECT state,details FROM work_stages WHERE runId=?').get(run.id);
+    return row?{...JSON.parse(String(row.details)),state:row.state}:null;
+  }
+  private stageHistory(task:Task):WorkStage[] {
+    return this.db.prepare(`SELECT s.state,s.details FROM work_stages s JOIN runs r ON r.id=s.runId
+      WHERE s.taskId=? AND s.taskRevision=? ORDER BY r.rowid DESC LIMIT 10`)
+      .all(task.id,task.taskRevision).map(row=>({...JSON.parse(String(row.details)),state:row.state} as WorkStage));
+  }
+  private stageOwnerFollowUp(task:Task,run:Run):boolean {
+    const instruction=this.recoveryInstruction(task.id);
+    return !!instruction?.mode&&!instruction.runId&&instruction.taskRevision===task.taskRevision&&instruction.priorRunId===run.id;
+  }
+  private settleStage(run:Run,task:Task,report:WorkReport):void {
+    const name=report.stage!, evidenceRef=report.evidenceRef!, checks=report.checks!, now=Date.now();
+    const fingerprint=createHash('sha256').update(JSON.stringify([evidenceRef,checks.replace(/\s+/gu,' ')])).digest('hex');
+    const repeated=this.db.prepare(`SELECT 1 FROM work_stages WHERE taskId=? AND taskRevision=?
+      AND json_extract(details,'$.fingerprint')=? LIMIT 1`).get(task.id,task.taskRevision,fingerprint);
+    const reason=repeated?'此证据和核对结果已登记。请核对真正的新进展或处理阻塞。':undefined;
+    this.db.prepare('INSERT INTO work_stages(runId,taskId,taskRevision,state,details) VALUES (?,?,?,?,?)')
+      .run(run.id,task.id,run.taskRevision,repeated?'blocked':'awaiting-decision',
+        JSON.stringify({runId:run.id,name,evidenceRef,summary:report.summary,checks,fingerprint,reason,at:now}));
+    this.set(`run-verified-end:${run.id}`,JSON.stringify({stage:true}));
+    this.db.prepare("UPDATE tasks SET lifecycle='open',rowVersion=rowVersion+1,updatedAt=? WHERE id=?").run(now,task.id);
+    this.enqueueManager(task.botId,`stage-settled:${run.id}`,'已记录阶段进展，任务仍未完成。请读取阶段证据与目标。',task.id,8);
+  }
+  private stageDecisionTarget(botId:string,taskId:string,version:number,runId:string) {
+    const task=this.getTask(taskId),run=this.latestRun(taskId),binding=this.activeBinding(taskId);
+    const stage=run?.id===runId?this.currentStage(task,run):null;
+    if(task.botId!==botId||task.rowVersion!==version||task.controlMode!=='auto'||task.lifecycle!=='open'||
+      !run||!stage||binding?.state!=='ready'||binding.id!==run.bindingId||binding.generation!==run.generation||
+      this.stageOwnerFollowUp(task,run)||
+      this.db.prepare("SELECT 1 FROM attentions WHERE taskId=? AND state='open'").get(taskId)) {
+      throw new AppError('stage-stale','阶段、任务版本或执行授权已改变。请核对原任务。');
+    }
+    return {task,stage};
+  }
+  advanceStage(requestId:string,botId:string,taskId:string,version:number,runId:string,step:unknown,dependency:unknown,origin:string|null,ownerRetry=false) {
+    const nextStep=requiredText(step,'已授权的具体下一步',3000),condition=readStageCondition(dependency);
+    const observerOrigin=condition?.sourceOrigin===origin?origin:null;
+    return this.command(requestId,'stage.advance',{botId,taskId,version,runId,nextStep,condition,origin,ownerRetry},()=>{
+      const {task,stage}=this.stageDecisionTarget(botId,taskId,version,runId);
+      const priorOrigin=this.db.prepare('SELECT observerOrigin FROM work_stages WHERE runId=?').get(runId)?.observerOrigin;
+      const retry=stage.state==='blocked'&&ownerRetry&&!!condition&&stage.observation?.state==='unavailable'&&
+        stage.nextStep===nextStep&&JSON.stringify(stage.condition)===JSON.stringify(condition)&&!!observerOrigin&&
+        (!priorOrigin||observerOrigin===priorOrigin);
+      if(stage.state!=='awaiting-decision'&&!retry)throw new AppError('stage-decided','此阶段已有处理决定。请读取当前任务。');
+      const repeated=condition&&this.db.prepare(`SELECT 1 FROM work_stages WHERE taskId=? AND taskRevision=? AND runId!=?
+        AND json_extract(details,'$.condition')=? LIMIT 1`).get(taskId,task.taskRevision,runId,JSON.stringify(condition));
+      const now=Date.now(), details={...stage,nextStep,condition,observation:undefined,reason:undefined} as WorkStage;
+      const decision:WorkStage['state']=repeated?'blocked':!condition?'ready':observerOrigin?'waiting':'blocked';
+      if(repeated)details.reason='已经核对过同一外部条件。请确认下一阶段需要的具体前提。';
+      else if(condition&&!observerOrigin) {
+        const expected=condition.sourceOrigin;
+        details.reason=`本端没有 ${expected} 的可信观察来源。请由宿主负责人配置只读观察，或由项目负责人补充指定对象的状态。`;
+        details.observation={state:'unavailable',detail:details.reason,at:now};
+      }
+      this.db.prepare('UPDATE work_stages SET state=?,details=?,nextCheckAt=?,failures=0,observerOrigin=? WHERE runId=?')
+        .run(decision,JSON.stringify({...details,state:undefined}),decision==='waiting'?now:null,observerOrigin,runId);
+      this.db.prepare('UPDATE tasks SET rowVersion=rowVersion+1,updatedAt=? WHERE id=?').run(now,taskId);
+      this.event('stage.decided',taskId,{runId,nextStep,condition,state:decision});
+      this.settleManagerEvent(`manager-event:stage-settled:${runId}`);
+      if(decision==='ready')this.enqueueStageReady(botId,taskId,runId);
+      return {task:this.getTask(taskId),stage:{...details,state:decision}};
+    });
+  }
+  blockStage(requestId:string,botId:string,taskId:string,version:number,runId:string,note:unknown) {
+    const reason=requiredText(note,'阶段不能继续的具体原因',3000);
+    return this.command(requestId,'stage.block',{botId,taskId,version,runId,reason},()=>{
+      const {stage}=this.stageDecisionTarget(botId,taskId,version,runId);
+      if(stage.state!=='awaiting-decision')throw new AppError('stage-decided','此阶段已有处理决定。请读取当前任务。');
+      this.db.prepare("UPDATE work_stages SET state='blocked',details=json_set(details,'$.reason',?) WHERE runId=?").run(reason,runId);
+      this.db.prepare('UPDATE tasks SET rowVersion=rowVersion+1,updatedAt=? WHERE id=?').run(Date.now(),taskId);
+      this.event('stage.blocked',taskId,{runId,reason});
+      this.settleManagerEvent(`manager-event:stage-settled:${runId}`);
+      return {task:this.getTask(taskId),stage:{...stage,reason,state:'blocked' as const}};
+    });
+  }
+  private enqueueStageReady(botId:string,taskId:string,runId:string) {
+    this.enqueueManager(botId,`stage-ready:${runId}`,'阶段之后的已授权下一步可以执行。请沿用同一 Task 和 Worker。',taskId,8);
+  }
+  dueStages(limit:number,now=Date.now()):DueStage[] {
+    return this.db.prepare(`SELECT s.runId,s.taskId,s.nextCheckAt AS checkAt,t.rowVersion,s.observerOrigin AS origin,
+      json_extract(s.details,'$.condition') AS condition FROM work_stages s
+      JOIN tasks t ON t.id=s.taskId AND t.taskRevision=s.taskRevision AND t.lifecycle='open' AND t.controlMode='auto'
+      JOIN bots ON bots.id=t.botId AND bots.deletedAt IS NULL
+      JOIN runs r ON r.id=s.runId AND r.sessionId=t.sessionId AND r.finishedAt IS NOT NULL
+      JOIN bindings b ON b.id=r.bindingId AND b.state='ready' AND b.sessionId=t.sessionId
+      WHERE s.state='waiting' AND s.nextCheckAt<=? AND s.observerOrigin IS NOT NULL
+        AND r.id=(SELECT id FROM runs WHERE taskId=t.id ORDER BY createdAt DESC,rowid DESC LIMIT 1)
+        AND NOT EXISTS (SELECT 1 FROM metadata m WHERE m.key='recovery-instruction:' || t.id
+          AND json_extract(m.value,'$.taskRevision')=t.taskRevision AND json_extract(m.value,'$.priorRunId')=r.id
+          AND json_extract(m.value,'$.mode') IS NOT NULL AND json_extract(m.value,'$.runId') IS NULL)
+      ORDER BY s.nextCheckAt,s.runId LIMIT ?`).all(now,limit)
+      .map(row=>({...row,condition:JSON.parse(String(row.condition))} as DueStage));
+  }
+  recordStageObservation(due:DueStage,observation:StageObservation,now=Date.now()):void {
+    const task=this.getTask(due.taskId),run=this.latestRun(due.taskId),binding=this.activeBinding(due.taskId);
+    const stage=run?.id===due.runId?this.currentStage(task,run):null;
+    const row=this.db.prepare('SELECT nextCheckAt,failures,observerOrigin FROM work_stages WHERE runId=?').get(due.runId);
+    if(stage?.state!=='waiting'||!row||row.nextCheckAt!==due.checkAt||row.observerOrigin!==due.origin||
+      task.rowVersion!==due.rowVersion||task.controlMode!=='auto'||task.lifecycle!=='open'||this.isBotDeleted(task.botId)||
+      binding?.state!=='ready'||binding.id!==run?.bindingId||this.stageOwnerFollowUp(task,run))return;
+    // No asynchronous work between the fresh checks and commit in this single-owner ledger.
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      const failures=observation.state==='transient'?Number(row.failures)+1:0;
+      const outcome=failures>=5?{state:'unavailable' as const,detail:
+        'GitLab 连续五次读取暂不可用。请由宿主负责人核对本端网络与服务，或由项目负责人补充指定对象的状态。'}:observation;
+      const state=outcome.state==='satisfied'?'ready':outcome.state==='unsatisfied'||outcome.state==='unavailable'?'blocked':'waiting';
+      const next=state==='waiting'?now+30_000*2**Math.min(Math.max(failures-1,0),4):null;
+      const details={...stage,state:undefined,observation:{...outcome,at:now},reason:state==='blocked'?outcome.detail:undefined};
+      this.db.prepare('UPDATE work_stages SET state=?,details=?,nextCheckAt=?,failures=? WHERE runId=?')
+        .run(state,JSON.stringify(details),next,failures,due.runId);
+      if(stage.observation?.stateLabel!==outcome.stateLabel||stage.observation?.state!==outcome.state) {
+        this.event('stage.observed',task.id,{runId:due.runId,condition:stage.condition,...outcome});
+      }
+      if(state!=='waiting') {
+        this.db.prepare('UPDATE tasks SET rowVersion=rowVersion+1,updatedAt=? WHERE id=?').run(now,task.id);
+        if(state==='ready')this.enqueueStageReady(task.botId,task.id,due.runId);
+        else this.enqueueManager(task.botId,`stage-blocked:${due.runId}:${due.rowVersion}`,
+          `外部条件未满足或不可读：${stageConditionText(due.condition)}。请从任务详情说明当前事实。`,task.id,8);
+      }
+      this.db.exec('COMMIT');
+    } catch(error) {this.db.exec('ROLLBACK');throw error;}
+  }
   acceptResult(requestId:string,taskId:string,expectedRowVersion:number,resultId:string):Task {
     return this.command(requestId,'result.accept',{taskId,expectedRowVersion,resultId},()=>{
       const task=this.getTask(taskId);const run=this.latestRun(taskId);const result=run?this.runResult(run.id):null;
       if(task.rowVersion!==expectedRowVersion)throw new AppError('version-conflict','任务已经更新，请刷新后再验收。');
+      this.assertNoTaskClose(taskId);
       if(task.lifecycle!=='review'||!result||result.id!==resultId||result.taskRevision!==task.taskRevision||run?.state!=='settled')throw new AppError('result-stale','当前成果不能验收，请重新核对。');
       if(this.db.prepare('SELECT 1 FROM resources WHERE runId=?').get(run.id)||this.db.prepare("SELECT 1 FROM attentions WHERE taskId=? AND state='open' AND kind!='review'").get(taskId))throw new AppError('needs-attention','还有执行或待办未处理。');
       const now=Date.now();this.db.prepare('INSERT INTO reviews VALUES (?,?,?,?,?,?)').run(randomUUID(),resultId,'user','accepted','用户检查当前证据后接受',now);
@@ -1506,26 +1730,34 @@ export class Store {
       }
       if(!run||run.finishedAt!==null)throw new AppError('no-active-run','没有正在执行的尝试；未知状态请使用核对。');
       this.db.prepare("UPDATE tasks SET controlMode='paused',rowVersion=rowVersion+1,updatedAt=? WHERE id=?").run(Date.now(),taskId);
-      this.db.prepare("UPDATE runs SET state='cancelling' WHERE id=?").run(run.id);
-      this.db.prepare("UPDATE outbox SET state='cancelled' WHERE id IN (?,?) AND state='pending'").run(`input:${run.inputId}`,`run:${run.id}`);
-      this.event('run.stop-requested',taskId,{runId:run.id});return {runId:run.id,requested:true as const};
+      this.markRunStopping(run);
+      return {runId:run.id,requested:true as const};
     });
+  }
+  private markRunStopping(run:Run):void {
+    this.db.prepare("UPDATE runs SET state='cancelling' WHERE id=?").run(run.id);
+    this.db.prepare("UPDATE outbox SET state='cancelled' WHERE id IN (?,?) AND state='pending'").run(`input:${run.inputId}`,`run:${run.id}`);
+    this.event('run.stop-requested',run.taskId,{runId:run.id});
   }
   settleCancelled(id:string,notify=true):void {
     if(this.getRun(id).finishedAt!==null)return;
     this.command(`cancelled:${id}`,'run.cancelled',{id},()=>{
       const run=this.getRun(id);if(run.state!=='cancelling')throw new AppError('stop-not-requested','没有停止请求。');
-      const budget=this.db.prepare("SELECT 1 FROM events WHERE kind='run.budget-reached' AND taskId=? AND json_extract(data,'$.runId')=?").get(run.taskId,id);
-      this.db.prepare("UPDATE runs SET state='cancelled',finishedAt=?,note=? WHERE id=?").run(Date.now(),budget?run.note:'已核对停止',id);
-      if(budget)this.db.prepare('INSERT OR IGNORE INTO attentions(id,taskId,kind,question,taskRevision,createdAt) VALUES (?,?,?,?,?,?)').run(`run:${id}`,run.taskId,'recovery',`${run.note} 已确认停止；不会自动重试。`,run.taskRevision,Date.now());
-      this.db.prepare("UPDATE inputs SET state='discarded' WHERE id=? AND state!='entered'").run(run.inputId);
-      this.db.prepare("UPDATE attentions SET state='stale' WHERE taskId=? AND kind='approval' AND state='open'").run(run.taskId);
-      const input=this.getRunInput(id);if(input.attentionId&&input.state==='discarded')this.db.prepare("UPDATE attentions SET state='open' WHERE id=? AND state='responding'").run(input.attentionId);
-      this.db.prepare('DELETE FROM resources WHERE runId=?').run(id);
-      this.db.prepare('UPDATE tasks SET rowVersion=rowVersion+1,updatedAt=? WHERE id=?').run(Date.now(),run.taskId);
-      if(budget&&notify)this.enqueueManager(this.getTask(run.taskId).botId,`budget-stopped:${id}`,`${run.note} 已确认停止；不会自动重试。请在任务详情检查进展并明确核对后再安排。`,run.taskId,10);
-      this.event('run.cancelled',run.taskId,{runId:id});return {};
+      this.finishStoppedRun(run,notify);return {};
     });
+  }
+  private finishStoppedRun(run:Run,notify:boolean,unsent=false):void {
+    const {id,taskId}=run;
+    const budget=this.db.prepare("SELECT 1 FROM events WHERE kind='run.budget-reached' AND taskId=? AND json_extract(data,'$.runId')=?").get(taskId,id);
+    this.db.prepare("UPDATE runs SET state='cancelled',finishedAt=?,note=? WHERE id=?").run(Date.now(),budget?run.note:'已核对停止',id);
+    if(budget)this.db.prepare('INSERT OR IGNORE INTO attentions(id,taskId,kind,question,taskRevision,createdAt) VALUES (?,?,?,?,?,?)').run(`run:${id}`,taskId,'recovery',`${run.note} 已确认停止；不会自动重试。`,run.taskRevision,Date.now());
+    this.db.prepare("UPDATE inputs SET state='discarded' WHERE id=? AND state!='entered'").run(run.inputId);
+    this.db.prepare("UPDATE attentions SET state='stale' WHERE taskId=? AND kind='approval' AND state='open'").run(taskId);
+    const input=this.getRunInput(id);if(input.attentionId&&input.state==='discarded')this.db.prepare("UPDATE attentions SET state='open' WHERE id=? AND state='responding'").run(input.attentionId);
+    this.db.prepare('DELETE FROM resources WHERE runId=?').run(id);
+    this.db.prepare('UPDATE tasks SET rowVersion=rowVersion+1,updatedAt=? WHERE id=?').run(Date.now(),taskId);
+    if(budget&&notify)this.enqueueManager(this.getTask(taskId).botId,`budget-stopped:${id}`,`${run.note} 已确认停止；不会自动重试。请在任务详情检查进展并明确核对后再安排。`,taskId,10);
+    this.event('run.cancelled',taskId,{runId:id,...(unsent?{unsent:true}:{})});
   }
   /** Chat can fill missing task essentials, never replace existing authorization or a goal. */
   completeTaskInput(requestId:string,taskId:string,attentionId:string,expectedRowVersion:number,input:{scope?:string;acceptance?:string},source:ChatSource):Task {
@@ -1533,6 +1765,7 @@ export class Store {
     return this.command(requestId,'task.complete-input',{taskId,attentionId,expectedRowVersion,...fields,source},()=>{
       const task=this.getTask(taskId),attention=this.db.prepare('SELECT * FROM attentions WHERE id=?').get(attentionId) as unknown as Attention|undefined;
       if(task.rowVersion!==expectedRowVersion)throw new AppError('version-conflict','任务已经更新，请刷新后补充。');
+      this.assertNoTaskClose(taskId);
       if(!attention||attention.taskId!==taskId||attention.kind!=='input'||attention.state!=='open'||attention.taskRevision!==task.taskRevision)throw new AppError('attention-stale','问题已失效或已有回答。');
       if(this.activeBinding(taskId))throw new AppError('execution-attached','执行会话已关联，不能通过补充缺项修改任务范围。');
       if(task.lifecycle!=='open'||(task.scope&&task.acceptance))throw new AppError('not-incomplete','当前任务没有可补充的缺项。');
@@ -1548,7 +1781,7 @@ export class Store {
     });
   }
   private pendingWorkerQuestions(task:Task,binding:Binding|null,attentions:Attention[]):Attention[] {
-    if(task.lifecycle!=='open'||binding?.state!=='ready'||!binding.sessionId||binding.sessionId!==task.sessionId
+    if(this.taskClose(task.id)||task.lifecycle!=='open'||binding?.state!=='ready'||!binding.sessionId||binding.sessionId!==task.sessionId
       ||binding.taskRevision!==task.taskRevision)return [];
     const open=attentions.filter(a=>a.taskId===task.id&&a.kind==='input'&&a.state==='open'&&a.taskRevision===task.taskRevision&&a.id.startsWith('run:'));
     if(!open.length||this.heldRuns().some(run=>run.taskId===task.id))return [];
@@ -1564,6 +1797,7 @@ export class Store {
       const attention=this.db.prepare('SELECT * FROM attentions WHERE id=?').get(attentionId) as unknown as Attention|undefined;
       if(!attention)throw new AppError('not-found','待办不存在。');const task=this.getTask(attention.taskId);
       if(task.rowVersion!==expectedRowVersion)throw new AppError('version-conflict','任务已经更新，请刷新后回答。');
+      this.assertNoTaskClose(task.id);
       if(attention.kind!=='input'||attention.state!=='open'||attention.taskRevision!==task.taskRevision||task.lifecycle!=='open')throw new AppError('attention-stale','问题已失效或已有回答。');
       const binding=this.activeBinding(task.id);
       if(!binding)throw new AppError('not-execution-question','请使用修改任务补全范围和验收条件。');
@@ -1583,6 +1817,7 @@ export class Store {
     return this.command(requestId,'result.reject',{taskId,expectedRowVersion,resultId,content,...(source?{source}:{})},()=>{
       const task=this.getTask(taskId),run=this.latestRun(taskId),result=run?this.runResult(run.id):null;
       if(task.rowVersion!==expectedRowVersion)throw new AppError('version-conflict','任务已经更新，请刷新后再返工。');
+      this.assertNoTaskClose(taskId);
       if(task.lifecycle!=='review'||!result||result.id!==resultId||result.taskRevision!==task.taskRevision)throw new AppError('result-stale','这份成果已失效。');
       if(this.heldRuns().some(r=>r.taskId===taskId))throw new AppError('run-active','执行尚未收敛，暂未安排返工。');
       this.db.prepare('INSERT INTO reviews VALUES (?,?,?,?,?,?)').run(randomUUID(),resultId,'user','rejected',content,Date.now());
@@ -1600,8 +1835,10 @@ export class Store {
     if(latest?.finishedAt===null)throw new AppError('run-active','请先停止当前执行。');
     const run=latest&&binding&&latest.bindingId===binding.id&&latest.sessionId===binding.sessionId&&
       latest.generation===binding.generation&&latest.taskRevision===task.taskRevision?latest:null;
+    const close=this.taskClose(taskId);
     const attentions=this.db.prepare(`SELECT id FROM attentions WHERE taskId=? AND taskRevision=? AND kind='recovery'
-      AND state='open' AND id IN (?,?) ORDER BY id`).all(taskId,task.taskRevision,`restore:${taskId}`,run?`run:${run.id}`:null)
+      AND state='open' AND id IN (?,?,?) ORDER BY id`).all(taskId,task.taskRevision,`restore:${taskId}`,run?`run:${run.id}`:null,
+        close&&close.runId===run?.id?`close:${close.id}`:null)
       .map(row=>String(row.id));
     if(!['open','review'].includes(task.lifecycle)||!attentions.length)throw new AppError('recovery-stale','当前没有可核对的执行恢复事项。');
     if(this.heldRuns().some(held=>held.taskId===taskId&&held.id!==run?.id))throw new AppError('run-active','还有其他执行占用待核对。');
@@ -1609,6 +1846,7 @@ export class Store {
       throw new AppError('binding-stale','执行会话关联待核对，请先确认当前关联。');
     }
     if(continuation) {
+      this.assertNoTaskClose(taskId);
       if(!attentions.includes(continuation.attentionId))throw new AppError('recovery-stale','这个恢复事项已经改变，请刷新后核对。');
       if(!binding||binding.id!==continuation.bindingId||binding.generation!==continuation.expectedBindingGeneration) {
         throw new AppError('binding-stale','执行会话关联已经改变，请刷新后核对。');
@@ -1619,43 +1857,118 @@ export class Store {
   }
   recoveryInstruction(taskId:string):RecoveryInstruction|null {
     const value=this.get(`recovery-instruction:${taskId}`);
-    return value?JSON.parse(value):null;
+    if(!value)return null;
+    const {directionRefs,...instruction}=JSON.parse(value) as StoredRecoveryInstruction;
+    if(directionRefs)instruction.directions=directionRefs.map(ref=>{
+      const source=this.get(`recovery-direction-source:${ref.id}`);
+      if(!source)throw new AppError('direction-unproven','待处理指示缺少原始消息记录，请核对任务。');
+      return {...ref,source:JSON.parse(source) as ChatSource};
+    });
+    if(!instruction.directions) {
+      const source=instruction.priorDirection??instruction.source;
+      instruction.directions=instruction.mode?[{id:directionId(source),source,mode:instruction.mode}]:[];
+    }
+    return instruction;
+  }
+  private writeRecoveryInstruction(taskId:string,{directions,...instruction}:RecoveryInstruction):void {
+    const directionRefs=directions?.map(({id,mode,source})=>{
+      const key=`recovery-direction-source:${id}`;
+      if(!this.get(key))this.set(key,JSON.stringify(source));
+      return {id,mode};
+    });
+    this.set(`recovery-instruction:${taskId}`,JSON.stringify({...instruction,directionRefs}));
+  }
+  recoveryDirectionStatus(instruction:RecoveryInstruction):RecoveryDirectionStatus {
+    const run=this.getRun(instruction.runId??instruction.priorRunId),task=this.getTask(run.taskId);
+    if(task.taskRevision!==instruction.taskRevision||this.latestRun(task.id)?.id!==run.id)return 'archived';
+    if(instruction.runId) {
+      const state=this.getRunInput(instruction.runId).state;
+      if(state==='entered')return 'entered';
+      if(state==='enqueued')return 'queued';
+      if(state==='unknown')return 'delivery-unknown';
+      return state==='discarded'?'discarded':'recorded';
+    }
+    if(task.lifecycle!=='open')return 'archived';
+    if(instruction.change?.kind==='revoke'&&!instruction.mode)return 'revoked';
+    return task.controlMode==='auto'&&instruction.mode&&run.finishedAt===null?'next-run':'recorded';
   }
   recoveryWorkPlan(runId:string):RecoveryWorkPlan|null {
     const value=this.get(`recovery-work:${runId}`);
     return value?JSON.parse(value):null;
   }
   saveRecoveryInstruction(taskId:string,expectedRowVersion:number,source:ChatSource,
-    mode?:RecoveryInstruction['mode'],keepPendingDirection=false,resumeManagement=false) {
-    const id=createHash('sha256').update(JSON.stringify([source.sessionId,source.messageId])).digest('hex');
-    this.command(`recovery-owner:${id}`,'task.recovery-instruction',{taskId,source,mode,keepPendingDirection,resumeManagement},()=>{
+    mode?:RecoveryInstruction['mode'],keepPendingDirection=false,resumeManagement=false,change?:RecoveryDirectionChange,
+    extra?:{earlier?:Omit<RecoveryDirection,'id'>[];onlyWhileActive?:boolean}) {
+    const id=directionId(source);
+    this.command(`recovery-owner:${id}`,'task.recovery-instruction',{taskId,source,mode,keepPendingDirection,resumeManagement,change,extra},()=>{
       const task=this.getTask(taskId),run=this.latestRun(taskId);
+      this.assertNoTaskClose(taskId);
       if(task.rowVersion!==expectedRowVersion)throw new AppError('version-conflict','任务已经更新，请重新读取状态。');
       if(this.botForSession(source.sessionId)?.id!==task.botId)throw new AppError('manager-scope','只能在任务当前的 Bot 对话保存指示。');
       requiredText(source.text,'用户指令原文',32_000);
       if(mode!==undefined&&mode!=='read-only'&&mode!=='authorized-work')throw new AppError('invalid-input','后续授权范围无效。');
       if(task.lifecycle!=='open'||!run||run.taskRevision!==task.taskRevision||
-        (run.finishedAt!==null&&!['blocked','recovery','paused','manual'].includes(task.status))) {
+        (run.finishedAt!==null&&!['blocked','recovery','paused','manual'].includes(task.status)&&task.stageState!=='ready')) {
         throw new AppError('recovery-stale','没有需要后续指示的当前执行。');
       }
-      if(resumeManagement&&(task.controlMode!=='paused'||!mode)) {
+      if(extra?.onlyWhileActive&&(!mode||change||keepPendingDirection||resumeManagement||
+        run.finishedAt!==null||!['queued','running'].includes(run.state))) {
+        throw new AppError('direction-stale','只能把同轮较早的独立指示加到仍在执行的任务。');
+      }
+      if(resumeManagement&&(task.controlMode!=='paused'||!mode||keepPendingDirection)) {
         throw new AppError('recovery-human-control','仅能根据明确的本次续跑指示恢复已暂停的任务。');
+      }
+      if(change&&(!['replace','revoke'].includes(change.kind)||keepPendingDirection||extra?.earlier?.length||
+        change.kind==='replace'&&!mode||change.kind==='revoke'&&mode)) {
+        throw new AppError('invalid-input','替代指示需给出具体新方向。撤回仅处理已保存的指示。');
       }
       const previous=this.recoveryInstruction(taskId);
       if(previous?.source.sessionId===source.sessionId&&previous.source.seq>=source.seq) {
         throw new AppError('recovery-stale','此任务有更新的用户指示。');
       }
-      if(previous&&!previous.runId)this.settleManagerEvent(`manager-event:continuation:${previous.id}`);
-      const carried=keepPendingDirection&&!mode&&previous?.mode&&!previous.runId&&previous.priorRunId===run.id&&
-        previous.taskRevision===task.taskRevision&&previous.source.sessionId===source.sessionId ? {
-          mode:previous.mode,priorDirection:previous.priorDirection??previous.source,
-        } : {};
-      const instruction:RecoveryInstruction={id,source,taskRevision:task.taskRevision,priorRunId:run.id,...(mode?{mode}:carried)};
-      this.set(`recovery-instruction:${taskId}`,JSON.stringify(instruction));
+      if(this.get(`recovery-direction-source:${id}`))throw new AppError('direction-stale','该用户消息已保存。');
+      let previousSeq=previous?.source.sessionId===source.sessionId?previous.source.seq:-1;
+      const additions=(extra?.earlier??[]).map(direction=>{
+        const original=direction.source;
+        requiredText(original.text,'用户指令原文',32_000);
+        if(original.sessionId!==source.sessionId||original.seq<=previousSeq||original.seq>=source.seq||
+          !['read-only','authorized-work'].includes(direction.mode)) {
+          throw new AppError('direction-stale','补充消息的来源或顺序已经改变。');
+        }
+        previousSeq=original.seq;
+        const directionKey=directionId(original);
+        if(this.get(`recovery-direction-source:${directionKey}`)||
+          this.db.prepare('SELECT 1 FROM requests WHERE id=?').get(`recovery-owner:${directionKey}`)) {
+          throw new AppError('direction-stale','这条较早的用户消息已经保存。');
+        }
+        return {id:directionKey,...direction};
+      });
+      const pending=previous&&!previous.runId&&previous.priorRunId===run.id&&
+        previous.taskRevision===task.taskRevision&&previous.source.sessionId===source.sessionId?previous.directions??[]:[];
+      const removedIds=change?(change.ids??pending.map(direction=>direction.id)):[];
+      if(change&&(!removedIds.length||new Set(removedIds).size!==removedIds.length||
+        removedIds.some(removed=>!pending.some(direction=>direction.id===removed)))) {
+        throw new AppError('direction-stale','要撤回或替代的指示已不在本次待处理范围内，请核对当前任务。');
+      }
+      const directions=[...pending.filter(direction=>!removedIds.includes(direction.id)),...additions];
+      if(mode)directions.push({id,source,mode});
+      // A narrower direction remains in force until the owner explicitly replaces or revokes it.
+      const effectiveMode=directions.some(direction=>direction.mode==='read-only')?'read-only':directions.at(-1)?.mode;
+      const instruction:RecoveryInstruction={id,source,taskRevision:task.taskRevision,priorRunId:run.id,directions,mode:effectiveMode,
+        ...(keepPendingDirection&&directions.length===1?{priorDirection:directions[0]!.source}:{}),
+        ...(change?{change:{kind:change.kind,removedIds}}:{})};
+      if(previous&&!previous.runId) {
+        const notice=`manager-event:continuation:${previous.id}`;
+        for(const suffix of ['',':settled',':restart'])this.settleManagerEvent(notice+suffix);
+      }
+      this.writeRecoveryInstruction(taskId,instruction);
       this.db.prepare("UPDATE tasks SET controlMode=?,rowVersion=rowVersion+1,updatedAt=? WHERE id=?")
         .run(resumeManagement?'auto':task.controlMode,Date.now(),taskId);
-      this.enqueueManager(task.botId,`continuation:${id}`,'有最新用户后续指示，请结合上一轮已核对的事实继续。',taskId,10);
-      this.event('task.recovery-instruction',taskId,{instructionId:id,priorRunId:run.id,source,mode,resumeManagement});
+      if(effectiveMode)this.enqueueManager(task.botId,`continuation:${id}`,'有待处理的用户指示，请结合上一轮已核对的事实继续。',taskId,10);
+      else if(change?.kind==='revoke')this.db.prepare('DELETE FROM waits WHERE taskId=?').run(taskId);
+      for(const extra of additions)this.event('task.recovery-instruction',taskId,
+        {instructionId:extra.id,priorRunId:run.id,source:extra.source,mode:extra.mode});
+      this.event('task.recovery-instruction',taskId,{instructionId:id,priorRunId:run.id,source,mode,resumeManagement,change:instruction.change});
       return {};
     });
     return {task:this.getTask(taskId),instruction:this.recoveryInstruction(taskId)!};
@@ -1708,7 +2021,7 @@ export class Store {
       this.db.prepare("UPDATE attentions SET state='resolved' WHERE id=? AND state='open'").run(`run:${run.id}`);
       const next=this.allocateRun(task,binding,true,expectedModel,instruction);
       this.set(`recovery-work:${next.id}`,JSON.stringify(work));
-      this.set(`recovery-instruction:${taskId}`,JSON.stringify({...instruction,runId:next.id}));
+      this.writeRecoveryInstruction(taskId,{...instruction,runId:next.id});
       this.settleManagerEvent(`manager-event:continuation:${instruction.id}`);
       this.event('run.continued',taskId,{runId:next.id,priorRunId:run.id,instructionId:instruction.id});
       return next;
@@ -1745,6 +2058,17 @@ export class Store {
     const payload={runId,callId,probe,auth,result};
     this.command(`worker-preflight:${runId}:${callId}`,'worker.preflight',payload,()=>{
       this.set(`worker-preflight:${runId}:${callId}`,JSON.stringify({probe,auth,result}));
+      return {};
+    });
+  }
+  readQueryReceipt(runId:string,callId:string):ReadQueryReceipt|null {
+    const value=this.get(`worker-read-query:${runId}:${callId}`);
+    return value?JSON.parse(value):null;
+  }
+  recordReadQueryReceipt(runId:string,callId:string,receipt:ReadQueryReceipt):void {
+    const key=`worker-read-query:${runId}:${callId}`;
+    this.command(key,'worker.read-query',{runId,callId,receipt},()=>{
+      this.set(key,JSON.stringify(receipt));
       return {};
     });
   }
@@ -1851,12 +2175,92 @@ export class Store {
       const task = this.getTask(id);
       if (task.rowVersion !== expectedRowVersion) throw new AppError('version-conflict', '任务已经更新，请刷新后再操作。');
       if (task.lifecycle === 'completed' || task.lifecycle === 'cancelled') throw new AppError('task-ended', '任务已结束。');
+      if(mode!=='paused')this.assertNoTaskClose(id);
       this.db.prepare('UPDATE tasks SET controlMode=?,rowVersion=rowVersion+1,updatedAt=? WHERE id=?').run(mode,Date.now(),id);
-      if(mode==='auto')this.enqueueManager(task.botId,`resume:${id}:${task.rowVersion+1}`,'任务恢复自动管理，请读取最新状态。',id,10);
+      if(mode==='auto'&&task.stageState==='awaiting-decision') {
+        const run=this.latestRun(id)!;
+        if(this.managerEvent(`manager-event:stage-settled:${run.id}`)?.state!=='pending') {
+          this.enqueueManager(task.botId,`stage-settled:${run.id}:${task.rowVersion+1}`,'任务恢复自动管理，请核对阶段证据。',id,8);
+        }
+      }else if(mode==='auto'&&!task.stageState) {
+        this.enqueueManager(task.botId,`resume:${id}:${task.rowVersion+1}`,'任务恢复自动管理，请读取最新状态。',id,10);
+      }
       this.event('task.control',id,{ mode }); return this.getTask(id);
     });
   }
-  private assertTaskSettled(taskId:string):void {
+  taskClose(taskId:string):TaskCloseRequest|null {
+    const value=this.get(`task-close:${taskId}`);
+    return value?JSON.parse(value) as TaskCloseRequest:null;
+  }
+  pendingTaskCloses():string[] {
+    return this.db.prepare(`SELECT t.id FROM tasks t JOIN metadata m ON m.key='task-close:' || t.id
+      WHERE t.lifecycle IN ('open','review')`).all().map(row=>String(row.id));
+  }
+  private assertNoTaskClose(taskId:string):void {
+    if(this.taskClose(taskId))throw new AppError('task-closing','此任务已请求关闭，请先完成关闭核对。');
+  }
+  requestTaskClose(requestId:string,taskId:string,expectedRowVersion:number,finishingRunId?:string):{stopRunId:string|null} {
+    return this.command(requestId,'task.close',{taskId,expectedRowVersion},()=>{
+      const task=this.getTask(taskId);
+      this.getBot(task.botId);
+      if(task.lifecycle==='cancelled')return {stopRunId:null};
+      if(task.rowVersion!==expectedRowVersion)throw new AppError('version-conflict','任务已经更新，请刷新后再关闭。');
+      if(!['open','review'].includes(task.lifecycle))throw new AppError('task-ended','任务已完成。');
+      if(this.taskClose(taskId))return {stopRunId:null};
+      const run=this.latestRun(taskId),binding=this.activeBinding(taskId);
+      const current=run?.taskRevision===task.taskRevision&&run.bindingId===binding?.id?run:null;
+      const intent:TaskCloseRequest={id:randomUUID(),taskRevision:task.taskRevision,runId:current?.id??null,activeRun:current?.finishedAt===null};
+      this.set(`task-close:${taskId}`,JSON.stringify(intent));
+      this.db.prepare("UPDATE tasks SET controlMode='paused',rowVersion=rowVersion+1,updatedAt=? WHERE id=?").run(Date.now(),taskId);
+      this.db.prepare('DELETE FROM waits WHERE taskId=?').run(taskId);
+      this.event('task.close-requested',taskId,intent);
+      if(!current||current.finishedAt!==null||current.state==='cancelling'||current.id===finishingRunId)return {stopRunId:null};
+      const input=this.getRunInput(current.id);
+      const delivery=this.db.prepare('SELECT state,attempts FROM outbox WHERE id IN (?,?)')
+        .all(`input:${input.id}`,`run:${current.id}`);
+      const unsent=input.state==='accepted'&&delivery.length>0&&delivery.every(row=>row.attempts===0&&row.state==='pending');
+      this.markRunStopping(current);
+      if(unsent)this.finishStoppedRun(current,false,true);
+      return {stopRunId:unsent?null:current.id};
+    });
+  }
+  closeRunNeedsReadback(run:Run,activeRun:boolean):boolean {
+    if(!activeRun&&run.state!=='cancelled'&&run.state!=='interrupted'&&!this.verifiedBlocker(run))return false;
+    return !this.db.prepare(`SELECT 1 FROM events WHERE taskId=? AND json_extract(data,'$.runId')=? AND
+      (kind='run.cancelled' AND json_extract(data,'$.unsent')=1 OR
+       kind='run.recovery-confirmed' AND json_extract(data,'$.actor')='user')`).get(run.taskId,run.id);
+  }
+  recordCloseBlocker(taskId:string,intentId:string,blocker:NonNullable<TaskCloseRequest['blocker']>,notify:boolean):void {
+    const intent=this.taskClose(taskId);
+    if(intent?.id!==intentId||JSON.stringify(intent.blocker)===JSON.stringify(blocker))return;
+    this.command(`close-blocker:${randomUUID()}`,'task.close-blocked',{taskId,intentId,blocker},()=>{
+      this.set(`task-close:${taskId}`,JSON.stringify({...intent,blocker}));
+      if(['effect-uncertain','run-proof','recovery-new-input','recovery-scope-changed'].includes(blocker.code)&&intent.runId) {
+        const raised=this.db.prepare('INSERT OR IGNORE INTO attentions(id,taskId,kind,question,taskRevision,createdAt) VALUES (?,?,?,?,?,?)')
+          .run(`close:${intentId}`,taskId,'recovery',blocker.message,intent.taskRevision,Date.now()).changes;
+        if(raised)this.db.prepare('UPDATE tasks SET rowVersion=rowVersion+1,updatedAt=? WHERE id=?').run(Date.now(),taskId);
+      }
+      this.event('task.close-blocked',taskId,{intentId,...blocker});
+      if(notify)this.enqueueManager(this.getTask(taskId).botId,`close-blocked:${intentId}:${blocker.code}`,
+        `任务的关闭请求已保存。尚不能关闭：${blocker.message} 请说明这一项，并保持任务暂停。`,taskId,10);
+      return {};
+    });
+  }
+  confirmTaskClose(taskId:string,intentId:string,expectedRowVersion:number,notify:boolean):Task {
+    return this.command(`close-finish:${intentId}`,'task.close-finish',{taskId,intentId,expectedRowVersion},()=>{
+      const task=this.getTask(taskId),intent=this.taskClose(taskId);
+      if(intent?.id!==intentId||task.taskRevision!==intent.taskRevision||task.rowVersion!==expectedRowVersion) {
+        throw new AppError('version-conflict','核对期间任务或关闭请求有变化，请重新读取。');
+      }
+      this.getBot(task.botId);
+      this.assertTaskSettled(taskId);
+      const cancelled=this.finishTaskCancellation(taskId,{closeRequestId:intentId,runId:intent.runId});
+      this.db.prepare('DELETE FROM metadata WHERE key=?').run(`task-close:${taskId}`);
+      if(notify)this.enqueueManager(task.botId,`task-closed:${intentId}`,'已核对执行结束，任务应用户的明确要求已关闭。请在原对话简短确认。',taskId,10);
+      return cancelled;
+    });
+  }
+  assertTaskSettled(taskId:string):void {
     if(this.db.prepare('SELECT 1 FROM runs LEFT JOIN resources ON resources.runId=runs.id WHERE runs.taskId=? AND (runs.finishedAt IS NULL OR resources.runId IS NOT NULL)').get(taskId))throw new AppError('run-active','请先停止执行并完成恢复核对，当前占用尚未释放。');
     const run=this.latestRun(taskId),task=this.getTask(taskId);
     const settled=run?.taskRevision===task.taskRevision&&this.verifiedBlocker(run);
@@ -1864,15 +2268,19 @@ export class Store {
     if(check&&(check.effectUncertain||!check.resolution)||settled&&run&&this.recoveryWorkPlan(run.id)?.context.effectUncertain) {
       throw new AppError('effect-uncertain','旧轮外部操作或核对结果仍未确认，暂未取消任务。');
     }
-    if(this.db.prepare(`SELECT 1 FROM attentions WHERE taskId=? AND id!=? AND
-      (kind='recovery' AND state='open' OR kind='approval' AND state IN ('open','stale') AND taskRevision=?)`)
-      .get(taskId,settled?`run:${run!.id}`:'',task.taskRevision))throw new AppError('needs-attention','请先完成仍未结算的事项。');
+    const attention=this.db.prepare(`SELECT kind,question FROM attentions WHERE taskId=? AND id!=? AND
+      (kind='recovery' AND state='open' OR kind='approval' AND state IN ('open','stale') AND taskRevision=?)
+      ORDER BY kind='approval' DESC,createdAt,id LIMIT 1`)
+      .get(taskId,settled?`run:${run!.id}`:'',task.taskRevision);
+    if(attention)throw new AppError('needs-attention',attention.kind==='approval'
+      ?`原生审批尚无结算回执。请核对会话中的审批结果。 ${attention.question}`:`请先完成恢复核对。 ${attention.question}`);
     if(this.db.prepare("SELECT 1 FROM inputs WHERE taskId=? AND state IN ('enqueued','unknown')").get(taskId)) {
       throw new AppError('input-uncertain','还有送达状态没有确认的输入。');
     }
     const binding=this.activeBinding(taskId);if(binding&&binding.state!=='ready')throw new AppError('session-recovery','请先核对会话创建结果。');
   }
   private discardPendingWork(taskId:string):void {
+    this.db.prepare("UPDATE work_stages SET state='superseded',nextCheckAt=NULL WHERE taskId=? AND state!='dispatched'").run(taskId);
     this.db.prepare("UPDATE inputs SET state='discarded' WHERE taskId=? AND state IN ('accepted','enqueued','unknown')").run(taskId);
     this.db.prepare("UPDATE outbox SET state='superseded' WHERE taskId=? AND state='pending'").run(taskId);
     this.db.prepare("UPDATE attentions SET state='stale' WHERE taskId=? AND state IN ('open','responding')").run(taskId);
@@ -1892,6 +2300,7 @@ export class Store {
     }
     const owned='SELECT id FROM tasks WHERE botId=?';
     this.db.prepare(`DELETE FROM waits WHERE taskId IN (${owned})`).run(botId);
+    this.db.prepare("DELETE FROM metadata WHERE key IN (SELECT 'task-close:' || id FROM tasks WHERE botId=?)").run(botId);
     this.db.prepare(`UPDATE inputs SET state='discarded' WHERE taskId IN (${owned}) AND state='accepted'
       AND NOT EXISTS (SELECT 1 FROM runs JOIN resources ON resources.runId=runs.id WHERE runs.inputId=inputs.id)`).run(botId);
     this.db.prepare(`UPDATE outbox SET state='superseded' WHERE taskId IN (${owned}) AND state IN ('pending','blocked')`).run(botId);
@@ -1903,6 +2312,7 @@ export class Store {
   detachSession(requestId:string,taskId:string,expectedRowVersion:number):Task {
     return this.command(requestId,'session.detach',{taskId,expectedRowVersion},()=>{
       const task=this.getTask(taskId);if(task.rowVersion!==expectedRowVersion)throw new AppError('version-conflict','任务已经更新，请刷新后解除关联。');
+      this.assertNoTaskClose(taskId);
       if(task.lifecycle!=='open')throw new AppError('task-ended','仅未完成任务可以解除关联；待验收成果请先返工或取消任务。');
       this.assertTaskSettled(taskId);const binding=this.activeBinding(taskId);if(!binding)throw new AppError('not-found','没有当前执行会话。');
       this.db.prepare("UPDATE bindings SET state='released' WHERE id=?").run(binding.id);
@@ -1915,10 +2325,14 @@ export class Store {
     return this.command(requestId,'task.cancel',{taskId,expectedRowVersion},()=>{
       const task=this.getTask(taskId);if(task.rowVersion!==expectedRowVersion)throw new AppError('version-conflict','任务已经更新，请刷新后取消。');
       if(!['open','review'].includes(task.lifecycle))throw new AppError('task-ended','任务已经结束。');
-      this.assertTaskSettled(taskId);this.discardPendingWork(taskId);this.db.prepare('DELETE FROM waits WHERE taskId=?').run(taskId);
-      this.db.prepare("UPDATE tasks SET lifecycle='cancelled',controlMode='paused',rowVersion=rowVersion+1,updatedAt=? WHERE id=?").run(Date.now(),taskId);
-      this.event('task.cancelled',taskId,{});return this.getTask(taskId);
+      this.assertNoTaskClose(taskId);
+      this.assertTaskSettled(taskId);return this.finishTaskCancellation(taskId,{});
     });
+  }
+  private finishTaskCancellation(taskId:string,receipt:Record<string,unknown>):Task {
+    this.discardPendingWork(taskId);this.db.prepare('DELETE FROM waits WHERE taskId=?').run(taskId);
+    this.db.prepare("UPDATE tasks SET lifecycle='cancelled',controlMode='paused',rowVersion=rowVersion+1,updatedAt=? WHERE id=?").run(Date.now(),taskId);
+    this.event('task.cancelled',taskId,receipt);return this.getTask(taskId);
   }
   sqliteInfo(): { sqliteVersion: string; journalMode: string } {
     const sqlite = this.db.prepare('SELECT sqlite_version() AS version').get() as { version: string };

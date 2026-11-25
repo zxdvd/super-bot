@@ -9,7 +9,7 @@ const mr = 'https://gitlab.example.test/team/app/-/merge_requests/1087';
 const cr = 'https://review.example.test/c/client/+/1842763';
 const doc = 'https://example.feishu.cn/docx/fixture';
 
-function fixture(store:Store,links?:DeliveryLinks) {
+function fixture(store:Store,links?:DeliveryLinks,primaryLink?:string) {
   const bot=store.createBot('bot',{name:'Delivery fixture',instructions:'Synthetic files'});
   const manager=store.beginManager('manager',bot.id,'/synthetic/manager');store.confirmManager(manager.id,manager.requestedSessionId);
   const task=store.createTask('task',{botId:bot.id,goal:'Write facts',scope:'Own files',acceptance:'Read facts',reviewPolicy:'human'});
@@ -17,10 +17,39 @@ function fixture(store:Store,links?:DeliveryLinks) {
   const run=store.reserveRun('dispatch',task.id,store.getTask(task.id).rowVersion);
   store.saveRunMessage(run.id,'worker','{}');store.claimDispatch(run.id);store.inputEntered(run.id,'worker',1);
   const result=store.workerReport(run.id,'report',{kind:'ready',summary:'Facts written',checks:'Read facts',
-    evidence:[{path:'/synthetic/work/result.md',sha256:'synthetic',bytes:20}],links});store.settleRun(run.id);
+    evidence:[{path:'/synthetic/work/result.md',sha256:'synthetic',bytes:20}],links,primaryLink});store.settleRun(run.id);
   const event=store.pendingManagerEvents(bot.id).find(item=>item.id===`manager-event:settled:${run.id}`)!;
   return {bot,manager,task,run,result,event};
 }
+
+for(const variant of ['worker','manager','clear','replace'] as const)test(`formal primary choice follows the ${variant} registration`,()=>{
+  const store=new Store(':memory:');try {
+    const links={MR:mr,CR:cr,方案:doc};
+    const {bot,manager,task,result}=fixture(store,links,'方案');
+    const sessionId=manager.requestedSessionId,resultId=result.resultId!,delivery={taskId:task.id,resultId,text:'已核对'};
+    const submit=(id:string,initial:{links?:DeliveryLinks;primaryLink?:string|null})=>store.managerDeliver(id,bot.id,sessionId,id,delivery,initial);
+    assert.deepEqual(store.reportedDeliveryArtifacts(store.taskDetail(task.id).run!.id),{links,primaryLink:'方案'});
+    assert.throws(()=>submit('unregistered',{primaryLink:doc}),{code:'invalid-primary-link'});
+    assert.throws(()=>submit('missing',{links:{MR:mr},primaryLink:'CR'}),{code:'invalid-primary-link'});
+    if(variant==='worker')submit('inherited',{});
+    else if(variant==='manager')submit('selected',{primaryLink:'CR'});
+    else if(variant==='clear')submit('clear',{primaryLink:null});
+    else submit('replace',{links:{MR:mr}});
+    const primary=variant==='worker'?'方案':variant==='manager'?'CR':undefined;
+    const expectedLinks=variant==='replace'?{MR:mr}:links;
+    assert.equal(store.taskDetail(task.id).deliveredResult,null);
+    store.managerNotificationDelivered(`manager-event:delivery:${resultId}`,sessionId,{turn:1,seq:2,endSeq:3,messageId:'visible'});
+    assert.deepEqual(store.chatDeliveries(sessionId,1,3),[{taskId:task.id,resultId,links:expectedLinks,...(primary?{primaryLink:primary}:{})}]);
+    const patch=(id:string,links:unknown,primary?:string|null)=>store.managerUpdateDeliveryLinks(
+      id,bot.id,sessionId,task.id,store.getTask(task.id).rowVersion,resultId,links,primary);
+    assert.throws(()=>patch('unregistered-update',{},'absent'),{code:'invalid-primary-link'});
+    patch('owner-update',undefined,'MR');
+    assert.equal(store.chatDeliveries(sessionId,1,3)[0]?.primaryLink,'MR');
+    patch('owner-removal',{MR:null});
+    assert.equal(store.chatDeliveries(sessionId,1,3)[0]?.primaryLink,undefined);
+    assert.equal(store.chatDeliveries(sessionId,1,4).length,0,'corrections preserve the original receipt coordinates');
+  }finally{store.close();}
+});
 
 test('formal delivery inherits the exact ready links without resubmitting the URL',()=>{
   for(const useDeliver of [true,false]) {

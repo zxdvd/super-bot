@@ -815,3 +815,10 @@ ELECTRON_RUN_AS_NODE=1 '/Applications/DeepSeek Harness.app/Contents/MacOS/DeepSe
 
 - 在隔离 DSH Web rc.1 和 Desktop rc.5 中用 Edge 切换两个 Bot。给同一个 Bot 留下一项正在运行的任务、一项待补充的任务和一份待验收成果，侧栏、首页和聊天工作按钮显示「进行中 1」「需处理 1」，收起侧栏后只显示进行中数量。只剩两份待验收成果时，外层徽标消失，打开工作面板可查看待验收数量和成果。[浏览器回归](../../../scripts/smoke-work-activity.mjs)
 - 合成账本中有 106 项待验收时，Bot 汇总和收件箱分组均显示 106。另核对了 Bot 仍在自动审查、通知送达不确定，以及折叠测试任务等情况。[账本回归](../../../test/work-activity.test.ts)
+
+## 2026-11-26 · 跨阶段执行、追加指示和关闭任务
+
+- 隔离 DSH Web 收到一条文档任务，Worker 写入并回读目录、引用和附录。第二阶段等待指定流水线时名额已释放，任务没有产生成果。重启宿主后，本地 HTTPS 测试服务返回同一流水线成功，原 Worker 收到下一步。共四轮执行、一次最终评审、一次正式交付。另一个运行中的任务收到一条明确的关闭消息后停止并关闭。[原生阶段与关闭验收](../../../scripts/smoke-task-stages.mjs)
+- 在真实 Web 输入框内，Worker 运行期间连续发送两条具名的只读要求。原 Worker 下一轮收到两条指示，分别读取了两份不同的回执。macOS Worker 的 Git 工作区查询同时经过原生工具执行、持久回执和恢复核对。旧基线文件只读了一次。[聊天续跑验收](../../../scripts/smoke-req005.mjs)
+- 给同一项交付登记四个外部链接，并指定其中一个为首要入口。在 Web 和 Desktop 原聊天中，展开前可直接打开首要链接；完整交付仍指向本次成果。飞书模拟传输也取得同一首要链接。修改次要链接后，正式发送回执保持原样。[原生浏览器验收](../../../scripts/smoke-chat-result-links.mjs) · [飞书转发验收](../../../scripts/smoke-feishu.mjs)
+- Web 和 Desktop 的工作面板均可关闭任务。适配层覆盖了关闭过程中重启、停止回执缺失和普通 Shell 成功返回但外部效果仍未确认三种情况。[工作面板验收](../../../scripts/smoke-work-activity.mjs) · [关闭核对回归](../../../test/adapter/intervention.test.ts)

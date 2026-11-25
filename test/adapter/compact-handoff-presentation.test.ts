@@ -52,6 +52,27 @@ test('native chat shows short named choices and discloses larger sets without ra
   assert.deepEqual(compact.props.children.props.children.map((link: typeof disclosure) => link.props.href), [plan, client, links['外部记录']]);
 });
 
+test('native and Feishu keep the registered primary visible with many secondary links', () => {
+  const links = { '后端 MR': mr, '联调方案': plan, '客户端': client, '主要记录': 'https://project.example.invalid/latest' };
+  const primaryLink = '主要记录';
+  const display = DeliveryItems({ links, primaryLink, replyLinks: new Set() })!;
+  const [primary, other] = display.props.children.props.children;
+  assert.equal(primary.props.children.props.href, links[primaryLink]);
+  assert.equal(other.type, 'details');
+  assert.deepEqual(other.props.children[1].props.children.map((link: typeof other) => link.props.href), [mr, plan, client]);
+  const text = `评审已准备，请打开记录。\n\n[查看完整交付](${publicHost}${path})`;
+  const deliveries = [{taskId, resultId, links, primaryLink}];
+  assert.equal(feishuDeliveryText(text, deliveries, publicHost, fits), [
+    '评审已准备，请打开记录。', '', `查看完整交付：${publicHost}${path}`,
+    `${primaryLink}：${links[primaryLink]}`, '另有 3 项交付物见完整成果。',
+  ].join('\n'));
+  const duplicate = `[原回复已有入口](${links[primaryLink]})\n\n${text}`;
+  assert.equal(feishuDeliveryText(duplicate, deliveries, publicHost, fits).split(links[primaryLink]).length, 2);
+  const noDuplicate = DeliveryItems({ links, primaryLink, replyLinks: new Set([links[primaryLink]]) })!;
+  assert.equal(noDuplicate.props.children.type, 'div');
+  assert.deepEqual(noDuplicate.props.children.props.children.map((link: typeof other) => link.props.href), [mr, plan, client]);
+});
+
 test('native link corrections invalidate only the exact matching result', () => {
   const tool = (action: string, id = resultId, isError = false): ToolChatData => ({ root: {
     kind: 'tool-result', name: 'super_bot_manage', seq: 12, time: 0, callId: 'synthetic', isError, subCalls: [],

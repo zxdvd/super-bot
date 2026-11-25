@@ -14,6 +14,7 @@ export function verifyRunTurn(run:Run,input:RunInput,proof:RunTurn,events:readon
   if(events.slice(proof.startSeq!+1,proof.endSeq!).some(e=>e.type==='turn/start'||e.type==='turn/end'))refuse('自动输入和结束事件不属于同一轮次。');
   if(events.filter(e=>e.type==='user/message'&&e.data.source?.kind==='super-bot'&&e.data.source.runId===run.id).length!==1)refuse('自动输入存在重复或不明确的持久身份。');
   if(proof.endKind!=='completed'&&!(run.state==='cancelling'&&proof.endKind==='aborted')&&
+    !(forReadback&&run.state==='cancelled'&&proof.endKind==='aborted')&&
     !(forReadback&&run.state==='interrupted'&&proof.endKind==='error'))refuse('自动轮次非正常结束，请核对；没有补成功。');
   return events.slice(proof.endSeq!+1).filter(e=>e.type==='user/message'&&e.data.source?.kind==='user'&&'rpcId' in e.data.source).map(e=>e.data.id);
 }

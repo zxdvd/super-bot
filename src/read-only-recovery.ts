@@ -1,5 +1,6 @@
 import {isAbsolute, resolve} from 'node:path';
 import {containedPath} from './evidence.ts';
+import {WORKER_QUERY_TOOL,type GitStatusResult,type GIT_STATUS_QUERY} from './git-status-query.ts';
 import type {RunEvent} from './run-proof.ts';
 
 export type ReadProbe = {kind:'file'; path:string; offset?:number; limit?:number};
@@ -27,8 +28,13 @@ export type RecoveryCheck = {
 export type PriorTools = {
   files:{evidence:ProbeEvidence;known?:ProbeResult}[];
   clusters:{callId:string;callSeq:number;resultSeq:number;args:string}[];
+  queries:{callId:string;callSeq:number;kind:typeof GIT_STATUS_QUERY;result:Pick<GitStatusResult,'status'|'message'>}[];
   potentialEffects:{tool:string;callSeq:number;result:'reported-success'|'reported-error'|'missing'}[];
   incomplete:boolean;
+};
+type QueryCall={callId:string;callSeq:number;args:string;resultText:string};
+export type ReadQueryReceipt = {
+  kind:typeof GIT_STATUS_QUERY; cwd:string; turn:number; inputSeq:number; result:GitStatusResult;
 };
 
 function asReadProbe(raw:string,cwd:string):ReadProbe|null {
@@ -45,9 +51,10 @@ function asReadProbe(raw:string,cwd:string):ReadProbe|null {
 }
 
 /** Only durable calls in the exact verified Worker turn count as evidence. */
-export function inspectPriorTools(events:readonly RunEvent[],cwd:string,turn:number,startSeq:number,endSeq:number):PriorTools {
+export function inspectPriorTools(events:readonly RunEvent[],cwd:string,turn:number,startSeq:number,endSeq:number,
+  verifiedQuery:(call:QueryCall)=>ReadQueryReceipt|null=()=>null):PriorTools {
   const eventsInTurn=events.slice(startSeq+1,endSeq);
-  const checks:PriorTools={files:[],clusters:[],potentialEffects:[],incomplete:false};
+  const checks:PriorTools={files:[],clusters:[],queries:[],potentialEffects:[],incomplete:false};
   const results=new Map<string,RunEvent[]>();
   const latestFiles=new Map<string,PriorTools['files'][number]|null>();
   const callIds=new Set<string>();
@@ -81,12 +88,22 @@ export function inspectPriorTools(events:readonly RunEvent[],cwd:string,turn:num
           {status:'denied',message:'原生 Worker 在上一轮缺少对该文件路径的读取权限。'}:undefined;
         latestFiles.set(key,result.data.message.isError===true&&(missing||known)?
           {evidence,...(known?{known}:{})}:null);
+        continue;
       }
-      continue;
     }
     if(name==='super_bot_preflight'&&result&&typeof args==='string') {
       checks.clusters.push({callId,callSeq:call.seq,resultSeq:result.seq,args});
       continue;
+    }
+    const content=result?.data.message.content;
+    if(name===WORKER_QUERY_TOOL&&typeof args==='string'&&result&&result.data.message.isError!==true&&
+      content?.length===1&&content[0]?.type==='text'&&typeof content[0].text==='string') {
+      const receipt=verifiedQuery({callId,callSeq:call.seq,args,resultText:content[0].text});
+      if(receipt) {
+        const {kind,result:{status,message}}=receipt;
+        checks.queries.push({callId,callSeq:call.seq,kind,result:{status,message}});
+        continue;
+      }
     }
     checks.potentialEffects.push({tool:name,callSeq:call.seq,result:result?
       result.data.message.isError?'reported-error':'reported-success':'missing'});

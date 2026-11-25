@@ -12,7 +12,8 @@
 | 输入送达与消费 | 已验证；存在宿主限制 | accepted/enqueued/entered 分开。已 claim 后取消可能丢失 Inbox 项且无 user/message，转人工核对，不推断已消费。`probe:run` |
 | Worker 续跑输入 | 按原生会话当前可见内容派发 | 同一任务版本和 Worker 保留完整说明时，回答、返工只发送本轮要求。缺失的说明及先前已入场的补充从账本恢复。用 `SUPER_BOT_TEST_WORKER_CONTEXT=1 node scripts/smoke-mirror.mjs` 核对模型实际收到的消息。 |
 | Agent 自行核对失败预检 | 在原任务执行一次有证据的只读核对 | 核对原轮、输入、审批和后台活动后，Bot 可按原权限核实文件、Kubernetes 权限或具名资源。核对结论保留在详情与审计中，原失败记录保留。用 `SUPER_BOT_TEST_VERIFIED_RECOVERY=1 node scripts/smoke-mirror.mjs` 复验。 |
-| 从聊天继续受阻任务 | 原生对话和已绑定本人的飞书群 | 用户用任务名称回答，Bot 保留最新指示、旧轮报告和已核实的操作结果。用 `npm run smoke:feishu -- --req005` 在隔离宿主复验。配置 README 中的浏览器参数后，验收从真实聊天输入框开始。 |
+| 从聊天补充指示与续跑 | 原生对话和已绑定本人的飞书群 | Worker 执行时可在原任务继续补充。待处理指示默认按顺序累积，按用户明示撤回或替代。下一轮保留具体要求和收窄后的授权范围。详情显示已记下、排入下一轮、进入 Worker 或投递待核对。用 `npm run smoke:feishu -- --req005` 在隔离宿主复验。配置 README 中的浏览器参数后，可从真实聊天输入框验证。 |
+| Git 工作区只读回执 | 已验证 macOS Full Access Worker | `super_bot_query` 在原任务目录内用系统只读沙箱和 Apple 工具链 Git 读取 HEAD 及暂存、未暂存和未跟踪状态。子模块仅报告已记录的提交变化。继续时匹配原轮、工具请求和持久结果。普通 Shell 的历史记录缺少此证明时仍按外部效果待核对处理。 |
 | files 模式工具范围 | 已验证 | read/write/edit 与报告；绝对路径、实际目录、符号链接检查；额外 scoped 工具再由执行 guard 拒绝。`smoke-directory.mjs`、`smoke-scoped-tools.mjs` |
 | Worker Full Access 的 Shell、子 Agent | 默认开放，显式 false 才使用 files | 普通 DSH Session 的原生工具已实际执行 Bash 和子 Agent；由现有宿主配置能力，不额外裁剪工具。不能因此推断任意外部进程可停止 |
 | ready 与最终验收 | 已验证 | ready 只是候选；执行收敛和文件完整哈希均需核对。默认人工；显式 Bot 授权保持独立审计。`smoke:execution`、`smoke:workflow`、`smoke:manager` |

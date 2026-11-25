@@ -53,7 +53,7 @@ export function RecoveryPanel({ w, detail, recovery }: { w: WorkspaceState; deta
           })}>核对并继续</button>}
         <button disabled={disabled} onClick={() => w.mutate('run.recover', {
           ...version, requestId: `recover:${task.id}:${task.rowVersion}`,
-        })}>仅核对并保持暂停</button>
+        })}>{detail.closeRequest ? '确认核对并关闭任务' : '仅核对并保持暂停'}</button>
       </div>
     </>}
   </section>;

@@ -22,7 +22,8 @@ const eventLabels: Record<string, string> = {
   'run.recovery-check-started': 'Bot 开始只读核对', 'run.recovery-observed': 'Bot 记录恢复核对结果',
   'run.end-verified': 'Bot 已核实上轮结束', 'task.recovery-instruction': '已保存聊天中的后续指示',
   'run.continued': '已按最新指示续跑',
-  'task.cancelled': '用户取消任务', 'session.detached': '解除执行会话关联', 'work.report-stale': '保留已失效报告的审计',
+  'task.cancelled': '任务已关闭', 'task.close-requested': '用户请求关闭任务', 'task.close-blocked': '关闭任务待核对',
+  'session.detached': '解除执行会话关联', 'work.report-stale': '保留已失效报告的审计',
   'approval.asked': '原生工具请求审批', 'approval.decided': '原生审批已有结果', 'workdir.failed': '工作目录准备失败',
   'workdir.cleanup': '工作目录已清理', 'workdir.cleanup-failed': '工作目录自动清理失败',
   'dev.reload-applied': '关联构建的原生重载已确认',
@@ -131,6 +132,8 @@ export function stage(task: Task): Stage {
 /** The short status a row shows: the stage, refined by the concrete reason where that helps. */
 export function stageText(task: Task, readOnly = false): string {
   const s = stage(task);
+  if (task.status === 'blocked' && task.stageState === 'waiting') return '等待外部条件';
+  if (task.status === 'blocked' && task.stageState === 'awaiting-decision') return 'Bot 正在核对下一步';
   if (task.activity === 'attention' && s !== 'needs-you') return '通知待核对';
   if (task.activity === 'working' && s === 'done') return 'Bot 正在交付';
   if (task.activity === 'working' && s === 'review') return task.managerReviewed ? 'Bot 正在交付' : 'Bot 跟进中';

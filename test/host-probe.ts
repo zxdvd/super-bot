@@ -21,13 +21,14 @@ import { DshExecution } from '../src/dsh.ts';
 import { Managers } from '../src/manager.ts';
 import { SessionId } from '@deepseek-ai/dsh-session/types';
 import type {SessionStore} from '@deepseek-ai/dsh-session';
-import { artifactDeliveryText, artifactEditReply, artifactGoal, artifactLinks, artifactPortProbeGoal, artifactPortProbeText, artifactReference,
+import { closeTask, stageArtifacts, stageGoal, stoppableGoal } from './stage-host-fixture.ts';
+import { artifactDeliveryText, artifactEditReply, artifactGoal, artifactLinks, artifactPrimary, artifactPortProbeGoal, artifactPortProbeText, artifactReference,
   artifactRevision, replacementMr, supplementalDoc } from './delivery-link-fixture.ts';
 import { deploymentEffectGoal, deploymentEffectRequest, deploymentProbe, deploymentRecoveryGoal, deploymentRecoveryRequest,
   effectRecoveryGoal, effectRecoveryRequest,
   permissionProbe, permissionRecoveryGoal, permissionRecoveryRequest, readRecoveryGoal, readRecoveryRequest,
   recoveryEffectName, recoveryEffectText, recoveryFileName, recoveryGoals } from './recovery-host-fixture.ts';
-import { ambiguous, baselineFile, baselineValue, cancelWiring, clarify, imageBlocked, imageGoal, imageRequest, imageResult, imageScope,
+import { ambiguous, appendixFile, appendixScope, appendixValue, baselineFile, baselineValue, cancelWiring, clarify, imageBlocked, imageGoal, imageRequest, imageResult, imageScope,
   imageVersion, pauseWiring, pendingContinue, pendingGoal, pendingInitial, pendingRequest, pendingResult, pendingScope,
   preflightFile, preflightGoal, preflightRequest, preflightResult, preflightValue, receiptFile, receiptValue,
   req005Goals, startupContinue, startupGoal, startupRequest, startupResult, versionFile,
@@ -143,10 +144,10 @@ class ProbeAdapter extends LlmAdapter {
         ? text.match(/#super-bot-task=([a-f0-9-]+)&resultId=([a-f0-9-]+)/) : null;
       const namedRequest=trigger?.source?.kind==='user'
         ? [preflightRequest,imageRequest,wiringRequest,startupRequest,pendingRequest].indexOf(text) : -1;
-      const continuationTarget=new Map([[imageScope,imageGoal],[startupContinue,startupGoal],[pendingContinue,pendingGoal],[pendingScope,pendingGoal]]).get(text);
-      const namedFollowup=trigger?.source?.kind==='user' && (continuationTarget||[ambiguous,pauseWiring,cancelWiring].includes(text));
-      const wantedAction=continuationTarget?'continue':text===pauseWiring?'pause':'cancel';
-      const wantedGoal=continuationTarget??wiringGoal;
+      const continuationTarget=new Map([[imageScope,imageGoal],[startupContinue,startupGoal],[pendingContinue,pendingGoal],[pendingScope,pendingGoal],[appendixScope,pendingGoal]]).get(text);
+      const namedFollowup=trigger?.source?.kind==='user' && (continuationTarget||[ambiguous,pauseWiring,cancelWiring,closeTask].includes(text));
+      const wantedAction=continuationTarget?'continue':text===pauseWiring?'pause':text===closeTask?'close':'cancel';
+      const wantedGoal=continuationTarget??(text===closeTask?stoppableGoal:wiringGoal);
       const lastResult=later.findLast(message=>message.role==='tool');
       const successfulTool=lastResult?.role==='tool'&&!lastResult.isError;
       if(namedRequest>=0&&!prior) {
@@ -168,7 +169,7 @@ class ProbeAdapter extends LlmAdapter {
         }
       }else if(namedFollowup&&prior?.action==='detail'&&value?.task?.goal===wantedGoal) {
         plan={action:wantedAction,taskId:value.task.id,expectedRowVersion:value.task.rowVersion,userInstruction:text,
-          ...([imageScope,pendingScope].includes(text)?{continuationMode:'read-only'}:{})};
+          ...([imageScope,pendingScope,appendixScope].includes(text)?{continuationMode:'read-only'}:{})};
       }else if(continuationNotice&&prior?.action==='detail'&&currentTask&&req005Goals.includes(currentTask.goal)) {
         plan={action:'continue',taskId:currentTask.id,expectedRowVersion:currentTask.rowVersion};
       }else if(trigger?.source?.kind==='user'&&(remember||delegate||decision||convention||workConvention)) {
@@ -203,6 +204,8 @@ class ProbeAdapter extends LlmAdapter {
         else if(trigger?.source?.kind==='user'&&text===permissionRecoveryRequest)plan={action:'create',goal:permissionRecoveryGoal,scope:'只读核对 Kubernetes context synthetic 的 namespace fixture 中 get persistentvolumeclaims 权限',acceptance:'报告实际共享身份与权限结果'};
         else if(trigger?.source?.kind==='user'&&text===deploymentRecoveryRequest)plan={action:'create',goal:deploymentRecoveryGoal,scope:'只读核对 Kubernetes context synthetic 的 namespace fixture 下 Deployment fixture-deployment',acceptance:'报告实际共享身份与指定 Deployment 的最新状态'};
         else if(trigger?.source?.kind==='user'&&text===deploymentEffectRequest)plan={action:'create',goal:deploymentEffectGoal,scope:`在任务目录写入 ${recoveryEffectName}，并只读核对 Kubernetes context synthetic 的 namespace fixture 下 Deployment fixture-deployment`,acceptance:'报告已执行操作与指定 Deployment 的最新状态'};
+        else if(trigger?.source?.kind==='user'&&text===stoppableGoal)plan={action:'create',goal:stoppableGoal,scope:'合成资料任务目录',acceptance:'资料整理完成'};
+        else if(trigger?.source?.kind==='user'&&text===stageGoal)plan={action:'create',goal:stageGoal,scope:'在当前任务目录中生成目录、引用、附录和最终说明，只读核对 fixture/docs 的 42 号引用检查流水线',acceptance:'最终说明已生成并回读'};
         else if(foreign)plan={action:'detail',taskId:foreign};
         else if(trigger?.source?.kind==='user'&&text==='请用 Shell 运行本机命令，把合成检查结果保存成文件。')plan={action:'create',goal:'LOCAL_CLI_PROBE',scope:'只在任务目录运行合成 Shell 命令，不访问外部服务',acceptance:'result.md 内容为 LOCAL_CLI_OK'};
         else if(trigger?.source?.kind==='user'&&['DF14_RECEIPT_PROBE','MIRROR_PROGRESS_PROBE'].includes(text))plan={action:'create',goal:text,scope:'专用任务目录，不访问网络',acceptance:'result.md 包含两项合成事实并已回读'};
@@ -228,7 +231,12 @@ class ProbeAdapter extends LlmAdapter {
       else if(prior.action==='detail'&&value?.task?.controlMode==='auto') {
         if(trigger?.source?.kind==='user'&&text==='再加一句结论。'&&value.result)plan={action:'rework',taskId:value.task.id,expectedRowVersion:value.task.rowVersion,resultId:value.result.id};
         else if(trigger?.source?.kind==='user'&&text==='读者是新同事，保持简短。'&&value.pendingQuestions?.[0])plan={action:'respond',taskId:value.task.id,expectedRowVersion:value.task.rowVersion,attentionId:value.pendingQuestions[0].id};
-        else if(value.result&&value.task.lifecycle==='review'&&!value.task.managerReviewed) {
+        else if(value.task.goal===stageGoal&&value.stage?.state==='awaiting-decision') {
+          const completed=stageArtifacts.find(item=>item.name===value.stage.name);
+          assert.ok(completed);
+          plan={action:'advance_stage',taskId:value.task.id,runId:value.stage.runId,expectedRowVersion:value.task.rowVersion,nextStep:completed.nextStep,
+            ...(completed===stageArtifacts[1]?{condition:{kind:'gitlab-pipeline',sourceOrigin:value.stageObserver.origin,project:'fixture/docs',number:42}}:{})};
+        }else if(value.result&&value.task.lifecycle==='review'&&!value.task.managerReviewed) {
           const rework=String(value.task.goal).includes('MANAGER_REWORK_LOOP')||(String(value.task.goal).includes('MANAGER_REWORK_PROBE')&&!JSON.stringify(value.files).includes('修订'));
           plan={action:'review',taskId:value.task.id,expectedRowVersion:value.task.rowVersion,resultId:value.result.id,verdict:rework?'rework':'accept',note:rework?'请补充修订说明后重新提交。':'已通过 detail 读取文件内容：含标题、两项事实，并有回读记录。默认提交用户最终验收。'};
         }else if(value.task.status==='unscheduled')plan={action:'dispatch',taskId:value.task.id,expectedRowVersion:value.task.rowVersion};
@@ -370,8 +378,11 @@ class ProbeAdapter extends LlmAdapter {
         }
         if(!calls.includes('super_bot_report')) {
           if(goal===wiringGoal)plan={name:'super_bot_report',args:{kind:'waiting',summary:wiringQuestion}};
-          else if(!receipt) {
+          else if(goal===pendingGoal&&first&&process.platform==='darwin'&&!calls.includes('super_bot_query')) {
+            plan={name:'super_bot_query',args:{kind:'git-working-tree-status'}};
+          }else if(!receipt) {
             if(!first)assert.ok(body.includes(goal===imageGoal?imageScope:pendingScope),body);
+            if(!first&&goal===pendingGoal)assert.ok(body.includes(appendixScope),body);
             plan={name:'read',args:{file_path:path}};
           }else {
             assert.ok(receipt.role==='tool');
@@ -383,8 +394,14 @@ class ProbeAdapter extends LlmAdapter {
               assert.equal(receipt.isError??false,false,observed);
               const expected=goal===imageGoal?imageVersion:first?baselineValue:receiptValue;
               assert.ok(observed.includes(expected),observed);
+              if(goal===pendingGoal&&!first) {
+                const appendixRead=later.flatMap(message=>message.content).find(block=>block.type==='tool-call'&&block.name==='read'&&JSON.parse(block.arguments).file_path===join(cwd,appendixFile));
+                const appendix=appendixRead?.type==='tool-call'&&later.find(message=>message.role==='tool'&&message.toolCallId===appendixRead.id);
+                if(appendix)assert.ok(appendix.role==='tool'&&!appendix.isError&&messageText(appendix).includes(appendixValue));
+                else plan={name:'read',args:{file_path:join(cwd,appendixFile)}};
+              }
               const summary=goal===imageGoal?(first?imageBlocked:imageResult):(first?pendingInitial:pendingResult);
-              plan={name:'super_bot_report',args:{kind:'blocked',summary,checks:observed}};
+              plan??={name:'super_bot_report',args:{kind:'blocked',summary,checks:observed}};
             }
           }
         }
@@ -417,7 +434,18 @@ class ProbeAdapter extends LlmAdapter {
         await new Promise<void>(release=>this.stalled.set(options.sessionId!,{release,signal:options.signal}));
         this.stalled.delete(options.sessionId);options.signal?.throwIfAborted();
       }
-      const planned=[effectRecoveryGoal,deploymentEffectGoal,startupGoal].includes(goal)&&!calls.includes('write')
+      const checkpoint=goal===stageGoal?stageArtifacts[previous.length]:undefined;
+      if(goal===stageGoal&&previous.length)assert.ok(body.includes(stageArtifacts[previous.length-1].nextStep),body);
+      const checkpointFile=checkpoint?join(cwd,checkpoint.filename):undefined;
+      const checkpointCall=later.flatMap(message=>message.content).find(block=>block.type==='tool-call'&&block.name==='read');
+      const checkpointRead=checkpointCall?.type==='tool-call'&&later.find(message=>message.role==='tool'&&message.toolCallId===checkpointCall.id);
+      const planned=checkpoint&&checkpointFile?
+        (!calls.includes('write')?{name:'write',args:{file_path:checkpointFile,content:checkpoint.contents}}:
+         !calls.includes('read')?{name:'read',args:{file_path:checkpointFile}}:
+         !calls.includes('super_bot_report')&&checkpointRead&&messageText(checkpointRead).includes(checkpoint.contents)?
+            {name:'super_bot_report',args:{kind:'stage',stage:checkpoint.name,evidenceRef:checkpoint.filename,
+              summary:checkpoint.contents,checks:'已回读 '+checkpoint.filename}}:null):
+        [effectRecoveryGoal,deploymentEffectGoal,startupGoal].includes(goal)&&!calls.includes('write')
         ?{name:'write',args:{file_path:join(cwd,recoveryEffectName),content:recoveryEffectText}}
         :clusterProbe&&!preflightReport?{name:'super_bot_preflight',args:clusterProbe}
         :recoveryRead&&!preflightReport?{name:'read',args:{file_path:join(cwd,recoveryFileName)}}
@@ -429,7 +457,7 @@ class ProbeAdapter extends LlmAdapter {
         !localCli&&!calls.includes('write')?{name:'write',args:{file_path:goal.startsWith('RELATIVE_PATH_PROBE')?'result.md':file,content:'# 合成成果\n\n事实一：这份文档由隔离测试模型生成。\n事实二：测试没有访问网络或使用模型凭证。\n'+(revised?'\n修订：已按返工要求补充说明。\n':'')+(goal.startsWith('LARGE_RESULT_PROBE')?'\n'+'x'.repeat(16000):'')+
            (goal.startsWith('MEMORY_WORK_A')?'\n蓝色主题便于区分合成环境。\n合成归档按季度组织。\n':'')}}:
         !calls.includes('read')?{name:'read',args:{file_path:file}}:
-        (progressProbe?!reports.includes('ready'):!calls.includes('super_bot_report'))?{name:'super_bot_report',args:{kind:'ready',summary:artifactReport??(localCli?'已执行本机 Shell 并生成合成结果。':revisedReceipt?'已提交合成说明的修订版。':'已生成并回读两项事实的说明文件。'),checks:revisedArtifact?artifactRevision.checks:artifactReport?`已回读合成证据。参考资料：[方案模板](${artifactReference})。`:localCli?'原生 bash 执行后已 read 回读 LOCAL_CLI_OK。':revisedReceipt?'已回读修订版新增的结论。':'result.md 包含标题和两项事实；已用原生 read 工具回读核对。',files:[file],...(reportLinks&&{links:reportLinks})}}:null;
+        (progressProbe?!reports.includes('ready'):!calls.includes('super_bot_report'))?{name:'super_bot_report',args:{kind:'ready',summary:artifactReport??(localCli?'已执行本机 Shell 并生成合成结果。':revisedReceipt?'已提交合成说明的修订版。':'已生成并回读两项事实的说明文件。'),checks:revisedArtifact?artifactRevision.checks:artifactReport?`已回读合成证据。参考资料：[方案模板](${artifactReference})。`:localCli?'原生 bash 执行后已 read 回读 LOCAL_CLI_OK。':revisedReceipt?'已回读修订版新增的结论。':'result.md 包含标题和两项事实；已用原生 read 工具回读核对。',files:[file],...(reportLinks&&{links:reportLinks}),...(reportedArtifacts&&!revisedArtifact&&{primaryLink:artifactPrimary})}}:null;
       if(planned) {
         const id=ToolCallId(randomUUID()),args=JSON.stringify(planned.args);
         yield {type:'block-start',index:0,blockType:'tool-call'};

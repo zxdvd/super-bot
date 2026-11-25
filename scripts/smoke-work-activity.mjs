@@ -87,8 +87,14 @@ export async function smokeWorkActivity({ configure, launch, call, makeBot, prob
       await home.click();
       await homeRow(activeQuestion).click();
       await header(activeQuestion).waitFor();
-      await call(host, 'task.cancel', { requestId: randomUUID(), id: clarify.id,
-        expectedRowVersion: (await call(host, 'task.detail', { id: clarify.id })).task.rowVersion });
+      await header(activeQuestion).click();
+      await sections.getByRole('button', { name: /Clarify scope/ }).click();
+      await detailDrawer.getByText('更多操作', { exact: true }).click();
+      await detailDrawer.getByRole('button', { name: '关闭任务', exact: true }).click();
+      await detailDrawer.getByRole('button', { name: '确认关闭任务', exact: true }).click();
+      await wait(async () => (await call(host, 'task.detail', { id: clarify.id })).task.lifecycle === 'cancelled', 'panel close settled');
+      await detailDrawer.getByRole('button', { name: '关闭任务详情', exact: true }).click();
+      await header('进行中 1').click();
       await probe(host, 'release-stalled-model', held.worker);
       await delivered(held.id);
       for (const [button, title] of [[row(''), bot.name], [header(''), bot.name + ' · 打开或收起工作视图']]) {

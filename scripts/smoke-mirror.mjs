@@ -69,22 +69,22 @@ async function configure(role, { bundleDir = bundle, ...options } = {}) {
   }));
   await patch(role, options);
 }
-async function patch(role, { paired = false, mirrorDir = pairs, hmr = !skipHmr, managerWakesPerHour = 20, probeModule = '@zxdvd/super-bot/mirror-probe', data = roles[role].data, fullAccess = false } = {}) {
+async function patch(role, { paired = false, mirrorDir = pairs, hmr = !skipHmr, managerWakesPerHour = 20, probeModule = '@zxdvd/super-bot/mirror-probe', data = roles[role].data, fullAccess = false, gitLabObserverOrigin } = {}) {
   const { profile } = roles[role];
   const path = join(profile, 'cordis.patch.yml');
   const temp = `${path}.tmp`;
   await writeFile(temp, JSON.stringify([
     ...(hmr ? [] : [{ id: 'hmr', disabled: true }]),
-    { id: 'super-bot', config: { dataDir: data, fullAccess, managerWakesPerHour, ...(paired ? { mirrorDir } : {}) } },
+    { id: 'super-bot', config: { dataDir: data, fullAccess, managerWakesPerHour, gitLabObserverOrigin, ...(paired ? { mirrorDir } : {}) } },
     { insert: [{ id: 'super-bot-contract-probe', name: probeModule }] },
   ]));
   await rename(temp, path);
 }
 
 const children = new Map();
-async function launch(role, generation, { path = process.env.PATH } = {}) {
+async function launch(role, generation, { path = process.env.PATH, testCa } = {}) {
   const { home, profile } = roles[role];
-  const env = { PATH: path, HOME: shellHome, TMPDIR: tmp, DSH_HOME: home, DSH_TELEMETRY_DISABLED: '1' };
+  const env = { PATH: path, ...(testCa && { NODE_EXTRA_CA_CERTS: testCa }), HOME: shellHome, TMPDIR: tmp, DSH_HOME: home, DSH_TELEMETRY_DISABLED: '1' };
   const logPath = join(base, `${role}-${generation}.log`);
   const log = await open(logPath, 'wx', 0o600);
   const desktop = role === 'desktop';
@@ -280,7 +280,10 @@ async function restrictedTransport(role, taskId) {
 
 const files = {};
 try {
-  if (process.env.SUPER_BOT_TEST_WORKER_CONTEXT === '1') {
+  if (process.env.SUPER_BOT_TEST_TASK_STAGES === '1') {
+    const { smokeTaskStages } = await import('./smoke-task-stages.mjs');
+    await smokeTaskStages({ base, configure, launch, stop, call, makeBot, probe, wait });
+  } else if (process.env.SUPER_BOT_TEST_WORKER_CONTEXT === '1') {
     const { smokeWorkerContext } = await import('./smoke-worker-context.mjs');
     await smokeWorkerContext({ base, configure, launch, call, makeBot, probe, wait });
   } else if (process.env.SUPER_BOT_TEST_VERIFIED_RECOVERY === '1') {

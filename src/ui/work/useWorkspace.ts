@@ -183,7 +183,7 @@ export function useWorkspace({ api, initialBotId, initialLink, sessionId, mirror
         const owner = await api.call<Bot | null>('bot.for-session', { sessionId }); if (!current()) return false;
         if (owner?.id !== botId) throw new Error('当前对话归属已改变，请重新打开 Bot 的工作视图。');
       }
-      const scoped = sessionId && ['task.dispatch', 'attention.respond', 'result.accept', 'result.reject',
+      const scoped = sessionId && ['task.dispatch', 'task.close', 'attention.respond', 'result.accept', 'result.reject',
         'run.recover', 'run.recover-and-continue', 'manager.notification.resolve'].includes(action);
       const result = await api.call<T>(action, scoped ? { ...payload, sessionId } : payload);
       if (!current()) return false;
