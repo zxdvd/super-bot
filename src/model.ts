@@ -51,7 +51,7 @@ export interface Task {
   sessionId: string | null;
   createdAt: number;
   updatedAt: number;
-  status: 'unscheduled' | 'needs-input' | 'approval' | 'paused' | 'manual' | 'completed' | 'cancelled' | 'review' | 'queued' | 'running' | 'stopping' | 'recovery';
+  status: 'unscheduled' | 'needs-input' | 'approval' | 'paused' | 'manual' | 'completed' | 'cancelled' | 'review' | 'queued' | 'running' | 'stopping' | 'recovery' | 'blocked';
   /** Next actor from the local ledger, supplied by the inbox query. */
   activity?: WorkActivity | null;
   activityQuestion?: string;
@@ -114,6 +114,7 @@ export interface Run {
   createdAt:number; finishedAt:number|null; note:string;
 }
 export interface RunInput {id:string; taskId:string; kind:string; content:string; state:string; messageId:string|null; messageJson:string|null; attentionId:string|null; createdAt:number}
+export type WorkerPriorInput = Pick<RunInput,'id'|'content'|'messageId'> & {kind:'answer'|'rework';order:number};
 
 export interface ModelRoute {
   provider: string;

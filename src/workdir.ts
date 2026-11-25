@@ -286,5 +286,5 @@ export function workdirSummary(cwd:string,info:WorkdirInfo|null|undefined):strin
   if(mode==='isolated')return `${cwd} (fresh isolated directory for this task)`;
   if(mode==='hook')return `${cwd} (provisioned by the user's workspace hook; follow that directory's own instructions such as AGENTS.md)`;
   if(mode==='default')return `${cwd} (private task directory)`;
-  return `${cwd} (existing directory chosen for this task; Super Bot gives this run exclusive use of it)`;
+  return `${cwd} (existing directory chosen for this task; preserve other work in this checkout)`;
 }

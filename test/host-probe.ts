@@ -1,11 +1,13 @@
 /** Deterministic adapter inside the real, isolated DSH host. Never shipped in lib/. */
 import type { Context } from '@deepseek-ai/cordis';
-import { LlmAdapter,LlmError, createUserMessage, ToolCallId, type GenerateOptions, type StreamChunk } from '@deepseek-ai/dsh-llm';
+import { LlmAdapter,LlmError, createUserMessage, ToolCallId, type GenerateOptions, type StreamChunk, type UserMessage } from '@deepseek-ai/dsh-llm';
 import type { Agent } from '@deepseek-ai/dsh-agent';
 import type {} from '@deepseek-ai/dsh-tools';
 import type {} from '@deepseek-ai/dsh-api-session-controller';
 import type { SessionRequestId } from '@deepseek-ai/dsh-api-session-controller/types';
 import type {} from '@deepseek-ai/dsh-workspace';
+import type {} from '@deepseek-ai/dsh-compaction';
+import type {} from '@deepseek-ai/dsh-commands';
 import type { JobOutcome } from '@deepseek-ai/dsh-jobs';
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
@@ -21,6 +23,10 @@ import { SessionId } from '@deepseek-ai/dsh-session/types';
 import type {SessionStore} from '@deepseek-ai/dsh-session';
 import { artifactDeliveryText, artifactEditReply, artifactGoal, artifactLinks, artifactPortProbeGoal, artifactPortProbeText, artifactReference,
   artifactRevision, replacementMr, supplementalDoc } from './delivery-link-fixture.ts';
+import { deploymentEffectGoal, deploymentEffectRequest, deploymentProbe, deploymentRecoveryGoal, deploymentRecoveryRequest,
+  effectRecoveryGoal, effectRecoveryRequest,
+  permissionProbe, permissionRecoveryGoal, permissionRecoveryRequest, readRecoveryGoal, readRecoveryRequest,
+  recoveryEffectName, recoveryEffectText, recoveryFileName, recoveryGoals } from './recovery-host-fixture.ts';
 
 declare module '@deepseek-ai/dsh-llm' {
   interface MessageSourceMap {
@@ -32,9 +38,19 @@ export const inject = ['sessionPersistence','sessions','llm','tools','sessionCon
 const provider = 'super-bot-probe';
 const toolName = 'super_bot_probe_report';
 const scopedToolName='super_bot_scoped_probe';
+type RequestMessage=GenerateOptions['messages'][number];
+const messageText=(message:RequestMessage)=>message.content.flatMap(block=>block.type==='text'?[block.text]:[]).join('');
+type WorkerInput=Extract<RequestMessage,{role:'user'}> & {source:Extract<UserMessage['source'],{kind:'super-bot'}>};
+const isWorkerInput=(message:RequestMessage):message is WorkerInput=>message.role==='user'&&message.source?.kind==='super-bot';
+
+interface WorkerContextObservation {
+  runId:string; inputId:string; previousRunIds:string[]; previousFullRunIds:string[];
+  characters:number; bytes:number; taskInputBytes:number;
+}
 
 class ProbeAdapter extends LlmAdapter {
   calls: {sessionId?: string;purpose?:string;ids:string[];tools:string[];markers:string[]}[] = [];
+  workerContexts=new Map<string,Map<string,WorkerContextObservation>>();
   approvalWrites=new Set<string>();
   readyWithJob=new Set<string>();
   scopedAttempts=new Map<string,number>();
@@ -47,6 +63,13 @@ class ProbeAdapter extends LlmAdapter {
   async *stream(options: GenerateOptions): AsyncIterable<StreamChunk> {
     options.signal?.throwIfAborted();
     this.calls.push({sessionId:options.sessionId,purpose:options.purpose,ids:options.messages.flatMap(m=>m.id?[m.id]:[]),tools:(options.tools??[]).map(t=>t.name),markers:[...new Set(JSON.stringify(options.messages).match(/SB_MATERIAL_[A-Z0-9_]+/g)??[])]});
+    if(options.purpose==='compaction') {
+      const text='Synthetic checkpoint: earlier local work completed and no external action was requested.';
+      yield {type:'block-start',index:0,blockType:'text'};
+      yield {type:'text-delta',index:0,text};
+      yield {type:'block-end',index:0,block:{type:'text',text}};
+      yield {type:'finish',reason:{kind:'stop'}};return;
+    }
     const scopedInput=options.messages.findLast(message=>message.role==='user'&&(message.source?.kind==='user'||message.source?.kind==='super-bot'));
     if(scopedInput&&options.tools?.some(tool=>tool.name===scopedToolName)&&scopedInput.content.some(block=>block.type==='text'&&block.text.includes('SCOPED_TOOL_PROBE'))&&!options.messages.slice(options.messages.indexOf(scopedInput)+1).some(message=>message.content.some(block=>block.type==='tool-call'&&block.name===scopedToolName))) {
       if(options.sessionId)this.scopedAttempts.set(options.sessionId,(this.scopedAttempts.get(options.sessionId)??0)+1);
@@ -82,12 +105,23 @@ class ProbeAdapter extends LlmAdapter {
         await new Promise<void>(resolve=>{if(options.signal?.aborted)resolve();else options.signal?.addEventListener('abort',()=>resolve(),{once:true});});
         options.signal?.throwIfAborted();
       }
+      const recoveryNotice=trigger?.source?.kind==='super-bot-manager'&&text.includes('Call inspect-recovery with this exact taskId');
+      const recoveryTask=recoveryNotice&&value?.task?.status==='recovery'&&recoveryGoals.includes(value.task.goal)?value.task:undefined;
+      const pauseForFixture=recoveryTask&&prior?.action==='detail'&&recoveryTask.goal!==effectRecoveryGoal;
+      const challengeRecoveryScope=recoveryTask?.goal===readRecoveryGoal;
       const holdKey=`${options.sessionId}:${trigger?.id}`;
-      if(!this.heldManagerInputs.has(holdKey)&&(value?.task?.goal==='MANAGER_HOLD_PROBE'||value?.task?.goal==='MANAGER_STALE_PROBE'||(value?.task?.goal==='MANAGER_STALE_REVIEW_PROBE'&&value.result))) {
+      if(!this.heldManagerInputs.has(holdKey)&&(pauseForFixture||value?.task?.goal==='MANAGER_HOLD_PROBE'||value?.task?.goal==='MANAGER_STALE_PROBE'||(value?.task?.goal==='MANAGER_STALE_REVIEW_PROBE'&&value.result))) {
         assert.ok(options.sessionId);
         this.heldManagerInputs.add(holdKey);
         await new Promise<void>(release=>this.stalled.set(options.sessionId!,{release,signal:options.signal}));
         this.stalled.delete(options.sessionId);options.signal?.throwIfAborted();
+      }
+      if(challengeRecoveryScope&&prior?.action==='list'&&!later.some(message=>message.content.some(block=>block.type==='tool-call'&&block.name==='bash'))) {
+        const id=ToolCallId(randomUUID()),args=JSON.stringify({description:'合成恢复权限拒绝验证',command:'printf RECOVERY_GUARD_MUST_NOT_EXECUTE > recovery-guard-probe.txt',timeoutMs:1000});
+        yield {type:'block-start',index:0,blockType:'tool-call'};
+        yield {type:'tool-call-delta',index:0,id,name:'bash',argumentsDelta:args};
+        yield {type:'block-end',index:0,block:{type:'tool-call',id,name:'bash',arguments:args}};
+        yield {type:'finish',reason:{kind:'tool-calls'}};return;
       }
       let plan:Record<string,unknown>|null=null;
       const remember=text.match(/^请把「(.+)」保存为以后的默认工作约定。$/);
@@ -112,10 +146,24 @@ class ProbeAdapter extends LlmAdapter {
           yield {type:'block-start',index:0,blockType:'text'};yield {type:'text-delta',index:0,text:reply};
           yield {type:'block-end',index:0,block:{type:'text',text:reply}};yield {type:'finish',reason:{kind:'stop'}};return;
         }
+      }else if(challengeRecoveryScope&&prior?.action==='detail') {
+        plan={action:'list'};
+      }else if(recoveryTask&&['detail','list'].includes(String(prior?.action))) {
+        plan={action:'inspect-recovery',taskId:recoveryTask.id};
+      }else if(recoveryNotice&&prior?.action==='inspect-recovery'&&value?.status==='eligible') {
+        plan={action:'recover-preflight',taskId:value.taskId,expectedRowVersion:value.rowVersion};
+      }else if(recoveryNotice&&prior?.action==='recover-preflight'&&value?.status==='readable'
+        &&calls.filter(call=>call.type==='tool-call'&&JSON.parse(call.arguments).action==='recover-preflight').length===1) {
+        plan=prior;
       }else if(value?.task?.goal==='MANAGER_STEP_PROBE')plan={action:'detail',taskId:value.task.id};
       else if(!prior) {
         const foreign=text.match(/CROSS_BOT:([^\s]+)/)?.[1];
-        if(foreign)plan={action:'detail',taskId:foreign};
+        if(trigger?.source?.kind==='user'&&text===readRecoveryRequest)plan={action:'create',goal:readRecoveryGoal,scope:`只读当前任务目录的 ${recoveryFileName}`,acceptance:'报告实际读取结果'};
+        else if(trigger?.source?.kind==='user'&&text===effectRecoveryRequest)plan={action:'create',goal:effectRecoveryGoal,scope:`写入合成标记 ${recoveryEffectName}，并只读检查 ${recoveryFileName}`,acceptance:'报告已执行操作与实际读取结果'};
+        else if(trigger?.source?.kind==='user'&&text===permissionRecoveryRequest)plan={action:'create',goal:permissionRecoveryGoal,scope:'只读核对 Kubernetes context synthetic 的 namespace fixture 中 get persistentvolumeclaims 权限',acceptance:'报告实际共享身份与权限结果'};
+        else if(trigger?.source?.kind==='user'&&text===deploymentRecoveryRequest)plan={action:'create',goal:deploymentRecoveryGoal,scope:'只读核对 Kubernetes context synthetic 的 namespace fixture 下 Deployment fixture-deployment',acceptance:'报告实际共享身份与指定 Deployment 的最新状态'};
+        else if(trigger?.source?.kind==='user'&&text===deploymentEffectRequest)plan={action:'create',goal:deploymentEffectGoal,scope:`在任务目录写入 ${recoveryEffectName}，并只读核对 Kubernetes context synthetic 的 namespace fixture 下 Deployment fixture-deployment`,acceptance:'报告已执行操作与指定 Deployment 的最新状态'};
+        else if(foreign)plan={action:'detail',taskId:foreign};
         else if(trigger?.source?.kind==='user'&&text==='请用 Shell 运行本机命令，把合成检查结果保存成文件。')plan={action:'create',goal:'LOCAL_CLI_PROBE',scope:'只在任务目录运行合成 Shell 命令，不访问外部服务',acceptance:'result.md 内容为 LOCAL_CLI_OK'};
         else if(trigger?.source?.kind==='user'&&['DF14_RECEIPT_PROBE','MIRROR_PROGRESS_PROBE'].includes(text))plan={action:'create',goal:text,scope:'专用任务目录，不访问网络',acceptance:'result.md 包含两项合成事实并已回读'};
         else if(trigger?.source?.kind==='user'&&[artifactGoal,artifactPortProbeGoal].includes(text))plan={action:'create',goal:text,scope:'隔离合成链接和本地证据',acceptance:'报告明确的交付物和回读记录'};
@@ -180,63 +228,102 @@ class ProbeAdapter extends LlmAdapter {
       }else if(workerQuestion)reply=`${workerQuestion.question}\n${workerQuestion.markdown}`;
       else if(clarification)reply=clarification.question;
       else if(prior?.action==='dispatch'||(prior?.action==='create'&&(value?.run||value?.deferred)))reply='已经开始处理，完成后我会回到这里交付。';
+      else if(recoveryNotice&&prior?.action==='inspect-recovery'&&value?.status==='needs-human')reply=value.message;
+      else if(recoveryNotice&&prior?.action==='recover-preflight') {
+        reply=value?.message??value?.result?.message??reply;
+        if(value?.effectUncertain)reply+=' 原操作是否产生该效果仍待核对。';
+      }
       else if(trigger?.source?.kind==='user')reply='你好，我可以帮你安排文档工作。';
       yield {type:'block-start',index:0,blockType:'text'};yield {type:'text-delta',index:0,text:reply};
       yield {type:'block-end',index:0,block:{type:'text',text:reply}};yield {type:'finish',reason:{kind:'stop'}};return;
     }
     const latestInput=options.messages.findLast(m=>m.role==='user'&&(m.source?.kind==='super-bot'||m.source?.kind==='user'));
-    const reliabilityInput=options.messages.findLast(m=>m.role==='user'&&m.source?.kind==='super-bot'&&m.content.some(b=>b.type==='text'&&b.text.includes('Goal: RELIABILITY_')));
-    const workInput=reliabilityInput??(latestInput?.source?.kind==='super-bot'?latestInput:undefined);
+    const reliabilityInput=options.messages.filter(isWorkerInput).findLast(message=>messageText(message).includes('Goal: RELIABILITY_'));
+    const workInput=reliabilityInput??(latestInput&&isWorkerInput(latestInput)?latestInput:undefined);
     if(latestInput?.source?.kind==='user'&&latestInput.content.some(block=>block.type==='text'&&block.text.includes('NATIVE_HOLD_PROBE'))) {
       assert.ok(options.sessionId);await new Promise<void>(release=>this.stalled.set(options.sessionId!,{release,signal:options.signal}));
       this.stalled.delete(options.sessionId);options.signal?.throwIfAborted();
     }
     if(workInput) {
-      const body=workInput.content.filter(b=>b.type==='text').map(b=>b.text).join('');
-      if(body.includes('Goal: RELIABILITY_HOLD')&&options.sessionId&&!this.reliabilityHeld.has(options.sessionId)) {
+      const body=messageText(workInput);
+      const { taskId, runId, inputId }=workInput.source;
+      const previous=options.messages.slice(0,options.messages.indexOf(workInput)).filter(isWorkerInput)
+        .filter(message=>message.source.taskId===taskId);
+      const previousFull=previous.filter(message=>/^Goal: /m.test(messageText(message)));
+      const fullInput=previousFull.at(-1);
+      const context=/^Goal: /m.test(body)?body:fullInput?messageText(fullInput):'';
+      const goal=context.match(/^Goal: ([^\n]*)/m)?.[1]??'';
+      const revised=body.includes('Additional user input (rework):');
+      if(options.sessionId) {
+        const observations=this.workerContexts.get(options.sessionId)??new Map<string,WorkerContextObservation>();
+        if(!observations.has(runId))observations.set(runId,{runId,inputId,
+          previousRunIds:previous.map(message=>message.source.runId),previousFullRunIds:previousFull.map(message=>message.source.runId),
+          characters:[...body].length,bytes:Buffer.byteLength(body),taskInputBytes:previous.reduce((sum,message)=>sum+Buffer.byteLength(messageText(message)),Buffer.byteLength(body))});
+        this.workerContexts.set(options.sessionId,observations);
+      }
+      if(goal.startsWith('RELIABILITY_HOLD')&&options.sessionId&&!this.reliabilityHeld.has(options.sessionId)) {
         this.reliabilityHeld.add(options.sessionId);
         await new Promise<void>(release=>this.stalled.set(options.sessionId!,{release,signal:options.signal}));
         this.stalled.delete(options.sessionId);options.signal?.throwIfAborted();
       }
-      if(body.includes('Goal: RELIABILITY_MISSING_REPORT')) {
+      if(goal.startsWith('RELIABILITY_MISSING_REPORT')) {
         yield {type:'block-start',index:0,blockType:'text'};
         yield {type:'block-end',index:0,block:{type:'text',text:'No report on purpose.'}};
         yield {type:'finish',reason:{kind:'stop'}};return;
       }
-      if(body.includes('Goal: MODEL_FAILURE_PROBE'))throw new LlmError('Synthetic missing credential; no provider request was made','MISSING_CREDENTIAL');
-      if(body.includes('Goal: UNRESPONSIVE_MODEL_PROBE')) {
+      if(goal.startsWith('MODEL_FAILURE_PROBE'))throw new LlmError('Synthetic missing credential; no provider request was made','MISSING_CREDENTIAL');
+      if(goal.startsWith('UNRESPONSIVE_MODEL_PROBE')) {
         assert.ok(options.sessionId);
         await new Promise<void>(release=>this.stalled.set(options.sessionId!,{release,signal:options.signal}));
         this.stalled.delete(options.sessionId);options.signal?.throwIfAborted();
       }
-      if(body.includes('Goal: STOP_PROBE')) {
+      if(goal.startsWith('STOP_PROBE')) {
         await new Promise<void>(resolve=>{if(options.signal?.aborted)resolve();else options.signal?.addEventListener('abort',()=>resolve(),{once:true});});
         options.signal?.throwIfAborted();
       }
       // The dispatch line may carry a note after the path, e.g. "(private task directory). Work only inside it…".
-      const cwd=body.match(/Working directory: (.+?)(?: \(.*)?$/m)?.[1];assert.ok(cwd);
+      const cwd=context.match(/^Working directory: (.+?)(?: \([^)]*\)|\. Work only inside it;|$)/m)?.[1];assert.ok(cwd);
       const later=options.messages.slice(options.messages.indexOf(workInput)+1);
       const calls=later.flatMap(m=>m.content.filter(b=>b.type==='tool-call').map(b=>b.name));
       const file=join(cwd,'result.md');
-      if(body.includes('Goal: READY_WITH_JOB_PROBE')&&options.sessionId)this.readyWithJob.add(options.sessionId);
-      const approvalProbe=body.includes('Goal: APPROVAL_PROBE');
+      if(goal.startsWith('READY_WITH_JOB_PROBE')&&options.sessionId)this.readyWithJob.add(options.sessionId);
+      const approvalProbe=goal.startsWith('APPROVAL_PROBE');
       if(approvalProbe&&!calls.includes('write')&&options.sessionId)this.approvalWrites.add(options.sessionId);
-      const hasAnswer=options.messages.some(m=>m.content.some(b=>b.type==='text'&&b.text.includes('Additional user input (answer):')));
-      const needsAnswer=body.includes('Goal: ASK_PROBE')&&!hasAnswer;
-      const localCli=body.includes('Goal: LOCAL_CLI_PROBE');
-      const progressProbe=body.includes('Goal: MIRROR_PROGRESS_PROBE');
-      const revisedArtifact=body.includes(`Goal: ${artifactPortProbeGoal}`)&&body.includes('Additional user input (rework):');
-      const reportedArtifacts=body.includes(`Goal: ${artifactGoal}`)||body.includes(`Goal: ${artifactPortProbeGoal}`);
+      const hasAnswer=revised||[...previous,workInput].some(message=>messageText(message).includes('Additional user input (answer):'));
+      const needsAnswer=goal.startsWith('ASK_PROBE')&&!hasAnswer;
+      const localCli=goal.startsWith('LOCAL_CLI_PROBE');
+      const progressProbe=goal.startsWith('MIRROR_PROGRESS_PROBE');
+      const revisedArtifact=goal===artifactPortProbeGoal&&revised;
+      const reportedArtifacts=goal===artifactGoal||goal===artifactPortProbeGoal;
       const artifactReport=reportedArtifacts
         ? [revisedArtifact?artifactRevision.text:'已核对合成交付物。',
           ...Object.entries(revisedArtifact?artifactRevision.links:artifactLinks).map(([name,url])=>`- [${name}](${url})`)].join('\n') : null;
-      const revisedReceipt=body.includes('Goal: DF14_RECEIPT_PROBE')&&body.includes('Additional user input (rework):');
+      const revisedReceipt=goal.startsWith('DF14_RECEIPT_PROBE')&&revised;
       const reports=progressProbe?later.flatMap(m=>m.content.flatMap(b=>b.type==='tool-call'&&b.name==='super_bot_report'?[JSON.parse(b.arguments).kind]:[])):[];
-      const planned=progressProbe&&!reports.includes('progress')?{name:'super_bot_report',args:{kind:'progress',summary:'MIRROR_NATIVE_PROGRESS'}}:
-        localCli&&!calls.includes('bash')?{name:'bash',args:{description:"生成本机 Shell 合成检查结果",command:"printf 'LOCAL_CLI_OK\\n' > result.md"}}:body.includes('Goal: STEP_BUDGET_PROBE')?{name:'read',args:{file_path:join(cwd,'missing-budget-probe.txt')}}:approvalProbe&&calls.includes('write')&&!existsSync(file)&&!calls.includes('super_bot_report')?{name:'super_bot_report',args:{kind:'failed',summary:'审批路径结束，写入没有生成文件；请核对原生审批结果。'}}:
+      const recoveryRead=[readRecoveryGoal,effectRecoveryGoal].includes(goal);
+      const clusterProbe=goal===permissionRecoveryGoal?permissionProbe:[deploymentRecoveryGoal,deploymentEffectGoal].includes(goal)?deploymentProbe:null;
+      const preflightReport=(()=>{
+        if(!recoveryRead&&!clusterProbe)return null;
+        const tool=clusterProbe?'super_bot_preflight':'read';
+        const call=later.flatMap(message=>message.content).findLast(block=>block.type==='tool-call'&&block.name===tool);
+        if(!call||call.type!=='tool-call')return null;
+        const result=later.find(message=>message.role==='tool'&&message.toolCallId===call.id);
+        assert.ok(result?.role==='tool');
+        if(clusterProbe)assert.equal(result.isError??false,false,messageText(result));
+        else assert.equal(result.isError,true,messageText(result));
+        return messageText(result);
+      })();
+      const planned=[effectRecoveryGoal,deploymentEffectGoal].includes(goal)&&!calls.includes('write')
+        ?{name:'write',args:{file_path:join(cwd,recoveryEffectName),content:recoveryEffectText}}
+        :clusterProbe&&!preflightReport?{name:'super_bot_preflight',args:clusterProbe}
+        :recoveryRead&&!preflightReport?{name:'read',args:{file_path:join(cwd,recoveryFileName)}}
+        :preflightReport?(calls.includes('super_bot_report')?null:{name:'super_bot_report',args:{kind:clusterProbe?'blocked':'failed',
+          summary:'预检未完成，当前轮结束。',checks:preflightReport}})
+        :progressProbe&&!reports.includes('progress')?{name:'super_bot_report',args:{kind:'progress',summary:'MIRROR_NATIVE_PROGRESS'}}:
+        localCli&&!calls.includes('bash')?{name:'bash',args:{description:"生成本机 Shell 合成检查结果",command:"printf 'LOCAL_CLI_OK\\n' > result.md"}}:goal.startsWith('STEP_BUDGET_PROBE')?{name:'read',args:{file_path:join(cwd,'missing-budget-probe.txt')}}:approvalProbe&&calls.includes('write')&&!existsSync(file)&&!calls.includes('super_bot_report')?{name:'super_bot_report',args:{kind:'failed',summary:'审批路径结束，写入没有生成文件；请核对原生审批结果。'}}:
         needsAnswer&&!calls.includes('super_bot_report')?{name:'super_bot_report',args:{kind:'waiting',summary:'请说明文档面向谁？'}}:
-        !localCli&&!calls.includes('write')?{name:'write',args:{file_path:body.includes('Goal: RELATIVE_PATH_PROBE')?'result.md':file,content:'# 合成成果\n\n事实一：这份文档由隔离测试模型生成。\n事实二：测试没有访问网络或使用模型凭证。\n'+(body.includes('Additional user input (rework):')?'\n修订：已按返工要求补充说明。\n':'')+(body.includes('Goal: LARGE_RESULT_PROBE')?'\n'+'x'.repeat(16000):'')+
-           (body.includes('Goal: MEMORY_WORK_A')?'\n蓝色主题便于区分合成环境。\n合成归档按季度组织。\n':'')}}:
+        !localCli&&!calls.includes('write')?{name:'write',args:{file_path:goal.startsWith('RELATIVE_PATH_PROBE')?'result.md':file,content:'# 合成成果\n\n事实一：这份文档由隔离测试模型生成。\n事实二：测试没有访问网络或使用模型凭证。\n'+(revised?'\n修订：已按返工要求补充说明。\n':'')+(goal.startsWith('LARGE_RESULT_PROBE')?'\n'+'x'.repeat(16000):'')+
+           (goal.startsWith('MEMORY_WORK_A')?'\n蓝色主题便于区分合成环境。\n合成归档按季度组织。\n':'')}}:
         !calls.includes('read')?{name:'read',args:{file_path:file}}:
         (progressProbe?!reports.includes('ready'):!calls.includes('super_bot_report'))?{name:'super_bot_report',args:{kind:'ready',summary:artifactReport??(localCli?'已执行本机 Shell 并生成合成结果。':revisedReceipt?'已提交合成说明的修订版。':'已生成并回读两项事实的说明文件。'),checks:revisedArtifact?artifactRevision.checks:artifactReport?`已回读合成证据。参考资料：[方案模板](${artifactReference})。`:localCli?'原生 bash 执行后已 read 回读 LOCAL_CLI_OK。':revisedReceipt?'已回读修订版新增的结论。':'result.md 包含标题和两项事实；已用原生 read 工具回读核对。',files:[file]}}:null;
       if(planned) {
@@ -575,10 +662,28 @@ export function apply(ctx:Context) {
         }
         return Response.json({ok:true,cwd:ctx.workingDirectory.get(agent.session),status:agent.status});
       }
+      if(body.action==='compact-worker-context') {
+        assert.ok(body.sessionId&&body.text);
+        const resolved=await ctx.sessionController.resolveAgent(SessionId(body.sessionId));assert.ok('agent' in resolved);
+        const { agent }=resolved;
+        assert.ok(agent.session.header.cwd?.startsWith(join(home!,'super-bot')+'/'));
+        assert.equal(agent.model.current()?.provider,provider);
+        await bounded(agent.whenIdle(),'Worker before context compaction');
+        const original=agent.session.snapshotEvents().find(event=>event.type==='user/message'&&isWorkerInput(event.data)
+          &&event.data.source.runId===body.text&&/^Goal: ASK_PROBE$/m.test(messageText(event.data)));
+        assert.ok(original);
+        const commands=ctx.get('commands');assert.ok(commands,'native host command registry');
+        const command=await bounded(commands.execute(agent,'/compact',[],AbortSignal.timeout(12000)),'Worker context compaction');
+        assert.equal(command?.result.kind,'success',command?.result.text);
+        const summary=agent.session.snapshotEvents().findLast(event=>event.type==='compaction/summary');
+        assert.ok(summary?.type==='compaction/summary'&&summary.data.shadowedSeqs.includes(original.seq),command?.result.text);
+        assert.ok(!agent.session.deriveMessages().some(message=>isWorkerInput(message)&&message.source.runId===body.text));
+        return Response.json({ok:true,shadowed:summary.data.shadowedSeqs.length,compactionId:summary.data.compactionId});
+      }
       if(body.action==='inspect-session') {
         assert.ok(body.sessionId);const resolved=await ctx.sessionController.resolveAgent(SessionId(body.sessionId));assert.ok('agent' in resolved);
         assert.ok(resolved.agent.session.header.cwd?.startsWith(join(home!,'super-bot')+'/'));
-        return Response.json({ok:true,events:resolved.agent.session.snapshotEvents().filter(e=>['turn/start','turn/end','user/message','agent/inbox/spliced'].includes(e.type)).map(e=>({seq:e.seq,type:e.type,data:e.data})),pendingItems:[...resolved.agent.inbox.nextTurn.map(m=>({id:m.id,target:'next-turn'})),...resolved.agent.inbox.nextStep.map(m=>({id:m.id,target:'next-step'}))],sessionId:resolved.agent.id,status:resolved.agent.status,pending:resolved.agent.inbox.nextTurn.length+resolved.agent.inbox.nextStep.length,stalled:adapter.stalled.has(resolved.agent.id),stalledAborted:adapter.stalled.get(resolved.agent.id)?.signal?.aborted??false,managerAttempts:adapter.managerAttempts.get(resolved.agent.id)??[],materialMarkers:adapter.calls.filter(call=>call.sessionId===body.sessionId&&(!call.purpose||call.purpose==='conversation')).at(-1)?.markers??[],assistantTexts:resolved.agent.session.snapshotEvents().filter(event=>event.type==='assistant/message').map(event=>event.data.message.content.filter(block=>block.type==='text').map(block=>block.text).join('')),historyMessageIds:resolved.agent.session.snapshotEvents().filter(event=>event.type==='user/message').map(event=>event.data.id),modelSteps:adapter.calls.filter(call=>call.sessionId===body.sessionId&&(!call.purpose||call.purpose==='conversation')).length,scopedProbeCalls:scopedCalls.get(resolved.agent.id)??0,scopedProbeAttempts:adapter.scopedAttempts.get(resolved.agent.id)??0,
+        return Response.json({ok:true,events:resolved.agent.session.snapshotEvents().filter(e=>['turn/start','turn/end','user/message','agent/inbox/spliced'].includes(e.type)).map(e=>({seq:e.seq,type:e.type,data:e.data})),pendingItems:[...resolved.agent.inbox.nextTurn.map(m=>({id:m.id,target:'next-turn'})),...resolved.agent.inbox.nextStep.map(m=>({id:m.id,target:'next-step'}))],sessionId:resolved.agent.id,status:resolved.agent.status,pending:resolved.agent.inbox.nextTurn.length+resolved.agent.inbox.nextStep.length,stalled:adapter.stalled.has(resolved.agent.id),workerContexts:[...adapter.workerContexts.get(resolved.agent.id)?.values()??[]],stalledAborted:adapter.stalled.get(resolved.agent.id)?.signal?.aborted??false,managerAttempts:adapter.managerAttempts.get(resolved.agent.id)??[],materialMarkers:adapter.calls.filter(call=>call.sessionId===body.sessionId&&(!call.purpose||call.purpose==='conversation')).at(-1)?.markers??[],assistantTexts:resolved.agent.session.snapshotEvents().filter(event=>event.type==='assistant/message').map(event=>event.data.message.content.filter(block=>block.type==='text').map(block=>block.text).join('')),historyMessageIds:resolved.agent.session.snapshotEvents().filter(event=>event.type==='user/message').map(event=>event.data.id),modelSteps:adapter.calls.filter(call=>call.sessionId===body.sessionId&&(!call.purpose||call.purpose==='conversation')).length,scopedProbeCalls:scopedCalls.get(resolved.agent.id)??0,scopedProbeAttempts:adapter.scopedAttempts.get(resolved.agent.id)??0,
           toolResults:resolved.agent.session.snapshotEvents().filter(event=>event.type==='tool/result').map(event=>event.data),modelTools:adapter.calls.filter(call=>call.sessionId===body.sessionId&&(!call.purpose||call.purpose==='conversation')).at(-1)?.tools??[],executedTools:resolved.agent.session.snapshotEvents().filter(event=>event.type==='tool/call').map(event=>event.data.name),
           productTools:ctx.tools.definitions().map(tool=>tool.name).filter(name=>['super_bot_report','super_bot_manage'].includes(name))});
       }

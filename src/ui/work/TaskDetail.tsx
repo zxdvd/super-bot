@@ -4,7 +4,9 @@ import { ownerLabel, type MirrorDetail, type MirrorEvent } from '../../mirror.ts
 import { useEffect, useRef } from 'react';
 import { workUrl, type WorkLink } from '../../work-links.ts';
 import { ConfirmAction, Section, Tag } from '../kit.tsx';
-import { canReviewResult, canStartTask, eventTitle, reviewLabel, settling, stageText, stageTone, time } from './format.ts';
+import {
+  canReviewResult, canStartTask, eventTitle, recoveryEventMessage, reviewLabel, settling, stageText, stageTone, time,
+} from './format.ts';
 import { ReplyForm, TaskForm } from './forms.tsx';
 import { ChildWaitHistory, CurrentChildWaits } from './ChildWaits.tsx';
 import { ModelHistory, ModelPreview } from './ModelDetails.tsx';
@@ -137,12 +139,26 @@ const reportLabels: Record<string, string> = { progress: '进度', waiting: '等
 function Audit({ detail, readOnly = false }: { detail: Pick<Detail, 'task'> & { events: MirrorEvent[] }; readOnly?: boolean }) {
   const { task } = detail;
   return <details className="advanced"><summary>执行与审计记录</summary>
-    <dl><dt>{readOnly ? '最近 50 条关键事件' : '关键事件'}</dt><dd>{detail.events.map(e => <div className="event" key={e.id}>
-      {time(e.createdAt)} · {e.report ? reportLabels[e.report.kind] ?? eventTitle(e) : eventTitle(e)}
-      {e.report && <p className="full-text">{e.report.summary}</p>}
-    </div>)}</dd></dl>
+    <dl><dt>{readOnly ? '最近 50 条关键事件' : '关键事件'}</dt><dd>{detail.events.map(e => {
+      const summary = e.report?.summary ?? (!readOnly ? recoveryEventMessage(e) : undefined);
+      return <div className="event" key={e.id}>
+        {time(e.createdAt)} · {e.report ? reportLabels[e.report.kind] ?? eventTitle(e) : eventTitle(e)}
+        {summary && <p className="full-text">{summary}</p>}
+      </div>;
+    })}</dd></dl>
     <div className="muted caption">目标版本 {task.taskRevision} · 创建时 Bot 配置 {task.botConfigRevision} · 修改 {task.rowVersion}</div>
   </details>;
+}
+
+function RecoveryFinding({ detail }: { detail: Detail }) {
+  const { task, recoveryCheck } = detail;
+  const message = recoveryCheck?.resolution?.message;
+  if (!message || !['blocked', 'recovery'].includes(task.status)) return null;
+  return <section className="attention-box" aria-label="只读核对结果">
+    <strong>{task.status === 'blocked' ? 'Bot 已确认前提未满足' : 'Bot 已记录核对结果'}</strong>
+    <p className="full-text">{message}</p>
+    {task.status === 'blocked' && <p>处理前提后，可以在原对话请 Bot 继续安排。</p>}
+  </section>;
 }
 
 export function LinkedTaskContent({ w, detail, link, close, onReturn }: {
@@ -282,6 +298,7 @@ export function TaskDrawer({ w, compact, onReturn }: { w: WorkspaceState; compac
         <TaskDetailHeader w={w} detail={detail} close={close} onReturn={onReturn} recoveryPanel={!!detail.recovery?.worker}/>
         {detail.recovery && <RecoveryPanel w={w} detail={detail} recovery={detail.recovery}
           key={`${detail.task.id}:${detail.task.rowVersion}:${detail.recovery.attentionId}:${detail.binding?.generation}`}/>}
+        <RecoveryFinding detail={detail}/>
         <Attentions w={w} detail={detail}/>
         <CurrentChildWaits detail={detail} api={w.api} online={w.online}/>
         {!resultBeforeProgress && <Progress detail={detail}/>}

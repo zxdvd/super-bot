@@ -1,3 +1,4 @@
+import {inspectPriorTools,type ProbeEvidence,type ProbeResult,type PriorTools,type ReadProbe} from './read-only-recovery.ts';
 /** The only execution adapter. Product state never depends on a DSH object. */
 import {symbols,type Context} from '@deepseek-ai/cordis';
 import type {} from '@deepseek-ai/dsh-api-session-controller';
@@ -11,7 +12,9 @@ import type { Agent } from '@deepseek-ai/dsh-agent';
 import type { JobId } from '@deepseek-ai/dsh-jobs';
 import {carrierKeyOf} from '@deepseek-ai/dsh-scope';
 import {ChildWaitObservation,type NativeChildEdge} from './dsh-child-wait.ts';
-import { createUserMessage,freezeMessage,type UserMessage } from '@deepseek-ai/dsh-llm';
+import { randomUUID } from 'node:crypto';
+import { parseClusterProbe,prepareClusterProbe } from './kubernetes-preflight.ts';
+import { freezeMessage,ToolCallId,type UserMessage } from '@deepseek-ai/dsh-llm';
 import type {Session,SessionStore} from '@deepseek-ai/dsh-session';
 import type {} from '@deepseek-ai/dsh-session-persistence';
 import {verifyRunTurn} from './run-proof.ts';
@@ -20,7 +23,7 @@ import { realpath } from 'node:fs/promises';
 import { realpathSync } from 'node:fs';
 import { setTimeout as delay } from 'node:timers/promises';
 import { join,isAbsolute,basename } from 'node:path';
-import {cleanupWorkdir,provisionWorkdir,workdirPolicy,workdirSummary,type WorkdirPolicy,type WorkdirRequest} from './workdir.ts';
+import {cleanupWorkdir,provisionWorkdir,workdirPolicy,type WorkdirPolicy,type WorkdirRequest} from './workdir.ts';
 import {nameAutomaticSession,workerTitle} from './sidebar.ts';
 import { AppError,requiredText,optionalText,type Binding,type Run,type Task,type WorkReport,type ExistingSessionGrant,type ExistingSessionPreview } from './model.ts';
 import type { ChildWaitDetail,ChildWaitMember,RecoveryContinuation,RecoveryDetail,RecoveryInput,RecoveryInputKind,
@@ -29,16 +32,8 @@ import { actualModelRequests,modelRoute,nativeModel,observeNativeModel,readModel
 import type { Store } from './store.ts';
 import { captureEvidence,containedPath,verifyEvidence,evidencePaths,type CapturedEvidence } from './evidence.ts';
 import {configureRole,fullAccessEnabled,type RuntimeOptions} from './runtime.ts';
-import { materialPrompt } from './materials.ts';
+import { createWorkerRunMessage,registerWorkerContext,workerPromptPlan,workerStandingPrompt } from './worker-prompt.ts';
 import { ReloadAdmission } from './reload-admission.ts';
-
-declare module '@deepseek-ai/dsh-llm' {
-  interface MessageSourceMap {'super-bot':{kind:'super-bot';taskId:string;runId:string;inputId:string;taskRevision:number;generation:number}}
-}
-
-const CODE_DELIVERY = `For code work, after reading the applicable project instructions and before editing, record the opening Git HEAD and relevant staged, unstaged, and untracked changes. Keep the baseline scoped to the files you expect to touch. Preserve existing work, including changes in files you edit. If Git or the baseline is unavailable, state what you could verify.
-In ready, use summary for what changed and checks for commands actually run, their outcomes, and what remains unverified. Make the opening HEAD, relevant existing changes, and this run's attributable diff visible in the summary or a concise attachment. Compare with the opening state, including for files you both found dirty and edited. Treat the full diff against HEAD as worktree context. If you cannot attribute a change, say so. Attach a scoped diff when useful and include actual changed source where available. For any relevant host, identify a matching native load receipt for this result and build, or say that loading there is unverified. Only reload when authorized.
-For ordinary non-code work, keep the report brief and use the checks and files relevant to that task.\nIn any ready report, explicitly list links to deliverables you actually produced and want the user to open, with a distinct display name and an actual URL for each. Keep reference links distinct. A local-only change without a submitted review has no MR or CR link. Include file evidence and checks even when a document is the only deliverable.`;
 
 /** Host defaults are not a model selection made for this conversation. */
 export function selectedModel(ctx:Context,agent:Agent) {
@@ -196,6 +191,52 @@ export class DshExecution {
       },
     },{when:({agent})=>this.store.heldRuns().some(r=>r.sessionId===agent.id&&r.finishedAt===null&&
       !this.store.isBotDeleted(this.store.getTask(r.taskId).botId))}));
+    if(fullAccessEnabled(this.options))this.ctx.effect(()=>this.ctx.tools.register({
+      name:'super_bot_preflight',
+      description:'Read-only Kubernetes preflight under an existing authorized shared identity. Use when the original task authorizes checking an explicit Kubernetes context and namespace. Verify permission via SelfSubjectAccessReview or read one named Deployment/PVC. Never use this to apply changes, impersonate another identity, change auth, or guess a context. Report the returned status, then use blocked if a prerequisite failed.',
+      parameters:{type:'object',properties:{
+        kind:{type:'string',enum:['permission','deployment-state','volume-state']},
+        context:{type:'string'},namespace:{type:'string'},
+        name:{type:'string',description:'Exact object name, or an empty string for a namespace-level permission check.'},
+        verb:{type:'string',description:'For a permission check only. The verb is queried, never performed.'},
+        resource:{type:'string',description:'For a permission check only. Kubernetes resource such as deployments.apps or persistentvolumeclaims.'},
+      },required:['kind','context','namespace','name'],additionalProperties:false},
+      output:{schema:{type:'object',additionalProperties:true},render:(_args,value)=>[{type:'text',text:JSON.stringify(value)}]},
+      execute:async(args,exec)=>{
+        const run=this.store.heldRuns().find(r=>r.sessionId===exec.agent?.id&&r.state==='running'&&r.finishedAt===null);
+        if(!run||!this.autoTurns.has(run.id)||!this.store.runTurn(run.id)?.inputSeq||!exec.agent) {
+          throw new AppError('preflight-scope','没有绑定到此会话与轮次的任务授权。');
+        }
+        const probe=parseClusterProbe(args),binding=this.store.getBinding(run.bindingId),task=this.store.getTask(run.taskId);
+        const authorize=()=>{
+          exec.signal.throwIfAborted();
+          const current=this.store.getRun(run.id),latest=this.store.getTask(task.id);
+          if(this.disposed||current.state!=='running'||current.finishedAt!==null||latest.rowVersion!==task.rowVersion||
+            latest.controlMode!=='auto'||this.store.isBotDeleted(task.botId)||this.store.activeBinding(task.id)?.id!==binding.id||
+            this.store.finalReport(run.id))throw new AppError('preflight-scope','原任务或当前工具授权已改变。');
+          this.assertDirectory(exec.agent!,binding.cwd);
+        };
+        authorize();
+        const signal=AbortSignal.any([exec.signal,AbortSignal.timeout(17000)]);
+        const prior=this.store.preflightReceipt(run.id,exec.callId);
+        if(prior) {
+          if(JSON.stringify(probe)!==JSON.stringify(prior.probe))throw new AppError('idempotency-conflict','此预检工具调用已用于其他参数。');
+          return prior.result;
+        }
+        let auth:string|null=null,result:ProbeResult;
+        try {
+          const prepared=await prepareClusterProbe(probe,signal,undefined,authorize);
+          authorize();
+          auth=prepared.auth;result=await prepared.check();
+        }catch(error){
+          result={status:'unavailable',message:error instanceof AppError?error.message:'Kubernetes 未返回可验证的预检结果。'};
+        }
+        authorize();
+        this.store.recordPreflightReceipt(run.id,exec.callId,probe,auth,result);
+        return result;
+      },
+    },{when:({agent})=>this.store.heldRuns().some(run=>run.sessionId===agent.id&&run.finishedAt===null&&
+      !this.store.isBotDeleted(this.store.getTask(run.taskId).botId))}));
     this.ctx.on('agent/created',({agent})=>{
       if(this.disposed)return;
       for(const run of this.store.heldRuns())if(run.sessionId===agent.id&&!this.running.has(run.id))this.withdrawWorkerInput(run,agent);
@@ -518,17 +559,15 @@ export class DshExecution {
     }
     return this.deliverRun(run,agent,b);
   }
-  private deliverRun(run:Run,agent:Agent,b:Binding):Run {
+  private deliverRun(run:Run,agent:Agent,b:Binding,recovery?:{note:string|null}):Run {
     if(this.running.has(run.id)||run.finishedAt!==null)return this.store.getRun(run.id);
-    const taskId=run.taskId,task=this.store.getTask(taskId),botContext=this.store.taskBotContext(taskId);
+    const taskId=run.taskId,task=this.store.getTask(taskId);
+    const standing=workerStandingPrompt(task,b,this.store.taskBotContext(taskId),fullAccessEnabled(this.options));
     let input=this.store.getRunInput(run.id);
+    const previous=this.store.previousWorkerInputs(run);
     if(!input.messageJson) {
-      const convention=botContext.workConvention;
-      const conventionPrompt=convention
-        ? `\nWork convention recorded for this task (${convention.source}). Follow it within the current task scope and authorization:\n${convention.text}`
-        : '';
-      const supplement=`\nScheduling fact: Super Bot has reserved this working directory for the current run. Its ledger rejects concurrent runs in overlapping directories and keeps unresolved runs reserved. You do not need another confirmation that an earlier Super Bot run released this directory. This does not cover unrelated external processes.\n${input.kind==='answer'||input.kind==='rework'?`Additional user input (${input.kind}): ${input.content}`:''}`;
-      const message=createUserMessage({source:{kind:'super-bot',taskId,runId:run.id,inputId:run.inputId,taskRevision:run.taskRevision,generation:run.generation},content:[{type:'text',text:`You are executing a NEW attempt of one Super Bot task.\nCurrent run: ${run.id}. Reports from previous attempts do not complete this run. Re-check current facts and perform the authorized work; do not merely repeat an earlier conclusion. Submit a fresh super_bot_report for this run.\nBot configuration revision: ${task.botConfigRevision}\nBot responsibility: ${botContext.instructions}${materialPrompt(botContext.materials)}${conventionPrompt}\nGoal: ${task.goal}\nAuthorized scope: ${task.scope}\nAcceptance criteria: ${task.acceptance}\nWorking directory: ${workdirSummary(b.cwd,b.workdir)}. Work only inside it; do not change other checkouts or directories.${supplement}\n${fullAccessEnabled(this.options)?'This Worker uses the native Full Access preset. Use native tools including shell to implement and test the requested work. Keep work scoped to this task. Do not modify unrelated projects or credentials. Change host configuration only when this task explicitly authorizes that change. Report actual changed source files and test results.':'Use only read/write/edit in this directory, always with absolute file_path values. Do not change working directories. Worker 完整权限未开启：当前 fullAccess: false。Shell and external CLI tools are unavailable in files mode; report this limitation, never ask for a tool channel. To enable them, set fullAccess: true in the Super Bot config of the active profile cordis.patch.yml and reload when idle.'}\n${CODE_DELIVERY}\nUse super_bot_report(progress) at meaningful checkpoints, such as written changes or a focused failing or passing test. State what was actually observed. For reloads, report a matching host receipt when available. Use waiting to ask a necessary question. For ready provide files and checks explaining every acceptance criterion. Never claim the task is accepted; the user decides.`}]});
+      const prompt=workerPromptPlan(agent,run,standing,previous);
+      const message=createWorkerRunMessage(run,input,standing,prompt,recovery);
       input=this.store.saveRunMessage(run.id,message.id,JSON.stringify(message));
     }
     const releaseMask=fullAccessEnabled(this.options)?()=>{}:agent.ctx.tools.restrict({allow:['read','write','edit','super_bot_report']});
@@ -547,9 +586,11 @@ export class DshExecution {
       return next();
     });
     let released=false;
+    let releaseContext=()=>{};
     const release=()=>{
       if(released)return;
       released=true;clearTimeout(deadline);
+      releaseContext();
       releaseStatus();releaseStopping();
       if(!this.deletedRuns.has(run.id))treeCheck.releaseEvents?.();
       for(const wait of treeCheck.waits.values())wait.finish('unknown',null);
@@ -613,8 +654,16 @@ export class DshExecution {
       if(subject===agent&&status==='idle')finishTurn();
     });
     try {
+      const message=freezeMessage(JSON.parse(input.messageJson!) as UserMessage);
+      releaseContext=registerWorkerContext(agent,run,standing,message,previous,
+        ()=>this.store.runTurn(run.id)?.turn!=null,
+        ()=>{
+          const active=this.store.getRun(run.id),current=this.store.getTask(taskId);
+          return !this.disposed&&active.finishedAt===null&&active.state!=='cancelling'&&current.taskRevision===run.taskRevision
+            &&current.controlMode!=='manual'&&this.store.activeBinding(taskId)?.id===b.id&&!this.store.isBotDeleted(task.botId);
+        });
       if(!this.store.claimDispatch(run.id)){release();this.store.runRecovery(run.id,'投递记录已经发出，但回执不完整。没有重复投递，请核对原生会话。');return this.store.getRun(run.id);}
-      agent.followup(freezeMessage(JSON.parse(input.messageJson!) as UserMessage));
+      agent.followup(message);
       this.autoTurns.add(run.id);
       this.store.inputEnqueued(run.id);
       if(!fullAccessEnabled(this.options)){deadline=setTimeout(()=>{void this.stopForBudget(run.id,'time');},10*60*1000);deadline.unref();}
@@ -925,6 +974,195 @@ export class DshExecution {
       new Promise<'unknown'>(resolve=>setImmediate(()=>resolve('unknown')))]);
     if(outcome!=='quiet')throw new AppError('child-unknown','原生子树仍在活动或无法确认，请核对后再试。');
   }
+  /** The Manager may inspect this notice's exact prior Run without replaying Worker work. */
+  private async readAutoRecovery(taskId:string,rowVersion:number,runId:string,managerId:string,authorize:()=>void) {
+    const identity={taskId,runId,rowVersion};
+    const refused=(message:string,extra:Record<string,unknown>={})=>({status:'needs-human' as const,...identity,message,...extra});
+    authorize();
+    const previous=this.store.recoveryCheck(runId);
+    if(previous) {
+      const detail=this.store.taskDetail(taskId),{task,run,binding}=detail;
+      if(previous.managerId!==managerId||task.controlMode!=='auto'||task.lifecycle!=='open'||
+        run?.id!==runId||binding?.id!==run.bindingId||binding?.sessionId!==run.sessionId||binding?.generation!==run.generation||
+        run.taskRevision!==task.taskRevision||task.rowVersion!==(previous.resolution&&!previous.effectUncertain&&
+          previous.resolution.status!=='unavailable'?previous.rowVersion+1:previous.rowVersion)||
+        ![task.rowVersion,previous.rowVersion].includes(rowVersion)) {
+        return refused('核对记录所属的任务、执行或授权版本已变更。请查看当前状态。');
+      }
+      if(previous.resolution)return {status:'already-checked' as const,...identity,result:previous.resolution};
+      return refused('已有一次只读核对登记，但缺少结果。请检查这次核对记录并决定是否安排新检查。');
+    }
+    const validate=()=>{
+      authorize();
+      if(this.disposed)throw new AppError('unavailable','插件正在退出。');
+      return this.store.autoRecoveryTarget(taskId,rowVersion,runId,managerId);
+    };
+    let target:ReturnType<Store['autoRecoveryTarget']>;
+    try{target=validate();}
+    catch(error){if(error instanceof AppError)return refused(error.message);throw error;}
+    const {run,binding,input,proof}=target;
+    const report=this.store.finalReport(runId);
+    const settledFailure=run.state==='failed'&&!!report&&proof.reportId===report.id&&['failed','blocked'].includes(report.kind);
+    if(!settledFailure&&run.state!=='interrupted') {
+      return refused('没有已结束且可归属的失败或中断执行。请核对上轮的具体外部效果，再决定如何继续。');
+    }
+    const readEvidence=async(agent?:Agent)=>{
+      const events=await this.readRunEvents(run,agent?.session);
+      const later=verifyRunTurn(run,input,proof,events,true);
+      if(later.length||events.some(event=>event.seq>proof.endSeq!&&
+        (event.type==='turn/start'||event.type==='user/message'||event.type==='tool/call'||event.type==='approval/asked'))) {
+        throw new AppError('recovery-new-input','旧轮结束后已有新的会话活动。请按最新会话状态决定下一步。');
+      }
+      const segment=events.slice(proof.startSeq!+1,proof.endSeq!);
+      if(segment.some(event=>{
+        if(event.type==='working-directory/change'||event.type==='approval/asked')return true;
+        if(event.type!=='user/message'||event.seq===proof.inputSeq)return false;
+        const source=event.data.source as {kind:string;form?:unknown};
+        return !((source?.kind==='runtime-context'||source?.kind==='time-context')&&source.form==='snapshot'||
+          source?.kind==='skill-catalog'&&source.form==='catalog');
+      })) {
+        throw new AppError('recovery-scope-changed','原轮包含额外输入、目录变化或审批，无法证明同一操作授权。');
+      }
+      return inspectPriorTools(events,binding.cwd,proof.turn!,proof.startSeq!,proof.endSeq!);
+    };
+    // Inspect the persisted evidence before resolving the Worker. Unsupported and ambiguous
+    // cases remain passive even if the Worker is currently cold.
+    let checks:PriorTools;
+    try {checks=await readEvidence();validate();}
+    catch(error){if(error instanceof AppError)return refused(error.message);throw error;}
+    const sessions=checks.clusters.map(call=>({...call,receipt:this.store.preflightReceipt(runId,call.callId)}));
+    const receipts=[...new Map(sessions.filter(call=>call.receipt).map(call=>
+      [JSON.stringify([call.receipt!.probe,call.receipt!.auth]),call])).values()];
+    const observed=receipts.flatMap(call=>call.receipt&&call.receipt.auth&&call.receipt.result.status!=='unavailable'?
+      [{probe:call.receipt.probe,result:call.receipt.result,callSeq:call.callSeq,resultSeq:call.resultSeq}]:[]);
+    const effectUncertain=!settledFailure||checks.incomplete||checks.potentialEffects.length>0||sessions.some(call=>!call.receipt);
+    const candidates:{evidence:ProbeEvidence;known?:ProbeResult}[]=effectUncertain?[]:[...checks.files];
+    if(fullAccessEnabled(this.options))for(const {receipt,callId,callSeq,resultSeq} of receipts)if(receipt?.auth) {
+      const stateInquiry=receipt.probe.kind==='deployment-state'||receipt.probe.kind==='volume-state';
+      if(effectUncertain&&stateInquiry||!effectUncertain&&(
+        ['unavailable','missing','denied'].includes(receipt.result.status)||
+        receipt.result.status==='present'&&receipt.result.observed?.ready===false)) {
+        candidates.push({evidence:{probe:receipt.probe,auth:receipt.auth,callId,callSeq,resultSeq},
+          ...(receipt.result.status==='denied'?{known:receipt.result}:{})});
+      }
+    }
+    const blockers={observed,priorTools:checks.potentialEffects,
+      ...(candidates.length>1?{competingChecks:candidates.map(({evidence,known})=>
+        ({probe:evidence.probe,...(known?{result:known}:{})}))}:{})};
+    if(candidates.length!==1) {
+      return refused(effectUncertain?
+        '当前记录不足以确认外部动作及其结果。请对照已核实的目标状态或原操作回执，决定是否仍需行动。':
+        '原轮没有单一可按同一授权核对的只读失败证据。请根据报告核对具体的前置条件或所需动作。',blockers);
+    }
+    const {evidence,known}=candidates[0]!;
+    try {
+      const resolved=await this.ctx.sessionController.resolveAgent(SessionId(binding.sessionId));
+      validate();
+      if('error' in resolved||resolved.agent.id!==binding.sessionId)throw new AppError('session-unavailable','无法确认原生 Worker 的活动状态。');
+      const agent=resolved.agent;
+      this.assertRecoveryQuiet(agent,runId);
+      this.assertDirectory(agent,binding.cwd);
+      const tree=originalService(this.nativeSubagents());
+      await this.confirmRecoveryTree(agent);
+      const fresh=await readEvidence(agent);
+      validate();
+      this.assertRecoveryQuiet(agent,runId);
+      this.assertDirectory(agent,binding.cwd);
+      if(tree!==originalService(this.nativeSubagents())||JSON.stringify(checks)!==JSON.stringify(fresh)) {
+        throw new AppError('recovery-stale','核对时发现原工具证据或后台服务发生变化。');
+      }
+      return {status:'eligible' as const,...identity,evidence,known,agent,tree,cwd:binding.cwd,effectUncertain,...blockers};
+    }catch(error){if(error instanceof AppError)return refused(error.message);throw error;}
+  }
+  async inspectAutoRecovery(taskId:string,rowVersion:number,runId:string,managerId:string,authorize:()=>void) {
+    const checked=await this.readAutoRecovery(taskId,rowVersion,runId,managerId,authorize);
+    if(checked.status!=='eligible')return checked;
+    const {evidence}=checked;
+    return {status:'eligible',taskId,runId,rowVersion,probe:evidence.probe,...(checked.known?{known:checked.known}:{}),
+      effectUncertain:checked.effectUncertain,observed:checked.observed,priorTools:checked.priorTools,
+      message:checked.effectUncertain?
+        '上轮已经结束，但原操作是否产生外部效果仍待确认。现有授权仅允许核对同一资源的状态。':
+        '已核实上轮结束，当前没有新的输入或未结算后台活动。可以核对同一只读目标。'};
+
+  }
+  async performAutoRecovery(taskId:string,rowVersion:number,runId:string,managerId:string,signal:AbortSignal,authorize:()=>void) {
+    return this.reloadAdmission.run(`Manager read-only recovery ${taskId}`,async()=>{
+      const checked=await this.readAutoRecovery(taskId,rowVersion,runId,managerId,authorize);
+      if(checked.status!=='eligible')return checked;
+      const {evidence,known,agent,tree,cwd,effectUncertain}=checked;
+      const validate=()=>{
+        authorize();
+        this.store.autoRecoveryTarget(taskId,rowVersion,runId,managerId);
+        this.assertRecoveryQuiet(agent,runId);
+        this.assertDirectory(agent,cwd);
+        if(tree!==originalService(this.nativeSubagents()))throw new AppError('recovery-stale','后台服务已变更。');
+      };
+      validate();
+      if(!this.store.claimRecoveryCheck(taskId,runId,managerId,rowVersion,evidence,effectUncertain)) {
+        return {status:'already-checked',taskId,runId,result:this.store.recoveryCheck(runId)?.resolution??null};
+      }
+      let result:ProbeResult,excerpt:string|undefined;
+      let performed=false;
+      if(known)result=known;
+      else if(evidence.probe.kind==='file') {
+        const checked=await this.retryNativeRead(evidence.probe,cwd,agent,signal,validate);
+        ({result,excerpt}=checked);performed=true;
+      } else {
+        try {
+          if(!evidence.auth)throw new AppError('kube-identity-unproven','没有先前共享身份的回执。');
+          const prepared=await prepareClusterProbe(evidence.probe,
+            AbortSignal.any([signal,AbortSignal.timeout(17000)]),evidence.auth,validate);
+          validate();
+          result=await prepared.check();performed=true;
+        }catch(error){
+          result={status:'unavailable',message:error instanceof AppError?error.message:'Kubernetes 未返回可验证的预检结果。'};
+        }
+      }
+      validate();
+      this.store.finishRecoveryCheck(taskId,runId,managerId,result,performed);
+      return {...result,taskId,runId,effectUncertain,task:this.store.getTask(taskId),...(excerpt!==undefined?{excerpt}:{})};
+    });
+  }
+  private async retryNativeRead(probe:ReadProbe,cwd:string,agent:Agent,signal:AbortSignal,validate:()=>void):Promise<{result:ProbeResult;excerpt?:string}> {
+    const callId=ToolCallId(`super-bot-recovery-${randomUUID()}`);
+    const controller=new AbortController();
+    const releaseApproval=this.ctx.on('session/event',(session,event)=>{
+      if(session===agent.session&&event.type==='approval/asked')controller.abort();
+    });
+    const releaseGuard=agent.ctx.on('tools/execute',(exec,next)=>{
+      if(exec.callId===callId) {
+        validate();
+        if(containedPath(cwd,probe.path)!==probe.path)throw new AppError('path-changed','原读取目标路径已变更。');
+      }
+      return next();
+    });
+    try {
+      const response=await this.ctx.tools.execute({
+        agent,signal:AbortSignal.any([signal,controller.signal,AbortSignal.timeout(5000)]),
+        calls:[{type:'tool-call',id:callId,name:'read',arguments:JSON.stringify({
+          file_path:probe.path,...(probe.offset!==undefined?{offset:probe.offset}:{}),...(probe.limit!==undefined?{limit:probe.limit}:{}),
+        })}],
+      });
+      const value=response.results.find(item=>item.callId===callId)?.result;
+      if(value?.isError===false) {
+        const verified=value.value as {path?:unknown;offset?:unknown;lines?:unknown}|null;
+        if(!verified||verified.path!==probe.path||verified.offset!==(probe.offset??1)||!Array.isArray(verified.lines)) {
+          return {result:{status:'unavailable',message:'原生读取结果的路径或读取范围不匹配。'}};
+        }
+        const excerpt=value.content.filter(item=>item.type==='text').map(item=>item.text).join('\n').slice(0,8000);
+        return {result:{status:'readable',message:'原生 Worker 身份已读取同一路径和范围。'},excerpt};
+      }
+      const code=value?.error.info?.code;
+      if(code==='FS_NOT_FOUND')return {result:{status:'missing',message:'原路径仍无该文件，需要提供或生成该文件。'}};
+      if(code==='FS_PERMISSION_DENIED') {
+        return {result:{status:'denied',message:'原生 Worker 缺少此文件的读取权限。'}};
+      }
+      if(controller.signal.aborted) {
+        return {result:{status:'unavailable',message:'原生审批策略要求审批此文件读取，自动核对已停止。'}};
+      }
+      return {result:{status:'unavailable',message:'原生 Worker 未返回可验证的读取结果。'}};
+    }finally{releaseGuard();releaseApproval();}
+  }
   async recover(requestId:string,taskId:string,rowVersion:number,acknowledged:unknown,continuation?:RecoveryContinuation,authorize=()=>{}) {
     if(acknowledged!==true)throw new AppError('confirmation-required','请先检查原生会话、文件和外部效果，再确认核对完成。');
     const action=continuation?'run.continue-recovery':'run.resolve-recovery';
@@ -968,7 +1206,7 @@ export class DshExecution {
         configureRole(this.ctx,agent,'worker',this.options);
         if(!selectedModel(this.ctx,agent))throw modelRequired();
         this.assertRecoveryQuiet(agent,target.run?.id);
-        return this.deliverRun(run,agent,binding);
+        return this.deliverRun(run,agent,binding,{note:target.run?.note??null});
       }catch{
         // The new Run is already reserved. Preserve its receipt and quarantine any unknown delivery.
         this.store.runRecovery(run.id,'新执行未能确认开始。请检查原生会话；没有自动重投。');

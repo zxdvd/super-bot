@@ -410,7 +410,8 @@ test('continue schedules and delivers one new Run despite duplicate and competin
   assert.equal(f.sent.length, 1);
   assert.notEqual(f.sent[0]!.id, 'old-message');
   assert.deepEqual(f.sent[0]!.source, { kind: 'super-bot', taskId: f.task.id, runId: newRun.id,
-    inputId: newRun.inputId, taskRevision: f.task.taskRevision, generation: f.binding.generation });
+    inputId: newRun.inputId, taskRevision: f.task.taskRevision, generation: f.binding.generation,
+    bindingId: f.binding.id, promptMode: 'full' });
   assert.deepEqual(await f.call(CONTINUE, request), first);
   assert.equal((await f.call(CONTINUE, { ...request, expectedBindingGeneration: 42 })).error.code, 'idempotency-conflict');
   const after = await f.detail();

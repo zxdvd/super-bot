@@ -10,6 +10,8 @@
 | Bot 配置与参考资料 | 已验证 API 与 UI | 配置版本、最多 4 个本地 UTF-8 文本快照；旧任务保持原配置，变更撤销旧 Manager。`smoke-bot-config.mjs` 含并发重复请求、源文件变化和启用前任务积压 |
 | 部分会话历史授权 | 不提供 | 原生模型仍能读取既有上下文；仅支持明确授权整段历史，或另建全新会话 |
 | 输入送达与消费 | 已验证；存在宿主限制 | accepted/enqueued/entered 分开。已 claim 后取消可能丢失 Inbox 项且无 user/message，转人工核对，不推断已消费。`probe:run` |
+| Worker 续跑输入 | 按原生会话当前可见内容派发 | 同一任务版本和 Worker 保留完整说明时，回答、返工只发送本轮要求。缺失的说明及先前已入场的补充从账本恢复。用 `SUPER_BOT_TEST_WORKER_CONTEXT=1 node scripts/smoke-mirror.mjs` 核对模型实际收到的消息。 |
+| Agent 自行核对失败预检 | 在原任务执行一次有证据的只读核对 | 核对原轮、输入、审批和后台活动后，Bot 可按原权限核实文件、Kubernetes 权限或具名资源。核对结论保留在详情与审计中，原失败记录保留。用 `SUPER_BOT_TEST_VERIFIED_RECOVERY=1 node scripts/smoke-mirror.mjs` 复验。 |
 | files 模式工具范围 | 已验证 | read/write/edit 与报告；绝对路径、实际目录、符号链接检查；额外 scoped 工具再由执行 guard 拒绝。`smoke-directory.mjs`、`smoke-scoped-tools.mjs` |
 | Worker Full Access 的 Shell、子 Agent | 默认开放，显式 false 才使用 files | 普通 DSH Session 的原生工具已实际执行 Bash 和子 Agent；由现有宿主配置能力，不额外裁剪工具。不能因此推断任意外部进程可停止 |
 | ready 与最终验收 | 已验证 | ready 只是候选；执行收敛和文件完整哈希均需核对。默认人工；显式 Bot 授权保持独立审计。`smoke:execution`、`smoke:workflow`、`smoke:manager` |
@@ -30,6 +32,8 @@
 | 运行中热卸载/热替换 | 空闲插件原生 HMR 已实测 | 独立宿主验证 link 源码监听及 tgz→link 配置重组：同 PID、同版本换成新模块。真实 Super Bot 后端重挂载、前端 rebuilt SSE 通过。`dev:reload` 用于日常空闲重载，`dev` 用于隔离自动监听；活动执行期间不热替换 |
 | 同机 Web 与 macOS Desktop | 真实原生 Host 已验证，日常界面待验收 | Web rc.1、rc.5 与实际 Desktop rc.5 Host。各自原账本、原生聊天和验收可用，对端只读查阅。Desktop 动态端口、两端热载与断线重连通过。[启用说明](../README.md#同机-web-与-desktop-只读镜像) |
 | 真实模型质量、Token/费用 | 已有真实模型试用记录 | 日常 Web 已用真实模型委派 Full Access Worker 执行 Shell、子 Agent、测试，且验证了补充需求、原对话交付和同任务返工。真正有歧义时的澄清、个人首版验收及精确费用归因待用户试用 |
+
+Kubernetes 自动核对使用宿主已有的 `kubectl`，需要 HTTPS context、可固定的令牌或客户证书，以及 API 返回的身份。依赖交互式登录或外部认证插件的 context 会说明身份待核实。写入回执不明时，Bot 只能复查先前已记录的同一资源，详情分别保留资源现状和原操作仍待核对的事实。
 
 Bot Full Access 的工具执行核对当前 Manager、轮次、已入场的输入与宿主步骤的执行证据。正常 DSH 宿主信任输入包含原生聊天 owner 与来源字段等同的可信本机 `sessionController.prompt` 输入。已绑定的飞书 owner 输入还须经入站收据核验。工具可能在执行授权前出现在模型的声明中，实际执行须通过 Super Bot 守卫和 DSH 原有策略及审批。PTC 虚拟运行器与嵌套调用继续受限。
 

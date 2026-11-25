@@ -139,6 +139,8 @@ Node 用 fnm 管理时，可用 `fnm exec --using=24.21.0 npm run dev`，无需�
 
 ## 使用完整原生 Worker
 
+首次派发时，Worker 会收到任务目标、范围、验收条件和创建任务时保存的 Bot 约定。同一 Worker 收到回答或返工要求时，只要原生会话仍保留对应说明，就只发送本轮要求。换会话、修改目标版本或上下文压缩导致说明缺失时，宿主会从账本补齐。Manager 无需逐轮重写任务说明。
+
 角色模型和项目目录可在所用 profile 的 `cordis.patch.yml` 中配置。管理会话已有模型记录时沿用原生选择；仅在没有模型记录时用 `managerModel` 填入默认值。Bot 派发时，Worker 优先使用 `workerModel`，其次使用 Worker 会话已记录的原生选择，再继承当前 Bot 对话已记录的选择。手动开始和核对后继续使用 Worker 角色覆盖或 Worker 原生选择。以下 provider、model 和推理档位均为占位示例，请换成当前 profile 已配置并受提供方支持的值。
 
 ```yaml
@@ -385,4 +387,6 @@ dsh plugin --profile super-bot-trial add /absolute/path/zxdvd-super-bot-0.1.3.tg
 
 默认使用 files 模式，以证明旧工具约束确实在人工续轮前解除；`SUPER_BOT_TEST_FULL_ACCESS=true npm run smoke:reliability` 验证默认 Full Access 路径。脚本不继承模型凭证或生产 dataDir，日志中的本机启动 token 不要分享。结果只证明宿主/账本契约，不替代真实模型质量、浏览器 ↑ 按钮和 Desktop 验收。详见 [可靠性验证](docs/reliability-verification.md)。
 
-重启只读核对持久会话日志：仅在自动输入身份、所属 turn/start/end、边界最终报告及原进程后台安静证据全部匹配时幂等补结算；补结算后暂停任务，不唤醒 Manager、不自动验收或重投模型/工具。只有 ready、缺少权威 turn/end、后台效果未知或旧版本无证据时保留占用并解释 recovery。恢复 Agent 时仅移除可精确归属旧 Run 的待处理自动输入，保留人工输入；不为恢复主动打开会话。
+重启时，宿主按持久会话日志核对自动输入、所属轮次的起止事件、最终报告及原进程后台活动的收敛记录。证据完整才补结算。成果与等待报告补结算后保持暂停。自动管理的任务如果留下已结束的失败报告，Bot 可以接到通知，在原任务核对失败原因。
+
+只读预检失败时，Bot 会先确认上一轮确已结束，并检查原 Worker 是否还有输入、审批、作业或子 Agent 待处理。条件满足时，Bot 可按原身份再次读取任务目录中的同一文件范围，或在 Full Access 下核对原 Kubernetes 身份在指定命名空间的权限、具名 Deployment 或 PVC 的状态。已确认缺权限时直接报告缺少的操作和资源。前一次可能产生写入时，有对应的只读查询就先查资源现状；如果仍无法确认写入结果，Bot 会在原任务说明需要人核实什么。任务详情保留原失败记录及核对结论。

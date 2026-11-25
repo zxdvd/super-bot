@@ -18,6 +18,13 @@ function resultRecord({ id, runId, taskRevision, summary, checks, createdAt, hum
 
 function auditRecord({ id, kind, createdAt, data }: MirrorEvent): MirrorEvent {
   const event = { id, kind, createdAt, data: '{}' };
+  if (['run.recovery-check-started', 'run.recovery-observed', 'run.recovery-confirmed'].includes(kind)) {
+    const { actor, result } = JSON.parse(data) as { actor?: unknown; result?: { status?: unknown; observed?: { ready?: unknown } } };
+    const status = result?.observed?.ready === false ? 'not-ready' : result?.status;
+    const outcome = typeof status === 'string' && ['readable', 'allowed', 'denied', 'present', 'missing', 'unavailable', 'not-ready'].includes(status)
+      ? status : undefined;
+    return { ...event, data: JSON.stringify({ actor: actor === 'manager' || actor === 'user' ? actor : undefined, outcome }) };
+  }
   if (kind !== 'work.report' && kind !== 'manager.delivered' && kind !== 'approval.decided') return event;
   const fields = JSON.parse(data) as Record<string, unknown>;
   if (kind === 'work.report' && typeof fields.kind === 'string' && typeof fields.summary === 'string') {

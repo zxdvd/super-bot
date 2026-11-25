@@ -6,7 +6,8 @@ import { createHash, randomUUID } from 'node:crypto';
 import schemaVersion from '../schema-version.json' with {type:'json'};
 import { AppError, requiredText, optionalText, taskStatus, type ChatSource, type Bot, type Task, type NewBot, type NewTask, type TaskPage, type ControlMode, type Attention, type Binding, type Run, type RunInput, type WorkReport, type Result,type ManagerBinding,type ManagerEvent,type ExistingSessionGrant,type ReferenceMaterial,type TaskBotContext,type DispatchWait,type WorkdirInfo,type RunTurn,botDraft } from './model.ts';
 import { RESULT_FRESH_MS, type ChatDeliveryStatus, type DeliveredResult, type DeliveryLinks, type RecoveryContinuation, type ReloadReceipt, type RunChildWait,
-  type TaskProgress, type UncertainDelivery, type WorkerModelPlan } from './model.ts';
+  type TaskProgress, type UncertainDelivery, type WorkerModelPlan, type WorkerPriorInput } from './model.ts';
+import type { ClusterProbe, ProbeEvidence, ProbeResult, RecoveryCheck } from './read-only-recovery.ts';
 import { readDeliveryLinks } from './delivery-artifacts.ts';
 import {parseWorkdirRequest} from './workdir.ts';
 import type { CapturedEvidence } from './evidence.ts';
@@ -423,10 +424,14 @@ export class Store {
   managerEventEntered(id:string,messageId:string,durable=false):void {
     this.db.prepare("UPDATE outbox SET state='entered' WHERE id=? AND (state='sending' OR (?=1 AND state='unknown')) AND json_extract(payload,'$.messageId')=?").run(id,Number(durable),messageId);
   }
-  managerEventTargets(id:string,messageId:string,botId:string,taskId:string):boolean {
-    return !!this.db.prepare(`SELECT 1 FROM outbox WHERE id=? AND kind='manager.notify' AND state='entered' AND taskId=?
+  managerEvent(id:string):ManagerEvent|undefined {
+    return this.db.prepare("SELECT id,taskId,payload,state,createdAt FROM outbox WHERE id=? AND kind='manager.notify'").get(id) as unknown as ManagerEvent|undefined;
+  }
+  managerEventTargets(id:string,messageId:string,botId:string,taskId:string,scopeOnly=false):boolean {
+    return !!this.db.prepare(`SELECT 1 FROM outbox WHERE id=? AND kind='manager.notify' AND taskId=?
+      AND (state='entered' OR (?=1 AND state IN ('sending','unknown','done','handled')))
       AND coalesce(json_extract(payload,'$.deliveryOnly'),0)=0
-      AND json_extract(payload,'$.messageId')=? AND json_extract(payload,'$.botId')=?`).get(id,taskId,messageId,botId);
+      AND json_extract(payload,'$.messageId')=? AND json_extract(payload,'$.botId')=?`).get(id,taskId,Number(scopeOnly),messageId,botId);
   }
   managerEventUnknown(id:string):void {
     // Idle/entry alone is not permission to repeat a notification.
@@ -684,6 +689,10 @@ export class Store {
       else if(run?.state==='running')status='running';
       else if(run?.state==='queued')status='queued';
       else if(has('input'))status='needs-input';
+      else if(status==='unscheduled'&&run&&run.taskRevision===task.taskRevision) {
+        const result=this.recoveryCheck(run.id)?.resolution;
+        if(result&&(['denied','missing'].includes(result.status)||result.observed?.ready===false))status='blocked';
+      }
     }
     const managerReviewed=!!(run&&this.db.prepare("SELECT 1 FROM reviews JOIN results ON results.id=reviews.resultId WHERE results.runId=? AND reviews.actor LIKE 'manager:%' LIMIT 1").get(run.id));
     return {...task,status,managerReviewed,blockingAttention};
@@ -714,7 +723,8 @@ export class Store {
     const receipt=this.deliveryReceipt(task,exact?.id);
     if(!receipt)return null;
     const result=exact??this.resultById(receipt.resultId);
-    return result&&{...result,deliveredAt:receipt.deliveredAt,deliveryText:receipt.deliveryText,links:JSON.parse(receipt.linksJson)};
+    return result&&{...result,deliveredAt:receipt.deliveredAt,
+      ...(receipt.deliveryText!==undefined?{deliveryText:receipt.deliveryText}:{}),links:JSON.parse(receipt.linksJson)};
   }
   chatDeliveryStatus(task:Task,result:Result|null,historical=false):ChatDeliveryStatus|null {
     if(!result||result.taskId!==task.id||(!historical&&!['review','completed'].includes(task.lifecycle)))return null;
@@ -747,7 +757,7 @@ export class Store {
     const wait=canWait&&(resourceNotice||this.db.prepare('SELECT 1 FROM waits WHERE taskId=?').get(id))?this.dispatchWait(id):null;
     const attentions=this.db.prepare('SELECT * FROM attentions WHERE taskId=? ORDER BY createdAt,id').all(id) as unknown as Attention[];
     const currentRun=run?.taskRevision===task.taskRevision&&run.bindingId===binding?.id?run:null;
-    return { task,wait,autoDispatchPending,runHeld:!!(run&&this.db.prepare('SELECT 1 FROM resources WHERE runId=?').get(run.id)),runTurn:run?this.runTurn(run.id):null,binding,bindingHistory:this.db.prepare("SELECT * FROM bindings WHERE taskId=? AND state='released' ORDER BY generation DESC").all(id).map(row=>this.toBinding(row)),run,input:this.pendingInput(id)??(run?this.getRunInput(run.id):null),result,
+    return { task,wait,autoDispatchPending,runHeld:!!(run&&this.db.prepare('SELECT 1 FROM resources WHERE runId=?').get(run.id)),runTurn:run?this.runTurn(run.id):null,recoveryCheck:run?this.recoveryCheck(run.id):null,binding,bindingHistory:this.db.prepare("SELECT * FROM bindings WHERE taskId=? AND state='released' ORDER BY generation DESC").all(id).map(row=>this.toBinding(row)),run,input:this.pendingInput(id)??(run?this.getRunInput(run.id):null),result,
       deliveredResult,chatDelivery:this.chatDeliveryStatus(task,result),progress:this.taskProgress(task,currentRun,result),
       attentions,pendingQuestions:this.pendingWorkerQuestions(task,binding,attentions),
       events: this.db.prepare("SELECT id,kind,data,createdAt FROM events WHERE taskId=? AND kind NOT GLOB 'child-wait.*' ORDER BY id DESC LIMIT 50").all(id) as unknown as { id: number; kind: string; data: string; createdAt: number }[],
@@ -993,6 +1003,14 @@ export class Store {
   getRunInput(id:string):RunInput {
     const run=this.getRun(id);return {...this.db.prepare('SELECT * FROM inputs WHERE id=?').get(run.inputId)} as unknown as RunInput;
   }
+  /** Past entered inputs can inform a new run without changing their delivery state. */
+  previousWorkerInputs(run:Run):WorkerPriorInput[] {
+    return this.db.prepare(`SELECT i.id,i.kind,i.content,i.messageId FROM runs r JOIN inputs i ON i.id=r.inputId
+      WHERE r.taskId=? AND r.taskRevision=? AND r.rowid<(SELECT rowid FROM runs WHERE id=?)
+      AND i.id<>? AND i.kind IN ('answer','rework') AND i.state='entered'
+      GROUP BY i.id ORDER BY MAX(r.rowid)`).all(run.taskId,run.taskRevision,run.id,run.inputId)
+      .map((row,index)=>({...row,order:index+1})) as unknown as WorkerPriorInput[];
+  }
   pendingInput(taskId:string):RunInput|null {
     const input=this.db.prepare("SELECT * FROM inputs WHERE taskId=? AND kind IN ('answer','rework') AND state='accepted' ORDER BY createdAt,id LIMIT 1").get(taskId) as unknown as RunInput|undefined;
     return input?{...input}:null;
@@ -1167,7 +1185,7 @@ export class Store {
       }
       this.db.prepare("UPDATE attentions SET state='stale' WHERE taskId=? AND kind='approval' AND state='open'").run(run.taskId);
       this.db.prepare('INSERT OR IGNORE INTO attentions(id,taskId,kind,question,taskRevision,createdAt) VALUES (?,?,?,?,?,?)').run(`run:${id}`,run.taskId,'recovery',note,run.taskRevision,Date.now());
-      if(notify)this.enqueueManager(this.getTask(run.taskId).botId,`recovery:${id}`,`执行待核对：${note}\n请打开任务详情及原生会话 ${run.sessionId} 核对输入、文件和后台活动；未知执行仍保留占用，不会自动重投或重跑。`,run.taskId,10);
+      if(notify)this.enqueueManager(this.getTask(run.taskId).botId,`recovery:${id}`,`执行待核对：${note} 不会自动重投旧任务。`,run.taskId,10);
       this.event('run.recovery',run.taskId,{runId:id,note});return {};
     });
   }
@@ -1252,8 +1270,15 @@ export class Store {
       const kind=last.kind==='ready'?'review':last.kind==='waiting'?'input':'recovery';
       this.db.prepare('INSERT OR IGNORE INTO attentions(id,taskId,kind,question,taskRevision,createdAt) VALUES (?,?,?,?,?,?)').run(`run:${id}`,run.taskId,kind,last.kind==='ready'?'成果与执行已核对，请检查证据并验收。':report.summary,run.taskRevision,Date.now());
       this.db.prepare('UPDATE tasks SET lifecycle=?,rowVersion=rowVersion+1,updatedAt=? WHERE id=?').run(last.kind==='ready'?'review':'open',Date.now(),run.taskId);
-      if(!notify){this.db.prepare("UPDATE tasks SET controlMode='paused' WHERE id=?").run(run.taskId);this.event('run.reconciled',run.taskId,{runId:id});}
+      if(!notify){
+        if(!failed)this.db.prepare("UPDATE tasks SET controlMode='paused' WHERE id=?").run(run.taskId);
+        this.event('run.reconciled',run.taskId,{runId:id});
+      }
       if(notify)this.enqueueManager(task.botId,`settled:${id}`,`执行已结束，报告类型 ${last.kind}。请读当前账本和成果，不要重放旧输入。`,task.id);
+      else if(failed&&this.runTurn(id)?.quiet===1) {
+        // The restarted process can verify this attempt, but still must reconcile newer input.
+        this.enqueueManager(task.botId,`settled:${id}`,`执行已结束，报告类型 ${last.kind}。请读当前账本核对阻塞。`,task.id);
+      }
       this.event('run.settled',run.taskId,{runId:id,kind:last.kind});return {};
     });
   }
@@ -1403,6 +1428,74 @@ export class Store {
     }
     return {task,binding,run,attentions};
   }
+  autoRecoveryTarget(taskId:string,rowVersion:number,runId:string,managerId:string) {
+    const target=this.recoveryTarget(taskId,rowVersion),{task,run,attentions}=target;
+    const manager=this.activeManager(task.botId);
+    if(!manager||manager.id!==managerId||manager.state!=='ready'||
+      manager.configRevision!==this.getBot(task.botId).configRevision) {
+      throw new AppError('manager-scope','原管理会话的授权已改变。');
+    }
+    if(task.controlMode!=='auto'||task.lifecycle!=='open') {
+      throw new AppError('recovery-human-control','任务已暂停、接管或结束。');
+    }
+    if(run?.id!==runId||!target.binding?.sessionId||attentions.length!==1||attentions[0]!==`run:${runId}`) {
+      throw new AppError('recovery-stale','上一轮执行、恢复事项或工作会话已被替换。');
+    }
+    if(this.db.prepare("SELECT 1 FROM attentions WHERE taskId=? AND id!=? AND state IN ('open','responding','stale') AND kind IN ('input','approval') AND taskRevision=? AND (state!='stale' OR kind='approval')").get(taskId,attentions[0],task.taskRevision)||
+      this.pendingInput(taskId)) {
+      throw new AppError('recovery-pending','还有未处理的输入或没有回执的原生审批。');
+    }
+    const input=this.getRunInput(runId),proof=this.runTurn(runId);
+    if(input.state!=='entered'||!proof?.quiet||proof.endSeq===null) {
+      throw new AppError('recovery-unproven','没有可归属的持久轮次结束和后台收敛证据。');
+    }
+    return {...target,run,binding:{...target.binding,sessionId:target.binding.sessionId},input,proof};
+  }
+  preflightReceipt(runId:string,callId:string):{probe:ClusterProbe;auth:string|null;result:ProbeResult}|null {
+    const value=this.get(`worker-preflight:${runId}:${callId}`);
+    return value?JSON.parse(value):null;
+  }
+  recordPreflightReceipt(runId:string,callId:string,probe:ClusterProbe,auth:string|null,result:ProbeResult):void {
+    const payload={runId,callId,probe,auth,result};
+    this.command(`worker-preflight:${runId}:${callId}`,'worker.preflight',payload,()=>{
+      this.set(`worker-preflight:${runId}:${callId}`,JSON.stringify({probe,auth,result}));
+      return {};
+    });
+  }
+  recoveryCheck(runId:string):RecoveryCheck|null {
+    const value=this.get(`run-recovery-check:${runId}`);
+    return value?JSON.parse(value):null;
+  }
+  claimRecoveryCheck(taskId:string,runId:string,managerId:string,rowVersion:number,evidence:ProbeEvidence,effectUncertain=false):boolean {
+    if(this.recoveryCheck(runId))return false;
+    return this.command(`auto-recovery:${runId}`,'run.recovery-check',{taskId,runId,managerId,rowVersion,evidence,effectUncertain},()=>{
+      const {proof}=this.autoRecoveryTarget(taskId,rowVersion,runId,managerId);
+      if(proof.startSeq===null||!(proof.startSeq<evidence.callSeq&&evidence.callSeq<evidence.resultSeq&&evidence.resultSeq<proof.endSeq!)) {
+        throw new AppError('recovery-unproven','读取工具与原轮次结束的证据不匹配。');
+      }
+      const receipt:RecoveryCheck={managerId,rowVersion,evidence,...(effectUncertain?{effectUncertain:true}:{})};
+      this.set(`run-recovery-check:${runId}`,JSON.stringify(receipt));
+      this.event('run.recovery-check-started',taskId,{runId,actor:'manager',managerId,turn:proof.turn,
+        callSeq:evidence.callSeq,resultSeq:evidence.resultSeq,endSeq:proof.endSeq,probe:evidence.probe,effectUncertain});
+      return true;
+    });
+  }
+  finishRecoveryCheck(taskId:string,runId:string,managerId:string,result:ProbeResult,performed:boolean):void {
+    const receipt=this.recoveryCheck(runId);
+    if(!receipt||receipt.managerId!==managerId||receipt.resolution)throw new AppError('recovery-stale','恢复核对凭据已失效。');
+    this.command(`auto-recovery-result:${runId}`,'run.recovery-check-result',{taskId,runId,managerId,result,performed},()=>{
+      const target=this.autoRecoveryTarget(taskId,receipt.rowVersion,runId,managerId);
+      this.set(`run-recovery-check:${runId}`,JSON.stringify({...receipt,resolution:result}));
+      if(receipt.effectUncertain||result.status==='unavailable') {
+        this.event('run.recovery-observed',taskId,{runId,actor:'manager',managerId,result,performed,
+          effectUncertain:receipt.effectUncertain??false});
+      } else {
+        this.closeRecovery(target,'auto',{managerId,result,performed});
+        this.db.prepare('DELETE FROM waits WHERE taskId=?').run(taskId);
+      }
+      return {};
+    });
+  }
   resolveRunRecovery(requestId:string,taskId:string,expectedRowVersion:number):Task {
     return this.command(requestId,'run.resolve-recovery',{taskId,expectedRowVersion},()=>{
       const target=this.recoveryTarget(taskId,expectedRowVersion);
@@ -1417,7 +1510,7 @@ export class Store {
       return this.allocateRun(this.getTask(taskId),target.binding,true,expectedModel);
     });
   }
-  private closeRecovery({task,run,attentions}:ReturnType<Store['recoveryTarget']>,mode:'paused'|'auto'):void {
+  private closeRecovery({task,run,attentions}:ReturnType<Store['recoveryTarget']>,mode:'paused'|'auto',checked?:{managerId:string;result:ProbeResult;performed:boolean}):void {
     if(run) {
       this.db.prepare('DELETE FROM resources WHERE runId=?').run(run.id);
       this.db.prepare("UPDATE inputs SET state='discarded' WHERE id=? AND state IN ('accepted','unknown','enqueued')").run(run.inputId);
@@ -1431,7 +1524,8 @@ export class Store {
     for(const id of attentions)this.db.prepare("UPDATE attentions SET state='resolved' WHERE id=?").run(id);
     this.db.prepare("UPDATE attentions SET state='stale' WHERE taskId=? AND kind='approval' AND state='open'").run(task.id);
     this.db.prepare('UPDATE tasks SET controlMode=?,rowVersion=rowVersion+1,updatedAt=? WHERE id=?').run(mode,Date.now(),task.id);
-    this.event('run.recovery-confirmed',task.id,{runId:run?.id??null,actor:'user'});
+    this.event('run.recovery-confirmed',task.id,{runId:run?.id??null,
+      ...(checked?{actor:'manager',...checked}:{actor:'user'})});
   }
   managerReview(requestId:string,botId:string,taskId:string,expectedRowVersion:number,resultId:string,verdict:'accept'|'rework'|'human',text:string,requested?:{verdict:'accept';note:string},chatReview?:{reviewSessionId:string;reviewCallId:string}):Task {
     const note=requiredText(text,'验收判断');

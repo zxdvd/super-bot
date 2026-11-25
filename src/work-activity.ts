@@ -17,6 +17,9 @@ function activities(scoped: boolean) {
       AND a.state='open' AND a.kind IN ('input','approval','recovery')) THEN 'attention'
     WHEN EXISTS (SELECT 1 FROM runs r WHERE r.taskId=t.id AND r.finishedAt IS NULL
       AND r.state IN ('queued','running','cancelling')) THEN 'working'
+    WHEN t.lifecycle='open' AND t.controlMode='auto' AND (
+      json_extract(recovery.value,'$.resolution.status') IN ('denied','missing')
+      OR json_extract(recovery.value,'$.resolution.observed.ready')=0) THEN 'attention'
     WHEN t.lifecycle='review' AND delivery.state IN ('pending','sending','entered') AND m.sessionId IS NOT NULL THEN 'working'
     WHEN t.lifecycle='review' AND delivery.id IS NOT NULL THEN 'attention'
     WHEN t.id IN (SELECT taskId FROM outbox WHERE kind='manager.notify' AND (state='blocked' OR
@@ -26,8 +29,9 @@ function activities(scoped: boolean) {
     WHEN t.lifecycle='review' THEN 'attention'
     END AS activity
     FROM tasks t JOIN managers_now m ON t.botId=m.id
-    LEFT JOIN results res ON t.lifecycle IN ('review','completed') AND res.taskRevision=t.taskRevision AND res.runId=(
-      SELECT id FROM runs WHERE taskId=t.id ORDER BY createdAt DESC,rowid DESC LIMIT 1)
+    LEFT JOIN runs latest ON latest.id=(SELECT id FROM runs WHERE taskId=t.id ORDER BY createdAt DESC,rowid DESC LIMIT 1)
+    LEFT JOIN metadata recovery ON latest.taskRevision=t.taskRevision AND recovery.key='run-recovery-check:' || latest.id
+    LEFT JOIN results res ON t.lifecycle IN ('review','completed') AND res.taskRevision=t.taskRevision AND res.runId=latest.id
     LEFT JOIN outbox delivery ON delivery.id='manager-event:delivery:' || res.id
     WHERE (t.lifecycle IN ('open','review') OR (t.lifecycle='completed' AND t.id IN
       (SELECT taskId FROM outbox WHERE kind='manager.notify' AND state IN ('pending','sending','entered','blocked','unknown')
