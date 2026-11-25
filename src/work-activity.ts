@@ -25,12 +25,13 @@ function activities(scoped: boolean) {
       OR json_extract(recovery.value,'$.resolution.observed.ready')=0
       OR json_extract(recovery.value,'$.effectUncertain')=1) THEN 'attention'
     WHEN t.lifecycle='review' AND delivery.state IN ('pending','sending','entered') AND m.sessionId IS NOT NULL THEN 'working'
-    WHEN t.lifecycle='review' AND delivery.id IS NOT NULL THEN 'attention'
+    WHEN t.lifecycle='review' AND delivery.state IN ('pending','sending','entered','blocked','unknown') THEN 'attention'
+    WHEN t.lifecycle='review' AND delivery.state IN ('done','handled') THEN 'review'
     WHEN t.id IN (SELECT taskId FROM outbox WHERE kind='manager.notify' AND (state='blocked' OR
       (state='unknown' AND coalesce(json_extract(payload,'$.reconcileAttempts'),0)>=3))) THEN 'attention'
     WHEN t.controlMode='auto' AND m.sessionId IS NOT NULL AND t.id IN
       (SELECT taskId FROM outbox WHERE kind='manager.notify' AND state IN ('pending','sending','entered')) THEN 'working'
-    WHEN t.lifecycle='review' THEN 'attention'
+    WHEN t.lifecycle='review' THEN 'review'
     END AS activity
     FROM tasks t JOIN managers_now m ON t.botId=m.id
     LEFT JOIN runs latest ON latest.id=(SELECT id FROM runs WHERE taskId=t.id ORDER BY createdAt DESC,rowid DESC LIMIT 1)
@@ -46,12 +47,19 @@ export function botWorkSummaries(db: DatabaseSync): BotWorkSummary[] {
   return db.prepare(`WITH managers_now AS (${managers}), activity AS (${activities(false)})
     SELECT m.id,m.name,m.sessionId,
       count(a.id) FILTER (WHERE a.activity='working' AND instr(a.goal,?)!=1) AS working,
-      count(a.id) FILTER (WHERE a.activity='attention') AS attention
+      count(a.id) FILTER (WHERE a.activity='attention') AS attention,
+      count(a.id) FILTER (WHERE a.activity='review' AND instr(a.goal,?)!=1) AS review
     FROM managers_now m LEFT JOIN activity a ON a.botId=m.id GROUP BY m.id ORDER BY m.createdAt,m.id`)
-    .all(TEST_TASK_PREFIX) as unknown as BotWorkSummary[];
+    .all(TEST_TASK_PREFIX, TEST_TASK_PREFIX) as unknown as BotWorkSummary[];
 }
 
 export function inboxActivity(db: DatabaseSync, botId: string) {
   const rows = db.prepare(`WITH managers_now AS (${managers}) ${activities(true)}`).all(botId);
-  return new Map(rows.map(row => [String(row.id), row.activity as WorkActivity | null]));
+  const byTask = new Map<string, WorkActivity | null>();
+  let reviewTotal = 0;
+  for (const row of rows) {
+    byTask.set(String(row.id), row.activity as WorkActivity | null);
+    if (row.activity === 'review' && !String(row.goal).startsWith(TEST_TASK_PREFIX)) reviewTotal++;
+  }
+  return { byTask, reviewTotal };
 }

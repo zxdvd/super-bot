@@ -131,7 +131,7 @@ export function stage(task: Task): Stage {
 /** The short status a row shows: the stage, refined by the concrete reason where that helps. */
 export function stageText(task: Task, readOnly = false): string {
   const s = stage(task);
-  if (task.activity === 'attention' && !['review', 'needs-you'].includes(s)) return '通知待核对';
+  if (task.activity === 'attention' && s !== 'needs-you') return '通知待核对';
   if (task.activity === 'working' && s === 'done') return 'Bot 正在交付';
   if (task.activity === 'working' && s === 'review') return task.managerReviewed ? 'Bot 正在交付' : 'Bot 跟进中';
   if (task.activity === 'working' && s === 'waiting') return '等待自动跟进';
@@ -143,7 +143,12 @@ export function stageText(task: Task, readOnly = false): string {
   if (s === 'running' || s === 'waiting' && (task.status === 'paused' || task.status === 'manual')) return labels[task.status];
   return stageLabels[s];
 }
-export const stageTone = (task: Task): StageTone => blocker(task) === 'recovery' ? 'danger' : stageTones[stage(task)];
+export function stageTone(task: Task): StageTone {
+  if (blocker(task) === 'recovery') return 'danger';
+  if (task.activity === 'attention') return 'attention';
+  if (task.activity === 'working') return 'success';
+  return stageTones[stage(task)];
+}
 
 export function unseenResult(task: Task, seenAt: number | undefined, now: number): boolean {
   const at = task.deliveredAt;
@@ -170,9 +175,9 @@ export function inboxGroups(tasks: readonly Task[], seen: Record<string, number>
     if (isTestTask(task)) { (needs ? groups.blockedTests : groups.tests).push(task); continue; }
     const fresh = unseenResult(task, seen[task.id], now);
     if (fresh) groups.fresh.push(task);
-    if (task.activity === 'working' || s === 'running') groups.active.push(task);
-    else if (s === 'review') groups.review.push(task);
-    else if (needs) groups.attention.push(task);
+    if (needs) groups.attention.push(task);
+    else if (task.activity === 'working' || s === 'running') groups.active.push(task);
+    else if (task.activity === 'review' || s === 'review') groups.review.push(task);
     else if (s === 'waiting') groups.waiting.push(task);
     else if (!fresh) groups.recent.push(task);
   }

@@ -32,30 +32,59 @@ export async function smokeWorkActivity({ configure, launch, call, makeBot, prob
       }
       const held = await dispatch('RELIABILITY_HOLD');
       await wait(async () => (await probe(host, 'inspect-session', held.worker)).stalled, 'held Worker');
-      await header('进行中').waitFor();
+      await header('进行中 1').waitFor();
       await nav.getByRole('button', { name: other.name, exact: true }).click();
       await header('').waitFor();
       const ask = await dispatch('ASK_PROBE');
-      await row('等你处理').waitFor();
+      const activeQuestion = '进行中 1 · 需处理 1';
+      await row(activeQuestion).waitFor();
       await header('').waitFor();
-      await row('等你处理').click();
-      await header('等你处理').click();
+      await row(activeQuestion).click();
+      await header(activeQuestion).click();
       const sections = page.locator('.inbox-group');
       await sections.filter({ hasText: '请说明文档面向谁？' }).waitFor();
-      assert.deepEqual((await sections.locator('h3').allTextContents()).slice(0, 2), ['进行中', '等你处理']);
+      assert.deepEqual((await sections.locator('h3').allTextContents()).slice(0, 2), ['进行中', '需处理']);
       await sections.getByRole('button', { name: /ASK_PROBE/ }).click();
       await page.getByRole('textbox', { name: '回答', exact: true }).fill('面向新同事。');
       await page.getByRole('button', { name: '保存回答' }).click();
-      await header('进行中').waitFor();
-      await row('进行中').waitFor();
       await probe(host, 'select-test-model', bot.managerId);
+      const delivered = id => wait(async () => {
+        const detail = await call(host, 'task.detail', { id });
+        return detail.chatDelivery?.state === 'delivered' && detail;
+      }, 'reviewed result delivered', 600);
+      await delivered(ask.id);
+      await header('进行中 1 · 待验收 1').waitFor();
+      const clarify = await call(host, 'task.create', { requestId: randomUUID(), botId: bot.id, goal: 'Clarify scope',
+        scope: '', acceptance: 'Confirm scope', reviewPolicy: 'human' });
+      const mixed = '进行中 1 · 需处理 1 · 待验收 1';
+      await header(mixed).waitFor();
+      const counts = row(mixed).locator('.sb-work-count:visible');
+      assert.deepEqual(await counts.evaluateAll(nodes => nodes.map(node => [node.dataset.status, node.textContent])),
+        [['working', '1'], ['attention', '1'], ['review', '1']]);
+      await sections.filter({ has: page.getByRole('heading', { name: '待验收', exact: true }) }).waitFor();
+      assert.deepEqual((await sections.locator('h3').allTextContents()).slice(0, 3), ['进行中', '需处理', '待验收']);
+      const summary = page.locator('.sb-title').getByRole('img', { name: mixed, exact: true });
+      await summary.waitFor();
+      assert.deepEqual(await summary.locator('.sb-work-count:visible').allTextContents(), ['进行中 1', '需处理 1', '待验收 1']);
+      await page.getByRole('button', { name: /^(Collapse sidebar|收起侧边栏)$/ }).click();
+      const railRow = page.locator('.sb-sidebar-rail').getByRole('button', { name: bot.name + ' · ' + mixed, exact: true });
+      await railRow.waitFor();
+      assert.equal(await railRow.getAttribute('title'), bot.name + ' · ' + mixed);
+      assert.deepEqual(await railRow.locator('.sb-work-count:visible').evaluateAll(nodes => nodes.map(node => node.dataset.status)),
+        ['working']);
+      assert.equal(await railRow.evaluate(node => node.scrollWidth <= node.clientWidth && node.innerText.includes('1')), true);
+      await page.getByRole('button', { name: /^(Open sidebar|打开侧边栏|展开侧边栏)$/ }).click();
+      await page.getByRole('button', { name: 'Super Bot', exact: true }).click();
+      await page.getByRole('button', { name: bot.name + ' · ' + mixed + ' · 继续聊天', exact: true }).click();
+      await header(mixed).waitFor();
+      await call(host, 'task.cancel', { requestId: randomUUID(), id: clarify.id,
+        expectedRowVersion: (await call(host, 'task.detail', { id: clarify.id })).task.rowVersion });
       await probe(host, 'release-stalled-model', held.worker);
+      await delivered(held.id);
+      await row('待验收 2').waitFor();
+      await header('待验收 2').waitFor();
       for (const { id } of [ask, held]) {
-        const detail = await wait(async () => {
-          const d = await call(host, 'task.detail', { id });
-          return d.chatDelivery?.state === 'delivered' && d;
-        }, 'reviewed result delivered', 600);
-        await header('等你处理').waitFor();
+        const detail = await call(host, 'task.detail', { id });
         await call(host, 'result.accept', { requestId: randomUUID(), id, resultId: detail.result.id,
           expectedRowVersion: detail.task.rowVersion });
       }
@@ -64,15 +93,15 @@ export async function smokeWorkActivity({ configure, launch, call, makeBot, prob
       await call(host, 'sidebar.pin', { botId: bot.id, sessionId: bot.managerId });
       await call(host, 'task.create', { requestId: randomUUID(), botId: bot.id, goal: 'Clarify scope',
         scope: '', acceptance: 'Confirm scope', reviewPolicy: 'human' });
-      await row('等你处理').waitFor();
+      await row('需处理 1').waitFor();
       await page.getByRole('button', { name: '切换到 Workspace', exact: true }).click();
       const native = page.locator('[data-slot="sidebar.session.row.trailing"]');
-      await native.locator('[title="等你处理"]').first().waitFor();
-      const markedRows = await native.locator('[title="等你处理"]').evaluateAll(badges =>
+      await native.locator('.sb-work-counts[title="需处理 1"]').first().waitFor();
+      const markedRows = await native.locator('.sb-work-counts[title="需处理 1"]').evaluateAll(badges =>
         badges.map(badge => badge.closest('[data-row-key]')?.getAttribute('data-row-key')));
       assert.deepEqual([...new Set(markedRows)], ['session:' + bot.managerId]);
       await page.close();
-      console.log(role + ': switched chats, running → question → answer → delivered → accepted; panel order and badges verified.');
+      console.log(role + ': verified ordered counts, collapsed rail, home, work button, inbox, review-only, idle and session isolation.');
     }
   } finally { await browser.close(); }
 }

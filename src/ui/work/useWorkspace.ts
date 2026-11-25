@@ -1,6 +1,6 @@
 /** All Workspace state, the polling loop and guarded mutations. Views receive the returned object read-only. */
 import { useEffect, useRef, useState } from 'react';
-import type { Bot, TaskPage, WorkspaceStatus } from '../../model.ts';
+import type { Bot, TaskInboxPage, TaskPage, WorkspaceStatus } from '../../model.ts';
 import { ownerLabel, type MirrorDetail, type MirrorSelection } from '../../mirror.ts';
 import type { BackupInfo } from '../../backups.ts';
 import type { WorkLink } from '../../work-links.ts';
@@ -16,7 +16,7 @@ export interface WorkspaceProps {
   onBotDeleted?: (bot: Bot) => void;
 }
 export const PAGE_SIZE = 25;
-export type Page = TaskPage & { truncated?: boolean };
+export type Page = TaskPage & Partial<Pick<TaskInboxPage, 'truncated' | 'reviewTotal'>>;
 const ACTIVE = ['queued', 'running', 'stopping', 'approval'];
 
 async function existing<T>(query: Promise<T>): Promise<T | undefined> {

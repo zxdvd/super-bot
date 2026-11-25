@@ -2,6 +2,7 @@
 import type { Bot, Task } from '../model.ts';
 import { ownerLabel } from '../mirror.ts';
 import { styles } from './styles.ts';
+import { WorkBadges } from './work/activity.tsx';
 import { inboxGroups, time } from './work/format.ts';
 import { BotForm, TaskForm } from './work/forms.tsx';
 import { BotPanel } from './work/BotPanel.tsx';
@@ -20,9 +21,8 @@ const VIEWS: readonly (readonly [WorkView, string])[] = [['inbox', '收件箱'],
 function Summary({ w }: { w: WorkspaceState }) {
   if (w.view === 'list' || w.view === 'settings' || !w.page) return null;
   const groups = inboxGroups(w.page.items, w.seen, w.now);
-  return <span className="summary">
-    进行中 <strong>{groups.active.length}</strong> · 等你处理 <strong>{groups.attentionCount + groups.review.length}</strong>
-  </span>;
+  return <WorkBadges counts={{ working: groups.active.length, attention: groups.attentionCount,
+    review: w.page.reviewTotal ?? groups.review.length }} showLabels/>;
 }
 
 function Header({ w, compact, onReturn }: { w: WorkspaceState; compact: boolean; onReturn?: () => void }) {

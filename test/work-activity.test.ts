@@ -4,7 +4,23 @@ import { Store } from '../src/store.ts';
 import { botWorkSummaries } from '../src/work-activity.ts';
 import type { MirrorDetail } from '../src/mirror.ts';
 import { readLocalMirror } from '../src/mirror-queries.ts';
-import { canStartTask, eventTitle, recoveryEventMessage, stage, stageText, workGroup } from '../src/ui/work/format.ts';
+import { canStartTask, eventTitle, inboxGroups, recoveryEventMessage, stage, stageText, workGroup } from '../src/ui/work/format.ts';
+
+function readyResult(store: Store, botId: string, goal: string, reviewPolicy: 'human' | 'bot' = 'human') {
+  const task = store.createTask(goal, { botId, goal, scope: 'Scope', acceptance: 'Criteria', reviewPolicy });
+  const binding = store.beginBinding(`bind:${goal}`, task.id, task.rowVersion, '/synthetic/activity');
+  store.confirmBinding(binding.id, binding.requestedSessionId);
+  const version = () => store.getTask(task.id).rowVersion;
+  const run = store.reserveRun(`run:${goal}`, task.id, version());
+  store.saveRunMessage(run.id, 'worker', '{}');
+  store.claimDispatch(run.id);
+  store.inputEntered(run.id, 'worker', 1);
+  const { resultId } = store.workerReport(run.id, 'report', { kind: 'ready', summary: 'Ready', checks: 'Read facts',
+    evidence: [{ path: '/synthetic/activity/result.md', sha256: 'synthetic', bytes: 20 }] });
+  store.settleRun(run.id);
+  assert.ok(resultId);
+  return { task, version, resultId, eventId: `manager-event:delivery:${resultId}` };
+}
 
 test('a settled business blocker has no owner action in the local or mirrored work view', t => {
   const store = new Store(':memory:');
@@ -49,10 +65,11 @@ test('summary excludes inactive and folded work, scopes manager rows and include
   make('【测试】active fixture');
   for (let i = 0; i < 105; i++) make('paused-' + i, 'Scope', true);
   const summary = () => botWorkSummaries(store.db).find(row => row.id === bot.id)!;
-  assert.deepEqual({ ...summary() }, { id: bot.id, name: bot.name, sessionId: manager.requestedSessionId, working: 1, attention: 1 });
+  assert.deepEqual({ ...summary() }, { id: bot.id, name: bot.name, sessionId: manager.requestedSessionId,
+    working: 1, attention: 1, review: 0 });
   const idle = botWorkSummaries(store.db).find(row => row.id === other.id)!;
   assert.equal(idle.sessionId, null);
-  assert.equal(idle.working + idle.attention, 0);
+  assert.equal(idle.working + idle.attention + idle.review, 0);
   const inbox = store.taskInbox(bot.id);
   assert.equal(inbox.truncated, true);
   assert.equal(inbox.items.find(t => t.id === active.id)?.activity, 'working');
@@ -61,6 +78,68 @@ test('summary excludes inactive and folded work, scopes manager rows and include
   assert.equal(summary().attention, 0);
   store.controlTask('manual', active.id, active.rowVersion, 'manual');
   assert.equal(summary().working, 0);
+});
+
+test('automatic review and delivery, delivery issues, and human acceptance use distinct activities', t => {
+  const store = new Store(':memory:');
+  t.after(() => store.close());
+  const bot = store.createBot('bot', { name: 'Results', instructions: 'Synthetic only' });
+  const manager = store.beginManager('manager', bot.id, '/synthetic/manager');
+  store.confirmManager(manager.id, manager.requestedSessionId);
+  const human = readyResult(store, bot.id, 'Human review');
+  const automatic = readyResult(store, bot.id, 'Automatic approval', 'bot');
+  const fixture = readyResult(store, bot.id, '【测试】Folded review');
+  const activity = (id: string) => store.taskInbox(bot.id).items.find(item => item.id === id)?.activity;
+  const assertCounts = (working: number, attention: number, review: number) => {
+    const { id: _id, name: _name, sessionId: _sessionId, ...counts } = botWorkSummaries(store.db)[0]!;
+    assert.deepEqual(counts, { working, attention, review });
+    assert.equal(store.taskInbox(bot.id).reviewTotal, review);
+  };
+  const deliver = (eventId: string) => store.managerNotificationDelivered(eventId, manager.requestedSessionId,
+    { turn: 1, seq: 2, endSeq: 3, messageId: 'visible' });
+
+  assertCounts(2, 0, 0);
+  store.managerReview('review-human', bot.id, human.task.id, human.version(), human.resultId, 'human', 'Review ready');
+  store.managerReview('review-bot', bot.id, automatic.task.id, automatic.version(), automatic.resultId, 'accept', 'Verified');
+  store.managerReview('review-fixture', bot.id, fixture.task.id, fixture.version(), fixture.resultId, 'human', 'Review ready');
+  assert.equal(store.getTask(automatic.task.id).lifecycle, 'completed');
+  assert.equal(activity(automatic.task.id), 'working');
+  assertCounts(2, 0, 0);
+
+  assert.equal(store.managerDeliveryUncertain(human.eventId), true);
+  assert.equal(store.managerDeliveryUncertain(fixture.eventId), true);
+  assert.equal(activity(human.task.id), 'attention');
+  assertCounts(1, 2, 0);
+  store.resolveManagerNotification('handled-fixture', bot.id, fixture.eventId, 'handled', true);
+  assert.equal(activity(fixture.task.id), 'review');
+  deliver(human.eventId);
+  assert.equal(activity(human.task.id), 'review');
+  assertCounts(1, 0, 1);
+
+  const groups = inboxGroups(store.taskInbox(bot.id).items, {}, Date.now());
+  assert.deepEqual(groups.review.map(item => item.id), [human.task.id]);
+  assert.deepEqual(groups.tests.map(item => item.id), [fixture.task.id]);
+  deliver(automatic.eventId);
+  store.acceptResult('accept', human.task.id, human.version(), human.resultId);
+  assertCounts(0, 0, 0);
+});
+
+test('counts include old reviews while the inbox keeps its recent review window bounded', t => {
+  const store = new Store(':memory:');
+  t.after(() => store.close());
+  t.mock.timers.enable({ apis: ['Date'], now: 100000 });
+  const bot = store.createBot('bot', { name: 'Old results', instructions: 'Synthetic only' });
+  const oldest = readyResult(store, bot.id, 'Oldest waiting result');
+  for (let i = 0; i < 105; i++) {
+    t.mock.timers.tick(1000);
+    readyResult(store, bot.id, `Review ${i}`);
+  }
+  const inbox = store.taskInbox(bot.id);
+  assert.equal(inbox.truncated, true);
+  assert.equal(inbox.reviewTotal, 106);
+  assert.equal(botWorkSummaries(store.db)[0]?.review, 106);
+  assert.equal(inbox.items.filter(item => item.activity === 'review').length, 100);
+  assert.equal(inbox.items.some(item => item.id === oldest.task.id), false);
 });
 
 test('a verified prerequisite blocker stays visible after recovery closes and mirrors only the outcome',t=>{

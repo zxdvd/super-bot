@@ -1,7 +1,7 @@
 import { useState, useSyncExternalStore } from 'react';
 import type { Context } from '@deepseek-ai/cordis';
 import type { SidebarSectionOwnerProps, SidebarFooterActionOwnerProps } from '@deepseek-ai/dsh-client-ui-sidebar/client';
-import { activityLabel, useWorkFeed, WorkBadge } from './work/activity.tsx';
+import { activityLabel, useWorkFeed, WorkBadges } from './work/activity.tsx';
 import type { WorkspaceApi } from './work/api.ts';
 
 const styles = `
@@ -12,7 +12,10 @@ const styles = `
 .sb-sidebar-button:hover,.sb-sidebar-button:focus-visible{background:var(--dsw-alias-interactive-bg-hover,rgba(127,127,127,.15));}
 .sb-sidebar-button:disabled{cursor:wait;opacity:.6;}
 .sb-sidebar-label{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+.sb-sidebar-bots .sb-work-counts{flex-shrink:0;max-width:75%;}
 .sb-sidebar-rail .sb-sidebar-button,.sb-sidebar-button.sb-sidebar-rail{justify-content:center;padding:4px;}
+.sb-sidebar-rail .sb-sidebar-button{flex-direction:column;gap:2px;}
+.sb-sidebar-rail .sb-work-counts{max-width:100%;}
 .sb-sidebar-mode{font-size:13px;}
 .sb-sidebar-message{margin:4px 8px;font-size:12px;overflow-wrap:anywhere;}
 .sb-sidebar-rail .sb-sidebar-message{margin:4px 0;}
@@ -37,12 +40,12 @@ function BotList({ api, wide, lifetime }: { api: WorkspaceApi; wide: boolean; li
   const status = loadFailed ? '暂时无法读取 Bot' : !bots ? '正在读取 Bot…' : !bots.length ? '暂无 Bot' : '';
   return <nav aria-label="Bot" className={wide ? 'sb-sidebar-bots' : 'sb-sidebar-bots sb-sidebar-rail'}>
     {bots?.map(bot => {
-      const label = loadFailed ? '' : activityLabel(bot);
-      const title = label ? bot.name + ' · ' + label : bot.name;
+      const counts = loadFailed ? undefined : bot;
+      const title = [bot.name, activityLabel(counts)].filter(Boolean).join(' · ');
       return <button key={bot.id} type="button" className="sb-sidebar-button" aria-label={title} title={title}
         disabled={opening?.id === bot.id} onClick={() => void open(bot.id)}>
         <span className="sb-sidebar-label">{wide ? bot.name : Array.from(bot.name)[0]}</span>
-        <WorkBadge label={label} compact={!wide}/>
+        <WorkBadges counts={counts} primaryOnly={!wide}/>
       </button>;
     })}
     {status && (wide || loadFailed) && <p className="sb-sidebar-message" role="status" title={status}

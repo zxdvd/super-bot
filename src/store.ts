@@ -5,7 +5,7 @@ import { mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
 import schemaVersion from '../schema-version.json' with {type:'json'};
-import { AppError, requiredText, optionalText, taskStatus, type ChatSource, type Bot, type Task, type NewBot, type NewTask, type TaskPage, type ControlMode, type Attention, type Binding, type Run, type RunInput, type WorkReport, type Result,type ManagerBinding,type ManagerEvent,type ExistingSessionGrant,type ReferenceMaterial,type TaskBotContext,type DispatchWait,type WorkdirInfo,type RunTurn,botDraft } from './model.ts';
+import { AppError, requiredText, optionalText, taskStatus, type ChatSource, type Bot, type Task, type NewBot, type NewTask, type TaskPage, type TaskInboxPage, type ControlMode, type Attention, type Binding, type Run, type RunInput, type WorkReport, type Result,type ManagerBinding,type ManagerEvent,type ExistingSessionGrant,type ReferenceMaterial,type TaskBotContext,type DispatchWait,type WorkdirInfo,type RunTurn,botDraft } from './model.ts';
 import { RESULT_FRESH_MS, type ChatDeliveryStatus, type DeliveredResult, type DeliveryLinks, type RecoveryContinuation, type ReloadReceipt, type RunChildWait,
   DEFAULT_BOT_RUNNING_TASKS, type BotCapacity, type TaskProgress, type UncertainDelivery,
   type WorkerModelPlan, type WorkerPriorInput, type RecoveryInstruction, type RecoveryWorkContext } from './model.ts';
@@ -960,7 +960,7 @@ export class Store {
     const snapshotVersion = Number(this.db.prepare('SELECT coalesce(max(id),0) AS n FROM events').get()?.n);
     return { items: rows.map(row=>this.withDelivery(this.decorateTask(row))), total, limit, offset, counts, snapshotVersion };
   }
-  taskInbox(botId: string): TaskPage & { truncated: boolean } {
+  taskInbox(botId: string): TaskInboxPage {
     const open=this.listTasks({botId,lifecycle:'open',limit:100});
     const review=this.listTasks({botId,lifecycle:'review',limit:100});
     const completed=this.listTasks({botId,lifecycle:'completed',limit:30});
@@ -978,9 +978,9 @@ export class Store {
       const task=this.withDelivery(this.getTask(String(id)));
       if(task.blockingAttention || (task.deliveredAt ?? 0)>freshSince) visible.set(task.id,task);
     }
-    const activity = inboxActivity(this.db, botId);
+    const { byTask: activity, reviewTotal } = inboxActivity(this.db, botId);
     for (const [id, state] of activity) {
-      if (state && !visible.has(id)) visible.set(id, this.withDelivery(this.getTask(id)));
+      if ((state === 'working' || state === 'attention') && !visible.has(id)) visible.set(id, this.withDelivery(this.getTask(id)));
     }
     const question = this.db.prepare(`SELECT question FROM attentions WHERE taskId=? AND taskRevision=?
       AND kind='input' AND state='open' ORDER BY createdAt,id LIMIT 1`);
@@ -988,7 +988,7 @@ export class Store {
       ...task, activity: activity.get(task.id) ?? null,
       ...(task.blockingAttention === 'input' ? { activityQuestion: question.get(task.id, task.taskRevision)?.question as string } : {}),
     }));
-    return {...open,items,limit:items.length,truncated:open.total>open.items.length||review.total>review.items.length};
+    return {...open,items,limit:items.length,reviewTotal,truncated:open.total>open.items.length||review.total>review.items.length};
   }
   private toBinding(row:unknown):Binding {
     const {workdir,...binding}=row as Omit<Binding,'workdir'>&{workdir?:string|null};

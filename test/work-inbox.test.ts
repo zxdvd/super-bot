@@ -69,6 +69,20 @@ test('a verified delivery stays new until opened regardless of acceptance', () =
   assert.equal(unseenResult({ ...done, deliveredAt: undefined }, undefined, NOW), false);
 });
 
+test('inbox follows delivery activity before showing a result as awaiting acceptance', () => {
+  const delivering = task({ lifecycle: 'review', status: 'review', activity: 'working', managerReviewed: true });
+  const uncertain = task({ lifecycle: 'review', status: 'review', activity: 'attention' });
+  const review = task({ lifecycle: 'review', status: 'review', activity: 'review' });
+  const groups = inboxGroups([review, uncertain, delivering], {}, NOW);
+  assert.deepEqual(groups.active, [delivering]);
+  assert.deepEqual(groups.attention, [uncertain]);
+  assert.deepEqual(groups.review, [review]);
+  assert.equal(stageText(delivering), 'Bot 正在交付');
+  assert.equal(stageTone(delivering), 'success');
+  assert.equal(stageText(uncertain), '通知待核对');
+  assert.equal(stageTone(uncertain), 'attention');
+});
+
 test('recent tail is bounded and newest first', () => {
   const finished = Array.from({ length: 12 }, (_, i) => task({ lifecycle: 'cancelled', status: 'cancelled', updatedAt: NOW - i * 1000 }));
   const recent = inboxGroups(finished, {}, NOW, 5).recent;

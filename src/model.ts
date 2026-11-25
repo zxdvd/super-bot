@@ -42,8 +42,8 @@ export interface TaskBotContext {
 }
 export type Lifecycle = 'open' | 'review' | 'completed' | 'cancelled';
 export type ControlMode = 'auto' | 'paused' | 'manual';
-export type WorkActivity = 'working' | 'attention';
-export type BotWorkSummary = { id: string; name: string; sessionId: string | null; working: number; attention: number };
+export type WorkActivity = 'working' | 'attention' | 'review';
+export type BotWorkSummary = { id: string; name: string; sessionId: string | null; working: number; attention: number; review: number };
 
 export interface Task {
   id: string;
@@ -84,6 +84,7 @@ export interface TaskPage {
   snapshotVersion: number;
   counts: { all: number; open: number; review: number; completed: number; cancelled: number };
 }
+export type TaskInboxPage = TaskPage & { truncated: boolean; reviewTotal: number };
 export interface NewBot { name: string; instructions: string;referencePaths?:string[] }
 export function botDraft(input:NewBot):NewBot {
   const paths=input.referencePaths??[];

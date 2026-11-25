@@ -5,7 +5,7 @@ import { Workspace, type WorkspaceApi } from './Workspace.tsx';
 import { styles } from './styles.ts';
 import { readTaskLink, workLinkForUrl } from './work-navigation.ts';
 import { workUrl, type WorkLink } from '../work-links.ts';
-import { activityLabel, useWorkFeed, WorkBadge } from './work/activity.tsx';
+import { activityLabel, useWorkFeed, WorkBadges } from './work/activity.tsx';
 import { reloadSettingsKey, returningToReloadSettings } from './DeveloperSettings.tsx';
 import { FeishuSettings } from './FeishuSettings.tsx';
 
@@ -137,17 +137,22 @@ export function BotHome({ api }: { api: WorkspaceApi }) {
     {error && <p role="alert" className="notice error">{error}</p>}
     {deletedName && <p className="notice slim" role="status">已删除「{deletedName}」。</p>}
     {loading ? <p className="muted">正在读取你的 Bot…</p> : <>
-      {bots.map(bot => <article key={bot.id} className="bot-row">
-        <button disabled={busy} className="bot-open" onClick={() => void chat(bot)}>
-          <span className="bot-name"><strong>{bot.name}</strong>
-            <WorkBadge label={activityLabel(!feed.failed ? feed.bots?.find(row => row.id === bot.id) : undefined)}/></span>
-          {catalog && <div className="muted wrap">{ownerLabel[catalog.owner]} 创建 · {bot.id}</div>}
-          <div className="muted">继续聊天 →</div>
-        </button>
-        <button disabled={busy} onClick={() => {
-          api.beginNavigation(); setDeletedName(''); setWork({ botId: bot.id });
-        }}>工作</button>
-      </article>)}
+      {bots.map(bot => {
+        const counts = feed.failed ? undefined : feed.bots?.find(row => row.id === bot.id);
+        const label = [bot.name, activityLabel(counts), '继续聊天'].filter(Boolean).join(' · ');
+        const originId = catalog ? `sb-origin-${bot.id}` : undefined;
+        return <article key={bot.id} className="bot-row">
+          <button disabled={busy} className="bot-open" aria-label={label} title={label} aria-describedby={originId}
+            onClick={() => void chat(bot)}>
+            <span className="bot-name"><strong>{bot.name}</strong><WorkBadges counts={counts}/></span>
+            {catalog && <div id={originId} className="muted wrap">{ownerLabel[catalog.owner]} 创建 · {bot.id}</div>}
+            <div className="muted">继续聊天 →</div>
+          </button>
+          <button disabled={busy} onClick={() => {
+            api.beginNavigation(); setDeletedName(''); setWork({ botId: bot.id });
+          }}>工作</button>
+        </article>;
+      })}
       {catalog && catalog.state !== 'disabled' && <section aria-label={`${ownerLabel[catalog.peer]} 的 Bot`}>
         {catalog.state === 'offline' && <p role="status">{ownerLabel[catalog.peer]} 离线，暂时无法读取该端的 Bot。</p>}
         {catalog.state === 'unverified' && <p role="status">

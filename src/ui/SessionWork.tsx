@@ -7,13 +7,14 @@ import type { SessionOrigin } from '../mirror.ts';
 import { resultFileUrl, type WorkLink } from '../work-links.ts';
 import { Workspace, type WorkspaceApi } from './Workspace.tsx';
 import { watchSessionBot, toggleSessionWork, watchSessionOrigin, type FileTarget } from './work-navigation.ts';
-import { activityLabel, useWorkFeed, WorkBadge } from './work/activity.tsx';
+import { activityLabel, useWorkFeed, WorkBadges } from './work/activity.tsx';
 import { ResultFilePreview } from './work/ResultFilePreview.tsx';
 
 type Resolved = { sessionId: string; bot: Bot | null; error?: string };
 const buttonStyle = {
   cursor: 'pointer', color: 'inherit', background: 'transparent', border: '1px solid var(--dsw-alias-border-l3, #87908d50)',
   borderRadius: 7, padding: '5px 10px', font: 'inherit', whiteSpace: 'nowrap',
+  display: 'inline-flex', flexWrap: 'wrap', alignItems: 'center', gap: 6, maxWidth: '100%',
 } as const;
 
 function useSessionBot(api: WorkspaceApi, sessionId: string, sidebar: ISidebarRight) {
@@ -29,10 +30,11 @@ export function WorkButton({ api, sessionId, sidebar }: { api: WorkspaceApi; ses
   const resolved = useSessionBot(api, sessionId, sidebar);
   const feed = useWorkFeed(api);
   if (!resolved?.bot) return null;
-  const label = activityLabel(feed.failed ? undefined : feed.bots?.find(row => row.sessionId === sessionId && row.id === resolved.bot?.id));
-  return <button type="button" title={`${resolved.bot.name} · 打开或收起工作视图`}
+  const counts = feed.failed ? undefined : feed.bots?.find(row => row.sessionId === sessionId && row.id === resolved.bot?.id);
+  const label = activityLabel(counts);
+  return <button type="button" title={[resolved.bot.name, '打开或收起工作视图', label].filter(Boolean).join(' · ')}
     aria-label={['打开或收起当前 Bot 的工作', label].filter(Boolean).join(' · ')}
-    onClick={() => toggleSessionWork(sessionId, sidebar)} style={buttonStyle}>工作{label && <> · <WorkBadge label={label}/></>}</button>;
+    onClick={() => toggleSessionWork(sessionId, sidebar)} style={buttonStyle}>工作<WorkBadges counts={counts}/></button>;
 }
 
 type HintLocale = Pick<LocaleRuntime, 'subscribe' | 'getSnapshot' | 'resolveText'>;

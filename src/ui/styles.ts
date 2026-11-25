@@ -154,8 +154,6 @@ const views = `
 .sb-shell{position:relative;height:100%;overflow:hidden}
 .sb-wrap.wide{max-width:1600px}
 .sb .sb-title{display:flex;align-items:center;gap:12px;flex-wrap:wrap;min-width:0}
-.sb .summary{font-size:12px;color:var(--sb-muted)}
-.sb .summary strong{color:var(--dsw-alias-label-primary);font-weight:600}
 .sb .header-actions{display:flex;align-items:center;gap:8px;flex-shrink:0}
 .sb button.icon{padding:6px 10px;line-height:1;min-width:34px}
 .sb button.icon.active{border-color:var(--sb-accent);color:var(--sb-accent)}

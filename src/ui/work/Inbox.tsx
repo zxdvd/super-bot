@@ -6,14 +6,15 @@ import { SystemIssues } from './SystemIssues.tsx';
 import { TaskRow } from './TaskRow.tsx';
 import type { WorkspaceState } from './useWorkspace.ts';
 
-function Group({ w, title, tasks, empty, aside, folded = [] }: {
-  w: WorkspaceState; title: string; tasks: Task[]; empty?: string; aside?: ReactNode; folded?: Task[];
+function Group({ w, title, tasks, aside, folded = [], total }: {
+  w: WorkspaceState; title: string; tasks: Task[]; aside?: ReactNode; folded?: Task[]; total?: number;
 }) {
-  const count = tasks.length + folded.length;
-  if (!count && !empty) return null;
+  const shown = tasks.length + folded.length;
+  const count = total ?? shown;
+  if (!count) return null;
   return <section className="card inbox-group" aria-label={title}>
     <header className="group-head"><h3>{title}</h3><span className="count">{count}</span><span className="spacer"/>{aside}</header>
-    {!count && <p className="group-empty muted">{empty}</p>}
+    {shown < count && <p className="group-empty muted">显示 {shown} 项，完整记录见“全部”。</p>}
     {tasks.map(task => <TaskRow key={task.id} w={w} task={task}/>)}
     <TestTasks w={w} tasks={folded} nested/>
   </section>;
@@ -21,7 +22,7 @@ function Group({ w, title, tasks, empty, aside, folded = [] }: {
 
 export function TestTasks({ w, tasks, nested = false }: { w: WorkspaceState; tasks: Task[]; nested?: boolean }) {
   if (!tasks.length) return null;
-  const blocked = tasks.filter(task => stage(task) === 'needs-you').length;
+  const blocked = tasks.filter(task => task.activity === 'attention' || stage(task) === 'needs-you').length;
   return <details className={nested ? 'group-empty' : 'card inbox-group'}>
     <summary>测试任务 · {tasks.length}{!nested && blocked > 0 && ` · ${blocked} 项需处理`}</summary>
     {tasks.map(task => <TaskRow key={task.id} w={w} task={task}/>)}
@@ -41,7 +42,8 @@ export function Inbox({ w, onReturn }: { w: WorkspaceState; onReturn?: () => voi
       <button disabled={!w.online} onClick={() => w.setForm('task')}>或直接新建任务</button>
     </div> : <>
       <Group w={w} title="进行中" tasks={groups.active}/>
-      <Group w={w} title="等你处理" tasks={[...groups.attention, ...groups.review]} folded={groups.blockedTests}/>
+      <Group w={w} title="需处理" tasks={groups.attention} folded={groups.blockedTests}/>
+      <Group w={w} title="待验收" tasks={groups.review} total={w.page?.reviewTotal}/>
       <Group w={w} title="待安排或已暂停" tasks={groups.waiting}/>
       <Group w={w} title="新成果" tasks={groups.fresh} aside={clear}/>
       <Group w={w} title="最近结束" tasks={groups.recent}/>
