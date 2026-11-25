@@ -10,5 +10,4 @@
         # workdirHook:              # Optional; any tool that prints SB_WORKDIR=<dir>, e.g. `tw ws create {name}`.
         #   create: my-tool create {name} {args.repos}
         #   argNames: [repos]
-        # maxRunningTasks: 2        # Global Worker slots.
         # managerWakesPerHour: 20   # Per-Bot automatic wakes; hitting it records a visible problem.

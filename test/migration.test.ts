@@ -61,9 +61,11 @@ test('a version 10 ledger keeps held Runs while dropping directory exclusivity',
   const upgraded=new Store(file);
   try {
     assert.deepEqual(upgraded.heldRuns().map(item=>item.id),[run.id]);
+    assert.deepEqual(upgraded.botCapacity(bot.id), { maxRunningTasks: null, botLimit: 5, botHeld: 1 });
     assert.equal(upgraded.activeBinding(first.id)?.cwd,cwd);
     const next=upgraded.reserveRun('second',second.id,second.rowVersion);
     assert.deepEqual(new Set(upgraded.heldRuns().map(item=>item.id)),new Set([run.id,next.id]));
+    assert.equal(upgraded.botCapacity(bot.id).botHeld, 2);
     assert.deepEqual(upgraded.db.prepare('PRAGMA foreign_key_check').all(),[]);
   }finally{upgraded.close();}
 });

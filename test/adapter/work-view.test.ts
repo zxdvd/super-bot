@@ -55,8 +55,22 @@ test('chat work settings give each Bot panel a distinct React key', () => {
     const { children } = BotPanel({ w, bot: f.a, onBotDeleted: () => {} }).props;
     const keys = children.flat().flatMap((child: { key?: string | null } | undefined) => child?.key ?? []);
     assert.ok(keys.includes(`feishu:${f.a.id}`));
+    assert.ok(keys.includes(`worker-capacity:${f.a.id}`));
     assert.ok(keys.includes(`delete:${f.a.id}:${f.a.configRevision}`));
     assert.equal(new Set(keys).size, keys.length);
+  } finally { f.store.close(); }
+});
+
+test('read-only mirror offers neither Worker capacity controls nor capacity queries', () => {
+  const f = fixture();
+  try {
+    const w = { sessionId: f.a.managerSessionId, locked: true,
+      mirror: { owner: 'desktop', bot: { id: f.a.id, name: f.a.name } } } as WorkspaceState;
+    const mirrored = BotPanel({ w, bot: f.a }).props.children;
+    assert.ok(!mirrored.some((child: { key?: string | null } | undefined) => child?.key === `worker-capacity:${f.a.id}`));
+    for (const op of ['bot.capacity.get', 'bot.capacity.set']) {
+      assert.throws(() => parseMirrorQuery({ op, botId: f.a.id }), { code: 'invalid-input' });
+    }
   } finally { f.store.close(); }
 });
 
@@ -566,12 +580,15 @@ test('DF-13 task detail explains capacity waits and offers consistent actions', 
   const f = fixture();
   const w = { locked: false } as WorkspaceState;
   try {
-    f.store.maxRunningTasks = 1;
-    for (const task of [f.ta, f.tb]) {
+    f.store.setBotCapacity('one-slot', f.b.id, null, 1);
+    const holderTask = f.store.createTask('holder-task', {
+      botId: f.b.id, goal: 'Occupy B capacity', scope: 'Own work', acceptance: 'Read', reviewPolicy: 'human',
+    });
+    for (const task of [holderTask, f.tb]) {
       const binding = f.store.beginBinding(`binding-${task.id}`, task.id, task.rowVersion, '/synthetic/shared');
       f.store.confirmBinding(binding.id, binding.requestedSessionId);
     }
-    const holder = f.store.reserveRun('holder', f.ta.id, f.store.getTask(f.ta.id).rowVersion);
+    const holder = f.store.reserveRun('holder', holderTask.id, f.store.getTask(holderTask.id).rowVersion);
     const show = () => {
       const detail = f.store.taskDetail(f.tb.id);
       const head: any[] = TaskDetailHeader({ w, detail, close: () => {} }).props.children;
@@ -589,7 +606,7 @@ test('DF-13 task detail explains capacity waits and offers consistent actions', 
     f.store.enqueueManager(f.b.id, `capacity:${f.tb.id}:${rowVersion}`, 'Synthetic wait', f.tb.id);
     const blocked = show();
     assert.deepEqual(blocked.starts, [false, false]);
-    assert.match(blocked.status, /等待执行名额/);
+    assert.match(blocked.status, /等待当前 Bot 的执行名额/);
     assert.match(blocked.status, /Bot 会继续安排/);
     f.store.saveRunMessage(holder.id, 'holder-input', '{}');
     f.store.claimDispatch(holder.id);f.store.inputEntered(holder.id, 'holder-input', 1);

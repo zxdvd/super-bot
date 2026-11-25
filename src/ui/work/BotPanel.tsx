@@ -7,6 +7,7 @@ import { FeishuPanel } from './FeishuPanel.tsx';
 import { forgetView, rememberBot, rememberedBot, rememberedView } from './storage.ts';
 import { managerOpener } from './SystemIssues.tsx';
 import type { WorkspaceState } from './useWorkspace.ts';
+import { WorkerCapacityPanel } from './WorkerCapacityPanel.tsx';
 
 const TIDY_HINT = '整理仅处理已加载且可确认由当前 Bot 自动创建的会话，不唤醒未加载历史。已有项目分组名请在原生侧栏菜单改名；'
   + '历史保留手动归档，不自动隐藏待验收或可返工的工作。';
@@ -112,6 +113,7 @@ export function BotPanel({ w, bot, focusFeishu, onBotDeleted }: {
       <p className="caption">配置版本 {bot.configRevision} · 参考文本 {bot.materials.length} 份</p>
       {bot.materials.map(material => <p key={material.path} className="wrap caption">{material.path} · {material.bytes} 字节</p>)}
     </Section>
+    {!w.mirror && <WorkerCapacityPanel key={`worker-capacity:${bot.id}`} w={w} botId={bot.id}/>}
     <ManagerSection w={w} bot={bot}/>
     <FeishuPanel key={`feishu:${bot.id}`} api={w.api} botId={bot.id} botName={bot.name} locked={w.locked} focus={focusFeishu}/>
     <Section title="侧栏"><SidebarActions w={w} bot={bot}/></Section>

@@ -792,3 +792,9 @@ ELECTRON_RUN_AS_NODE=1 '/Applications/DeepSeek Harness.app/Contents/MacOS/DeepSe
 - 在隔离的 DSH Web rc.1 和 Desktop rc.5 用确定性模型，从原聊天派发、回答、要求返工，再执行原生上下文压缩并继续返工。检查实际模型输入、原生消息 ID 和任务账本归属。Web 对照中，回答这轮新增的任务消息从 3,391 字节降至 520，返工从 3,376 字节降至 505。压缩移走任务说明后，下一轮会从账本恢复说明和已入场的用户补充。字节数只统计新增任务消息。[原生派发回归](../../../scripts/smoke-worker-context.mjs)
 - 用同一个任务和 Worker 复现文件预检失败、文件随后可读、权限已明确拒绝、具名资源从缺失到就绪，以及写入效果待核对。核对后原失败报告仍可查；重复通知不会再执行检查。恢复通知里直接调用 Shell 或管理其他工作均被宿主拒绝。另用真实 kubectl v1.32.8 对本机隔离 TLS API 核对授权允许、带原因的拒绝、Deployment 存在但未就绪和 PVC 已绑定。[原生恢复回归](../../../scripts/smoke-verified-recovery.mjs) · [恢复证据与竞态回归](../../../test/adapter/verified-recovery.test.ts)
 - 在隔离的 Edge 中从原聊天工作侧栏打开缺权限的任务，详情显示「Bot 已确认前提未满足」和共享身份缺少的具体权限。展开审计可见 Bot 完成核对，现场无直接重跑按钮。使用合成任务、身份和资源。
+
+## 2026-11-25 · REQ-004 每个 Bot 的 Worker 并发
+
+- 隔离 DSH Web 和 Edge 中，旧 profile 设有 `maxRunningTasks: 1`。同一账本的两个 Bot 各运行 5 个独立 Worker，第六个 A 任务进入 A 的队列。从聊天旁设置把 A 调到 6 后，该任务自动启动。清空并保存后，A 显示占用 6/5，B 显示 5/5，已有的 11 个 Worker 继续运行。轮询与重新进入设置后，容量表单都只有一份。[原生并发回归](../../../scripts/smoke-bot-capacity.mjs)
+- 用上一版创建隔离账本，让 A 占满旧宿主名额，B 已入队。用新版打开同一账本后，B 直接获得自己的名额，A 的执行记录和占用均保留。配对 Web 和 Desktop 也通过原生宿主的双向只读镜像回归。
+- 在隔离 Edge 复核普通删除和强制删除的二次确认，取消确认后 Bot 仍在。强制删除后，目标 Bot 的未结束任务显示已取消，另一个 Bot 仍可打开。[删除回归](../../../scripts/smoke-bot-delete.mjs)

@@ -517,7 +517,7 @@ test('once granted, Worker dispatch and Manager automatic wake cannot enter befo
   const s = scheduler(t, f.root);
   const { task, sessionId } = s.createTask('protected');
   const other = s.createTask('second-task');
-  s.store.maxRunningTasks = 1;
+  s.store.setBotCapacity('one-slot', task.botId, null, 1);
   const notice = s.notify();
   const endpoint = await f.mount(hmrFixture(), s.admission, s.blockers).ready;
   writeFileSync(f.hold, 'hold staging');

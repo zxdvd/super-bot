@@ -23,7 +23,8 @@
 | Manager 约束 | 已验证 | 单 Bot 一轮、全局两轮；实际 12 步、自动轮次 5 分钟、每小时 20 次唤醒及换会话不重置额度均通过 `smoke-manager-budget.mjs`。files 模式手动管理对话受 12 步限制，Full Access 为 24 步，没有自动轮次计时器；`smoke-manager-capacity.mjs` 真实两轮占位、第三轮排队与释放后进入通过 |
 | Manager 迟到命令 | 已验证 | 模型读取后暂停，用户改目标或在 Worker 原生输入；迟到 dispatch/review 被拒绝。`smoke-manager-stale.mjs` |
 | Manager 更换回执 | 已验证 | 重试只对应原准备代数；配置变化后的新 Manager 不被旧请求选择模型。首次继承在原生解析后重新核对当前身份。`smoke-manager-lifecycle.mjs`、5 项适配层回归 |
-| 两个 Worker 容量 | 已验证 | 同一 Bot 的两个独立 Worker 在同一个目录同时运行。第三项等到名额释放后由另一个 Bot 派发。`smoke-capacity.mjs` |
+| Worker 并发 | 按 Bot 独立计数，默认各 5 个 | 在 Bot 的「工作 → 设置与维护 → Worker 并发」修改上限。使用 `node scripts/smoke-bot-capacity.mjs` 验证两个 Bot 同时各占 5 个名额、排队和调额补位。浏览器参数与飞书烟测相同。 |
+| Worker 同目录并行 | Bot 内按队列补位 | `smoke-capacity.mjs` 为测试 Bot 设置上限 2，验证两个 Worker 同时运行、第三项在其中一个结束后启动。可用 `SUPER_BOT_TEST_SHARED_WORKDIR` 指定同一隔离目录，用 `SUPER_BOT_TEST_LOG` 指定测试宿主日志。 |
 | 后台作业收敛 | 已验证契约；产品能力有限 | Agent idle 不代表 job 停止，kill accepted 不代表 settled。合成 job 探针及 `smoke-background.mjs` 实际 ready→恢复门槛验证；Full Access 的真实 Shell 工作仍依赖原生作业收敛事实 |
 | 重启与未知投递 | 已验证支持范围 | 报告/settle/验收事务回滚和提交回执重开、entered 失败、Fake 旧 Agent 存活重装 adapter 均通过。实际 SIGKILL、投递后丢回执、Manager 通知丢回执均不自动重放责任。`smoke-restart.mjs`、`probe:run` |
 | 账本迁移和恢复 | 已验证主要窗口 | schema 2→7、实际 schema 6→7、失败回滚、未提交升级进程中断、一致性快照、新目录恢复、schema 6 旧版本实际回退。快照发布后清单中断的重试保留原快照；缺失/损坏文件拒绝成功。`npm test`、`smoke-restored.mjs`、实际安装包 `smoke-backup-retry.mjs` |

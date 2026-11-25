@@ -152,11 +152,12 @@ test('restart of force-deleted Bot releases an unobservable reservation and quar
   let store=new Store(path);
   try {
     const f=attempt(store);
+    store.setBotCapacity('one-slot',f.task.botId,null,1);
     store.db.exec("UPDATE inputs SET state='enqueued'; UPDATE run_turns SET turn=NULL,startSeq=NULL,inputSeq=NULL;");
     store.deleteBot('delete',f.task.botId,store.getBot(f.task.botId).configRevision,true);
-    assert.equal(store.heldRuns().length,1);
+    assert.deepEqual(store.deletedBotRuns(f.task.botId).map(run=>run.id),[f.run.id]);
     store.close();store=new Store(path);
-    store.maxRunningTasks=1;
+    assert.deepEqual(store.deletedBotRuns(f.task.botId).map(run=>run.id),[f.run.id]);
     const a=adapter(store,[],f.run.sessionId);
     await a.execution.whenReconciled();
     assert.equal(a.reads(),0,'missing turn proof never reloads an old Session');

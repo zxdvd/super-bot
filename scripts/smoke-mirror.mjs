@@ -69,13 +69,13 @@ async function configure(role, { bundleDir = bundle, ...options } = {}) {
   }));
   await patch(role, options);
 }
-async function patch(role, { paired = false, mirrorDir = pairs, hmr = !skipHmr, limit = 2, probeModule = '@zxdvd/super-bot/mirror-probe', data = roles[role].data, fullAccess = false } = {}) {
+async function patch(role, { paired = false, mirrorDir = pairs, hmr = !skipHmr, managerWakesPerHour = 20, probeModule = '@zxdvd/super-bot/mirror-probe', data = roles[role].data, fullAccess = false } = {}) {
   const { profile } = roles[role];
   const path = join(profile, 'cordis.patch.yml');
   const temp = `${path}.tmp`;
   await writeFile(temp, JSON.stringify([
     ...(hmr ? [] : [{ id: 'hmr', disabled: true }]),
-    { id: 'super-bot', config: { dataDir: data, fullAccess, maxRunningTasks: limit, ...(paired ? { mirrorDir } : {}) } },
+    { id: 'super-bot', config: { dataDir: data, fullAccess, managerWakesPerHour, ...(paired ? { mirrorDir } : {}) } },
     { insert: [{ id: 'super-bot-contract-probe', name: probeModule }] },
   ]));
   await rename(temp, path);
@@ -487,7 +487,7 @@ async function smokeMirror() {
     assert.deepEqual([...new Set(openers)], [String(hosts[role].pid)]);
     assert.deepEqual(await dbIdentity(role), identities[role]);
     if (skipHmr) continue;
-    await patch(role, { paired: true, limit: 3 });
+    await patch(role, { paired: true, managerWakesPerHour: 21 });
     const refreshed = await wait(async () => {
       try { const next = await endpoint(role); return next.id !== active.id && next; } catch { return; }
     }, `${role} native profile HMR`);

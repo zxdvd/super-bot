@@ -22,7 +22,7 @@ try {await run([cli,'--profile','reliability','--from-default-profile','web','--
 finally {await init.close();}
 const patch=join(base,'host.patch.json');
 await writeFile(patch,JSON.stringify([{id:'hmr',disabled:true},{insert:[
-  {id:'super-bot',name:join(root,'lib/index.js'),config:{fullAccess:process.env.SUPER_BOT_TEST_FULL_ACCESS==='true',maxRunningTasks:16}},
+  {id:'super-bot',name:join(root,'lib/index.js'),config:{fullAccess:process.env.SUPER_BOT_TEST_FULL_ACCESS==='true'}},
   {id:'super-bot-contract-probe',name:join(root,'.runtime/probe-plugin/index.js')},
 ]}]));
 let active;

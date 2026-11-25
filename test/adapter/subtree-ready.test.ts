@@ -84,11 +84,13 @@ async function fixture(version:'rc.1'|'rc.5'='rc.5') {
     close:async()=>{joined.resolve(true);agent.cancel();agent.status='idle';idle.resolve();await execution.dispose();store.close();assert.ok(directory.startsWith(resolve('.runtime/subtree-ready-')));rmSync(directory,{recursive:true,force:true});}};
 }
 
-test('force delete waits for the exact Worker child and Job before returning capacity', {timeout:3000},async()=>{
+test('force delete retains the Worker reservation until the exact child and Job settle', {timeout:3000},async()=>{
   const f=await fixture();try {
-    f.store.maxRunningTasks=1;
+    f.store.setBotCapacity('one-slot',f.bot.id,null,1);
     const other=f.store.createBot('other',{name:'Unrelated bot',instructions:'Synthetic only'});
     const next=f.store.createTask('other-task',{botId:other.id,goal:'Continue',scope:'Own work',acceptance:'Read',reviewPolicy:'human'});
+    const binding=f.store.beginBinding('other-bind',next.id,next.rowVersion,f.directory);
+    f.store.confirmBinding(binding.id,binding.requestedSessionId);
     f.startRootJob();f.startChild();
     f.agent.inbox.nextTurn.push({id:'native-user',source:{kind:'user',rpcId:'native'}});
     f.store.deleteBot('delete',f.bot.id,f.bot.configRevision,true);
@@ -99,16 +101,19 @@ test('force delete waits for the exact Worker child and Job before returning cap
     assert.equal(f.agent.inbox.nextTurn[0].id,'native-user');
     assert.equal(f.store.getTask(f.task.id).lifecycle,'cancelled');
     assert.equal(f.store.getRun(f.run.id).state,'cancelling');
-    assert.equal(f.store.dispatchBlocker(next.id),'capacity');
+    assert.deepEqual(f.store.deletedBotRuns(f.bot.id).map(run=>run.id),[f.run.id]);
+    assert.equal(f.store.dispatchBlocker(next.id),null);
+    const independent=f.store.reserveRun('other-run',next.id,f.store.getTask(next.id).rowVersion);
+    assert.equal(independent.state,'queued');
     await f.emit('turn/end',{turn:1,reason:{kind:'aborted',reason:{kind:'user'}}});
     await f.emit('turn/start',{turn:2});
     await f.emit('user/message',{id:'native-user',source:{kind:'user',rpcId:'native'}});
     f.finishRootJob();
     await delay(300);
-    assert.equal(f.store.dispatchBlocker(next.id),'capacity','owned child remains live after parent and Job settle');
+    assert.deepEqual(f.store.deletedBotRuns(f.bot.id).map(run=>run.id),[f.run.id], 'owned child still holds the deleted Bot reservation');
     f.finishChild();
-    while(f.store.heldRuns().length)await delay(25);
-    assert.equal(f.store.dispatchBlocker(next.id),null);
+    while(f.store.deletedBotRuns(f.bot.id).length)await delay(25);
+    assert.deepEqual(f.store.heldRuns().map(run=>run.id),[independent.id]);
     assert.equal(f.store.getRun(f.run.id).state,'cancelled');
     assert.deepEqual(f.killedJobs,['worker-job']);
   }finally{await f.close();}
@@ -144,7 +149,7 @@ for(const version of ['rc.1','rc.5'] as const)test(`${version} early ready holds
     assert.equal(returned,false,'the first ready stays in the parent turn until tree work converges');
     assert.equal(f.store.runResult(f.run.id),null,'do not hash or commit evidence before the child finishes');
     assert.equal(f.store.getRun(f.run.id).finishedAt,null);assert.equal(f.store.heldRuns().length,1);assert.equal(f.released(),false);
-    f.store.maxRunningTasks=1;
+    f.store.setBotCapacity('one-slot',f.bot.id,null,1);
     const other=f.store.createTask('other',{botId:f.task.botId,goal:'Queued work',scope:'Same directory',acceptance:'Own files',reviewPolicy:'human'});
     const binding=f.store.beginBinding('other-bind',other.id,other.rowVersion,f.directory);f.store.confirmBinding(binding.id,binding.requestedSessionId);
     assert.equal(f.store.dispatchBlocker(other.id),'capacity');

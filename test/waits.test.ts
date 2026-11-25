@@ -4,8 +4,9 @@ import assert from 'node:assert/strict';
 import {Store} from '../src/store.ts';
 
 function setup(max=2) {
-  const store=new Store(':memory:');store.maxRunningTasks=max;
+  const store=new Store(':memory:');
   const bot=store.createBot('bot',{name:'FIFO',instructions:'Synthetic only'});
+  store.setBotCapacity('capacity',bot.id,null,max);
   const manager=store.beginManager('manager',bot.id,'/tmp/sb-fifo-manager');store.confirmManager(manager.id,manager.requestedSessionId);
   const task=(name:string,cwd:string)=>{
     const created=store.createTask(`task-${name}`,{botId:bot.id,goal:`Goal ${name}`,scope:'Own files',acceptance:'Read back',reviewPolicy:'human'});
@@ -35,7 +36,7 @@ test('slot fairness counts earlier runnable waiters; stale or paused waiters do 
   assert.equal(store.dispatchWait(b)?.code,'capacity');wait(b);
   assert.equal(store.dispatchWait(c)?.code,'capacity');wait(c);
   finish(first.id);
-  assert.deepEqual(store.dispatchWait(c),{code:'capacity',holderTaskId:b,holderGoal:'Goal b'});
+  assert.deepEqual(store.dispatchWait(c),{code:'capacity',scope:'bot',holderTaskId:b,holderGoal:'Goal b'});
   assert.equal(store.dispatchWait(b),null);
   store.db.prepare("UPDATE outbox SET state='done' WHERE id LIKE ?").run(`manager-event:capacity:${b}:%`);
   assert.equal(store.dispatchWait(c),null,'a waiter whose resource notification ended no longer holds a place');

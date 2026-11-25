@@ -6,9 +6,9 @@ import { join } from 'node:path';
 import { Store } from '../src/store.ts';
 import { collectEvidence,verifyEvidence,containedPath,previewEvidence } from '../src/evidence.ts';
 
-function prepared(store:Store,key='1',cwd=`/tmp/task-${key}`,reviewPolicy:'human'|'bot'='human') {
-  const bot=store.createBot(`b:${key}`,{name:`Bot ${key}`,instructions:'文件工作'});
-  const task=store.createTask(`t:${key}`,{botId:bot.id,goal:'写一个说明文件',scope:'任务目录',acceptance:'说明包含两项事实',reviewPolicy});
+function prepared(store:Store,key='1',cwd=`/tmp/task-${key}`,reviewPolicy:'human'|'bot'='human',botId?:string) {
+  const owner=botId??store.createBot(`b:${key}`,{name:`Bot ${key}`,instructions:'文件工作'}).id;
+  const task=store.createTask(`t:${key}`,{botId:owner,goal:'写一个说明文件',scope:'任务目录',acceptance:'说明包含两项事实',reviewPolicy});
   const binding=store.beginBinding(`bnd:${key}`,task.id,1,cwd);store.claimBindingCreation(binding.id);store.confirmBinding(binding.id,binding.requestedSessionId);
   return store.getTask(task.id);
 }
@@ -372,16 +372,16 @@ test('run budgets persist the reason, retain ownership until stopped, and requir
   }finally{store.close();}
 });
 
-test('maxRunningTasks bounds global execution slots',()=>{
+test('a Bot override bounds new reservations for its own tasks',()=>{
   const directory=mkdtempSync(join(tmpdir(),'super-bot-slots-'));const store=new Store(join(directory,'ledger.sqlite'));
   try {
-    store.maxRunningTasks=1;
-    const one=prepared(store,'slot-1','/tmp/shared'),two=prepared(store,'slot-2','/tmp/shared');
+    const one=prepared(store,'slot-1','/tmp/shared'),two=prepared(store,'slot-2','/tmp/shared','human',one.botId);
+    store.setBotCapacity('one-slot',one.botId,null,1);
     store.reserveRun('slot-run-1',one.id,one.rowVersion);
     assert.equal(store.dispatchBlocker(two.id),'capacity');assert.throws(()=>store.reserveRun('slot-run-2',two.id,two.rowVersion),{code:'capacity'});
-    store.maxRunningTasks=2;assert.equal(store.dispatchBlocker(two.id),null);
+    store.setBotCapacity('two-slots',one.botId,1,2);assert.equal(store.dispatchBlocker(two.id),null);
     assert.equal(store.reserveRun('slot-run-2',two.id,two.rowVersion).state,'queued');
-    const three=prepared(store,'slot-3','/tmp/other');
+    const three=prepared(store,'slot-3','/tmp/other','human',one.botId);
     assert.throws(()=>store.reserveRun('slot-run-3',three.id,three.rowVersion),{code:'capacity'});
   }finally{store.close();rmSync(directory,{recursive:true,force:true});}
 });

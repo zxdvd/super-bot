@@ -6,10 +6,11 @@ import { test, type TestContext } from 'node:test';
 import { Context } from '@deepseek-ai/cordis';
 import { HostConnectionService, type Principal } from '@deepseek-ai/dsh-client-connection';
 import type { UserMessage } from '@deepseek-ai/dsh-llm';
-import { apply } from '../../src/index.ts';
+import { apply, Config } from '../../src/index.ts';
 import { Store } from '../../src/store.ts';
 
-async function fixture(t: TestContext, scenario: 'review' | 'interrupted' | 'capacity' | 'stale' = 'review', registry: 'rc1' | 'rc5' = 'rc1') {
+async function fixture(t: TestContext, scenario: 'review' | 'interrupted' | 'capacity' | 'bot-capacity' | 'legacy-capacity' | 'stale' = 'review',
+  registry: 'rc1' | 'rc5' = 'rc1') {
   const runtime = join(realpathSync(process.cwd()), '.runtime');
   mkdirSync(runtime, { recursive: true });
   const dataDir = mkdtempSync(join(runtime, 'df10-ledger-'));
@@ -39,12 +40,15 @@ async function fixture(t: TestContext, scenario: 'review' | 'interrupted' | 'cap
   } else {
     seed.runRecovery(run.id, 'Lost delivery receipt', false);
   }
-  if (scenario === 'capacity') {
-    const occupied = seed.createTask('occupied', { botId: other.id, goal: 'Other task', scope: 'Files', acceptance: 'Read', reviewPolicy: 'human' });
+  if (scenario === 'capacity' || scenario === 'bot-capacity' || scenario === 'legacy-capacity') {
+    const occupied = seed.createTask('occupied', {
+      botId: bot.id, goal: 'Other task', scope: 'Files', acceptance: 'Read', reviewPolicy: 'human',
+    });
     const next = seed.beginBinding('occupied-binding', occupied.id, occupied.rowVersion, join(dataDir, 'sibling'));
     seed.confirmBinding(next.id, next.requestedSessionId);
     const holding = seed.reserveRun('capacity-placeholder', occupied.id, seed.getTask(occupied.id).rowVersion);
     seed.runRecovery(holding.id, 'Retained occupation', false);
+    if (scenario === 'capacity') seed.setBotCapacity('one-slot', bot.id, null, 1);
   }
   if (scenario === 'stale') {
     seed.db.prepare('UPDATE attentions SET taskRevision=0 WHERE id=?').run(`run:${run.id}`);
@@ -125,11 +129,17 @@ async function fixture(t: TestContext, scenario: 'review' | 'interrupted' | 'cap
     assert.ok(dataDir.startsWith(join(runtime, 'df10-ledger-')));
     rmSync(dataDir, { recursive: true });
   });
-  await apply(ctx, { dataDir, ...(scenario === 'capacity' ? { maxRunningTasks: 1 } : {}) });
+  if (scenario === 'legacy-capacity') {
+    const { managerModel: _managerModel, workerModel: _workerModel, ...legacyConfig } = Config({ dataDir, maxRunningTasks: 1 });
+    await apply(ctx, legacyConfig);
+  } else {
+    await apply(ctx, { dataDir });
+  }
   function raw(action: string, payload: Record<string, unknown> = {}, peer = connection.browserPeer) {
+    const fields = action.startsWith('task.') || action.startsWith('run.') ? { id: task.id, ...payload } : payload;
     return fetch(new Request('http://localhost/api/super-bot', {
       method: 'POST', body: JSON.stringify({ type: 'client-request', rpcId: 'synthetic', method: 'super-bot',
-        payload: { id: task.id, action, ...payload } }),
+        payload: { action, ...fields } }),
     }), peer);
   }
   async function call(action: string, payload: Record<string, unknown> = {}) {
@@ -151,7 +161,7 @@ async function fixture(t: TestContext, scenario: 'review' | 'interrupted' | 'cap
     const db = new DatabaseSync(database, { readOnly: true });
     try { return snapshot(db); } finally { db.close(); }
   }
-  return { raw, call, detail, recoveryArgs, ledger, beforeLedger, task, run, binding, agent, mounted, owners, jobs, options, hooks,
+  return { raw, call, detail, recoveryArgs, ledger, beforeLedger, bot, other, task, run, binding, agent, mounted, owners, jobs, options, hooks,
     sent, removed, emit, tools, manager, otherManager, resolves: () => resolves, permissionChanges: () => permissionChanges,
     nonOwner: () => connection.createPeer({ principal: { kind: 'synthetic-other' } as unknown as Principal }),
     unauthenticated: () => connection.requestRejection({ headers: { host: 'localhost' } }),
@@ -467,4 +477,65 @@ test('capacity refusal rolls back recovery and uncertain post-reservation delive
   assert.equal(after.runHeld, true);
   assert.equal(after.input.state, 'unknown');
   assert.equal(after.recovery.attentionId, `run:${uncertain.value.id}`);
+});
+
+test('Bot capacity settings RPC governs the next Worker dispatch', async t => {
+  const f = await fixture(t, 'bot-capacity');
+  const original = (await f.call('bot.list')).value.find((bot: { id: string }) => bot.id === f.bot.id);
+  const recovery = await f.recoveryArgs();
+  const checked = await f.call('run.recover', recovery);
+  assert.ok(checked.ok);
+  assert.equal(checked.value.controlMode, 'paused');
+  const resumed = await f.call('task.control', {
+    requestId: 'turn-auto-on', expectedRowVersion: checked.value.rowVersion, mode: 'auto',
+  });
+  assert.ok(resumed.ok);
+
+  const current = await f.call('bot.capacity.get', { botId: f.bot.id });
+  assert.ok(current.ok);
+  assert.deepEqual(current.value, { maxRunningTasks: null, botLimit: 5, botHeld: 1 });
+  const rejected = await f.call('bot.capacity.set', {
+    requestId: 'mirror-limit', owner: 'desktop', botId: f.bot.id, expectedMaxRunningTasks: null, maxRunningTasks: 3,
+  });
+  assert.equal(rejected.error.code, 'invalid-input');
+  assert.deepEqual((await f.call('bot.capacity.get', { botId: f.bot.id })).value, current.value);
+  const lower = await f.call('bot.capacity.set', {
+    requestId: 'lower-limit', botId: f.bot.id, expectedMaxRunningTasks: null, maxRunningTasks: 1,
+  });
+  assert.ok(lower.ok);
+  assert.equal(lower.value.botLimit, 1);
+  const payload = { expectedRowVersion: resumed.value.rowVersion };
+  const full = await f.call('task.dispatch', { requestId: 'before-raise', ...payload });
+  assert.equal(full.error.code, 'capacity');
+  assert.equal((await f.detail()).runHeld, false);
+  assert.equal(f.sent.length, 0);
+
+  const raise = await f.call('bot.capacity.set', {
+    requestId: 'raise-limit', botId: f.bot.id, expectedMaxRunningTasks: 1, maxRunningTasks: 2,
+  });
+  assert.ok(raise.ok);
+  assert.equal(raise.value.botLimit, 2);
+  const dispatch = await f.call('task.dispatch', { requestId: 'after-raise', ...payload });
+  assert.ok(dispatch.ok);
+  assert.equal(dispatch.value.sessionId, f.binding.sessionId);
+  assert.equal(f.sent.length, 1);
+  assert.equal((await f.call('bot.capacity.get', { botId: f.bot.id })).value.botHeld, 2);
+  assert.deepEqual((await f.call('bot.capacity.get', { botId: f.other.id })).value, {
+    maxRunningTasks: null, botLimit: 5, botHeld: 0,
+  });
+  const updated = (await f.call('bot.list')).value.find((bot: { id: string }) => bot.id === f.bot.id);
+  assert.equal(updated.managerSessionId, original.managerSessionId);
+  assert.equal(updated.configRevision, original.configRevision);
+});
+
+test('legacy host maxRunningTasks is ignored during real Worker continuation', async t => {
+  const f = await fixture(t, 'legacy-capacity');
+  const capacity = () => f.call('bot.capacity.get', { botId: f.bot.id });
+  assert.deepEqual((await capacity()).value, { maxRunningTasks: null, botLimit: 5, botHeld: 2 });
+  const resumed = await f.call(CONTINUE, await f.recoveryArgs());
+  assert.ok(resumed.ok, JSON.stringify(resumed));
+  assert.notEqual(resumed.value.id, f.run.id);
+  assert.equal(resumed.value.sessionId, f.binding.sessionId);
+  assert.equal(f.sent.length, 1);
+  assert.deepEqual((await capacity()).value, { maxRunningTasks: null, botLimit: 5, botHeld: 2 });
 });

@@ -232,7 +232,7 @@ export class Managers {
           const override=data.conventionOverride===undefined?undefined:conventionExcerpt(data.conventionOverride,source.messages?.at(-1)??source);
           const created=this.store.createTask(requestId,{botId:bot.id,goal:requiredText(data.goal,'目标'),scope,acceptance,reviewPolicy:'human',...(workdir?{workdir}:{})},source,override);
           if(!oneStep)return {task:created};
-          authorize();const started=await this.startCreated(requestId,bot.id,created.id,exec.agent,authorize);
+          authorize();const started=await this.startCreated(requestId,created.id,exec.agent,authorize);
           return {task:this.store.getTask(created.id),...started};
         }
         const task=this.store.getTask(requiredText(data.taskId,'任务标识',200));
@@ -353,7 +353,7 @@ export class Managers {
             const prepared=this.store.activeBinding(task.id);
             return {prepared:true,task:this.store.getTask(task.id),workdir:prepared?workdirSummary(prepared.cwd,prepared.workdir):null,message:'会话已准备；使用返回的版本再次 dispatch。'};
           }
-          return this.runPrepared(requestId,bot.id,task,exec.agent,authorize);
+          return this.runPrepared(requestId,task,exec.agent,authorize);
         }
         if(data.action==='deliver') {
           const resultId=requiredText(data.resultId,'成果标识',200),text=requiredText(data.text,'交付说明',4000);
@@ -496,9 +496,8 @@ export class Managers {
     });
     this.timer=setInterval(()=>{void this.pump();},1000);this.timer.unref();
   }
-  /** Flush then read the native durable log. Live session/event and idle are not storage receipts. */
   /** Reserve a Run on an already prepared binding or queue a capacity notification. */
-  private async runPrepared(requestId:string,botId:string,task:Task,manager:Agent,authorize:()=>void) {
+  private async runPrepared(requestId:string,task:Task,manager:Agent,authorize:()=>void) {
     const binding=this.store.activeBinding(task.id);
     if(!binding?.sessionId)throw new AppError('session-recovery','执行会话需要核对，不能自动重建。');
     const workdir=workdirSummary(binding.cwd,binding.workdir);
@@ -508,29 +507,30 @@ export class Managers {
     }
     catch(error){
       if(!(error instanceof AppError)||error.code!=='capacity')throw error;
-      this.store.recordWait(task.id);
-      this.store.enqueueManager(botId,`capacity:${task.id}:${task.rowVersion}`,'等待执行名额：名额可用后再次核对任务并派发。',task.id);
+      authorize();
+      this.store.recordCapacityWait(requestId,task.id,task.rowVersion);
       const wait=this.store.dispatchWait(task.id);
-      const behind=wait?.holderTaskId?`排在任务 ${wait.holderTaskId}（${(wait.holderGoal??'').slice(0,80)}）之后`:'等待执行名额';
-      return {deferred:true,reason:wait?.code??error.code,holderTaskId:wait?.holderTaskId??null,holderGoal:wait?.holderGoal??null,
-        workdir,message:`执行名额已满，已按先后顺序排队（${behind}）。轮到时会通知你，不要轮询。`};
+      const behind=wait?.holderTaskId?`排在任务 ${wait.holderTaskId}（${(wait.holderGoal??'').slice(0,80)}）之后。`:'';
+      return {deferred:true,reason:error.code,holderTaskId:wait?.holderTaskId??null,holderGoal:wait?.holderGoal??null,
+        capacityScope:'bot',workdir,message:`已加入此 Bot 的执行队列。${behind}轮到时会通知你，不要轮询。`};
     }
   }
   private runWorkdir(run:Run):string|null {const binding=this.store.getBinding(run.bindingId);return binding?workdirSummary(binding.cwd,binding.workdir):null;}
   /** One-step create: prepare the Worker session and reserve its run inside the create call; retries reuse receipts. */
-  private async startCreated(requestId:string,botId:string,taskId:string,manager:Agent,authorize:()=>void):Promise<Record<string,unknown>> {
+  private async startCreated(requestId:string,taskId:string,manager:Agent,authorize:()=>void):Promise<Record<string,unknown>> {
     const prior=this.store.runForRequest(`${requestId}:dispatch`);
     if(prior)return {run:prior,workdir:this.runWorkdir(prior),expectedModel:this.store.runModelPlan(prior.id)};
     let task=this.store.getTask(taskId);
     if(task.status==='recovery'||task.controlMode!=='auto'||task.lifecycle!=='open'||!task.scope||!task.acceptance)return {message:'任务已保存，未自动派发；请核对任务状态。'};
     try {
       if(!this.store.activeBinding(task.id)){await this.execution.prepareSession(`${requestId}:prepare`,task.id,task.rowVersion);authorize();task=this.store.getTask(task.id);}
-      const result=await this.runPrepared(`${requestId}:dispatch`,botId,task,manager,authorize);
+      const result=await this.runPrepared(`${requestId}:dispatch`,task,manager,authorize);
       // The task is already scheduled (or queued for resources); the generic "new task" wake would be redundant.
       this.store.settleManagerEvent(`manager-event:created:${task.id}`);
       return result;
     }catch(error){if(error instanceof AppError&&!['manager-scope','manager-unavailable'].includes(error.code))return {dispatchError:{code:error.code,message:error.message}};throw error;}
   }
+  /** Flush then read the native durable log. Live session/event and idle are not storage receipts. */
   private async reconcileDelivery(session:Session,flush=true,selected?:ManagerEvent[]):Promise<void> {
     const manager=this.authority(session.id),notifications=selected??this.store.managerNotifications(manager.botId,50);
     if(!notifications.length)return;

@@ -99,10 +99,11 @@ SUPER_BOT_PROFILE=super-bot-trial npm run dev:reload -- --wait 30
 - `npm run smoke`：测试宿主运行时检查真实状态、WAL、未认证访问与跨域拒绝。
 - `npm pack --dry-run`：核对分发清单；运行数据和契约测试插件不进入安装包。
 
-Node 用 fnm 管理时，可用 `fnm exec --using=24.21.0 npm run dev`，无需改变机器默认版本。完整执行流程和可靠性门槛见任务清单。未启用 Manager 时，创建任务只保存目标，“开始执行”才调用原生会话中选定的模型。启用 Manager 后，完整且未暂停的任务会自动安排执行；Bot 的 `create` 默认在同一次调用内准备 Worker 会话并派发（执行名额满时排队），缺省的范围/验收由 Bot 推断或使用保守默认值；`dispatch: false` 保留先澄清缺项的流程。需要先核对时，请在创建表单选择“先暂停”。Worker 使用普通 DSH Session。默认（省略 `fullAccess` 或设为 `true`）使用原生 Full Access 预设和宿主可用工具，包括 Shell、Git 与子 Agent；Super Bot 不再附加工具白名单、目录守卫或执行步数/时长上限。每个任务的工作目录由 Bot 按实际情况选择（见下文“任务工作目录”），配置只给出允许范围、默认策略和可选 hook。全局默认最多两个未收敛任务。独立任务可在同一或嵌套目录并行，执行名额满时按先后顺序排队。暂停阻止后续派发，停止请求取消并核对收敛。只有显式 `fullAccess: false` 才启用 files 模式，用于兼容和隔离验证：只允许任务目录内 read/write/edit 与报告，每次最多 40 步或 10 分钟，目录变化和预算耗尽转核对。
+Node 用 fnm 管理时，可用 `fnm exec --using=24.21.0 npm run dev`，无需改变机器默认版本。完整执行流程和可靠性门槛见任务清单。未启用 Manager 时，创建任务只保存目标，“开始执行”才调用原生会话中选定的模型。启用 Manager 后，完整且未暂停的任务会自动安排执行；Bot 的 `create` 默认在同一次调用内准备 Worker 会话并派发（执行名额满时排队），缺省的范围/验收由 Bot 推断或使用保守默认值；`dispatch: false` 保留先澄清缺项的流程。需要先核对时，请在创建表单选择“先暂停”。Worker 使用普通 DSH Session。默认（省略 `fullAccess` 或设为 `true`）使用原生 Full Access 预设和宿主可用工具，包括 Shell、Git 与子 Agent；Super Bot 不再附加工具白名单、目录守卫或执行步数/时长上限。每个任务的工作目录由 Bot 按实际情况选择（见下文“任务工作目录”），配置只给出允许范围、默认策略和可选 hook。独立任务可在同一或嵌套目录并行，执行名额满时排队。暂停阻止后续派发，停止请求取消并核对收敛。只有显式 `fullAccess: false` 才启用 files 模式，用于兼容和隔离验证：只允许任务目录内 read/write/edit 与报告，每次最多 40 步或 10 分钟，目录变化和预算耗尽转核对。
 
+每个 Bot 默认可以同时运行 5 个 Worker。可在该 Bot 的「工作 → 设置与维护 → Worker 并发」查看占用、修改上限，或留空保存以恢复默认。各 Bot 独立分配名额，同一宿主上的两个 Bot 默认可各运行 5 个 Worker。调低上限后，已运行的 Worker 继续执行，等本 Bot 有空余名额时再派发排队任务。旧配置中的宿主级 `maxRunningTasks` 可移除。
 
-可选限额（Super Bot `config` 下，均为正整数）：`maxRunningTasks`（全局同时执行的 Worker 任务，默认 2）、`managerWakesPerHour`（每个 Bot 每小时自动唤醒，默认 20；达到后在状态里记录一次问题并保留通知，下一次成功唤醒后清除）、`managerConcurrentWakes`（同时唤醒的 Bot，默认 2）、`managerTurnMinutes`（单次自动 Bot 轮次上限，默认 5 分钟）。补交付最多 3 次、files 模式 40 步/10 分钟仍为固定值。
+Super Bot `config` 支持以下管理会话限额，均取正整数。`managerWakesPerHour`（每个 Bot 每小时自动唤醒，默认 20；达到后在状态里记录一次问题并保留通知，下一次成功唤醒后清除）、`managerConcurrentWakes`（同时唤醒的 Bot，默认 2）、`managerTurnMinutes`（单次自动 Bot 轮次上限，默认 5 分钟）。补交付最多 3 次、files 模式 40 步/10 分钟仍为固定值。
 
 ## 从 Bot 对话管理已有任务
 

@@ -20,12 +20,7 @@ function fixture(t:TestContext,workspace=false,extra:(directory:string)=>Record<
   const root=realpathSync(process.cwd());mkdirSync(join(root,'.runtime'),{recursive:true});
   const directory=mkdtempSync(join(root,'.runtime','p2-adapter-')),database=join(directory,'ledger.sqlite');
   const extras=extra(directory);
-  const openStore=()=>{
-    const store=new Store(database),maxRunningTasks=extras.maxRunningTasks;
-    if(typeof maxRunningTasks==='number')store.maxRunningTasks=maxRunningTasks;
-    return store;
-  };
-  let store=openStore();
+  let store=new Store(database);
   const bot=store.createBot('bot',{name:'P2 Bot',instructions:'Synthetic regression only'});
   const manager=store.beginManager('manager',bot.id,directory);store.confirmManager(manager.id,manager.requestedSessionId);
   const listeners=new Map<string,Function[]>(),tools=new Map<string,any>(),agents=new Map<string,any>();
@@ -93,7 +88,7 @@ function fixture(t:TestContext,workspace=false,extra:(directory:string)=>Record<
       agents.get(run.sessionId).finish();await new Promise<void>(resolve=>setImmediate(resolve));return report;
     },
     call:(callId:string,args:Record<string,unknown>,signal=new AbortController().signal)=>tools.get('super_bot_manage').execute(args,{agent:{id:manager.requestedSessionId},callId,signal}),
-    reload:async()=>{await managers.dispose();await execution.dispose();registrations.splice(0).forEach(off=>off());listeners.clear();store.close();store=openStore();execution=new DshExecution(ctx,store,directory,options());managers=new Managers(ctx,store,execution,directory,()=> 'https://example.test',options());install();},
+    reload:async()=>{await managers.dispose();await execution.dispose();registrations.splice(0).forEach(off=>off());listeners.clear();store.close();store=new Store(database);execution=new DshExecution(ctx,store,directory,options());managers=new Managers(ctx,store,execution,directory,()=> 'https://example.test',options());install();},
     close:async()=>{await managers.dispose();await execution.dispose();registrations.splice(0).forEach(off=>off());store.close();assert.equal(realpathSync(directory),directory);assert.ok(directory.startsWith(join(root,'.runtime','p2-adapter-')));rmSync(directory,{recursive:true,force:true});t.mock.timers.reset();},
   };
 }
@@ -403,7 +398,8 @@ test('configured workspace dispatches two tasks into independent directories',as
 
 
 test('legacy bindings in the same directory defer only while capacity is full',async t=>{
-  const f=fixture(t,false,()=>({maxRunningTasks:1}));try {
+  const f=fixture(t);try {
+    f.store.setBotCapacity('one-slot',f.bot.id,null,1);
     const tasks=[1,2].map(n=>f.store.createTask(`legacy-${n}`,{botId:f.bot.id,goal:`Legacy ${n}`,scope:'Own files',acceptance:'Read files',reviewPolicy:'human'}));
     for(const task of tasks) {
       const binding=f.store.beginBinding(`binding-${task.id}`,task.id,task.rowVersion,f.directory);
@@ -412,7 +408,7 @@ test('legacy bindings in the same directory defer only while capacity is full',a
     }
     const first=await f.call('first',{action:'dispatch',taskId:tasks[0].id,expectedRowVersion:f.store.getTask(tasks[0].id).rowVersion});
     const deferred=await f.call('second',{action:'dispatch',taskId:tasks[1].id,expectedRowVersion:f.store.getTask(tasks[1].id).rowVersion});
-    assert.equal(deferred.reason,'capacity');assert.equal(f.store.latestRun(tasks[1].id),null);
+    assert.equal(deferred.reason,'capacity');assert.equal(deferred.capacityScope,'bot');assert.equal(f.store.latestRun(tasks[1].id),null);
     f.store.db.exec("UPDATE outbox SET state='done' WHERE kind='manager.notify' AND id NOT LIKE 'manager-event:capacity:%'");
     assert.ok(f.store.pendingManagerEvents(f.bot.id)[0].id.startsWith('manager-event:capacity:'));
     await f.ctx.sessionController.create({workspaceId:f.directory as any,sessionId:f.manager.requestedSessionId as any});
@@ -442,19 +438,24 @@ test('create dispatches in one step with inferred fields and retries reuse the s
 
 test('one-step create keeps explicit Bot fields and queues instead of failing when capacity is full',async t=>{
   const f=fixture(t,true);try {
+    f.store.setBotCapacity('two-slots',f.bot.id,null,2);
     await f.native('request',1,'并行写三份介绍。');
     const results:any[]=[];
     for(const n of [1,2,3])results.push(await f.call(`create-${n}`,{action:'create',goal:`介绍 ${n}`,scope:`只写 doc-${n}.md`,acceptance:'回读'}));
     assert.ok(results[0].run&&results[1].run);assert.equal(results[2].deferred,true);assert.equal(results[2].task.scope,'只写 doc-3.md');
+    assert.equal(results[2].capacityScope,'bot');
+    assert.equal(results[2].task.acceptance,'回读');
+    assert.equal(f.store.latestRun(results[2].task.id),null);
     assert.ok(f.store.pendingManagerEvents(f.bot.id).some((e:any)=>e.id.startsWith(`manager-event:capacity:${results[2].task.id}`)));
   }finally{await f.close();}
 });
 
 const work=(directory:string)=>{const path=join(directory,'work');mkdirSync(path,{recursive:true});return path;};
 
-async function parallelFixture(t:TestContext,maxRunningTasks=2){
-  const f=fixture(t,false,directory=>({allowedRoots:[work(directory)],maxRunningTasks}));
+async function parallelFixture(t:TestContext,botLimit=2){
+  const f=fixture(t,false,directory=>({allowedRoots:[work(directory)]}));
   t.after(()=>f.close());
+  f.store.setBotCapacity('initial-limit',f.bot.id,null,botLimit);
   const root=work(f.directory);
   const dir=(name:string)=>{const path=join(root,name);mkdirSync(path,{recursive:true});return path;};
   const create=(name:string,path:string)=>f.call(`parallel-create:${name}`,{action:'create',goal:name,workdir:{mode:'existing',path}});
@@ -483,7 +484,7 @@ for(const waiters of [1,12]){
     const file=join(dir('independent'),'result.md');writeFileSync(file,'Independent evidence');
     const shared=dir('shared'),holder=await create('Holder',shared);
     assert.ok(holder.run);
-    f.store.maxRunningTasks=1; // The holder continues to occupy the remaining slot after settlement.
+    f.store.setBotCapacity('lower-limit',f.bot.id,2,1); // The holder occupies the remaining slot after settlement.
     const waiting=[];
     for(let i=0;i<waiters;i++){
       const queued=await create(`Queued ${i}`,shared);
@@ -588,6 +589,82 @@ test('DF-13 pump and dispatch preserve FIFO when there is one execution slot',as
   assert.equal(manager.messages.at(-1).source.eventId,`manager-event:capacity:${b.task.id}:${b.task.rowVersion}`);
   assert.ok((await dispatch('start-FIFO-B',b.task.id)).run);
   await endManager(manager,'Second waiter started');
+});
+
+for(const mode of ['dispatch retries','detail only','detail then raise before receipt'] as const)
+test(`lowering a Bot limit during its capacity wake preserves FIFO with ${mode}`,async t=>{
+  const {f,root,create,dispatch,pump,notice,openManager,enterManager,endManager}=await parallelFixture(t,1);
+  const holder=await create('Holder',root),first=await create('First waiter',root);
+  t.mock.timers.tick(1);
+  const second=await create('Second waiter',root);
+  assert.ok(holder.run);
+  assert.equal(first.reason,'capacity');
+  assert.equal(second.reason,'capacity');
+  const original=`manager-event:capacity:${first.task.id}:${first.task.rowVersion}`;
+  const secondNotice=`manager-event:capacity:${second.task.id}:${second.task.rowVersion}`;
+  const waitSequence=()=>f.store.db.prepare('SELECT seq FROM waits WHERE taskId=?').get(first.task.id)?.seq;
+  const sequence=waitSequence();
+  assert.ok(sequence);
+
+  const manager=await openManager();
+  f.store.setBotCapacity('raise-to-two',f.bot.id,1,2);
+  await pump();
+  assert.deepEqual(manager.messages.map((message:any)=>message.source.eventId),[original]);
+  await enterManager(manager);
+  assert.equal(notice(original)?.state,'entered');
+
+  f.store.setBotCapacity('lower-to-one',f.bot.id,2,1);
+  if(mode==='dispatch retries') {
+    const deferred=await dispatch('defer-first',first.task.id);
+    assert.equal(deferred.reason,'capacity');
+    assert.equal(deferred.capacityScope,'bot');
+    assert.deepEqual(await dispatch('defer-first',first.task.id),deferred);
+    assert.deepEqual(await dispatch('defer-first-again',first.task.id),deferred);
+  } else {
+    const detail=await f.call('detail-first',{action:'detail',taskId:first.task.id});
+    assert.equal(detail.wait?.code,'capacity');
+    assert.equal(detail.wait?.scope,'bot');
+  }
+  assert.equal(f.store.latestRun(first.task.id),null);
+  assert.equal(waitSequence(),sequence);
+  const retries=f.store.pendingManagerEvents(f.bot.id).filter(event=>event.id.startsWith(`${original}:`));
+  assert.equal(retries.length,1,'the blocked waiter has a single pending capacity notice');
+  assert.equal(notice(original)?.state,'entered');
+  const retry=retries[0].id;
+  if(mode==='detail then raise before receipt') {
+    f.store.setBotCapacity('raise-again',f.bot.id,1,2);
+    await pump();
+    assert.equal(manager.messages.length,1,'the original native wake still owns the active turn');
+    assert.equal(notice(retry)?.state,'pending');
+  }
+
+  await endManager(manager,'The Bot is still at its Worker limit');
+  assert.equal(notice(original),undefined,'the old capacity notice has its own durable receipt');
+  assert.equal(notice(retry)?.state,'pending');
+  assert.equal(notice(secondNotice)?.state,'pending');
+  if(mode!=='detail then raise before receipt') {
+    await pump();await pump();
+    assert.equal(manager.messages.length,1);
+    f.store.setBotCapacity('raise-again',f.bot.id,1,2);
+  }
+
+  await pump();
+  assert.deepEqual(manager.messages.map((message:any)=>message.source.eventId),[original,retry]);
+  await enterManager(manager);
+  assert.equal((await dispatch('try-second-first',second.task.id)).holderTaskId,first.task.id);
+  const started=await dispatch('start-first',first.task.id);
+  assert.ok(started.run);
+  assert.equal(f.store.latestRun(second.task.id),null);
+  await endManager(manager,'The first waiter started');
+  await pump();
+  assert.equal(manager.messages.length,2,'the holder and first waiter now occupy both slots');
+  await f.finish(first.task.id,[],'waiting');
+  f.store.settleManagerEvent(`manager-event:settled:${started.run.id}`);
+  await pump();
+  assert.deepEqual(manager.messages.map((message:any)=>message.source.eventId),[original,retry,secondNotice]);
+  await enterManager(manager);
+  assert.ok((await dispatch('start-second',second.task.id)).run);
+  await endManager(manager,'The second waiter started');
 });
 
 test('DF-13 unknown Worker enqueue retains recovery and only a confirmed retry fulfills the old intent',async t=>{

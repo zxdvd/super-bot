@@ -6,7 +6,8 @@ import { createHash, randomUUID } from 'node:crypto';
 import schemaVersion from '../schema-version.json' with {type:'json'};
 import { AppError, requiredText, optionalText, taskStatus, type ChatSource, type Bot, type Task, type NewBot, type NewTask, type TaskPage, type ControlMode, type Attention, type Binding, type Run, type RunInput, type WorkReport, type Result,type ManagerBinding,type ManagerEvent,type ExistingSessionGrant,type ReferenceMaterial,type TaskBotContext,type DispatchWait,type WorkdirInfo,type RunTurn,botDraft } from './model.ts';
 import { RESULT_FRESH_MS, type ChatDeliveryStatus, type DeliveredResult, type DeliveryLinks, type RecoveryContinuation, type ReloadReceipt, type RunChildWait,
-  type TaskProgress, type UncertainDelivery, type WorkerModelPlan, type WorkerPriorInput } from './model.ts';
+  DEFAULT_BOT_RUNNING_TASKS, type BotCapacity, type TaskProgress, type UncertainDelivery,
+  type WorkerModelPlan, type WorkerPriorInput } from './model.ts';
 import type { ClusterProbe, ProbeEvidence, ProbeResult, RecoveryCheck } from './read-only-recovery.ts';
 import { readDeliveryLinks } from './delivery-artifacts.ts';
 import {parseWorkdirRequest} from './workdir.ts';
@@ -19,8 +20,16 @@ const DELIVERY_ATTEMPT_LIMIT=3;
 const DELIVERY_RETRY_DELAY_MS=30000;
 const RESULT_DELIVERY_REASON='成果仍待在原对话交付。请确认当前版本，并在最终可见回复中附上完整的成果链接。';
 const DELIVERY_RETRIES_EXHAUSTED='成果补交付已达到 3 次上限，已停止自动唤醒。请在 Bot 对话或工作面板核对成果；未重新执行 Worker。';
+const BOT_CAPACITY_KEY = 'bot-capacity:';
 type ManagerProblem = { message: string; at: number; eventId?: string };
 export type BotDeletionReceipt = { botId: string; managerSessionId: string | null; feishuBindingId: string | null };
+
+function capacityOverride(value: unknown): number | null {
+  if (value === null) return null;
+  if (typeof value === 'number' && Number.isSafeInteger(value) && value > 0) return value;
+  throw new AppError('invalid-input', 'Bot 执行上限必须为正整数，留空可恢复默认。');
+}
+
 function deliveryUncertainReason(payload:{deliveryUncertainReason?:string;deliveryRetryExhausted?:boolean;
   legacyDelivery?:{explicit?:boolean};reconcileNote?:string}, diagnostic?:string):string {
   return payload.deliveryUncertainReason??diagnostic
@@ -32,8 +41,6 @@ function deliveryUncertainReason(payload:{deliveryUncertainReason?:string;delive
 /** One local database. Business transactions will live here, not in the UI/adapter. */
 export class Store {
   readonly db: DatabaseSync;
-  /** Global execution slots; set from config by the plugin entry. */
-  maxRunningTasks=2;
   constructor(path: string, readonly memory?: BotMemory) {
     if (path !== ':memory:') mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
     this.db = new DatabaseSync(path);
@@ -215,6 +222,56 @@ export class Store {
   }
   isBotDeleted(botId: string): boolean {
     return !!this.db.prepare('SELECT 1 FROM bots WHERE id=? AND deletedAt IS NOT NULL').get(botId);
+  }
+  botCapacity(botId: string): BotCapacity {
+    this.getBot(botId);
+    const override = this.botCapacityOverride(botId);
+    return {
+      maxRunningTasks: override, botLimit: override ?? DEFAULT_BOT_RUNNING_TASKS,
+      botHeld: this.heldCapacity(botId),
+    };
+  }
+  setBotCapacity(requestId: string, botId: string, expected: unknown, limit: unknown): BotCapacity {
+    const expectedMaxRunningTasks = capacityOverride(expected);
+    const maxRunningTasks = capacityOverride(limit);
+    this.command(requestId, 'bot.capacity.set', { botId, expectedMaxRunningTasks, maxRunningTasks }, () => {
+      this.getBot(botId);
+      if (this.botCapacityOverride(botId) !== expectedMaxRunningTasks) {
+        throw new AppError('version-conflict', 'Bot 执行上限已更新，请刷新后再保存。');
+      }
+      if (maxRunningTasks === expectedMaxRunningTasks) return {};
+      const key = BOT_CAPACITY_KEY + botId;
+      if (maxRunningTasks === null) this.db.prepare('DELETE FROM metadata WHERE key=?').run(key);
+      else this.set(key, String(maxRunningTasks));
+      if ((maxRunningTasks ?? DEFAULT_BOT_RUNNING_TASKS) < (expectedMaxRunningTasks ?? DEFAULT_BOT_RUNNING_TASKS)) {
+        this.keepBlockedCapacityWaits(botId);
+      }
+      this.event('bot.capacity.changed', null, { botId, maxRunningTasks });
+      return {};
+    });
+    return this.botCapacity(botId);
+  }
+  private botCapacityOverride(botId: string): number | null {
+    const value = Number(this.get(BOT_CAPACITY_KEY + botId));
+    return Number.isSafeInteger(value) && value > 0 ? value : null;
+  }
+  private heldCapacity(botId: string): number {
+    return Number(this.db.prepare(`SELECT count(*) AS count FROM resources q
+      JOIN runs r ON r.id=q.runId JOIN tasks t ON t.id=r.taskId WHERE t.botId=?`).get(botId)?.count);
+  }
+  private keepBlockedCapacityWaits(botId: string): void {
+    // A Manager may see that the slot is gone and finish its turn without trying dispatch again.
+    const inFlight = this.db.prepare(`SELECT t.id,t.rowVersion FROM waits w JOIN tasks t ON t.id=w.taskId
+      JOIN bindings b ON b.taskId=t.id AND b.state='ready' AND b.sessionId IS NOT NULL
+      WHERE t.botId=? AND EXISTS (SELECT 1 FROM outbox o WHERE o.kind='manager.notify' AND o.taskId=t.id
+        AND o.id GLOB 'manager-event:capacity:' || t.id || ':*' AND json_extract(o.payload,'$.botId')=t.botId
+        AND o.state IN ('sending','entered'))`).all(botId);
+    for (const row of inFlight) {
+      const taskId = String(row.id);
+      if (this.getTask(taskId).status === 'unscheduled' && this.dispatchWaitForBot(taskId, botId)) {
+        this.ensureCapacityNotification(botId, taskId, Number(row.rowVersion));
+      }
+    }
   }
   currentBotContext(botId:string):TaskBotContext {
     const bot=this.getBot(botId),row=this.db.prepare('SELECT materials FROM bots WHERE id=?').get(botId)!;
@@ -1086,25 +1143,57 @@ export class Store {
     return true;
   }
   dispatchBlocker(taskId:string):'capacity'|null {return this.dispatchWait(taskId)?.code??null;}
-  /** Earlier live waiters keep their place when execution slots free up. */
+  /** Earlier live waiters of the same Bot keep their place when its execution slots free up. */
   dispatchWait(taskId:string):DispatchWait|null {
-    const held=Number(this.db.prepare('SELECT count(*) AS n FROM resources').get()?.n);
-    if(held>=this.maxRunningTasks)return {code:'capacity',holderTaskId:null,holderGoal:null};
-    const mine=this.db.prepare('SELECT seq FROM waits WHERE taskId=?').get(taskId);
-    // Only eligible waiters with a live capacity notification hold a place.
-    const earlier=this.db.prepare(`SELECT w.taskId,t.goal FROM waits w JOIN tasks t ON t.id=w.taskId
-      JOIN bindings b ON b.taskId=w.taskId AND b.state='ready'
-      WHERE w.taskId!=? AND (? IS NULL OR w.seq<?) AND t.lifecycle='open' AND t.controlMode='auto'
+    const task = this.db.prepare('SELECT botId FROM tasks WHERE id=?').get(taskId);
+    if (!task) throw new AppError('not-found', '任务不存在。');
+    return this.dispatchWaitForBot(taskId, String(task.botId));
+  }
+  private dispatchWaitForBot(taskId: string, botId: string): DispatchWait | null {
+    const slots = (this.botCapacityOverride(botId) ?? DEFAULT_BOT_RUNNING_TASKS) - this.heldCapacity(botId);
+    if (slots <= 0) return { code: 'capacity', scope: 'bot', holderTaskId: null, holderGoal: null };
+
+    const seq = this.db.prepare('SELECT seq FROM waits WHERE taskId=?').get(taskId)?.seq ?? null;
+    // The waiter reserving the last available slot blocks this task, if one exists.
+    const holder = this.db.prepare(`SELECT w.taskId,t.goal FROM waits w JOIN tasks t ON t.id=w.taskId
+      JOIN bindings b ON b.taskId=w.taskId AND b.state='ready' AND b.sessionId IS NOT NULL
+      WHERE t.botId=? AND w.taskId!=? AND (? IS NULL OR w.seq<?) AND t.lifecycle='open' AND t.controlMode='auto'
+      AND t.scope!='' AND t.acceptance!=''
+      AND NOT EXISTS (SELECT 1 FROM attentions a WHERE a.taskId=w.taskId AND a.state='open')
       AND NOT EXISTS (SELECT 1 FROM runs r WHERE r.taskId=w.taskId AND r.finishedAt IS NULL)
-      AND EXISTS (SELECT 1 FROM outbox o WHERE o.kind='manager.notify' AND o.taskId=w.taskId AND o.id LIKE 'manager-event:capacity:%' AND o.state IN ('pending','sending','entered'))
-      ORDER BY w.seq`).all(taskId,mine?.seq??null,mine?.seq??null);
-    if(held+earlier.length<this.maxRunningTasks)return null;
-    return {code:'capacity',holderTaskId:String(earlier[0].taskId),holderGoal:String(earlier[0].goal)};
+      AND NOT EXISTS (SELECT 1 FROM resources q JOIN runs r ON r.id=q.runId WHERE r.taskId=w.taskId)
+      AND EXISTS (SELECT 1 FROM outbox o WHERE o.kind='manager.notify' AND o.taskId=w.taskId
+        AND o.id GLOB 'manager-event:capacity:' || w.taskId || ':*' AND o.state IN ('pending','sending','entered')
+        AND json_extract(o.payload,'$.botId')=t.botId)
+      ORDER BY w.seq LIMIT 1 OFFSET ?`).get(botId, taskId, seq, seq, slots - 1);
+    return holder ? { code: 'capacity', scope: 'bot', holderTaskId: String(holder.taskId), holderGoal: String(holder.goal) } : null;
   }
   /** Joins the FIFO line once; a later deferral of the same task keeps its original place. */
   recordWait(taskId:string):void {
-    const seq=Number(this.db.prepare('SELECT coalesce(max(seq),0)+1 AS n FROM waits').get()?.n);
-    this.db.prepare('INSERT OR IGNORE INTO waits(taskId,createdAt,seq) VALUES (?,?,?)').run(taskId,Date.now(),seq);
+    this.db.prepare('INSERT OR IGNORE INTO waits(taskId,createdAt,seq) SELECT ?,?,coalesce(max(seq),0)+1 FROM waits')
+      .run(taskId,Date.now());
+  }
+  recordCapacityWait(requestId: string, taskId: string, expectedRowVersion: number): void {
+    const receipt = `capacity-wait:${createHash('sha256').update(requestId).digest('hex')}`;
+    this.command(receipt, 'task.wait-capacity', { taskId, expectedRowVersion }, () => {
+      const task = this.getTask(taskId);
+      if (task.rowVersion !== expectedRowVersion) throw new AppError('version-conflict', '任务已更新，请重新读取执行状态。');
+      this.getBot(task.botId);
+      this.recordWait(taskId);
+      this.ensureCapacityNotification(task.botId, taskId, expectedRowVersion);
+      return {};
+    });
+  }
+  private ensureCapacityNotification(botId: string, taskId: string, rowVersion: number): void {
+    const key = `capacity:${taskId}:${rowVersion}`;
+    const previous = this.db.prepare(`SELECT count(*) FILTER (WHERE id=?) AS sameId, count(*) FILTER (WHERE state IN ('pending','blocked')
+      AND attempts=0 AND json_extract(payload,'$.messageId') IS NULL) AS unsent FROM outbox
+      WHERE kind='manager.notify' AND taskId=? AND json_extract(payload,'$.botId')=?
+        AND id GLOB 'manager-event:capacity:' || taskId || ':*'`).get(`manager-event:${key}`, taskId, botId);
+    if (previous?.unsent) return;
+    // Keep any earlier wake receipt and its row version before the optional suffix for reconciliation.
+    this.enqueueManager(botId, previous?.sameId ? `${key}:${randomUUID()}` : key,
+      '等待此 Bot 的执行名额：名额可用后再次核对任务并派发。', taskId);
   }
   reserveRun(requestId:string,taskId:string,expectedRowVersion:number,expectedModel?:WorkerModelPlan):Run {
     return this.command(requestId,'task.dispatch',{taskId,expectedRowVersion},()=>{
@@ -1118,9 +1207,9 @@ export class Store {
     if(task.lifecycle!=='open'||task.controlMode!=='auto'||!task.scope||!task.acceptance)throw new AppError('not-ready','任务当前不能自动执行，请核对目标和管理方式。');
     if(!b||b.state!=='ready'||!b.sessionId)throw new AppError('not-ready','请先准备执行会话。');
     if(this.db.prepare("SELECT 1 FROM attentions WHERE taskId=? AND state='open'").get(taskId))throw new AppError('needs-attention','请先处理当前待办。');
-    if(this.heldRuns().some(run=>run.taskId===taskId))throw new AppError('run-active','这个任务的上次执行尚未收敛。');
-    const blocker=this.dispatchBlocker(taskId);
-    if(blocker)throw new AppError(blocker,'执行名额已占用，请等待或核对已有执行。');
+    if(this.db.prepare('SELECT 1 FROM runs r JOIN resources q ON q.runId=r.id WHERE r.taskId=?').get(taskId))throw new AppError('run-active','这个任务的上次执行尚未收敛。');
+    const wait=this.dispatchWaitForBot(taskId,task.botId);
+    if(wait)throw new AppError(wait.code,'此 Bot 的执行名额已占用，请等待或核对已有执行。');
     const pending=this.pendingInput(taskId);
     if(recovering&&pending&&(pending.messageId!==null||pending.messageJson!==null||
       this.db.prepare("SELECT 1 FROM outbox WHERE id=? AND state!='pending'").get(`input:${pending.id}`))) {

@@ -57,7 +57,7 @@ export const Config = Schema.object({ dataDir: Schema.string().description('Supe
   mirrorDir: Schema.string().description('可选。同机 Web 与 Desktop 只读镜像的私有配对目录，含 pair.json。'),
   feishu: Schema.union([Schema.const(undefined), Schema.object({ enabled: Schema.boolean().default(false) })])
     .description('仅用于导入当前 profile 的旧飞书设置。之后由 Super Bot 设置管理。'),
-  maxRunningTasks:Schema.natural().min(1).default(2).description('全局同时执行的 Worker 任务数'),managerWakesPerHour:Schema.natural().min(1).default(20).description('每个 Bot 每小时自动唤醒上限；达到后记录问题并暂停自动唤醒'),managerConcurrentWakes:Schema.natural().min(1).default(2).description('同时自动唤醒的 Bot 数'),managerTurnMinutes:Schema.natural().min(1).default(5).description('单次自动 Bot 轮次上限（分钟）'),managerModel:roleModel,workerModel:roleModel });
+  managerWakesPerHour:Schema.natural().min(1).default(20).description('每个 Bot 每小时自动唤醒上限；达到后记录问题并暂停自动唤醒'),managerConcurrentWakes:Schema.natural().min(1).default(2).description('同时自动唤醒的 Bot 数'),managerTurnMinutes:Schema.natural().min(1).default(5).description('单次自动 Bot 轮次上限（分钟）'),managerModel:roleModel,workerModel:roleModel });
 
 export async function apply(ctx: Context, config: RuntimeOptions & {
   dataDir?: string; mirrorDir?: string; feishu?: { enabled?: boolean };
@@ -68,7 +68,6 @@ export async function apply(ctx: Context, config: RuntimeOptions & {
   const owner: BotOwner = (profile?.name ?? process.env.DSH_PROFILE) === 'desktop' ? 'desktop' : 'web';
   const peer = oppositeOwner(owner), binding = bindMirror(dataDir, owner, profile, config.mirrorDir);
   const store = new Store(join(dataDir, 'ledger.sqlite'), new BotMemory(dataDir));
-  store.maxRunningTasks=runtimeLimits(config).maxRunningTasks;
   let pairingIssue = binding.issue;
   const mirrorReady = binding.pair && startMirror(binding.pair, query => readLocalMirror(store, query)).catch(() => {
     pairingIssue = '无法启动本端只读镜像监听。';
@@ -163,6 +162,15 @@ export async function apply(ctx: Context, config: RuntimeOptions & {
       if (endpoint === 'bot.work') return { ok: true, value: botWorkSummaries(store.db) };
       if (endpoint === 'bot.list') return { ok: true, value: store.listBots() };
       if (endpoint === 'bot.for-session') return { ok: true, value: store.botForSession(requiredText(payload.sessionId,'会话标识',200)) };
+      if (endpoint === 'bot.capacity.get' || endpoint === 'bot.capacity.set') {
+        const keys = endpoint === 'bot.capacity.get' ? ['action', 'botId']
+          : ['action', 'botId', 'requestId', 'expectedMaxRunningTasks', 'maxRunningTasks'];
+        if (Object.keys(payload).some(key => !keys.includes(key))) throw new AppError('invalid-input', '请仅提供本端 Bot 与执行上限。');
+        const botId = requiredText(payload.botId, 'Bot 标识', 200);
+        if (endpoint === 'bot.capacity.get') return { ok: true, value: store.botCapacity(botId) };
+        return { ok: true, value: store.setBotCapacity(requiredText(payload.requestId, '请求标识', 200), botId,
+          payload.expectedMaxRunningTasks, payload.maxRunningTasks) };
+      }
       if (endpoint === 'sidebar.tidy' || endpoint === 'sidebar.pin') {
         const botId=requiredText(payload.botId,'Bot 标识',200),sessionId=requiredText(payload.sessionId,'主聊天标识',200);
         return {ok:true,value:endpoint==='sidebar.tidy'?await sidebar.tidy(botId,sessionId):await sidebar.pin(botId,sessionId)};
