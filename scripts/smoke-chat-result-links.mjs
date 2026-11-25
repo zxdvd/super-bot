@@ -5,7 +5,7 @@ import { mkdir, readFile, realpath, rename, writeFile } from 'node:fs/promises';
 import { basename, join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import {
-  artifactDeliveryText, artifactLinks, artifactPortProbeGoal, artifactPortProbeTail,
+  artifactDeliveryText, artifactGoal, artifactLinks, artifactPortProbeGoal, artifactPortProbeTail,
   artifactReference, artifactRevision, supplementalDoc,
 } from '../test/delivery-link-fixture.ts';
 
@@ -59,6 +59,7 @@ export async function smokeChatResultLinks({ base, configure, launch, stop, rpc,
   const [receipt] = receipts(delivered);
   assert.deepEqual(runIds(delivered), [first.run.id]);
   const oldFile = oldOrigin + filePath(id);
+  assert.ok(!original.includes(oldFile), 'compact native delivery links to the whole result, without listing evidence files');
   const firstBytes = Buffer.from(await (await host.get(filePath(id))).arrayBuffer());
   assert.equal(sha256(firstBytes), first.result.evidence[0].sha256);
   await stop('desktop');
@@ -173,6 +174,14 @@ export async function smokeChatResultLinks({ base, configure, launch, stop, rpc,
       assert.equal(new URL(page.url()).origin, host.base);
       assert.equal(new URL(page.url()).hash, workPath(task.id, resultId).slice(1));
     };
+    const replyItems = flow.getByRole('group', { name: '交付物', exact: true }).first();
+    await replyItems.waitFor();
+    const moreItems = replyItems.locator('summary');
+    if (await moreItems.count()) await moreItems.click();
+    for (const [name, href] of Object.entries(artifactLinks)) {
+      assert.equal(await replyItems.getByRole('link', { name, exact: true }).getAttribute('href'), href);
+    }
+    assert.equal(await replyItems.locator(`a[href="${artifactReference}"]`).count(), 0);
     await openWorkTask();
     await artifacts.waitFor();
     await assertArtifacts(artifactLinks);
@@ -233,6 +242,7 @@ export async function smokeChatResultLinks({ base, configure, launch, stop, rpc,
     await say(`请更新这项交付 ${host.base}${fragment}，新增交付物“飞书文档 · 联调纪要” ${supplementalDoc}。`);
     const patched = { ...artifactLinks, '飞书文档 · 联调纪要': supplementalDoc };
     await artifacts.getByRole('link', { name: '飞书文档 · 联调纪要' }).waitFor({ timeout: 10000 });
+    await replyItems.locator(`a[href="${supplementalDoc}"]`).waitFor({ state: 'attached', timeout: 10000 });
     await assertArtifacts(patched);
     assert.equal(await card.evaluate(element => element.isConnected), true);
     assert.equal(await collapse.getAttribute('aria-expanded'), 'true');
@@ -264,6 +274,8 @@ export async function smokeChatResultLinks({ base, configure, launch, stop, rpc,
     const preview = page.getByRole('region', { name: '成果文件预览' });
     let downloads = 0;
     page.on('download', () => downloads++);
+    // Earlier replies can still contain a direct file link from the previous host port.
+    await say(`CHAT_LINK_MARKDOWN:[旧版文件](${oldFile})`);
     await link(oldFile).click();
     await preview.getByLabel('成果文件内容').waitFor();
     assert.equal(await preview.getByLabel('成果文件内容').textContent(), firstBytes.toString('utf8'));
@@ -383,6 +395,16 @@ export async function smokeChatResultLinks({ base, configure, launch, stop, rpc,
     const webBot = await makeBot(web, 'WEB_ROOT_PROBE');
     await probe(web, 'select-test-model', webBot.managerId);
     const webBrowser = await openBrowserChat(web, webBot.name);
+    await probe(web, 'native-prompt', webBot.managerId, artifactGoal);
+    const webLinks = webBrowser.flow.getByRole('group', { name: '交付物', exact: true });
+    await webLinks.locator('summary').click({ timeout: 15000 });
+    for (const [name, href] of Object.entries(artifactLinks)) {
+      assert.equal(await webLinks.getByRole('link', { name, exact: true }).getAttribute('href'), href);
+    }
+    await webBrowser.flow.getByRole('link', { name: '查看完整交付', exact: true }).click();
+    const webDrawer = webBrowser.page.getByRole('dialog', { name: '任务详情' });
+    await webDrawer.getByRole('heading', { name: artifactGoal, exact: true }).waitFor();
+    await webDrawer.getByRole('button', { name: '关闭任务详情' }).click();
     const webRelative = await rootRelative(web, webBrowser.flow, webBot.managerId, 'RC1_ROOT');
     await webBrowser.context.close();
     await page.bringToFront();

@@ -1,13 +1,13 @@
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { AppType, Client, DefaultCache, defaultHttpInstance, Domain, EventDispatcher, WSClient } from '@larksuiteoapi/node-sdk';
 import { AppError } from './model.ts';
-import { isFeishuChatId, isFeishuOpenId, type FeishuCheckResult, type FeishuConfig, type FeishuConnectionState,
+import { feishuTextData, feishuTextDataFits, isFeishuChatId, isFeishuOpenId, MAX_FEISHU_TEXT_BODY_BYTES,
+  type FeishuCheckResult, type FeishuConfig, type FeishuConnectionState,
   type FeishuCredentials, type FeishuGroup, type FeishuGroupDiagnosis, type FeishuGroupTextMessage, type FeishuHandlers,
   type FeishuTextMessage, type FeishuTransport } from './feishu-types.ts';
 
 const MESSAGE_EVENT = 'im.message.receive_v1';
 const REQUEST_TIMEOUT_MS = 12_000;
-const MAX_TEXT_BODY_BYTES = 150_000;
 const BOT_IDENTITY_TIMEOUT_MS = 1200;
 const BOT_IDENTITY_RETRY_MS = 10_000;
 const FEISHU_ORIGIN = 'https://open.feishu.cn';
@@ -91,7 +91,7 @@ function humanText(event: Record<string, unknown>): FeishuTextMessage | null {
   if (typeof messageId !== 'string' || !/^om_[A-Za-z0-9_]{1,125}$/.test(messageId) || typeof content !== 'string') return null;
   const createdAt = typeof createTime === 'string' && /^\d+$/.test(createTime) ? Number(createTime) : createTime;
   if (typeof createdAt !== 'number' || !Number.isSafeInteger(createdAt) || createdAt < 0) return null;
-  if (Buffer.byteLength(content) > MAX_TEXT_BODY_BYTES) return null;
+  if (Buffer.byteLength(content) > MAX_FEISHU_TEXT_BODY_BYTES) return null;
   const text = readableText(content, mentions);
   if (!text) return null;
   return { chatId, messageId, senderOpenId, createdAt, text };
@@ -463,8 +463,8 @@ export function createFeishuTransport(config: FeishuConfig, options: TransportOp
         if (!isReady(connection)) throw new AppError('feishu-not-ready', '飞书长连接当前不可用。');
         assertChatId(chatId);
         assertUuid(uuid);
-        const data = { receive_id: chatId, msg_type: 'text', content: JSON.stringify({ text }), uuid };
-        if (Buffer.byteLength(JSON.stringify(data)) > MAX_TEXT_BODY_BYTES) {
+        const data = feishuTextData(chatId, text, uuid);
+        if (!feishuTextDataFits(data)) {
           throw new AppError('feishu-text-too-long', '该条文本超出飞书消息长度限制。');
         }
         const response = await im.message.create({ params: { receive_id_type: 'chat_id' }, data });

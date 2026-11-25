@@ -3,27 +3,54 @@ import assert from 'node:assert/strict';
 import {mkdirSync,mkdtempSync,rmSync,realpathSync} from 'node:fs';
 import {join} from 'node:path';
 import {Store} from '../src/store.ts';
+import type {DeliveryLinks} from '../src/model.ts';
 
 const mr = 'https://gitlab.example.test/team/app/-/merge_requests/1087';
 const cr = 'https://review.example.test/c/client/+/1842763';
 const doc = 'https://example.feishu.cn/docx/fixture';
 
-function fixture(store:Store) {
+function fixture(store:Store,links?:DeliveryLinks) {
   const bot=store.createBot('bot',{name:'Delivery fixture',instructions:'Synthetic files'});
   const manager=store.beginManager('manager',bot.id,'/synthetic/manager');store.confirmManager(manager.id,manager.requestedSessionId);
   const task=store.createTask('task',{botId:bot.id,goal:'Write facts',scope:'Own files',acceptance:'Read facts',reviewPolicy:'human'});
   const binding=store.beginBinding('binding',task.id,task.rowVersion,'/synthetic/work');store.confirmBinding(binding.id,binding.requestedSessionId);
   const run=store.reserveRun('dispatch',task.id,store.getTask(task.id).rowVersion);
   store.saveRunMessage(run.id,'worker','{}');store.claimDispatch(run.id);store.inputEntered(run.id,'worker',1);
-  const result=store.workerReport(run.id,'report',{kind:'ready',summary:'Facts written',checks:'Read facts',evidence:[{path:'/synthetic/work/result.md',sha256:'synthetic',bytes:20}]});store.settleRun(run.id);
+  const result=store.workerReport(run.id,'report',{kind:'ready',summary:'Facts written',checks:'Read facts',
+    evidence:[{path:'/synthetic/work/result.md',sha256:'synthetic',bytes:20}],links});store.settleRun(run.id);
   const event=store.pendingManagerEvents(bot.id).find(item=>item.id===`manager-event:settled:${run.id}`)!;
   return {bot,manager,task,run,result,event};
 }
 
+test('formal delivery inherits the exact ready links without resubmitting the URL',()=>{
+  for(const useDeliver of [true,false]) {
+    const store=new Store(':memory:');
+    try {
+      const links={方案:`${doc}?selection=${'12345'.repeat(2001)}#section`};
+      const {bot,manager,task,result}=fixture(store,links);
+      const sessionId=manager.requestedSessionId,resultId=result.resultId!;
+      const delivery={taskId:task.id,resultId,text:'已完成方案'};
+      const version=()=>store.getTask(task.id).rowVersion;
+      store.managerReview('review',bot.id,task.id,version(),resultId,'human','检查了任务成果');
+      if(useDeliver)store.managerDeliver('deliver',bot.id,sessionId,'deliver',delivery,{});
+      assert.equal(store.taskDetail(task.id).deliveredResult,null);
+      const eventId=`manager-event:delivery:${resultId}`;
+      const payload=store.db.prepare('SELECT payload FROM outbox WHERE id=?').get(eventId)?.payload;
+      assert.ok(payload);
+      assert.equal(JSON.parse(String(payload)).links,undefined,'the ready report supplies the original URL');
+      store.managerNotificationDelivered(eventId,sessionId,{turn:1,seq:2,endSeq:3,messageId:'visible'});
+      assert.deepEqual(store.taskDetail(task.id).deliveredResult?.links,links);
+      const updated=store.managerUpdateDeliveryLinks('remove',bot.id,sessionId,task.id,version(),resultId,{方案:null});
+      assert.deepEqual(updated,{});
+      assert.deepEqual(store.taskDetail(task.id).deliveredResult?.links,{},'owner removal overrides the Worker default');
+    }finally{store.close();}
+  }
+});
+
 test('registered delivery links require a durable receipt and KV patches preserve delivery and acceptance',()=>{
   const store=new Store(':memory:');
   try {
-    const {bot,manager,task,result}=fixture(store),resultId=result.resultId!,sessionId=manager.requestedSessionId;
+    const {bot,manager,task,result}=fixture(store,{草稿:doc}),resultId=result.resultId!,sessionId=manager.requestedSessionId;
     const delivery={taskId:task.id,resultId,text:'两项内容已检查'};
     const initial={后端MR:mr,前端MR:`${mr}?variant=web`,客户端CR:cr,方案:doc};
     const submit=(id:string,links:unknown)=>store.managerDeliver(id,bot.id,sessionId,id,delivery,{links});
@@ -77,15 +104,12 @@ test('registered delivery links require a durable receipt and KV patches preserv
 test('latest formal delivery stays visible throughout rework, with no links inherited by the new version',()=>{
   const store=new Store(':memory:');
   try {
-    const {bot,manager,task,result}=fixture(store),firstId=result.resultId!,sessionId=manager.requestedSessionId;
-    const deliver=(id:string,resultId:string,text:string,links?:unknown)=>{
-      store.managerDeliver(id,bot.id,sessionId,id,{taskId:task.id,resultId,text},{links});
-    };
+    const {bot,manager,task,result}=fixture(store,{MR:mr}),firstId=result.resultId!,sessionId=manager.requestedSessionId;
     const prove=(resultId:string,turn:number)=>{
       store.managerNotificationDelivered(`manager-event:delivery:${resultId}`,sessionId,
         {turn,seq:turn*10,endSeq:turn*10+1,messageId:`visible-${turn}`});
     };
-    deliver('first',firstId,'第一版',{MR:mr});prove(firstId,1);
+    store.managerDeliver('first',bot.id,sessionId,'first',{taskId:task.id,resultId:firstId,text:'第一版'},{});prove(firstId,1);
     store.rejectResult('rework',task.id,store.getTask(task.id).rowVersion,firstId,'补充事实');
     assert.equal(store.taskDetail(task.id).deliveredResult?.id,firstId);
     const patch=(resultId:string)=>store.managerUpdateDeliveryLinks('late',bot.id,sessionId,task.id,

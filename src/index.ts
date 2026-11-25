@@ -158,6 +158,18 @@ export async function apply(ctx: Context, config: RuntimeOptions & {
         return { ok: true, value: store.managerInfo(botId) };
       }
       if (endpoint === 'status') return { ok: true, value: status() };
+      if (endpoint === 'chat.delivery') {
+        const sessionId = requiredText(payload.sessionId, '会话标识', 200);
+        const { turn, endSeq } = payload;
+        if (typeof turn !== 'number' || !Number.isSafeInteger(turn) || turn < 0 ||
+          typeof endSeq !== 'number' || !Number.isSafeInteger(endSeq) || endSeq < 0 ||
+          Object.keys(payload).some(key => !['action', 'sessionId', 'turn', 'endSeq'].includes(key))) {
+          throw new AppError('invalid-input', '请提供当前 Bot 对话中已结束的轮次。');
+        }
+        if (!store.botForSession(sessionId)) return { ok: true, value: { deliveries: [] } };
+        await managers.waitForChatDelivery(sessionId);
+        return { ok: true, value: { deliveries: store.chatDeliveries(sessionId, turn, endSeq) } };
+      }
       if (endpoint === 'backup.create') return {ok:true,value:await createLedgerBackup(store,dataDir,requiredText(payload.requestId,'请求标识',200))};
       if (endpoint === 'bot.work') return { ok: true, value: botWorkSummaries(store.db) };
       if (endpoint === 'bot.list') return { ok: true, value: store.listBots() };

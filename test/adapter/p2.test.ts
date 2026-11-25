@@ -865,7 +865,9 @@ test('code delivery from native chat preserves a dirty Git baseline and reports 
   });
   assert.match(delivery.markdown, /Web and Desktop loading unverified/);
   assert.ok(delivery.markdown.includes(`resultId=${report.resultId}`));
-  assert.match(delivery.markdown, /\[facts\.md\].*\[app\.mjs\]/s);
+  assert.match(delivery.markdown, /\[查看完整交付\]/);
+  assert.doesNotMatch(delivery.markdown, /super-bot-file/);
+  assert.deepEqual(delivery.files.map((file: { name: string }) => file.name), ['facts.md', 'app.mjs']);
   assert.equal(detail.task.lifecycle, 'review');
   assert.equal(detail.result.humanAcceptedAt, null);
 });

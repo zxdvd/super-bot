@@ -61,6 +61,7 @@ test('first dispatch is full, while proven answer, rework and bare continuation 
   assert.match(textOf(full),/Bot responsibility: Prepare reports for the operations team/);
   assert.match(textOf(full),/Use Markdown tables/);
   assert.match(textOf(full),/Worker 完整权限未开启/);
+  assert.match(textOf(full),/register each actual external deliverable in links/);
   append(full);
   assert.equal(workerPromptPlan(agent,next,standing).mode,'delta');
   for (const kind of ['answer','rework','dispatch']) {

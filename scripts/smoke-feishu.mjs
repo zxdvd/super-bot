@@ -218,6 +218,16 @@ async function smokeDeliveryLinks(host, ownerBot, group, sessionId) {
   const originalMessages = await sent(host, group, artifactDeliveryText);
   assert.equal(originalMessages.length, 1);
   assert.ok(originalMessages[0].text.includes(resultLink));
+  assert.ok(originalMessages[0].text.includes('在运行 Bot 的电脑上查看完整交付'));
+  assert.ok(!originalMessages[0].text.includes('/api/super-bot-file'));
+  assert.ok(!originalMessages[0].text.includes(artifactReference));
+  const transcript = await model(host, 'inspect-session', { sessionId });
+  const reply = transcript.assistantTexts.find(text => text.includes(resultLink));
+  assert.ok(reply?.includes(artifactDeliveryText));
+  assert.ok(!reply.includes('/api/super-bot-file'));
+  assert.ok(Object.values(artifactLinks).every(url => !reply.includes(url)));
+  const forwardedArtifacts = Object.values(artifactLinks).filter(url => originalMessages[0].text.includes(url));
+  assert.equal(forwardedArtifacts.length, 2);
   const receipts = original.events.filter(event => event.kind === 'manager.delivered' && JSON.parse(event.data).resultId);
   assert.equal(receipts.length, 1);
 

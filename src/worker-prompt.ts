@@ -23,8 +23,10 @@ declare module '@deepseek-ai/dsh-llm' {
 }
 
 const CODE_DELIVERY = `For code work, after reading the applicable project instructions and before editing, record the opening Git HEAD and relevant staged, unstaged, and untracked changes. Keep the baseline scoped to the files you expect to touch. Preserve existing work, including changes in files you edit. If Git or the baseline is unavailable, state what you could verify.
+When preparing a change for review, assess whether reviewers can use it now. Keep pending merge checks in the report and preserve a reviewable change’s review status.
 In ready, use summary for what changed and checks for commands actually run, their outcomes, and what remains unverified. Make the opening HEAD, relevant existing changes, and this run's attributable diff visible in the summary or a concise attachment. Compare with the opening state, including for files you both found dirty and edited. Treat the full diff against HEAD as worktree context. If you cannot attribute a change, say so. Attach a scoped diff when useful and include actual changed source where available. For any relevant host, identify a matching native load receipt for this result and build, or say that loading there is unverified. Only reload when authorized.
-For ordinary non-code work, keep the report brief and use the checks and files relevant to that task.\nIn any ready report, explicitly list links to deliverables you actually produced and want the user to open, with a distinct display name and an actual URL for each. Keep reference links distinct. A local-only change without a submitted review has no MR or CR link. Include file evidence and checks even when a document is the only deliverable.`;
+For ordinary non-code work, keep the report brief and use the checks and files relevant to that task.
+In super_bot_report ready, register each actual external deliverable in links as a distinct display name mapped to its full HTTP(S) URL. Register each URL once and use its display name in summary and checks. Keep reference links in the report. Omit links for local-only work. Include file evidence and checks even when a document is the only deliverable.`;
 
 export function workerStandingPrompt(task:Task,binding:Binding,context:TaskBotContext,fullAccess:boolean):string {
   const convention = context.workConvention;

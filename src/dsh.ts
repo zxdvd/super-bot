@@ -135,13 +135,15 @@ export class DshExecution {
 
   install():void {
     this.ctx.effect(()=>this.ctx.tools.register({name:'super_bot_report',description:'Report progress, a question, a blockage, failure, or ready results to the task ledger. Ready requires files and acceptance checks. A ready report requests human review, it does not complete the task.',
-      parameters:{type:'object',properties:{kind:{type:'string',enum:['progress','waiting','ready','blocked','failed']},summary:{type:'string'},checks:{type:'string'},files:{type:'array',items:{type:'string'},maxItems:10}},required:['kind','summary'],additionalProperties:false},
+      parameters:{type:'object',properties:{kind:{type:'string',enum:['progress','waiting','ready','blocked','failed']},summary:{type:'string'},checks:{type:'string'},files:{type:'array',items:{type:'string'},maxItems:10},
+        links:{type:'object',additionalProperties:{type:'string'},description:'Ready only. Map a distinct display name to the full HTTP(S) URL of each actual external deliverable. Use files for local evidence and keep reference links in the report.'},
+      },required:['kind','summary'],additionalProperties:false},
       output:{schema:{type:'object',properties:{accepted:{type:'boolean'},resultId:{type:'string'},reason:{type:'string'},next:{type:'string'}},required:['accepted'],additionalProperties:false},render:(_args,value)=>[{type:'text',text:JSON.stringify(value)}]},
       execute:async(args,exec)=>{
         const run=this.store.heldRuns().find(r=>r.sessionId===exec.agent?.id&&r.finishedAt===null);
         if(!run||this.finishing.has(run.id))throw new AppError('report-scope','当前会话没有可报告的执行。');
         const data=args as Record<string,unknown>;const binding=this.store.getBinding(run.bindingId);
-        const report:WorkReport={kind:data.kind as WorkReport['kind'],summary:requiredText(data.summary,'报告内容'),checks:optionalText(data.checks,'验收说明')};
+        const report:WorkReport={kind:data.kind as WorkReport['kind'],summary:requiredText(data.summary,'报告内容'),checks:optionalText(data.checks,'验收说明'),links:data.links as WorkReport['links']};
         if(report.kind==='ready'&&this.store.recoveryWorkPlan(run.id)?.context.mode==='read-only') {
           throw new AppError('continuation-scope','本次只读核对只覆盖指定的后续步骤。请用 blocked 或 waiting 报告实际观察及余下事项。');
         }

@@ -46,7 +46,7 @@ const filePath = `/api/super-bot-file?resultId=${resultId}&index=0`;
 const withoutLink = await waitFor(async () => {
   const log = await inspect();
   const tool = log.toolResults.find(result => !result.message.isError && result.message.content.some(
-    block => block.type === 'text' && block.text.includes(`[查看成果并确认](${workUrl})`)));
+    block => block.type === 'text' && block.text.includes(`](${workUrl})`)));
   return tool && log.status === 'idle' && log.assistantTexts.includes('请查看上面的交付卡片。') && log;
 }, 'successful tool result and final reply without a link');
 assert.equal(withoutLink.assistantTexts.some(text => text.includes(workUrl)), false);
@@ -75,7 +75,7 @@ const delivered = await waitFor(async () => {
   return current.chatDelivery.state === 'delivered' && current;
 }, 'native final receipt');
 const log = await inspect();
-assert.ok(log.assistantTexts.some(text => text.includes(workUrl) && text.includes(client.base + filePath)));
+assert.ok(log.assistantTexts.some(text => text.includes(workUrl) && !text.includes(client.base + filePath)));
 assert.equal(delivered.result.humanAcceptedAt, null);
 assert.equal(delivered.run.id, ready.run.id);
 assert.equal((await status()).hourlyWakes, 1);

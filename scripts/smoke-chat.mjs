@@ -43,7 +43,7 @@ assert.equal(source.text,request);assert.equal(source.sessionId,manager.sessionI
 const download=`/api/super-bot-file?resultId=${detail.result.id}&index=0`;
 const resultLink=(taskId,resultId)=>`${client.base}/#super-bot-task=${taskId}&resultId=${resultId}`;
 await wait(async()=>{const session=await inspect();return session.status==='idle'&&session.assistantTexts.some(text=>
-  text.includes(client.base+download)&&text.includes(resultLink(task.id,detail.result.id))&&text.includes('等待你确认'));},'versioned delivery in original chat');
+  !text.includes(client.base+download)&&text.includes(resultLink(task.id,detail.result.id))&&text.includes('等待你确认'));},'versioned delivery in original chat');
 assert.equal(detail.result.humanAcceptedAt,null);
 const file=await client.get(download);assert.equal(file.status,200);const original=await file.text();assert.match(original,/事实一/);
 assert.equal((await client.get(download.replace('index=0','index=99'))).status,404);

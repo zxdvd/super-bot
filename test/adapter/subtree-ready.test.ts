@@ -75,7 +75,7 @@ async function fixture(version:'rc.1'|'rc.5'='rc.5') {
       for(const fn of agentListeners.get('subagent/end')??[])fn.call(carrier,{...childEdge(local),stopReason:'completed'});
       joined.resolve(true);
     },
-    call:(id:string)=>{order.push(id);return execute({kind:'ready',summary:'Final facts',checks:'Read final bytes',files:[file]},
+    call:(id:string,overrides:Record<string,unknown>={})=>{order.push(id);return execute({kind:'ready',summary:'Final facts',checks:'Read final bytes',files:[file],...overrides},
       {agent,callId:id,signal:abort.signal,concludeTurn:()=>{conclusions++;order.push('conclude');}});},
     conclusions:()=>conclusions,released:()=>released,treeCalls:()=>treeCalls,guard:(name:string)=>guard({name}),
     stop:()=>execution.stop('stop',task.id,store.getTask(task.id).rowVersion),
@@ -83,6 +83,25 @@ async function fixture(version:'rc.1'|'rc.5'='rc.5') {
     stopping:async(subject=agent,turn=1)=>{for(const fn of agentListeners.get('agent/turn-stopping')??[])await fn({agent:subject,turn,signal:abort.signal});},
     close:async()=>{joined.resolve(true);agent.cancel();agent.status='idle';idle.resolve();await execution.dispose();store.close();assert.ok(directory.startsWith(resolve('.runtime/subtree-ready-')));rmSync(directory,{recursive:true,force:true});}};
 }
+
+test('only ready reports register safe links, and a retry attests to the same links',async()=>{
+  const f=await fixture();try {
+    const result='https://example.test/releases/report',docs='https://docs.example.test/abc';
+    for(const invalid of [{link:'javascript:alert(1)'},{link:'https://user:pass@example.test/report'},[result],{link:null}]) {
+      await assert.rejects(f.call('bad',{links:invalid}),{code:'invalid-delivery-links'});
+    }
+    await assert.rejects(f.call('progress',{kind:'progress',links:{result}}),{code:'invalid-delivery-links'});
+    assert.equal(f.store.finalReport(f.run.id),null);
+    assert.equal(f.treeCalls(),0,'link validation happens before waiting for children or capturing files');
+    const receipt=await f.call('deliverables',{links:{result,docs}});
+    assert.equal(receipt.accepted,true);
+    assert.deepEqual(await f.call('deliverables',{links:{docs,result}}),receipt);
+    await assert.rejects(f.call('deliverables',{links:{result}}),{code:'idempotency-conflict'});
+    await assert.rejects(f.call('deliverables'),{code:'idempotency-conflict'});
+    const saved=f.store.db.prepare('SELECT data FROM reports WHERE runId=?').get(f.run.id);
+    assert.deepEqual(JSON.parse(String(saved?.data)).links,{docs,result});
+  }finally{await f.close();}
+});
 
 test('force delete retains the Worker reservation until the exact child and Job settle', {timeout:3000},async()=>{
   const f=await fixture();try {

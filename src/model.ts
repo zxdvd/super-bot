@@ -182,9 +182,12 @@ export interface RunChildWait {
 export type ChildWaitDetail = RunChildWait & { elapsedMs: number | null };
 
 export interface Evidence {path:string;sha256:string;bytes:number}
-export interface WorkReport {kind:'progress'|'waiting'|'ready'|'blocked'|'failed';summary:string;checks?:string;evidence?:Evidence[];requestedFiles?:string[]}
-export interface Result {id:string;runId:string;taskId:string;taskRevision:number;summary:string;checks:string;evidence:Evidence[];createdAt:number;humanAcceptedAt:number|null}
 export type DeliveryLinks = Record<string, string>;
+export interface WorkReport {
+  kind:'progress'|'waiting'|'ready'|'blocked'|'failed';summary:string;checks?:string;
+  evidence?:Evidence[];requestedFiles?:string[];links?:DeliveryLinks;
+}
+export interface Result {id:string;runId:string;taskId:string;taskRevision:number;summary:string;checks:string;evidence:Evidence[];createdAt:number;humanAcceptedAt:number|null}
 export interface DeliveredResult extends Result {
   deliveredAt: number;
   deliveryText?: string;

@@ -46,13 +46,15 @@ async function fixture(t:TestContext,fullAccess?:boolean,extra:Record<string,unk
   const call=(callId:string,args:Record<string,unknown>,sessionId=agent.id)=>handler(args,{agent:sessionId===agent.id?agent:{id:sessionId},callId,signal:new AbortController().signal});
   const enter=async(turn:number)=>{await emit('turn/start',{turn});const msg=agent.lastMessage;await emit('user/message',msg,'append');};
   const review=async(turn=1)=>{await emit('tool/call',{turn,step:0,callId:'review',name:'super_bot_manage',arguments:JSON.stringify({action:'review',taskId:task.id})});return call('review',{action:'review',taskId:task.id,expectedRowVersion:store.getTask(task.id).rowVersion,resultId:report.resultId,verdict:'human',note:'Read both facts'});};
-  const text=()=>`已写好，两项事实已检查；真实模型质量尚未验证，待你确认。\n[文件](https://example.test/api/super-bot-file?resultId=${report.resultId}&index=0)\n[查看成果并确认](https://example.test/#super-bot-task=${task.id}&resultId=${report.resultId})`;
+  const resultLink=()=>`[查看完整交付](https://example.test/#super-bot-task=${task.id}&resultId=${report.resultId})`;
+  const fileLink=()=>`[文件](https://example.test/api/super-bot-file?resultId=${report.resultId}&index=0)`;
+  const text=()=>`两项事实已写好并回读。\n${resultLink()}`;
   const assistant=async(turn:number,content:any[]=[{type:'text',text:text()}],finish='stop',interrupted=false)=>emit('assistant/message',{turn,step:1,message:{id:`assistant-${events.length}`,role:'assistant',source:{kind:'model',provider:'fake',model:'fake'},content},stream:[{type:'chunk',time:Date.now(),chunk:{type:'finish',reason:{kind:finish}}}],...(interrupted?{interrupted:true}:{})},'append');
   const end=async(turn:number,success=true)=>{await emit('turn/end',{turn,reason:success?{kind:'completed'}:{kind:'error',error:{code:'SYNTHETIC_MODEL_FAILURE'}}});agent.status='idle';resolveIdle();await new Promise<void>(resolve=>setImmediate(resolve));};
   const repeatEnd=(turn:number)=>listeners.get('session/event')?.(session,
     events.find(event=>event.type==='turn/end'&&event.data.turn===turn));
   const state=()=>store.db.prepare('SELECT state,payload FROM outbox WHERE id=?').get(`manager-event:delivery:${report.resultId}`);
-  return {allowed:()=>allowed,prompt:()=>prompt(),get store(){return store;},bot,manager,task,run,report,ready,agent,events,durable,pulse,enter,call,review,text,assistant,end,repeatEnd,state,emit,emitForeign,file,beginNative:()=>{agent.status='running';idle=new Promise<void>(resolve=>{resolveIdle=resolve;});},checkpoint:()=> (ctx.sessions as any).flush(session),reinstallWhileActive:()=>{retired.push(managers);managers=new Managers(ctx,store,execution,directory,()=> 'https://example.test',{fullAccess,...extra});managers.install();},guard:(name:string,args:Record<string,unknown>={})=>guard({name,arguments:args}),counts:()=>({followups,dispatches,cancels}),setFlush:(mode:typeof flushMode)=>{flushMode=mode;},unblockFlush:()=>allowFlush(),reload:async(reopen=false)=>{await managers.dispose();if(reopen){store.close();store=new Store(join(directory,'ledger.sqlite'));}managers=new Managers(ctx,store,execution,directory,()=> 'https://example.test',{fullAccess,...extra});managers.install();},close:async()=>{agent.status='idle';resolveIdle();await managers.dispose();for(const old of retired)await old.dispose();store.close();assert.ok(directory.startsWith(join(root,'.runtime','delivery-adapter-')));rmSync(directory,{recursive:true,force:true});t.mock.timers.reset();}};
+  return {allowed:()=>allowed,prompt:()=>prompt(),get store(){return store;},bot,manager,task,run,report,ready,agent,events,durable,pulse,enter,call,review,text,resultLink,fileLink,assistant,end,repeatEnd,state,emit,emitForeign,file,waitForChatDelivery:()=>managers.waitForChatDelivery(session.id),beginNative:()=>{agent.status='running';idle=new Promise<void>(resolve=>{resolveIdle=resolve;});},checkpoint:()=> (ctx.sessions as any).flush(session),reinstallWhileActive:()=>{retired.push(managers);managers=new Managers(ctx,store,execution,directory,()=> 'https://example.test',{fullAccess,...extra});managers.install();},guard:(name:string,args:Record<string,unknown>={})=>guard({name,arguments:args}),counts:()=>({followups,dispatches,cancels}),setFlush:(mode:typeof flushMode)=>{flushMode=mode;},unblockFlush:()=>allowFlush(),reload:async(reopen=false)=>{await managers.dispose();if(reopen){store.close();store=new Store(join(directory,'ledger.sqlite'));}managers=new Managers(ctx,store,execution,directory,()=> 'https://example.test',{fullAccess,...extra});managers.install();},close:async()=>{agent.status='idle';resolveIdle();await managers.dispose();for(const old of retired)await old.dispose();store.close();assert.ok(directory.startsWith(join(root,'.runtime','delivery-adapter-')));rmSync(directory,{recursive:true,force:true});t.mock.timers.reset();}};
 }
 
 test('model failure after committed review supplements final delivery without executing Worker or review again',async t=>{
@@ -62,6 +64,9 @@ test('model failure after committed review supplements final delivery without ex
     await f.end(1,false);
     assert.equal(f.store.db.prepare('SELECT state FROM outbox WHERE id=?').get(f.ready.id)?.state,'unknown');
     await f.reload();await f.pulse();assert.equal(f.counts().followups,2);await f.enter(2);
+    const retryNotice=f.agent.lastMessage.content[0].text;
+    assert.ok(retryNotice.includes(f.resultLink()));
+    assert.doesNotMatch(retryNotice,/super-bot-file/);
     assert.equal((await f.call('detail',{action:'detail',taskId:f.task.id})).result.id,f.report.resultId);
     for(const action of ['dispatch','review','create','respond','rework'])await assert.rejects(f.call(`forbidden-${action}`,{action,taskId:f.task.id}),{code:'delivery-only'});
     await f.assistant(2);await f.end(2);
@@ -87,12 +92,20 @@ test('DF-13 a selected delivery checks its own durable receipt even behind more 
 
 test('the original review turn can deliver without an extra wake, but never before the durability barrier',async t=>{
   const f=await fixture(t);try {
-    await f.pulse();await f.enter(1);await f.review();await f.assistant(1);
+    await f.pulse();await f.enter(1);await f.review();
+    const links={方案:'https://example.feishu.cn/docx/fixture'};
+    const {delivery}=await f.call('artifacts',{action:'deliver',taskId:f.task.id,resultId:f.report.resultId,text:'两项事实已写好并回读。',links});
+    const reply=await f.assistant(1,[{type:'text',text:delivery.markdown}]);
+    // An adapter observing the same turn/end may begin waiting before the Manager listener runs.
+    let settled=false;
+    const view=f.waitForChatDelivery().then(()=>{settled=true;});
     f.setFlush('blocked');const closing=f.end(1);
     await new Promise<void>(resolve=>setImmediate(resolve));assert.equal(f.state()?.state,'pending');
+    assert.equal(settled,false);
+    assert.deepEqual(f.store.chatDeliveries(f.agent.id,1,reply.seq+1),[]);
     const inboxTask=()=>f.store.taskInbox(f.bot.id).items.find(task=>task.id===f.task.id);
     assert.equal(inboxTask()?.deliveredAt,undefined);
-    f.unblockFlush();await closing;assert.equal(f.state()?.state,'done');
+    f.unblockFlush();await closing;await view;assert.equal(f.state()?.state,'done');
     assert.equal(inboxTask()?.deliveredAt,Date.now());
     assert.equal(inboxTask()?.lifecycle,'review');
     assert.equal(f.store.taskDetail(f.task.id).task.deliveredAt,Date.now());
@@ -112,6 +125,14 @@ test('the original review turn can deliver without an extra wake, but never befo
     const receipt=JSON.parse(String(f.state()?.payload)).chatDelivery;
     assert.equal(f.durable[receipt.seq].data.message.id,receipt.messageId);
     assert.equal(f.durable[receipt.endSeq].data.reason.kind,'completed');
+    const coordinates=[f.agent.id,receipt.turn,receipt.endSeq] as const;
+    const artifacts=[{taskId:f.task.id,resultId:f.report.resultId,links}];
+    assert.deepEqual(f.store.chatDeliveries(...coordinates),artifacts);
+    assert.deepEqual(f.store.chatDeliveries(...coordinates,receipt.messageId),artifacts);
+    assert.deepEqual(f.store.chatDeliveries(...coordinates,'another-reply'),[]);
+    assert.deepEqual(f.store.chatDeliveries(f.agent.id,receipt.turn,receipt.endSeq-1),[]);
+    assert.deepEqual(f.store.chatDeliveries(f.agent.id,receipt.turn+1,receipt.endSeq),[]);
+    assert.deepEqual(f.store.chatDeliveries('another-session',receipt.turn,receipt.endSeq),[]);
     await f.pulse();assert.equal(f.counts().followups,1);assert.equal(f.counts().dispatches,0);
   }finally{await f.close();}
 });
@@ -311,20 +332,21 @@ test('a different port or a root-relative native path requires a fresh exact Web
   const f=await fixture(t);try {
     await f.pulse();await f.enter(1);await f.review();
     const url=`https://example.test/#super-bot-task=${f.task.id}&resultId=${f.report.resultId}`;
-    const file=`/api/super-bot-file?index=0&amp;resultId=${f.report.resultId}`;
-    await f.assistant(1,[{type:'text',text:`[文件](${file}) [查看成果](${url.replace('https://example.test','http://127.0.0.1:49999')})`}]);
+    await f.assistant(1,[{type:'text',text:`[成果](${url.replace('https://example.test','')}) [成果](${url.replace('https://example.test','http://127.0.0.1:49999')})`}]);
     await f.end(1);assert.equal(f.state()?.state,'pending');
     await f.pulse();await f.enter(2);
-    await f.assistant(2,[{type:'text',text:`[文件](https://example.test${file}) [查看成果](${url})`}]);
+    await f.assistant(2,[{type:'text',text:`[查看完整交付](${url})`}]);
     await f.end(2);assert.equal(f.state()?.state,'done');
   }finally{await f.close();}
 });
 
 
-test('reconciliation accepts the exact new result link and matching file links',async t=>{
+test('the exact result link from detail is sufficient even with an attached file',async t=>{
   const f=await fixture(t);try {
     await f.pulse();await f.enter(1);await f.review();
     const detail=await f.call('detail',{action:'detail',taskId:f.task.id});
+    assert.equal(detail.delivery.chatMarkdown,f.resultLink());
+    assert.equal(detail.delivery.files.length,1);
     await f.assistant(1,[{type:'text',text:detail.delivery.chatMarkdown}]);await f.end(1);
     assert.equal(f.state()?.state,'done');assert.equal(f.counts().followups,1);
   }finally{await f.close();}
@@ -360,13 +382,14 @@ for(const delivered of [false,true])test(`legacy pending attempt 14 is reconcile
   }finally{await f.close();}
 });
 
-for(const variant of ['wrong-task','missing-index','wrong-path','bare-identifiers','wrong-explicit-result','empty-explicit-result','duplicate-explicit-result','fenced-code','inline-code','external-host','only-text','image'] as const)test(`${variant} cannot masquerade as a linked delivery`,async t=>{
+for(const variant of ['wrong-task','file-only','wrong-path','query','bare-identifiers','wrong-explicit-result','empty-explicit-result','duplicate-explicit-result','fenced-code','inline-code','external-host','only-text','image'] as const)test(`${variant} cannot masquerade as a linked delivery`,async t=>{
   const f=await fixture(t);try {
     await f.pulse();await f.enter(1);await f.review();
     const wrong='00000000-0000-0000-0000-000000000000';
     const text=variant==='wrong-task'?f.text().replaceAll(f.task.id,'another-task'):
-      variant==='missing-index'?f.text().replace('&index=0',''):
-      variant==='wrong-path'?f.text().replace('/api/super-bot-file','/wrong-file'):
+      variant==='file-only'?f.fileLink():
+      variant==='wrong-path'?f.text().replace('/#super-bot-task','/other#super-bot-task'):
+      variant==='query'?f.text().replace('/#super-bot-task','/?unrelated=1#super-bot-task'):
       variant==='bare-identifiers'?`已完成 resultId=${f.report.resultId} taskId=${f.task.id}`:
       variant==='fenced-code'?`成果链接如下\n\`\`\`md\n${f.text()}\n\`\`\``:
       variant==='inline-code'?f.text().split('\n').map(line=>`\`${line}\``).join('\n'):
@@ -380,7 +403,7 @@ for(const variant of ['wrong-task','missing-index','wrong-path','bare-identifier
   }finally{await f.close();}
 });
 
-test('DF-14 registered deliver succeeds but the native final must contain the exact result links',async t=>{
+test('DF-14 registered deliver succeeds but the native final must contain the exact result link',async t=>{
   const f=await fixture(t);try {
     await f.pulse();await f.enter(1);await f.review();assert.equal(f.state()?.state,'pending');
     const args={action:'deliver',taskId:f.task.id,resultId:f.report.resultId,text:'两项事实已写好；检查通过，真实模型质量未验证。'};
@@ -388,10 +411,10 @@ test('DF-14 registered deliver succeeds but the native final must contain the ex
     assert.equal(f.state()?.state,'pending');assert.equal(JSON.parse(String(f.state()?.payload)).chatDelivery,undefined);
     assert.deepEqual(first.delivery.files,[{name:'result.md',url:`/api/super-bot-file?resultId=${f.report.resultId}&index=0`}]);
     assert.equal(first.delivery.workUrl,`/#super-bot-task=${f.task.id}&resultId=${f.report.resultId}`);assert.equal(first.delivery.humanAcceptanceRequired,true);
-    assert.match(f.prompt(),/reply with the returned delivery\.markdown verbatim/);
+    assert.match(f.prompt(),/Reply in this conversation with the returned delivery\.markdown/);
     assert.doesNotMatch(f.prompt(),/delivery\.(?:workUrl|files)/);
-    assert.ok(first.delivery.markdown.includes(`(https://example.test/api/super-bot-file?resultId=${f.report.resultId}&index=0)`));
-    assert.ok(first.delivery.markdown.includes(`[查看成果并确认](https://example.test${first.delivery.workUrl})`));
+    assert.equal(first.delivery.resultLink,f.resultLink());
+    assert.equal(first.delivery.markdown,`${args.text}\n\n${f.resultLink()}`);
     assert.deepEqual(await f.call('deliver',args),first);
     assert.deepEqual(await f.call('deliver-again',args),first);
     await assert.rejects(f.call('deliver',{...args,text:'different'}),{code:'idempotency-conflict'});
@@ -411,9 +434,9 @@ test('DF-14 registered deliver succeeds but the native final must contain the ex
 test('DF-14 Markdown reference definitions in a different native text block do not create a link',async t=>{
   const f=await fixture(t);try {
     await f.pulse();await f.enter(1);await f.review();
-    const [,file,work]=f.text().split('\n');
-    const destination=work!.slice(work!.indexOf('(')+1,-1);
-    await f.assistant(1,[{type:'text',text:`${file}\n[查看成果][result]`},{type:'text',text:`\n[result]: ${destination}`}]);
+    const file=f.fileLink(),work=f.resultLink();
+    const destination=work.slice(work.indexOf('(')+1,-1);
+    await f.assistant(1,[{type:'text',text:`${file}\n[查看完整交付][result]`},{type:'text',text:`\n[result]: ${destination}`}]);
     await f.end(1);assert.equal(f.state()?.state,'pending');
     await f.pulse();await f.enter(2);
     await f.assistant(2,[{type:'text',text:file},{type:'text',text:work}]);
@@ -421,12 +444,12 @@ test('DF-14 Markdown reference definitions in a different native text block do n
   }finally{await f.close();}
 });
 
-test('DF-14 the registered tool preserves a filename with a Markdown closing bracket',async t=>{
+test('a filename containing Markdown punctuation stays in the exact result rather than the reply',async t=>{
   const f=await fixture(t,undefined,{},'result]draft.md');try {
     await f.pulse();await f.enter(1);await f.review();
     const {delivery}=await f.call('deliver',{action:'deliver',taskId:f.task.id,resultId:f.report.resultId,text:'合成文件'});
     assert.equal(delivery.files[0].name,'result]draft.md');
-    assert.ok(delivery.markdown.includes('[result\\]draft.md]('));
+    assert.equal(delivery.markdown,`合成文件\n\n${f.resultLink()}`);
     await f.assistant(1,[{type:'text',text:delivery.markdown}]);await f.end(1);
     assert.equal(f.store.taskDetail(f.task.id).chatDelivery?.state,'delivered');
   }finally{await f.close();}
@@ -470,13 +493,17 @@ for(const complete of [false,true])test(`DF-14 restart after the entered deliver
   }finally{await f.close();}
 });
 
-for(const visible of [false,true])test(`DF-14 rechecks legacy explicit done with historical tool data (visible=${visible})`,async t=>{
+for(const proof of ['tool-only','missing-index','legacy-files','historical-exact'] as const)test(`DF-14 rechecks a legacy receipt (${proof})`,async t=>{
   const f=await fixture(t);try {
+    const visible=proof==='legacy-files'||proof==='historical-exact';
     await f.pulse();await f.enter(1);await f.review();
     const {delivery}=await f.call('legacy',{action:'deliver',taskId:f.task.id,resultId:f.report.resultId,text:'历史成果'});
-    if(visible)await f.assistant(1,[{type:'text',text:delivery.markdown.replace(`&resultId=${f.report.resultId})`,')')}]);
-    else await f.assistant(1,[{type:'text',text:'查看工具卡片。'}]);
-    await f.end(1);
+    const work=proof==='historical-exact'?f.resultLink():f.resultLink().replace(`&resultId=${f.report.resultId})`,')');
+    const file=proof==='missing-index'?f.fileLink().replace('&index=0',''):f.fileLink();
+    await f.assistant(1,[{type:'text',text:proof==='tool-only'?'查看工具卡片。':`${file}\n${work}`}]);
+    // Persist the native turn closed by the old host without the current reconciler running on it first.
+    f.events.push({type:'turn/end',data:{turn:1,reason:{kind:'completed'}},seq:f.events.length,time:Date.now()});
+    await f.checkpoint();f.agent.cancel();
     const old={sessionId:f.agent.id,explicit:true,requestId:'legacy',delivery};
     f.store.db.prepare(`UPDATE outbox SET state='done',
       payload=json_set(json_remove(payload,'$.exactResultLink'),'$.chatDelivery',json(?)) WHERE id=?`)

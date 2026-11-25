@@ -15,6 +15,7 @@ import { returningToReloadSettings } from './ui/DeveloperSettings.tsx';
 import { createWorkFeed, SessionBadge } from './ui/work/activity.tsx';
 import { BotHome } from './ui/BotHome.tsx';
 import { installBotSidebar } from './ui/BotSidebar.tsx';
+import { ChatDeliveryLinks, type ChatDeliverySlot } from './ui/ChatDeliveryLinks.tsx';
 import { parseWorkLink, RESULT_FILE_PATH, workUrl } from './work-links.ts';
 
 export const inject = ['slots', 'uiWorkspace', 'connection', 'layout', 'sidebarRight', 'sidebarRightTabs'];
@@ -135,6 +136,9 @@ export function apply(context: Context): void {
         ? { link: linked, botId: params.botId, revision: tab.navigation.revision } : undefined}/> : null;
   }));
   ctx.slots.inject('main', () => ctx.slots.register({ name: 'main', key: 'super-bot', inject: () => ({}) }, () => <BotHome api={api}/>));
+  const tail = 'conversation.chat.turnTail';
+  ctx.slots.inject(tail, () => ctx.slots.register({ name: tail, id: 'super-bot-delivery-links' },
+    (props: ChatDeliverySlot) => <ChatDeliveryLinks {...props} api={api} source={ctx.sidebarRight.mounted}/>));
   ctx.slots.inject('sidebar.panellist', () => ctx.slots.register(
     { name: 'sidebar.panellist', id: 'super-bot', order: 11, label: () => 'Super Bot' }, Icon));
   ctx.effect(() => installBotSidebar(ctx.slots, api));

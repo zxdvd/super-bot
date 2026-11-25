@@ -5,10 +5,12 @@ import type { Context } from '@deepseek-ai/cordis';
 import type { Agent } from '@deepseek-ai/dsh-agent';
 import type { Session, SessionEvent } from '@deepseek-ai/dsh-session';
 import { finalAssistantText, isNativeOwner, messageText } from './dsh-chat-events.ts';
+import { feishuDeliveryText } from './feishu-delivery.ts';
 import { groupEvidence, recordGroupEvidence } from './feishu-group-evidence.ts';
 import type { FeishuGroups } from './feishu-groups.ts';
 import { reserveFeishuInput, untilFeishuAbort, type FeishuInput } from './feishu-inputs.ts';
-import type { FeishuBinding, FeishuConnectionState, FeishuGroupEvidence, FeishuGroupTextMessage, FeishuIdentity, FeishuTransport } from './feishu-types.ts';
+import { feishuTextData, feishuTextDataFits, type FeishuBinding, type FeishuConnectionState, type FeishuGroupEvidence,
+  type FeishuGroupTextMessage, type FeishuIdentity, type FeishuTransport } from './feishu-types.ts';
 import type { Managers } from './manager.ts';
 import { AppError } from './model.ts';
 import type { Store } from './store.ts';
@@ -62,7 +64,7 @@ export class FeishuBridge {
   constructor(
     private readonly ctx: Context,
     private readonly store: Store,
-    private readonly managers: Pick<Managers, 'submitFeishu' | 'registerFeishuBindingCheck'>,
+    private readonly managers: Pick<Managers, 'submitFeishu' | 'registerFeishuBindingCheck' | 'waitForChatDelivery'>,
     private readonly groups: Pick<FeishuGroups, 'get' | 'findByChat' | 'onUnbound'>,
     private readonly transport: FeishuTransport,
     private readonly config: FeishuIdentity,
@@ -263,13 +265,22 @@ export class FeishuBridge {
   }
 
   private forward(route: BindingEpoch & { sessionId?: string }, kind: 'web' | 'assistant' | 'feedback',
-    messageId: string, text: string): void {
+    messageId: string, text: string, delivery?: { turn: number; endSeq: number }): void {
     const { binding, sessionId, signal } = route;
     const uuid = createHash('sha256').update(JSON.stringify([this.config.appId, binding.id, sessionId, kind, messageId]))
       .digest('hex').slice(0, 40);
     this.enqueue(this.outgoing, route, async () => {
       let attempted = false;
       try {
+        if (sessionId && delivery && text.includes('super-bot-task=') && text.includes('resultId=')) {
+          try {
+            await untilFeishuAbort(this.managers.waitForChatDelivery(sessionId), signal);
+            if (!this.current(route)) return;
+            const { turn, endSeq } = delivery;
+            text = feishuDeliveryText(text, this.store.chatDeliveries(sessionId, turn, endSeq, messageId),
+              this.ctx.webServer?.getOrigin() ?? '', candidate => feishuTextDataFits(feishuTextData(binding.chatId, candidate, uuid)));
+          } catch { signal.throwIfAborted(); /* A failed optional receipt read leaves the regular reply forwardable. */ }
+        }
         for (const [attempt, wait] of SEND_RETRY_DELAYS.entries()) {
           if (wait) await delay(wait, undefined, { signal });
           signal.throwIfAborted();
@@ -353,7 +364,7 @@ export class FeishuBridge {
       state.assistant = undefined;
       if (event.type === 'turn/end' && event.data.reason.kind === 'completed' && reply?.turn === event.data.turn &&
           this.newerThan(reply.route, event.time) && this.current(reply.route)) {
-        this.forward(reply.route, 'assistant', reply.messageId, reply.text);
+        this.forward(reply.route, 'assistant', reply.messageId, reply.text, { turn: reply.turn, endSeq: event.seq });
       }
     }
   }

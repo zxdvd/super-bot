@@ -19,7 +19,7 @@ import type { MirrorRecords, ResultRecord, ReviewRecord } from './mirror.ts';
 const BLOCKING_ATTENTIONS="state='open' AND kind IN ('input','approval','recovery')";
 const DELIVERY_ATTEMPT_LIMIT=3;
 const DELIVERY_RETRY_DELAY_MS=30000;
-const RESULT_DELIVERY_REASON='成果仍待在原对话交付。请确认当前版本，并在最终可见回复中附上完整的成果链接。';
+const RESULT_DELIVERY_REASON='成果仍待在原对话交付。请在最终可见回复中附上当前版本的成果链接。';
 const DELIVERY_RETRIES_EXHAUSTED='成果补交付已达到 3 次上限，已停止自动唤醒。请在 Bot 对话或工作面板核对成果；未重新执行 Worker。';
 const BOT_CAPACITY_KEY = 'bot-capacity:';
 type ManagerProblem = { message: string; at: number; eventId?: string };
@@ -38,6 +38,15 @@ function deliveryUncertainReason(payload:{deliveryUncertainReason?:string;delive
     ??(payload.deliveryRetryExhausted?DELIVERY_RETRIES_EXHAUSTED:undefined)
     ??(payload.legacyDelivery?.explicit?'历史交付工具有回包，尚缺原聊天中的可核对回复。':undefined)
     ??payload.reconcileNote??'账本未能确认这份成果已在原聊天交付。';
+}
+
+function workerReportPayload(runId:string,callId:string,report:WorkReport,evidence:NonNullable<WorkReport['evidence']>) {
+  const {kind,requestedFiles}=report;
+  if(!['progress','waiting','ready','blocked','failed'].includes(kind))throw new AppError('invalid-report','报告类型无效。');
+  if(report.links!==undefined&&kind!=='ready')throw new AppError('invalid-delivery-links','只有成果报告可以提供交付物链接。');
+  const links=report.links===undefined?undefined:readDeliveryLinks(report.links,false);
+  return {runId,callId,kind,summary:requiredText(report.summary,'报告内容'),checks:optionalText(report.checks,'验收说明'),
+    evidence,...(requestedFiles?{requestedFiles}:{}),...(links?{links}:{})};
 }
 
 /** One local database. Business transactions will live here, not in the UI/adapter. */
@@ -72,6 +81,9 @@ export class Store {
         CREATE TABLE IF NOT EXISTS events (id INTEGER PRIMARY KEY AUTOINCREMENT, taskId TEXT, kind TEXT NOT NULL, data TEXT NOT NULL, createdAt INTEGER NOT NULL);
         CREATE INDEX IF NOT EXISTS events_child_wait_task ON events(taskId,id) WHERE kind GLOB 'child-wait.*';
         CREATE INDEX IF NOT EXISTS events_delivery_task ON events(taskId,id) WHERE kind='manager.delivered';
+        CREATE INDEX IF NOT EXISTS events_delivery_turn ON events(
+          json_extract(data,'$.sessionId'),json_extract(data,'$.turn'),json_extract(data,'$.endSeq')
+        ) WHERE kind='manager.delivered' AND json_type(data,'$.resultId')='text';
         CREATE INDEX IF NOT EXISTS events_settled_task ON events(taskId) WHERE kind='run.settled';
         CREATE TABLE IF NOT EXISTS inputs (id TEXT PRIMARY KEY, taskId TEXT NOT NULL REFERENCES tasks(id), kind TEXT NOT NULL, content TEXT NOT NULL, state TEXT NOT NULL DEFAULT 'accepted', createdAt INTEGER NOT NULL);
         CREATE TABLE IF NOT EXISTS attentions (id TEXT PRIMARY KEY, taskId TEXT NOT NULL REFERENCES tasks(id), kind TEXT NOT NULL, question TEXT NOT NULL, taskRevision INTEGER NOT NULL, state TEXT NOT NULL DEFAULT 'open', createdAt INTEGER NOT NULL);
@@ -607,9 +619,10 @@ export class Store {
         {resultId:result.id,taskRevision:task.taskRevision,deliverSessionId:sessionId,deliverCallId:callId});
       if(initial) {
         const eventId=`manager-event:delivery:${result.id}`;
-        const saved=this.db.prepare(`UPDATE outbox SET payload=json_set(payload,'$.deliveryText',?,'$.links',json(?))
+        const content={deliveryText:delivery.text,...(links?{links}:{})};
+        const saved=this.db.prepare(`UPDATE outbox SET payload=json_patch(payload,json(?))
           WHERE id=? AND state NOT IN ('done','handled','superseded') AND json_extract(payload,'$.deliveryText') IS NULL`)
-          .run(delivery.text,JSON.stringify(links??{}),eventId).changes;
+          .run(JSON.stringify(content),eventId).changes;
         if(!saved&&links) {
           const previous=this.db.prepare("SELECT state,json_extract(payload,'$.links') AS links FROM outbox WHERE id=?").get(eventId);
           if(previous?.state!=='done'&&String(previous?.links)===JSON.stringify(links))return delivery;
@@ -793,9 +806,11 @@ export class Store {
   }
   private deliveryReceipt(task:Task,resultId?:string) {
     const receipt=this.db.prepare(`SELECT r.id AS resultId,r.runId,o.id AS eventId,e.createdAt AS deliveredAt,
-      json_extract(o.payload,'$.deliveryText') AS deliveryText,json_extract(o.payload,'$.links') AS links
+      json_extract(o.payload,'$.deliveryText') AS deliveryText,
+      coalesce(json_extract(o.payload,'$.links'),json_extract(p.data,'$.links')) AS links
       FROM events e JOIN outbox o ON o.id=json_extract(e.data,'$.eventId') AND o.taskId=e.taskId
       JOIN results r ON r.taskId=e.taskId AND r.id=json_extract(e.data,'$.resultId')
+      LEFT JOIN reports p ON p.runId=r.runId AND p.kind='ready'
       WHERE e.taskId=? AND e.kind='manager.delivered' AND coalesce(json_extract(e.data,'$.explicit'),0)=0
         AND o.id='manager-event:delivery:' || r.id AND o.kind='manager.notify' AND o.state='done'
         AND json_extract(o.payload,'$.botId')=? AND json_extract(o.payload,'$.resultId')=r.id
@@ -812,6 +827,23 @@ export class Store {
     const result=exact??this.resultById(receipt.resultId);
     return result&&{...result,deliveredAt:receipt.deliveredAt,
       ...(receipt.deliveryText!==undefined?{deliveryText:receipt.deliveryText}:{}),links:JSON.parse(receipt.linksJson)};
+  }
+  /** Return only artifacts for results proven delivered in this completed native turn. */
+  chatDeliveries(sessionId:string,turn:number,endSeq:number,messageId?:string):{taskId:string;resultId:string;links:DeliveryLinks}[] {
+    const bot=this.botForSession(sessionId);
+    if(!bot)return [];
+    const rows=this.db.prepare(`SELECT e.taskId,json_extract(e.data,'$.resultId') AS resultId
+      FROM events e JOIN tasks t ON t.id=e.taskId
+      WHERE e.kind='manager.delivered' AND json_type(e.data,'$.resultId')='text'
+        AND json_extract(e.data,'$.sessionId')=? AND json_extract(e.data,'$.turn')=? AND json_extract(e.data,'$.endSeq')=?
+        AND coalesce(json_extract(e.data,'$.explicit'),0)=0 AND t.botId=?
+        AND (? IS NULL OR json_extract(e.data,'$.messageId')=?) ORDER BY e.id`)
+      .all(sessionId,turn,endSeq,bot.id,messageId??null,messageId??null);
+    return rows.flatMap(row=>{
+      const taskId=String(row.taskId), resultId=String(row.resultId), result=this.resultById(resultId);
+      const delivery=result?.taskId===taskId?this.deliveredResult(this.getTask(taskId),result):null;
+      return delivery?[{taskId,resultId,links:delivery.links}]:[];
+    });
   }
   chatDeliveryStatus(task:Task,result:Result|null,historical=false):ChatDeliveryStatus|null {
     if(!result||result.taskId!==task.id||(!historical&&!['review','completed'].includes(task.lifecycle)))return null;
@@ -1368,15 +1400,15 @@ export class Store {
     return row?.data;
   }
   workerReportReceipt(runId:string,callId:string,report:WorkReport):{accepted:true;resultId?:string}|undefined {
-    const row=this.db.prepare('SELECT data FROM reports WHERE id=?').get(`${runId}:${callId}`) as {data:string}|undefined;if(!row)return;
-    const saved=JSON.parse(row.data) as {evidence:WorkReport['evidence']};
-    return this.commandReceipt(`report:${runId}:${callId}`,'worker.report',{runId,callId,kind:report.kind,summary:requiredText(report.summary,'报告内容'),checks:optionalText(report.checks,'验收说明'),evidence:saved.evidence??[],...(report.requestedFiles?{requestedFiles:report.requestedFiles}:{})});
+    const row=this.db.prepare('SELECT data FROM reports WHERE id=?').get(`${runId}:${callId}`) as {data:string}|undefined;
+    const saved=row?JSON.parse(row.data) as WorkReport:undefined;
+    const payload=workerReportPayload(runId,callId,report,saved?.evidence??[]);
+    if(!row)return;
+    return this.commandReceipt(`report:${runId}:${callId}`,'worker.report',payload);
   }
   workerReport(runId:string,callId:string,report:WorkReport,captured?:readonly CapturedEvidence[]):{accepted:true;resultId?:string} {
-    const summary=requiredText(report.summary,'报告内容');
-    if(!['progress','waiting','ready','blocked','failed'].includes(report.kind))throw new AppError('invalid-report','报告类型无效。');
     const evidence = captured?.map(({file})=>file) ?? report.evidence ?? [];
-    const payload={runId,callId,kind:report.kind,summary,checks:optionalText(report.checks,'验收说明'),evidence,...(report.requestedFiles?{requestedFiles:report.requestedFiles}:{})};
+    const payload=workerReportPayload(runId,callId,report,evidence),{summary}=payload;
     if(report.kind==='ready'&&(!payload.checks||payload.evidence.length===0||(report.requestedFiles&&!captured))) {
       throw new AppError('evidence-required','提交成果必须有验收说明和文件证据。');
     }

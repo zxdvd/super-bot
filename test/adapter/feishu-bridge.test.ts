@@ -14,6 +14,7 @@ import type { FeishuConnectionState, FeishuGroupTextMessage, FeishuHandlers, Fei
 import { Managers } from '../../src/manager.ts';
 import { AppError, type ManagerBinding } from '../../src/model.ts';
 import { Store } from '../../src/store.ts';
+import { workUrl } from '../../src/work-links.ts';
 
 type FixtureAgent = {
   id: string;
@@ -38,6 +39,7 @@ type FixtureAgent = {
 
 const tick = () => new Promise<void>(resolve => setImmediate(resolve));
 const identity = { appId: 'cli_synthetic', ownerOpenId: 'ou_owner' };
+const syntheticOrigin = 'http://127.0.0.1:3080';
 
 async function fixture(t: TestContext) {
   t.mock.timers.enable({ apis: ['setInterval'] });
@@ -69,6 +71,7 @@ async function fixture(t: TestContext) {
       return agent ? { agent } : { error: 'synthetic missing' };
     } },
     sessionProjections: { snapshot: () => ({ values: { modelSelection: { next: model } } }) },
+    webServer: { getOrigin: () => syntheticOrigin },
     sessions: { flush: async () => true },
     sessionPersistence: {
       stat: async (id: string) => ({ eventCount: agents.get(id)!.history.length, sizeBytes: 100 }),
@@ -249,6 +252,29 @@ async function fixture(t: TestContext) {
     },
   };
 }
+
+test('the group receives named shortcuts only for the exact committed assistant message', async t => {
+  const f = await fixture(t), { a, b } = f;
+  const taskId = '11111111-1111-4111-8111-111111111111', resultId = '22222222-2222-4222-8222-222222222222';
+  const doc = 'https://example.invalid/delivery', href = syntheticOrigin + workUrl({ kind: 'result', taskId, resultId });
+  const reply = `已完成。\n\n[查看完整交付](${href})`;
+  const lookups = t.mock.method(f.store, 'chatDeliveries', (sessionId: string, turn: number, endSeq: number, messageId?: string) => {
+    if (sessionId !== a.agent.id) return [];
+    const final = a.agent.history.find(event => event.type === 'assistant/message');
+    assert.equal(messageId, final.data.message.id);
+    assert.equal(turn, final.data.turn);
+    assert.equal(endSeq, a.agent.history.at(-1).seq);
+    return [{ taskId, resultId, links: { '交付说明': doc } }];
+  });
+  await a.agent.startTurn(); await a.agent.assistant(reply); await a.agent.endTurn();
+  await b.agent.startTurn(); await b.agent.assistant(reply); await b.agent.endTurn();
+  await tick();
+  assert.equal(lookups.mock.callCount(), 2);
+  assert.equal(f.sent.length, 2);
+  assert.equal(f.sent.find(message => message.chatId === f.aa.chatId)?.text,
+    `已完成。\n\n在运行 Bot 的电脑上查看完整交付：${href}\n交付说明：${doc}`);
+  assert.equal(f.sent.find(message => message.chatId === f.bb.chatId)?.text, reply);
+});
 
 test('authorized Feishu turn can create, answer and rework in the real Manager while keeping the native owner distinct', async t => {
   const f = await fixture(t), { a, b, store } = f;

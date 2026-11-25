@@ -107,6 +107,16 @@ export interface FeishuTransport {
   diagnoseGroup(): Promise<FeishuGroupDiagnosis>;
 }
 
+export const MAX_FEISHU_TEXT_BODY_BYTES = 150_000;
+
+export function feishuTextData(chatId: string, text: string, uuid: string) {
+  return { receive_id: chatId, msg_type: 'text' as const, content: JSON.stringify({ text }), uuid };
+}
+
+export function feishuTextDataFits(data: ReturnType<typeof feishuTextData>): boolean {
+  return Buffer.byteLength(JSON.stringify(data)) <= MAX_FEISHU_TEXT_BODY_BYTES;
+}
+
 export function isFeishuChatId(value: unknown): value is string {
   return typeof value === 'string' && /^oc_[A-Za-z0-9_]{1,125}$/.test(value);
 }
