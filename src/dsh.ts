@@ -27,7 +27,7 @@ import {cleanupWorkdir,provisionWorkdir,workdirPolicy,type WorkdirPolicy,type Wo
 import {nameAutomaticSession,workerTitle} from './sidebar.ts';
 import { AppError,requiredText,optionalText,type Binding,type Run,type Task,type WorkReport,type ExistingSessionGrant,type ExistingSessionPreview } from './model.ts';
 import type { ChildWaitDetail,ChildWaitMember,RecoveryContinuation,RecoveryDetail,RecoveryInput,RecoveryInputKind,
-  RunChildWait,RunModels,WorkerModelPreview } from './model.ts';
+  RecoveryWorkContext,RunChildWait,RunModels,RunTurn,WorkerModelPreview } from './model.ts';
 import { actualModelRequests,modelRoute,nativeModel,observeNativeModel,readModelLog,workerModelPlan } from './dsh-model.ts';
 import type { Store } from './store.ts';
 import { captureEvidence,containedPath,verifyEvidence,evidencePaths,type CapturedEvidence } from './evidence.ts';
@@ -142,6 +142,9 @@ export class DshExecution {
         if(!run||this.finishing.has(run.id))throw new AppError('report-scope','当前会话没有可报告的执行。');
         const data=args as Record<string,unknown>;const binding=this.store.getBinding(run.bindingId);
         const report:WorkReport={kind:data.kind as WorkReport['kind'],summary:requiredText(data.summary,'报告内容'),checks:optionalText(data.checks,'验收说明')};
+        if(report.kind==='ready'&&this.store.recoveryWorkPlan(run.id)?.context.mode==='read-only') {
+          throw new AppError('continuation-scope','本次只读核对只覆盖指定的后续步骤。请用 blocked 或 waiting 报告实际观察及余下事项。');
+        }
         if(report.kind==='ready')report.requestedFiles=evidencePaths(data.files);
         exec.signal.throwIfAborted();
         const receipt=this.store.workerReportReceipt(run.id,exec.callId,report);
@@ -208,6 +211,9 @@ export class DshExecution {
           throw new AppError('preflight-scope','没有绑定到此会话与轮次的任务授权。');
         }
         const probe=parseClusterProbe(args),binding=this.store.getBinding(run.bindingId),task=this.store.getTask(run.taskId);
+        const work=this.store.recoveryWorkPlan(run.id);
+        const scoped=work?.context.mode==='read-only'?work.authorizedProbes.find(item=>JSON.stringify(item.probe)===JSON.stringify(probe)):undefined;
+        if(work?.context.mode==='read-only'&&!scoped)throw new AppError('preflight-scope','后续指示只能核对上一轮已有授权和身份回执的目标。');
         const authorize=()=>{
           exec.signal.throwIfAborted();
           const current=this.store.getRun(run.id),latest=this.store.getTask(task.id);
@@ -225,7 +231,7 @@ export class DshExecution {
         }
         let auth:string|null=null,result:ProbeResult;
         try {
-          const prepared=await prepareClusterProbe(probe,signal,undefined,authorize);
+          const prepared=await prepareClusterProbe(probe,signal,scoped?.auth,authorize);
           authorize();
           auth=prepared.auth;result=await prepared.check();
         }catch(error){
@@ -532,6 +538,7 @@ export class DshExecution {
   private async dispatchRun(requestId:string,taskId:string,rowVersion:number,authorize:()=>void,manager?:Agent):Promise<Run> {
     const task=this.store.getTask(taskId);
     if(task.status==='recovery')throw new AppError('recovery-required','请先在任务详情完成恢复核对。');
+    if(task.status==='blocked')throw new AppError('work-blocked','上一轮已结束，仍有任务前置或下一步需要核对。');
     const b=this.store.activeBinding(taskId);if(!b?.sessionId||b.state!=='ready')throw new AppError('not-ready','请先准备执行会话。');
     const resolved=await this.ctx.sessionController.resolveAgent(SessionId(b.sessionId));
     if(this.disposed)throw new AppError('unavailable','插件正在退出。');
@@ -562,26 +569,31 @@ export class DshExecution {
   private deliverRun(run:Run,agent:Agent,b:Binding,recovery?:{note:string|null}):Run {
     if(this.running.has(run.id)||run.finishedAt!==null)return this.store.getRun(run.id);
     const taskId=run.taskId,task=this.store.getTask(taskId);
-    const standing=workerStandingPrompt(task,b,this.store.taskBotContext(taskId),fullAccessEnabled(this.options));
+    const work=this.store.recoveryWorkPlan(run.id);
+    const readOnly=work?.context.mode==='read-only';
+    const fullAccess=fullAccessEnabled(this.options);
+    const standing=workerStandingPrompt(task,b,this.store.taskBotContext(taskId),fullAccess);
     let input=this.store.getRunInput(run.id);
     const previous=this.store.previousWorkerInputs(run);
     if(!input.messageJson) {
       const prompt=workerPromptPlan(agent,run,standing,previous);
-      const message=createWorkerRunMessage(run,input,standing,prompt,recovery);
+      const message=createWorkerRunMessage(run,input,standing,prompt,recovery,work?.context);
       input=this.store.saveRunMessage(run.id,message.id,JSON.stringify(message));
     }
-    const releaseMask=fullAccessEnabled(this.options)?()=>{}:agent.ctx.tools.restrict({allow:['read','write','edit','super_bot_report']});
+    const allowed=readOnly?['read','super_bot_report',...(work.authorizedProbes.length?['super_bot_preflight']:[])]:['read','write','edit','super_bot_report'];
+    const releaseMask=fullAccess&&!readOnly?()=>{}:agent.ctx.tools.restrict({allow:allowed});
     const releaseGuard=agent.ctx.tools.guard(exec=>{
       if(this.store.getRun(run.id).finishedAt!==null||this.store.getTask(taskId).controlMode==='manual'||this.store.isBotDeleted(task.botId))return 'This automatic run no longer has task authority.';
       if(exec.name!=='super_bot_report'&&this.store.finalReport(run.id))return 'A final report has been submitted; no new tool work is authorized in this run.';
-      if(!fullAccessEnabled(this.options)&&!['read','write','edit','super_bot_report'].includes(exec.name))return 'Only task file tools and super_bot_report are authorized for this run.';
-      if(fullAccessEnabled(this.options))return;
+      if(readOnly&&(this.store.getTask(taskId).controlMode!=='auto'||!allowed.includes(exec.name)))return 'This continuation authorizes only the available read-only checks and a report.';
+      if(!fullAccess&&!allowed.includes(exec.name))return 'Only task file tools and super_bot_report are authorized for this run.';
+      if(fullAccess&&!readOnly)return;
       try{this.assertDirectory(agent,b.cwd);}catch(error){return error instanceof Error?error.message:'Working directory changed';}
       if(!['read','write','edit'].includes(exec.name))return;
       try{const args=exec.arguments as {file_path?:unknown};if(typeof args.file_path!=='string'||!isAbsolute(args.file_path))return 'Use an absolute file_path inside the task working directory.';containedPath(b.cwd,args.file_path);}catch(error){return error instanceof Error?error.message:'File path refused';}
     });
     let steps=0;let deadline:ReturnType<typeof setTimeout>|undefined;
-    const releaseBudget=fullAccessEnabled(this.options)?()=>{}:agent.ctx.on('agent/pre-step',async(_payload,next)=>{
+    const releaseBudget=fullAccess&&!readOnly?()=>{}:agent.ctx.on('agent/pre-step',async(_payload,next)=>{
       if(++steps>40){await this.stopForBudget(run.id,'steps');throw new AppError('run-budget','执行达到步数上限。');}
       return next();
     });
@@ -666,7 +678,7 @@ export class DshExecution {
       agent.followup(message);
       this.autoTurns.add(run.id);
       this.store.inputEnqueued(run.id);
-      if(!fullAccessEnabled(this.options)){deadline=setTimeout(()=>{void this.stopForBudget(run.id,'time');},10*60*1000);deadline.unref();}
+      if(!fullAccess||readOnly){deadline=setTimeout(()=>{void this.stopForBudget(run.id,'time');},10*60*1000);deadline.unref();}
       const done=agent.whenIdle().then(()=>{
         if(this.disposed||finalized)return;
         this.assertQuiet(agent);finishTurn();
@@ -725,7 +737,8 @@ export class DshExecution {
     this.assertQuiet(resolved.agent);await verifyEvidence(detail.binding.cwd,detail.result.evidence);this.assertQuiet(resolved.agent);
     return detail;
   }
-  async stop(requestId:string,taskId:string,rowVersion:number,expectedRunId?:string) {
+  async stop(requestId:string,taskId:string,rowVersion:number,expectedRunId?:string,authorize=()=>{}) {
+    authorize();
     const exact=expectedRunId?this.store.latestRun(taskId):null;
     if(exact&&exact.id===expectedRunId&&this.finishing.has(exact.id)) {
       // A repeat may read its receipt, but a fresh stop must not change ongoing settlement.
@@ -974,6 +987,34 @@ export class DshExecution {
       new Promise<'unknown'>(resolve=>setImmediate(()=>resolve('unknown')))]);
     if(outcome!=='quiet')throw new AppError('child-unknown','原生子树仍在活动或无法确认，请核对后再试。');
   }
+  private async readRecoveryTools(run:Run,cwd:string,proof:RunTurn,agent?:Agent) {
+    const events=await this.readRunEvents(run,agent?.session);
+    const later=verifyRunTurn(run,this.store.getRunInput(run.id),proof,events,true);
+    if(later.length||events.some(event=>event.seq>proof.endSeq!&&
+      ['turn/start','turn/end','user/message','tool/call','tool/result','approval/asked','working-directory/change'].includes(event.type))) {
+      throw new AppError('recovery-new-input','旧轮结束后已有新的会话活动。请按最新会话状态决定下一步。');
+    }
+    const segment=events.slice(proof.startSeq!+1,proof.endSeq!);
+    if(segment.some(event=>{
+      if(event.type==='working-directory/change'||event.type==='approval/asked')return true;
+      if(event.type!=='user/message'||event.seq===proof.inputSeq)return false;
+      const source=event.data.source as {kind:string;form?:unknown};
+      return !((source?.kind==='runtime-context'||source?.kind==='time-context')&&source.form==='snapshot'||
+        source?.kind==='skill-catalog'&&source.form==='catalog');
+    })) {
+      throw new AppError('recovery-scope-changed','原轮包含额外输入、目录变化或审批，无法证明同一操作授权。');
+    }
+    return inspectPriorTools(events,cwd,proof.turn!,proof.startSeq!,proof.endSeq!);
+  }
+  private boundPreflightReceipts(runId:string,clusters:PriorTools['clusters']) {
+    return clusters.map(call=>{
+      const receipt=this.store.preflightReceipt(runId,call.callId);
+      try {
+        if(receipt&&JSON.stringify(parseClusterProbe(JSON.parse(call.args)))===JSON.stringify(receipt.probe))return {...call,receipt};
+      }catch{/* Invalid arguments cannot establish a matching authorized probe. */}
+      return {...call,receipt:null};
+    });
+  }
   /** The Manager may inspect this notice's exact prior Run without replaying Worker work. */
   private async readAutoRecovery(taskId:string,rowVersion:number,runId:string,managerId:string,authorize:()=>void) {
     const identity={taskId,runId,rowVersion};
@@ -1000,42 +1041,25 @@ export class DshExecution {
     let target:ReturnType<Store['autoRecoveryTarget']>;
     try{target=validate();}
     catch(error){if(error instanceof AppError)return refused(error.message);throw error;}
-    const {run,binding,input,proof}=target;
+    const {run,binding,proof}=target;
     const report=this.store.finalReport(runId);
     const settledFailure=run.state==='failed'&&!!report&&proof.reportId===report.id&&['failed','blocked'].includes(report.kind);
     if(!settledFailure&&run.state!=='interrupted') {
       return refused('没有已结束且可归属的失败或中断执行。请核对上轮的具体外部效果，再决定如何继续。');
     }
-    const readEvidence=async(agent?:Agent)=>{
-      const events=await this.readRunEvents(run,agent?.session);
-      const later=verifyRunTurn(run,input,proof,events,true);
-      if(later.length||events.some(event=>event.seq>proof.endSeq!&&
-        (event.type==='turn/start'||event.type==='user/message'||event.type==='tool/call'||event.type==='approval/asked'))) {
-        throw new AppError('recovery-new-input','旧轮结束后已有新的会话活动。请按最新会话状态决定下一步。');
-      }
-      const segment=events.slice(proof.startSeq!+1,proof.endSeq!);
-      if(segment.some(event=>{
-        if(event.type==='working-directory/change'||event.type==='approval/asked')return true;
-        if(event.type!=='user/message'||event.seq===proof.inputSeq)return false;
-        const source=event.data.source as {kind:string;form?:unknown};
-        return !((source?.kind==='runtime-context'||source?.kind==='time-context')&&source.form==='snapshot'||
-          source?.kind==='skill-catalog'&&source.form==='catalog');
-      })) {
-        throw new AppError('recovery-scope-changed','原轮包含额外输入、目录变化或审批，无法证明同一操作授权。');
-      }
-      return inspectPriorTools(events,binding.cwd,proof.turn!,proof.startSeq!,proof.endSeq!);
-    };
+    const readEvidence=(agent?:Agent)=>this.readRecoveryTools(run,binding.cwd,proof,agent);
     // Inspect the persisted evidence before resolving the Worker. Unsupported and ambiguous
     // cases remain passive even if the Worker is currently cold.
     let checks:PriorTools;
     try {checks=await readEvidence();validate();}
     catch(error){if(error instanceof AppError)return refused(error.message);throw error;}
-    const sessions=checks.clusters.map(call=>({...call,receipt:this.store.preflightReceipt(runId,call.callId)}));
+    const sessions=this.boundPreflightReceipts(runId,checks.clusters);
     const receipts=[...new Map(sessions.filter(call=>call.receipt).map(call=>
       [JSON.stringify([call.receipt!.probe,call.receipt!.auth]),call])).values()];
     const observed=receipts.flatMap(call=>call.receipt&&call.receipt.auth&&call.receipt.result.status!=='unavailable'?
       [{probe:call.receipt.probe,result:call.receipt.result,callSeq:call.callSeq,resultSeq:call.resultSeq}]:[]);
-    const effectUncertain=!settledFailure||checks.incomplete||checks.potentialEffects.length>0||sessions.some(call=>!call.receipt);
+    const effectUncertain=checks.incomplete||checks.potentialEffects.length>0||
+      sessions.some(call=>!call.receipt)||this.store.recoveryWorkPlan(runId)?.context.effectUncertain===true;
     const candidates:{evidence:ProbeEvidence;known?:ProbeResult}[]=effectUncertain?[]:[...checks.files];
     if(fullAccessEnabled(this.options))for(const {receipt,callId,callSeq,resultSeq} of receipts)if(receipt?.auth) {
       const stateInquiry=receipt.probe.kind==='deployment-state'||receipt.probe.kind==='volume-state';
@@ -1046,10 +1070,14 @@ export class DshExecution {
           ...(receipt.result.status==='denied'?{known:receipt.result}:{})});
       }
     }
-    const blockers={observed,priorTools:checks.potentialEffects,
+    const blockers={observed,priorTools:checks.potentialEffects,priorReport:this.store.runFinalReport(runId),
       ...(candidates.length>1?{competingChecks:candidates.map(({evidence,known})=>
         ({probe:evidence.probe,...(known?{result:known}:{})}))}:{})};
     if(candidates.length!==1) {
+      if(!effectUncertain&&!candidates.length) {
+        return {status:'blocked' as const,...identity,...blockers,settled:true,
+          message:'上一轮执行已经结束。报告所列的前置仍需处理，账本没有可以自动继续的同范围核对。'};
+      }
       return refused(effectUncertain?
         '当前记录不足以确认外部动作及其结果。请对照已核实的目标状态或原操作回执，决定是否仍需行动。':
         '原轮没有单一可按同一授权核对的只读失败证据。请根据报告核对具体的前置条件或所需动作。',blockers);
@@ -1084,6 +1112,106 @@ export class DshExecution {
         '上轮已经结束，但原操作是否产生外部效果仍待确认。现有授权仅允许核对同一资源的状态。':
         '已核实上轮结束，当前没有新的输入或未结算后台活动。可以核对同一只读目标。'};
 
+  }
+  /** A pending owner instruction waits quietly while native activity is observable. */
+  canWakeRecoveryContinuation(taskId:string):boolean {
+    const run=this.store.latestRun(taskId),binding=this.store.activeBinding(taskId);
+    if(!run||run.finishedAt===null||this.running.has(run.id)||this.finishing.has(run.id))return false;
+    if(this.store.verifiedBlocker(run)&&this.store.dispatchBlocker(taskId))return false;
+    if(!binding?.sessionId)return true;
+    const agent=this.ctx.agents.get(SessionId(binding.sessionId));
+    if(agent&&(agent.status!=='idle'||agent.inbox.nextTurn.length||agent.inbox.nextStep.length))return false;
+    const activity=this.observeRecoveryActivity(binding.sessionId,agent,run.id);
+    return activity.subtree.state!=='active'&&!activity.jobs?.some(job=>job.status==='running'||job.status==='stopping');
+  }
+  async continueRecovery(taskId:string,rowVersion:number,managerId:string,authorize:()=>void,manager?:Agent) {
+    type Outcome={status:'started'|'already-started'|'waiting'|'blocked';message:string;run?:Run};
+    return this.reloadAdmission.run(`Worker task ${taskId} continuation`,async():Promise<Outcome>=>{
+      const validate=()=>{
+        authorize();
+        if(this.disposed)throw new AppError('unavailable','插件正在退出。');
+        return this.store.continuationTarget(taskId,rowVersion,managerId);
+      };
+      authorize();
+      const saved=this.store.recoveryInstruction(taskId);
+      if(!saved)return {status:'blocked',message:'上一轮状态已记录，当前没有新的已授权后续指示。'};
+      if(saved.runId)return {status:'already-started',run:this.store.getRun(saved.runId),message:'这条用户指示已有执行记录。'};
+      try {
+        const {task,run,binding,instruction}=validate();
+        const resolved=await this.ctx.sessionController.resolveAgent(SessionId(binding.sessionId));
+        validate();
+        if('error' in resolved||resolved.agent.id!==binding.sessionId)throw new AppError('session-unavailable','无法确认原生 Worker 的活动状态。');
+        const agent=resolved.agent,tree=originalService(this.nativeSubagents());
+        this.assertRecoveryQuiet(agent,run.id);
+        this.assertDirectory(agent,binding.cwd);
+        await this.confirmRecoveryTree(agent);
+        validate();
+        const proof=this.store.runTurn(run.id);
+        const checks=proof?.quiet&&proof.endSeq!==null?await this.readRecoveryTools(run,binding.cwd,proof,agent):null;
+        validate();
+        this.assertRecoveryQuiet(agent,run.id);
+        this.assertDirectory(agent,binding.cwd);
+        if(tree!==originalService(this.nativeSubagents()))throw new AppError('child-unknown','原生子树服务已变更，请重新核对。');
+        const receipts=(checks?this.boundPreflightReceipts(run.id,checks.clusters):[]).map(call=>call.receipt);
+        const priorCheck=this.store.recoveryCheck(run.id);
+        const priorWork=this.store.recoveryWorkPlan(run.id);
+        const effectUncertain=!checks||checks.incomplete||checks.potentialEffects.length>0||
+          receipts.some(item=>!item)||priorCheck?.effectUncertain===true||priorWork?.context.effectUncertain===true;
+        if(!this.store.verifiedBlocker(run)) {
+          if(!checks||run.state!=='interrupted')throw new AppError('recovery-unproven','尚未找到可归属的旧轮结束或后台收敛证据，保留旧轮占用。');
+          if(effectUncertain)throw new AppError('effect-uncertain','原轮还有未确认的外部效果，保留旧轮占用。请核对操作回执或按现有授权查询目标状态。');
+          this.store.verifyInterruptedEnd(taskId,rowVersion,managerId);
+          rowVersion=this.store.getTask(taskId).rowVersion;
+          validate();
+        }
+        const byProbe=<T extends {probe:ReadProbe|ReturnType<typeof parseClusterProbe>}>(items:T[]):T[]=>
+          [...new Map(items.map(item=>[JSON.stringify(item.probe),item])).values()];
+        const authorizedProbes=fullAccessEnabled(this.options)?byProbe([
+          ...(priorWork?.authorizedProbes??[]),...receipts.flatMap(item=>item?.auth?[{probe:item.probe,auth:item.auth}]:[]),
+        ]):[];
+        const observations=byProbe([...(priorWork?.context.observations??[]),...receipts.flatMap(item=>
+          item?.auth&&item.result.status!=='unavailable'?[{probe:item.probe,result:item.result}]:[]),
+          ...(priorCheck?.resolution&&priorCheck.resolution.status!=='unavailable'&&priorCheck.evidence.probe.kind!=='file'?
+            [{probe:priorCheck.evidence.probe,result:priorCheck.resolution}]:[])]);
+        const mode=instruction.mode;
+        if(!mode||mode==='authorized-work'&&effectUncertain) {
+          const detail=observations.at(-1)?.result.message;
+          return {status:'blocked',message:[detail,effectUncertain?
+            '原轮外部效果仍需核对。现有记录只支持已有授权的具体只读核对。':
+            '旧轮已结束。请按已有证据核对缺失的前置或具体有授权的下一步。'].filter(Boolean).join(' ')};
+        }
+        if(this.store.dispatchBlocker(taskId)) {
+          this.store.recordCapacityWait(`continuation:${instruction.id}:${rowVersion}`,taskId,rowVersion);
+          return {status:'waiting',message:'已保存最新指示，等待此 Bot 的 Worker 执行名额。'};
+        }
+        const work:RecoveryWorkContext={priorRunId:run.id,mode,priorReport:this.store.runFinalReport(run.id),
+          priorCheck:priorCheck?.resolution??priorWork?.context.priorCheck,effectUncertain,
+          priorDirection:instruction.priorDirection?.text,probes:authorizedProbes.map(({probe})=>probe),observations};
+        const current=selectedModel(this.ctx,agent);
+        const inherited=!this.options.workerModel&&!current&&manager&&this.store.botForSession(manager.id)?.id===task.botId
+          ?selectedModel(this.ctx,manager):undefined;
+        const plan=workerModelPlan(current?modelRoute(current):null,this.options.workerModel,
+          inherited&&manager?{sessionId:manager.id,model:modelRoute(inherited)}:undefined);
+        if(!plan)throw new AppError('model-required','Worker 缺少可核实的模型选择，后续指示已保留。');
+        validate();
+        const next=this.store.reserveRecoveryContinuation(taskId,rowVersion,managerId,
+          {context:work,authorizedProbes},plan);
+        try {
+          configureRole(this.ctx,agent,'worker',this.options);
+          if(inherited)agent.model.select(inherited);
+          const launched=this.deliverRun(next,agent,binding);
+          if(launched.state!=='interrupted')return {status:'started',run:launched,message:mode==='read-only'?
+            '已在原任务开始限定范围的核对。':'已在原任务开始执行最新授权的步骤。'};
+        }catch {
+          this.store.runRecovery(next.id,'后续执行的投递待核对，已保存原指示并保留占用。');
+        }
+        return {status:'blocked',run:this.store.getRun(next.id),message:'后续执行的投递待核对，已保留原指示。'};
+      }catch(error) {
+        if(!(error instanceof AppError)||['manager-scope','recovery-scope'].includes(error.code))throw error;
+        const waiting=['run-active','session-busy','job-active','child-active','capacity'].includes(error.code);
+        return {status:waiting?'waiting':'blocked',message:error.message};
+      }
+    });
   }
   async performAutoRecovery(taskId:string,rowVersion:number,runId:string,managerId:string,signal:AbortSignal,authorize:()=>void) {
     return this.reloadAdmission.run(`Manager read-only recovery ${taskId}`,async()=>{
@@ -1235,7 +1363,21 @@ export class DshExecution {
       const duplicate=receipt();if(duplicate)return duplicate;
       validate();
       if('error' in resolved||resolved.agent.id!==binding.sessionId)throw new AppError('session-unavailable','无法核对原生会话，请恢复会话后再操作。');
-      this.assertQuiet(resolved.agent);
+      const agent=resolved.agent,run=this.store.latestRun(taskId);
+      this.assertQuiet(agent);
+      if(action==='task.cancel'&&run&&run.bindingId===binding.id&&this.store.verifiedBlocker(run)) {
+        const tree=originalService(this.nativeSubagents());
+        this.assertRecoveryQuiet(agent,run.id);
+        await this.confirmRecoveryTree(agent);
+        const proof=this.store.runTurn(run.id);
+        const checks=proof?.quiet&&proof.endSeq!==null?await this.readRecoveryTools(run,binding.cwd,proof,agent):null;
+        authorize();validate();
+        this.assertRecoveryQuiet(agent,run.id);
+        if(tree!==originalService(this.nativeSubagents()))throw new AppError('child-unknown','原生子树服务已变更，暂未取消任务。');
+        if(checks&&(checks.incomplete||checks.potentialEffects.some(tool=>tool.result!=='reported-success'))) {
+          throw new AppError('effect-uncertain','上轮有未确认的工具回执或外部效果，暂未取消任务。');
+        }
+      }
     }
     if(action==='session.detach')return this.store.detachSession(requestId,taskId,rowVersion);
     const cancelled=this.store.cancelTask(requestId,taskId,rowVersion);await this.autoCleanup(taskId);return cancelled;

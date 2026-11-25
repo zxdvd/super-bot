@@ -63,7 +63,8 @@ test('registered memory actions require current native Bot authority, user text,
   const save = (text: string) => call({ action: 'memory-save-convention', text });
   await assert.rejects(save('User convention'), { code: 'human-message-required' });
   const event = listeners.get('session/event')!;
-  event({ id: sessionId }, { type: 'user/message', seq: 3, data: { id: 'native-message', source: { kind: 'user', rpcId: 'rpc' },
+  event({ id: sessionId }, { type: 'turn/start', data: { turn: 1 } });
+  event({ id: sessionId }, { type: 'user/message', surfaceOp: 'append', seq: 3, data: { id: 'native-message', source: { kind: 'user', rpcId: 'rpc' },
     content: [{ type: 'text', text: 'Please save this work convention: User convention.' }] } });
   await assert.rejects(save('Model-generated convention'), { code: 'memory-human-text' });
   await save('User convention.');

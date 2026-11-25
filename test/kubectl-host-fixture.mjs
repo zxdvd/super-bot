@@ -34,9 +34,12 @@ if (args[0] === 'config') {
   } else {
     assert.deepEqual(command, ['get', 'deployments.apps', 'fixture-deployment', '-o', 'json', '--ignore-not-found=true']);
     record('get');
-    if (existsSync(ready)) console.log(JSON.stringify({
-      kind: 'Deployment', metadata: { name: 'fixture-deployment', namespace: 'fixture', uid: 'fixture-deployment-uid', generation: 4 },
-      spec: { replicas: 1 }, status: { observedGeneration: 4, replicas: 1, updatedReplicas: 1, availableReplicas: 1, readyReplicas: 1 },
-    }));
+    if (existsSync(ready)) {
+      const replicas = readFileSync(ready, 'utf8') === 'created-not-ready' ? 0 : 1;
+      console.log(JSON.stringify({
+        kind: 'Deployment', metadata: { name: 'fixture-deployment', namespace: 'fixture', uid: 'fixture-deployment-uid', generation: 4 },
+        spec: { replicas: 1 }, status: { observedGeneration: 4, replicas: 1, updatedReplicas: 1, availableReplicas: replicas, readyReplicas: replicas },
+      }));
+    }
   }
 }

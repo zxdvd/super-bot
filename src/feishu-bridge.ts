@@ -62,7 +62,7 @@ export class FeishuBridge {
   constructor(
     private readonly ctx: Context,
     private readonly store: Store,
-    private readonly managers: Pick<Managers, 'submitFeishu'>,
+    private readonly managers: Pick<Managers, 'submitFeishu' | 'registerFeishuBindingCheck'>,
     private readonly groups: Pick<FeishuGroups, 'get' | 'findByChat' | 'onUnbound'>,
     private readonly transport: FeishuTransport,
     private readonly config: FeishuIdentity,
@@ -74,6 +74,9 @@ export class FeishuBridge {
     this.running = true;
     this.connection = 'connecting';
     this.connectionError = undefined;
+    const stopBindingCheck = this.managers.registerFeishuBindingCheck?.((botId, bindingId) =>
+      !!this.epoch && this.running && this.groups.get(botId)?.id === bindingId);
+    if (stopBindingCheck) this.disposers.push(stopBindingCheck);
     this.disposers.push(this.groups.onUnbound(bindingId => this.revokeBinding(bindingId)));
     this.disposers.push(this.ctx.on('session/event', (session, event) => this.observe(session, event)));
     this.disposers.push(this.ctx.on('agent/created', ({ agent }) => { this.seedInbox(agent); }));

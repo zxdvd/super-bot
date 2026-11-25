@@ -12,6 +12,7 @@ export type Detail = {
   deliveredResult: DeliveredResult | null; linkedResult?: VisibleResult | null;
   autoDispatchPending?: boolean; recovery?: RecoveryDetail | null; model?: WorkerModelPreview;
   recoveryCheck?: Pick<RecoveryCheck, 'resolution'> | null;
+  settledBlocker?: 'settled-failure' | 'verified-end' | null;
   childWaits?: ChildWaitDetail[]; chatDelivery?: ChatDeliveryStatus | null; linkedChatDelivery?: ChatDeliveryStatus | null;
   progress?: TaskProgress; reloadEligible?: boolean;
 };

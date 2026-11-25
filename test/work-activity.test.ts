@@ -6,6 +6,34 @@ import type { MirrorDetail } from '../src/mirror.ts';
 import { readLocalMirror } from '../src/mirror-queries.ts';
 import { canStartTask, eventTitle, recoveryEventMessage, stage, stageText, workGroup } from '../src/ui/work/format.ts';
 
+test('a settled business blocker has no owner action in the local or mirrored work view', t => {
+  const store = new Store(':memory:');
+  t.after(() => store.close());
+  const bot = store.createBot('bot', { name: 'Release', instructions: 'Synthetic only' });
+  const task = store.createTask('task', { botId: bot.id, goal: 'Check production version', scope: 'Observe only',
+    acceptance: 'Report running image', reviewPolicy: 'human' });
+  const binding = store.beginBinding('bind', task.id, task.rowVersion, '/synthetic/release');
+  store.confirmBinding(binding.id, binding.requestedSessionId);
+  const run = store.reserveRun('dispatch', task.id, store.getTask(task.id).rowVersion);
+  store.saveRunMessage(run.id, 'm', JSON.stringify({ id: 'm' }));
+  store.claimDispatch(run.id);
+  store.inputEnqueued(run.id);
+  store.inputEntered(run.id, 'm', 1);
+  store.associateRunTurn(run.id, 1, 0, 1);
+  store.workerReport(run.id, 'report', { kind: 'blocked', summary: 'Release job missing', checks: 'Checked pipeline' });
+  store.observeRunEnd(run.id, 5, 'completed', true);
+  store.settleRun(run.id);
+  const mirror = readLocalMirror(store, { op: 'detail', id: task.id, botId: bot.id }) as MirrorDetail;
+  for (const row of [store.getTask(task.id), mirror.task]) {
+    assert.equal(row.status, 'blocked');
+    assert.equal(stageText(row), '任务受阻');
+    assert.equal(stage(row), 'waiting');
+    assert.equal(workGroup(row), 'doing');
+  }
+  assert.equal(botWorkSummaries(store.db)[0]?.attention, 0);
+  assert.equal(canStartTask(store.taskDetail(task.id)), false);
+});
+
 test('summary excludes inactive and folded work, scopes manager rows and includes actionable work beyond the inbox window', t => {
   const store = new Store(':memory:');
   t.after(() => store.close());

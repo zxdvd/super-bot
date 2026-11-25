@@ -117,8 +117,14 @@ export async function prepareClusterProbe(probe:ClusterProbe,signal:AbortSignal,
           value.status?.updatedReplicas===value.spec.replicas&&value.status?.availableReplicas===value.spec.replicas&&
           value.status?.readyReplicas===value.spec.replicas:
           value.status?.phase==='Bound';
-        return {status:'present',message:`${probe.namespace}/${probe.name} 已存在，当前${ready?'已就绪':'未就绪'}。`,
-          observed:{uid:metadata.uid,ready}};
+        const containers:unknown=probe.kind==='deployment-state'?value.spec?.template?.spec?.containers:undefined;
+        const deploymentImages=Array.isArray(containers)?containers.slice(0,20).flatMap(container=>
+          typeof container?.name==='string'&&container.name.length<=63&&dnsName.test(container.name)&&
+          typeof container.image==='string'&&/^[A-Za-z0-9._/@:+-]{1,350}$/.test(container.image)
+            ?[{container:container.name as string,image:container.image as string}]:[]):[];
+        const images=deploymentImages.length?` 部署规格镜像 ${deploymentImages.map(item=>`${item.container}=${item.image}`).join('、')}。`:'';
+        return {status:'present',message:`${probe.namespace}/${probe.name} 已存在，当前${ready?'已就绪':'未就绪'}。${images}`,
+          observed:{uid:metadata.uid,ready,...(deploymentImages.length?{deploymentImages}:{})}};
       }catch{return unavailable('Kubernetes 资源回执无法验证。');}
     },
   };

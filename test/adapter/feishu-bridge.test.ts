@@ -226,6 +226,13 @@ async function fixture(t: TestContext) {
       await emit('agent/created', { agent });
       return agent;
     },
+    async switchIdentity(config: typeof identity) {
+      await bridge.close();
+      groups = new FeishuGroups(store, config, transport);
+      bridge = new FeishuBridge(ctx, store, managers, groups, transport, config, admission);
+      bridge.start();
+      connection('ready');
+    },
     async reopen() {
       await bridge.close();
       for (const agent of agents.values()) agent.release();
@@ -264,7 +271,7 @@ test('authorized Feishu turn can create, answer and rework in the real Manager w
     action: 'create', goal: 'Synthetic work', scope: 'One file', acceptance: 'Readable', dispatch: false,
   });
   await assert.rejects(() => f.runTool(a.agent, { action: 'pause', taskId: task.id,
-    expectedRowVersion: task.rowVersion, userInstruction: '请安排合成任务' }), { code: 'human-message-required' });
+    expectedRowVersion: task.rowVersion, userInstruction: '模型伪造：请暂停合成任务' }), { code: 'control-human-text' });
   await a.agent.assistant('甲群已接单');
   await a.agent.endTurn();
   await b.agent.enter();
@@ -310,6 +317,47 @@ test('authorized Feishu turn can create, answer and rework in the real Manager w
   assert.deepEqual(f.sent.map(({ chatId, text }) => [chatId, text]), [
     ['oc_alpha', '甲群已接单'], ['oc_beta', '乙群独立回答'],
   ]);
+});
+
+test('only the still-bound Feishu owner can control existing work after its native message enters', async t => {
+  const f = await fixture(t), { a, store } = f;
+  const task=store.createTask('task-control',{botId:a.bot.id,goal:'镜像升级',scope:'Read',acceptance:'Report',reviewPolicy:'human'});
+  const action=(kind:string,text:string)=>f.runTool(a.agent,{action:kind,taskId:task.id,
+    expectedRowVersion:store.getTask(task.id).rowVersion,userInstruction:text});
+  const pause='镜像升级先暂停。',resume='镜像升级恢复自动管理。';
+  f.incoming('alpha-pause',pause);
+  await tick();
+  await a.agent.enter();
+  assert.equal((await action('pause',pause)).task.controlMode,'paused');
+  await a.agent.endTurn();
+
+  f.incoming('alpha-resume',resume);
+  await tick();
+  await a.agent.enter();
+  f.groups.unbind(a.bot.id,f.aa.id);
+  await assert.rejects(action('resume',resume),{code:'human-message-required'});
+  assert.equal(store.getTask(task.id).controlMode,'paused');
+  await a.agent.endTurn();
+});
+
+test('a saved Feishu clarification loses authority when the current identity changes with its old binding still in SQLite', async t => {
+  const f=await fixture(t),{a,store}=f;
+  const make=(name:string)=>store.createTask(name,{botId:a.bot.id,goal:name,scope:'Read only',acceptance:'Report',reviewPolicy:'human'});
+  const first=make('甲'),second=make('乙');
+  f.incoming('old-owner-direction','先只查线上版本。');
+  await tick();
+  await a.agent.enter();
+  assert.deepEqual((await f.runTool(a.agent,{action:'clarify',followUp:'continue',taskIds:[first.id,second.id]})).choices,['甲','乙']);
+  await a.agent.endTurn();
+  await f.switchIdentity({appId:'cli_syntheticNew',ownerOpenId:'ou_newOwner'});
+  assert.equal(store.db.prepare('SELECT id FROM feishu_group_bindings WHERE botId=?').get(a.bot.id)?.id,f.aa.id);
+  assert.equal(f.groups.get(a.bot.id),null);
+  a.agent.followup(f.web('甲。'));
+  await a.agent.enter();
+  await assert.rejects(f.runTool(a.agent,{action:'continue',taskId:first.id,expectedRowVersion:first.rowVersion,
+    userInstruction:'甲。',continuationMode:'read-only',useClarification:true}),{code:'clarification-stale'});
+  assert.equal(store.recoveryInstruction(first.id),null);
+  await a.agent.endTurn();
 });
 
 test('the Manager rejects claimed Feishu authority for forged source, modified text and replay', async t => {

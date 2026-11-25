@@ -8,7 +8,15 @@ export function isFeishuSource(source: UserMessage['source']): source is Message
 
 export function isNativeOwner(message: UserMessage): boolean {
   const source = message.source;
-  return source.kind === 'user' && !isFeishuSource(source) && 'rpcId' in source && !!source.rpcId && source.principal === undefined;
+  return source.kind === 'user' && !isFeishuSource(source) && 'rpcId' in source &&
+    typeof source.rpcId === 'string' && source.rpcId.length > 0 &&
+    Object.keys(source).every(key => key === 'kind' || key === 'rpcId' || key === 'clientTimeZone') &&
+    (!('clientTimeZone' in source) || typeof source.clientTimeZone === 'string');
+}
+
+export function isHostContext(message: UserMessage): boolean {
+  const kind: string = message.source.kind;
+  return kind === 'runtime-context' || kind === 'agent-instructions' || kind === 'time-context' || kind === 'skill-catalog';
 }
 
 export function messageText(message: Pick<UserMessage, 'content'>): string {

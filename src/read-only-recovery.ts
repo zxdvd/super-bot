@@ -12,7 +12,7 @@ export type RecoveryProbe = ReadProbe|ClusterProbe;
 export type ProbeResult = {
   status:'readable'|'allowed'|'denied'|'present'|'missing'|'unavailable';
   message:string;
-  observed?:{uid:string; ready:boolean};
+  observed?:{uid:string; ready:boolean; deploymentImages?:{container:string;image:string}[]};
 };
 export type ProbeEvidence = {
   probe:RecoveryProbe; callId:string; callSeq:number; resultSeq:number; auth?:string;
@@ -26,7 +26,7 @@ export type RecoveryCheck = {
 };
 export type PriorTools = {
   files:{evidence:ProbeEvidence;known?:ProbeResult}[];
-  clusters:{callId:string;callSeq:number;resultSeq:number}[];
+  clusters:{callId:string;callSeq:number;resultSeq:number;args:string}[];
   potentialEffects:{tool:string;callSeq:number;result:'reported-success'|'reported-error'|'missing'}[];
   incomplete:boolean;
 };
@@ -84,8 +84,8 @@ export function inspectPriorTools(events:readonly RunEvent[],cwd:string,turn:num
       }
       continue;
     }
-    if(name==='super_bot_preflight'&&result) {
-      checks.clusters.push({callId,callSeq:call.seq,resultSeq:result.seq});
+    if(name==='super_bot_preflight'&&result&&typeof args==='string') {
+      checks.clusters.push({callId,callSeq:call.seq,resultSeq:result.seq,args});
       continue;
     }
     checks.potentialEffects.push({tool:name,callSeq:call.seq,result:result?

@@ -78,11 +78,32 @@ export function reserveFeishuInput(store: Store, input: FeishuInput): { message:
 /** A receipt survives restarts for deduplication. Only a live submission can authorize a turn. */
 export class FeishuInputs {
   private pending = new Map<string, PendingInput>();
+  private currentBinding?: (botId: string, bindingId: string) => boolean;
 
   constructor(private readonly store: Store) {}
 
   isPending(message: UserMessage): boolean {
     return this.pending.has(message.id);
+  }
+
+  registerBindingCheck(check: (botId: string, bindingId: string) => boolean): () => void {
+    this.currentBinding = check;
+    return () => { if (this.currentBinding === check) this.currentBinding = undefined; };
+  }
+
+  /** A saved owner decision may carry on only while its verified route still matches. */
+  hasCurrentSource(source: ChatSource, botId: string): boolean {
+    const receipt = this.store.db.prepare(`
+      SELECT r.sessionId, r.botId, r.nativeSeq, r.textDigest, b.id AS currentBinding
+      FROM feishu_inbound_receipts r
+      LEFT JOIN feishu_group_bindings b ON b.id=r.bindingId AND b.botId=r.botId AND b.appId=r.appId AND b.ownerOpenId=r.senderOpenId
+      WHERE r.nativeMessageId=?
+    `);
+    return (source.messages ?? [source]).every(part => {
+      const item = receipt.get(part.messageId);
+      return !item || typeof item.currentBinding === 'string' && this.currentBinding?.(botId, item.currentBinding) === true &&
+        item.sessionId === source.sessionId && item.botId === botId && item.nativeSeq === part.seq && item.textDigest === digest(part.text);
+    });
   }
 
   private hasReceipt(sessionId: string, input: FeishuInput, message: UserMessage): boolean {

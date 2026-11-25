@@ -4,6 +4,7 @@ import {join} from 'node:path';
 import {tmpdir} from 'node:os';
 import {test,type TestContext} from 'node:test';
 import type {Context} from '@deepseek-ai/cordis';
+import type {UserMessage} from '@deepseek-ai/dsh-llm';
 import {Store} from '../../src/store.ts';
 import {DshExecution} from '../../src/dsh.ts';
 import {inspectPriorTools,type ClusterProbe,type ProbeResult} from '../../src/read-only-recovery.ts';
@@ -11,7 +12,7 @@ import {parseClusterProbe,prepareClusterProbe} from '../../src/kubernetes-prefli
 import type {RunEvent} from '../../src/run-proof.ts';
 
 const signal=new AbortController().signal;
-function fixture(t:TestContext,cluster?:{probe:ClusterProbe;auth:string;result:ProbeResult}) {
+function fixture(t:TestContext,cluster?:{probe:ClusterProbe;auth:string;result:ProbeResult},state:'settled'|'interrupted'|'running'='settled') {
   const cwd=mkdtempSync(join(realpathSync(tmpdir()),'sb-verified-recovery-'));
   const store=new Store(join(cwd,'ledger.sqlite'));
   t.after(()=>{store.close();rmSync(cwd,{recursive:true,force:true});});
@@ -29,10 +30,14 @@ function fixture(t:TestContext,cluster?:{probe:ClusterProbe;auth:string;result:P
   store.inputEnqueued(run.id);
   store.inputEntered(run.id,automatic.id,1);
   store.associateRunTurn(run.id,1,0,1);
-  store.workerReport(run.id,'blocked',{kind:'blocked',summary:'File unavailable',checks:'Native read could not find it'});
-  if(cluster)store.recordPreflightReceipt(run.id,'read',cluster.probe,cluster.auth,cluster.result);
-  store.observeRunEnd(run.id,cluster?6:5,'completed',true);
-  store.settleRun(run.id);
+  const endKind=state==='interrupted'?'error':'completed';
+  if(state!=='running') {
+    store.workerReport(run.id,'blocked',{kind:'blocked',summary:'File unavailable',checks:'Native read could not find it'});
+    if(cluster)store.recordPreflightReceipt(run.id,'read',cluster.probe,cluster.auth,cluster.result);
+    store.observeRunEnd(run.id,cluster?6:5,endKind,true);
+    if(state==='interrupted')store.runRecovery(run.id,'Lost process handle after observed end.');
+    else store.settleRun(run.id);
+  }
   const path=join(cwd,'fixture.txt');
   const args={file_path:path,offset:3,limit:4};
   const events:RunEvent[]=[
@@ -42,7 +47,7 @@ function fixture(t:TestContext,cluster?:{probe:ClusterProbe;auth:string;result:P
     {seq:3,type:'tool/call',data:{turn:1,step:2,callId:'read',name:'read',arguments:JSON.stringify(args)}},
     {seq:4,type:'tool/result',data:{turn:1,step:2,message:{toolCallId:'read',isError:true},
       error:{code:'FS_NOT_FOUND',reason:'file not found'}}},
-    {seq:5,type:'turn/end',data:{turn:1,reason:{kind:'completed'}}},
+    {seq:5,type:'turn/end',data:{turn:1,reason:{kind:endKind}}},
   ];
   if(cluster) {
     events[3]!.data.name='super_bot_preflight';
@@ -52,14 +57,19 @@ function fixture(t:TestContext,cluster?:{probe:ClusterProbe;auth:string;result:P
     events.push({seq:5,type:'tool/call',data:{turn:1,step:3,callId:'possible-write',name:'bash',arguments:'{}'}});
     events.push({...end,seq:6});
   }
-  const session={id:run.sessionId};
+  const session={id:run.sessionId,deriveMessages:()=>[]};
   const jobs:{id:string;owner:string;status:string}[]=[];
   const inbox={nextTurn:[] as object[],nextStep:[] as object[]};
-  const agent={id:run.sessionId,session,status:'idle',inbox,ctx:{on:()=>()=>{}}};
+  const sent:UserMessage[]=[];
+  const guards:((exec:{name:string;arguments?:unknown})=>string|undefined)[]=[];
+  const agent={id:run.sessionId,session,status:'idle',inbox,
+    ctx:{on:()=>()=>{},tools:{restrict:()=>()=>{},guard:(guard:typeof guards[number])=>{guards.push(guard);return ()=>{};}}},
+    followup:(message:UserMessage)=>{sent.push(message);},whenIdle:()=>new Promise(()=>{})};
   const options={nativeCode:'',beforeResolve:async()=>{},beforeRead:async()=>{}};
   let calls=0;
   const execution=()=>new DshExecution({
     workingDirectory:{get:()=>cwd},jobs:{list:()=>jobs},agents:{get:()=>agent,list:()=>[agent]},
+    permissionPresets:{set:()=>{}},sessionProjections:{snapshot:()=>({values:{modelSelection:{next:{provider:'fixture',model:'fixture'}}}})},
     sessions:{flush:async()=>true},
     sessionPersistence:{open:async()=>({header:session,read:async()=>({events:structuredClone(events)}),close:async()=>{}})},
     sessionController:{resolveAgent:async()=>{await options.beforeResolve();return {agent};}},
@@ -78,7 +88,7 @@ function fixture(t:TestContext,cluster?:{probe:ClusterProbe;auth:string;result:P
     }},
   } as unknown as Context,store,cwd,{fullAccess:!!cluster});
   const id=task.id,version=store.getTask(id).rowVersion;
-  return {store,task,run,manager,version,args,events,jobs,inbox,options,calls:()=>calls,execution,
+  return {store,task,run,manager,version,args,events,jobs,inbox,options,calls:()=>calls,execution,sent,guards,
     inspect:(e=execution())=>e.inspectAutoRecovery(id,version,run.id,manager.id,()=>{}),
     perform:(e=execution())=>e.performAutoRecovery(id,version,run.id,manager.id,signal,()=>{}),
   };
@@ -116,7 +126,10 @@ for(const block of ['unknown-call','pending-job','pending-input','new-native-tur
     }
     assert.equal((await f.perform()).status,'needs-human');
     assert.equal(f.calls(),0);
-    assert.equal(f.store.getTask(f.task.id).status,'recovery');
+    const detail=f.store.taskDetail(f.task.id);
+    assert.equal(detail.task.status,block==='human-pause'?'paused':'blocked');
+    assert.equal(detail.settledBlocker,'settled-failure');
+    assert.ok(detail.attentions.some(item=>item.id===`run:${f.run.id}`&&item.state==='open'));
   });
 }
 
@@ -160,7 +173,8 @@ test('unavailable exact read records uncertainty and never clears recovery',asyn
   f.options.nativeCode='ABORTED';
   assert.equal((await f.perform()).status,'unavailable');
   const detail=f.store.taskDetail(f.task.id);
-  assert.equal(detail.task.status,'recovery');
+  assert.equal(detail.task.status,'blocked');
+  assert.equal(detail.settledBlocker,'settled-failure');
   assert.ok(detail.events.some(event=>event.kind==='run.recovery-observed'));
   assert.equal((await f.perform()).status,'already-checked');
   assert.equal(f.calls(),1);
@@ -225,7 +239,9 @@ test('readback with a lost write receipt verifies the same resource once and ret
   const f=fixture(t,{probe,auth:original.auth,result});
   writeFileSync(cluster.state,JSON.stringify({kind:'Deployment',
     metadata:{namespace:'fixture',name:'demo',uid:'synthetic-uid',generation:2},
-    spec:{replicas:1},status:{observedGeneration:2,replicas:1,readyReplicas:1,updatedReplicas:0,availableReplicas:1}}));
+    spec:{replicas:1,template:{spec:{containers:[{name:'fixture-worker',image:'registry.example/worker:old'},
+      {name:'invalid',image:'unexpected\ntext'}]}}},
+    status:{observedGeneration:2,replicas:1,readyReplicas:1,updatedReplicas:0,availableReplicas:1}}));
   const inspection=await f.inspect();
   assert.equal(inspection.status,'eligible');
   assert.ok('effectUncertain' in inspection&&inspection.effectUncertain);
@@ -233,9 +249,12 @@ test('readback with a lost write receipt verifies the same resource once and ret
     entry=>entry.tool==='bash'&&entry.result==='missing'));
   const checked=await f.perform();
   assert.equal(checked.status,'present');
-  assert.deepEqual('observed' in checked&&checked.observed,{uid:'synthetic-uid',ready:false},
+  assert.deepEqual('observed' in checked&&checked.observed,{uid:'synthetic-uid',ready:false,
+    deploymentImages:[{container:'fixture-worker',image:'registry.example/worker:old'}]},
     'one ready old replica does not prove the current rollout is ready');
-  assert.equal(f.store.getTask(f.task.id).status,'recovery');
+  assert.ok('message' in checked);
+  assert.match(checked.message,/部署规格镜像 fixture-worker=registry.example\/worker:old/);
+  assert.equal(f.store.getTask(f.task.id).status,'blocked');
   assert.equal(f.store.recoveryCheck(f.run.id)?.effectUncertain,true);
   assert.equal((await f.perform()).status,'already-checked');
   assert.deepEqual(cluster.commands().map(args=>args[0]==='config'?'config':args.includes('whoami')?'whoami':args.includes('get')?'get':'other'),
@@ -246,4 +265,185 @@ test('readback with a lost write receipt verifies the same resource once and ret
   assert.ok(events.some(event=>event.kind==='run.recovery-observed'));
   assert.ok(events.every(event=>event.kind!=='run.recovery-confirmed'));
   assert.equal(f.calls(),0);
+  await assert.rejects(f.execution().endTaskLink('task.cancel','cancel-unknown-effect',f.task.id,f.version),
+    /未确认的工具回执或外部效果/);
+  assert.equal(f.store.getTask(f.task.id).lifecycle,'open');
+});
+
+test('settled business blockage can be cancelled without the legacy recovery acknowledgement',async t=>{
+  const f=fixture(t);
+  const cancelled=await f.execution().endTaskLink('task.cancel','cancel-settled',f.task.id,f.version);
+  assert.equal(cancelled.lifecycle,'cancelled');
+  assert.equal(f.store.taskRuns(f.task.id).length,1);
+  assert.equal(f.sent.length,0);
+  assert.equal(f.store.getRunInput(f.run.id).state,'entered');
+});
+
+test('ordinary settled business blockers report prior facts without opening an unnecessary owner decision',async t=>{
+  const f=fixture(t);
+  f.events[4]!.data.message.isError=false;
+  const inspected=await f.inspect();
+  assert.equal(inspected.status,'blocked');
+  assert.deepEqual('priorReport' in inspected&&inspected.priorReport,
+    {kind:'blocked',summary:'File unavailable',checks:'Native read could not find it'});
+  const detail=f.store.taskDetail(f.task.id);
+  assert.equal(detail.task.waitingForPrerequisite,true);
+  assert.equal(detail.task.blockingAttention,null);
+  assert.equal(f.calls(),0);
+});
+
+test('a durable interrupted read with a demonstrably quiet end can be checked without a new Worker',async t=>{
+  const f=fixture(t,undefined,'interrupted');
+  assert.equal(f.store.heldRuns()[0]?.id,f.run.id);
+  assert.equal(f.store.getTask(f.task.id).status,'recovery');
+  assert.equal((await f.perform()).status,'readable');
+  assert.equal(f.store.heldRuns().length,0);
+  assert.equal(f.store.taskDetail(f.task.id).settledBlocker,'verified-end');
+  assert.equal(f.calls(),1);
+  assert.equal(f.sent.length,0);
+  assert.equal((await f.perform()).status,'already-checked');
+});
+
+test('the newest owner instruction waits for native activity and is then delivered once on the original task',async t=>{
+  const f=fixture(t,undefined,'interrupted'),{store,task,run,manager}=f;
+  const initial={sessionId:manager.requestedSessionId,messageId:'owner-first',seq:17,text:'继续'};
+  const first=store.saveRecoveryInstruction(task.id,f.version,initial);
+  f.inbox.nextStep.push({source:{kind:'tool-jobs',form:'notice'}});
+  const firstAttempt=await f.execution().continueRecovery(task.id,first.task.rowVersion,manager.id,()=>{});
+  assert.equal(firstAttempt.status,'waiting');
+  assert.equal(f.execution().canWakeRecoveryContinuation(task.id),false);
+  assert.equal(store.heldRuns()[0]?.id,run.id);
+  assert.equal(f.inbox.nextStep.length,1);
+  const latest={...initial,messageId:'owner-latest',seq:19,text:'  先只查新版本  '};
+  const saved=store.saveRecoveryInstruction(task.id,first.task.rowVersion,latest,'read-only');
+  assert.deepEqual(store.saveRecoveryInstruction(task.id,f.version,initial).instruction.source,latest);
+  const duplicate=store.saveRecoveryInstruction(task.id,first.task.rowVersion,latest,'read-only');
+  assert.equal(duplicate.task.rowVersion,saved.task.rowVersion);
+  assert.equal(store.taskDetail(task.id).events.filter(event=>event.kind==='task.recovery-instruction').length,2);
+  f.inbox.nextStep.pop(); // The native consumer, not recovery, settles the pending result.
+  assert.equal(f.execution().canWakeRecoveryContinuation(task.id),true);
+  const resumed=await f.execution().continueRecovery(task.id,saved.task.rowVersion,manager.id,()=>{});
+  assert.equal(resumed.status,'started');
+  assert.ok(resumed.run);
+  assert.equal(resumed.run.taskId,task.id);
+  assert.equal(f.sent.length,1);
+  const workerText=f.sent[0]!.content[0];
+  assert.ok(workerText?.type==='text');
+  assert.match(workerText.text,/先只查新版本/);
+  assert.match(workerText.text,/File unavailable/);
+  assert.doesNotMatch(workerText.text,/Additional user input \(continuation\): 继续/);
+  assert.equal(store.getRunInput(resumed.run.id).content,latest.text);
+  assert.equal(store.recoveryWorkPlan(resumed.run.id)?.context.effectUncertain,false);
+  assert.match(f.guards[0]!({name:'bash'})??'',/read-only/);
+  assert.match(f.guards[0]!({name:'write'})??'',/read-only/);
+  assert.equal(store.getRunInput(run.id).state,'entered');
+  assert.equal(store.heldRuns()[0]?.id,resumed.run.id);
+  assert.equal((await f.execution().continueRecovery(task.id,saved.task.rowVersion,manager.id,()=>{})).status,'already-started');
+  assert.equal(f.sent.length,1);
+});
+
+test('interrupted execution with an unverified external operation keeps its slot and accepts no replacement Run',async t=>{
+  const f=fixture(t,undefined,'interrupted'),{store,task,run,manager}=f;
+  f.events[3]!.data.name='bash';
+  const source={sessionId:manager.requestedSessionId,messageId:'inspect-after-write',seq:6,text:'只查上一轮写入的结果'};
+  const saved=store.saveRecoveryInstruction(task.id,f.version,source,'read-only');
+  const output=await f.execution().continueRecovery(task.id,saved.task.rowVersion,manager.id,()=>{});
+  assert.equal(output.status,'blocked');
+  assert.match(output.message,/未确认的外部效果/);
+  assert.equal(store.heldRuns()[0]?.id,run.id);
+  assert.equal(store.getRunInput(run.id).state,'entered');
+  assert.equal(store.recoveryInstruction(task.id)?.runId,undefined);
+  assert.equal(f.sent.length,0);
+});
+
+test('a stored capacity wait and plain owner confirmation retain the last concrete direction',async t=>{
+  const f=fixture(t),{store,task,manager}=f;
+  store.setBotCapacity('capacity',task.botId,null,1);
+  const other=store.createTask('other',{botId:task.botId,goal:'Other work',scope:'Test files',acceptance:'Report',reviewPolicy:'human'});
+  const b=store.beginBinding('other-binding',other.id,other.rowVersion,'/tmp');
+  store.confirmBinding(b.id,b.requestedSessionId);
+  const hold=store.reserveRun('hold-capacity',other.id,store.getTask(other.id).rowVersion);
+  const firstSource={sessionId:manager.requestedSessionId,messageId:'concrete',seq:10,text:'仅查询工作目录里的版本'};
+  const first=store.saveRecoveryInstruction(task.id,f.version,firstSource,'read-only');
+  const current=store.saveRecoveryInstruction(task.id,first.task.rowVersion,{...firstSource,messageId:'confirm',seq:12,text:'继续'},undefined,true);
+  assert.equal(current.instruction.mode,'read-only');
+  assert.deepEqual(current.instruction.priorDirection,firstSource);
+  const restarted=f.execution();
+  const waited=await restarted.continueRecovery(task.id,current.task.rowVersion,manager.id,()=>{});
+  assert.equal(waited.status,'waiting');
+  assert.equal(f.sent.length,0);
+  assert.equal(store.taskDetail(task.id).wait?.code,'capacity');
+  const notice=`manager-event:continuation:${current.instruction.id}`;
+  assert.equal(store.claimManagerEvent(notice,'manager-lost','{}'),true);
+  store.resetUnconfirmedManagerEvents();
+  store.resetUnconfirmedManagerEvents();
+  assert.equal(store.managerEvent(`${notice}:restart`)?.state,'pending');
+  assert.equal(store.managerNotifications(task.botId).filter(event=>event.id===`${notice}:restart`).length,1);
+  store.requestStop('release-capacity',other.id,store.getTask(other.id).rowVersion,hold.id);
+  store.settleCancelled(hold.id);
+  assert.equal(store.dispatchBlocker(task.id),null);
+  const retried=await f.execution().continueRecovery(task.id,current.task.rowVersion,manager.id,()=>{});
+  assert.equal(retried.status,'started');
+  const text=f.sent[0]?.content[0];
+  assert.ok(text?.type==='text');
+  assert.match(text.text,/仅查询工作目录里的版本/);
+  assert.match(text.text,/Additional user input \(continuation\): 继续/);
+  assert.equal(store.recoveryInstruction(task.id)?.runId,retried.run?.id);
+});
+
+test('only a fresh concrete owner instruction can atomically resume a paused task',async t=>{
+  const f=fixture(t),{store,task,manager}=f;
+  const paused=store.controlTask('user-paused',task.id,f.version,'paused');
+  const prior={sessionId:manager.requestedSessionId,messageId:'waiter',seq:8,text:'先只核对版本'};
+  const persisted=store.saveRecoveryInstruction(task.id,paused.rowVersion,prior,'read-only');
+  assert.equal(persisted.task.controlMode,'paused');
+  assert.equal((await f.execution().continueRecovery(task.id,persisted.task.rowVersion,manager.id,()=>{})).status,'blocked');
+  assert.throws(()=>store.saveRecoveryInstruction(task.id,persisted.task.rowVersion,{...prior,messageId:'generic',seq:9},
+    undefined,true,true),/明确的本次续跑指示/);
+  const newest={...prior,messageId:'resume-with-limits',seq:10,text:'恢复执行，先只查新版本'};
+  const resumed=store.saveRecoveryInstruction(task.id,persisted.task.rowVersion,newest,'read-only',false,true);
+  assert.equal(resumed.task.controlMode,'auto');
+  const pausedAgain=store.controlTask('second-pause',task.id,resumed.task.rowVersion,'paused');
+  assert.equal(store.saveRecoveryInstruction(task.id,paused.rowVersion,newest,'read-only',false,true).task.rowVersion,pausedAgain.rowVersion);
+  assert.equal(store.getTask(task.id).controlMode,'paused');
+  assert.equal(f.sent.length,0);
+});
+
+for(const kind of ['ready','waiting'] as const)test(`an earlier ${kind} report is preserved without overriding a newer pending direction`,async t=>{
+  const f=fixture(t,undefined,'running'),{store,task,run,manager}=f;
+  const source={sessionId:manager.requestedSessionId,messageId:'during-old-run',seq:8,text:'应改为只读核对当前状态'};
+  const saved=store.saveRecoveryInstruction(task.id,f.version,source,'read-only');
+  store.workerReport(run.id,kind,{kind,summary:'Previous instruction',checks:'Past work',
+    ...(kind==='ready'?{evidence:[{path:'prior.txt',bytes:4,sha256:'test'}]}:{})});
+  store.observeRunEnd(run.id,5,'completed',true);
+  store.settleRun(run.id,false);
+  const detail=store.taskDetail(task.id);
+  assert.equal(detail.task.lifecycle,'open');
+  assert.equal(detail.task.controlMode,'auto');
+  assert.equal(detail.settledBlocker,'verified-end');
+  assert.equal(detail.attentions.some(attention=>attention.state==='open'),false);
+  if(kind==='ready')assert.equal(store.runResult(run.id)?.humanAcceptedAt,null);
+  else assert.equal(store.finalReport(run.id)?.kind,'waiting');
+  assert.equal(store.managerEvent(`manager-event:continuation:${saved.instruction.id}:settled`)?.state,'pending');
+  const continued=await f.execution().continueRecovery(task.id,detail.task.rowVersion,manager.id,()=>{});
+  assert.equal(continued.status,'started');
+  assert.equal(f.sent.length,1);
+});
+
+test('concrete owner authorization permits newly scoped work only with proven clean earlier tools',async t=>{
+  const f=fixture(t),{store,task,manager}=f;
+  const source={sessionId:manager.requestedSessionId,messageId:'owner-authorizes',seq:8,text:'用当前授权范围内的新步骤处理待办'};
+  const saved=store.saveRecoveryInstruction(task.id,f.version,source,'authorized-work');
+  f.events[3]!.data.name='bash';
+  const blocked=await f.execution().continueRecovery(task.id,saved.task.rowVersion,manager.id,()=>{});
+  assert.equal(blocked.status,'blocked');
+  assert.equal(f.sent.length,0);
+  assert.equal(store.recoveryInstruction(task.id)?.runId,undefined);
+  f.events[3]!.data.name='read';
+  const continued=await f.execution().continueRecovery(task.id,saved.task.rowVersion,manager.id,()=>{});
+  assert.equal(continued.status,'started');
+  assert.ok(continued.run);
+  assert.equal(store.recoveryWorkPlan(continued.run.id)?.context.mode,'authorized-work');
+  assert.equal(f.guards[0]!({name:'write',arguments:{file_path:f.args.file_path}}),undefined);
+  assert.equal(f.sent.length,1);
 });

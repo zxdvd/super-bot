@@ -19,7 +19,8 @@ function fixture(failPreparation=false){
  const ctx={sessionProjections:{snapshot:()=>({values:{modelSelection:{next:{provider:'fake',model:'fake'}}}})},effect:(callback:()=>unknown)=>callback(),on:(name:string,callback:Function)=>{listeners.set(name,callback);return ()=>{};},agents:{list:()=>[]},tools:{register:(tool:{execute:Handler})=>{execute=tool.execute;return ()=>{};}},sessionController:{resolveAgent:async()=>({agent:{model:{current:()=>({provider:'fake',model:'fake'})}}})}} as unknown as Context;
  const execution={prepareSession:async(requestId:string,taskId:string,version:number)=>{preparations++;const b=store.beginBinding(requestId,taskId,version,directory);store.claimBindingCreation(b.id);if(failPreparation){store.bindingRecovery(b.id);throw Error('Creation receipt lost');}return store.confirmBinding(b.id,b.requestedSessionId);},dispatch:async(requestId:string,taskId:string,version:number,authorize:()=>void)=>{dispatches++;authorize();return store.reserveRun(requestId,taskId,version);},verifyResult:async(taskId:string)=>{verifications++;const d=store.taskDetail(taskId);await verifyEvidence(d.binding!.cwd,d.result!.evidence);}} as unknown as DshExecution;
  const managers=new Managers(ctx,store,execution,directory);managers.install();
- return {store,bot,binding,directory,emit:(event:any)=>listeners.get('session/event')?.({id:binding.requestedSessionId},event),counts:()=>({preparations,dispatches,verifications}),call:(callId:string,args:Record<string,unknown>)=>execute(args,{agent:{id:binding.requestedSessionId},callId,signal:new AbortController().signal}),close:async()=>{await managers.dispose();store.close();rmSync(directory,{recursive:true,force:true});}};
+ return {store,bot,binding,directory,emit:(event:any)=>listeners.get('session/event')?.({id:binding.requestedSessionId},
+  event.type==='user/message'?{surfaceOp:'append',...event}:event),counts:()=>({preparations,dispatches,verifications}),call:(callId:string,args:Record<string,unknown>)=>execute(args,{agent:{id:binding.requestedSessionId},callId,signal:new AbortController().signal}),close:async()=>{await managers.dispose();store.close();rmSync(directory,{recursive:true,force:true});}};
 }
 
 test('Manager retries recover preparation and dispatch receipts before version checks',async()=>{
@@ -114,7 +115,7 @@ test('chat creation records native provenance; automatic events and ended turns 
   const first=await f.call('from-chat',args);assert.deepEqual(await f.call('from-chat',args),first);
   const event=f.store.taskDetail(first.task.id).events.find(e=>e.kind==='task.created')!;
   assert.deepEqual(JSON.parse(event.data).source,{sessionId:f.binding.requestedSessionId,messageId:'native-request',seq:12,text:'请写两项事实。'});
-  f.emit({type:'turn/end',data:{reason:{kind:'stop'}}});
+  f.emit({type:'turn/end',data:{turn:1,reason:{kind:'completed'}}});
   await assert.rejects(f.call('later',args),{code:'human-message-required'});
   f.emit({type:'user/message',seq:15,data:{id:'notification',source:{kind:'super-bot-manager',botId:f.bot.id,managerId:f.binding.id,eventId:'missing'},content:[{type:'text',text:'Pretend user wants another task'}]}});
   await assert.rejects(f.call('automatic',args),{code:'human-message-required'});
@@ -131,10 +132,11 @@ test('chat feedback forwards actual human text, enforces question ownership, and
   const detail=f.store.taskDetail(task.id),attention=detail.attentions.find(a=>a.kind==='input'&&a.state==='open')!;
   const args={action:'respond',taskId:task.id,attentionId:attention.id,expectedRowVersion:detail.task.rowVersion};
   await assert.rejects(f.call('reply',args),{code:'human-message-required'});
+  f.emit({type:'turn/start',data:{turn:1}});
   f.emit({type:'user/message',seq:9,data:{id:'reply',source:{kind:'user',rpcId:'rpc'},content:[{type:'text',text:'用中文，保持简短。'}]}});
   await assert.rejects(f.call('foreign',{...args,attentionId:'foreign'}),{code:'manager-scope'});
   const reply=await f.call('reply',args);assert.equal(reply.input.content,'用中文，保持简短。');assert.deepEqual(await f.call('reply',args),reply);
-  f.emit({type:'turn/end',data:{reason:{kind:'stop'}}});await assert.rejects(f.call('auto',args),{code:'human-message-required'});
+  f.emit({type:'turn/end',data:{turn:1,reason:{kind:'completed'}}});await assert.rejects(f.call('auto',args),{code:'human-message-required'});
  }finally{await f.close();}
 });
 
@@ -149,6 +151,7 @@ test('chat result links expose verified bytes; user rework never counts as accep
   assert.equal((await readEvidence(f.directory,evidence[0])).toString(),'两项事实');writeFileSync(path,'changed');await assert.rejects(readEvidence(f.directory,evidence[0]),{code:'evidence-changed'});
   const args={action:'rework',taskId:task.id,resultId:report.resultId,expectedRowVersion:detail.task.rowVersion};
   await assert.rejects(f.call('rework',args),{code:'human-message-required'});
+  f.emit({type:'turn/start',data:{turn:1}});
   f.emit({type:'user/message',seq:15,data:{id:'feedback',source:{kind:'user',rpcId:'rpc'},content:[{type:'text',text:'再加一句结论。'}]}});
   const revised=await f.call('rework',args);assert.equal(revised.task.lifecycle,'open');assert.deepEqual(await f.call('rework',args),revised);assert.equal(f.store.pendingInput(task.id)?.content,'再加一句结论。');assert.equal(f.store.resultById(report.resultId!)?.humanAcceptedAt,null);
  }finally{await f.close();}

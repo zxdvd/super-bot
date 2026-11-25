@@ -9,7 +9,7 @@ function taskRecord(task: Task, detail: boolean): Task {
     createdAt, updatedAt, status, managerReviewed, blockingAttention, deliveredAt, botConfigRevision } = task;
   return { id, botId, goal, scope: detail ? scope : '', acceptance: detail ? acceptance : '', reviewPolicy, lifecycle,
     controlMode, taskRevision, rowVersion, sessionId: null, createdAt, updatedAt, status, managerReviewed, blockingAttention,
-    deliveredAt, botConfigRevision };
+    ...(task.waitingForPrerequisite && { waitingForPrerequisite: true }), deliveredAt, botConfigRevision };
 }
 
 function resultRecord({ id, runId, taskRevision, summary, checks, createdAt, humanAcceptedAt, evidence }: Result): ResultRecord {

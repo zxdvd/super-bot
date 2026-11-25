@@ -2,7 +2,7 @@ import type { Agent } from '@deepseek-ai/dsh-agent';
 import { createUserMessage, type UserMessage } from '@deepseek-ai/dsh-llm';
 import type { Session } from '@deepseek-ai/dsh-session';
 import { materialPrompt } from './materials.ts';
-import type { Binding, Run, RunInput, Task, TaskBotContext, WorkerPriorInput } from './model.ts';
+import type { Binding, RecoveryWorkContext, Run, RunInput, Task, TaskBotContext, WorkerPriorInput } from './model.ts';
 import { workdirSummary } from './workdir.ts';
 
 declare module '@deepseek-ai/dsh-llm' {
@@ -57,7 +57,8 @@ function previousInputText(input:WorkerPriorInput):string {
 type WorkerPromptPlan = {mode:'full'|'delta';carried:readonly WorkerPriorInput[];inputOrder:number};
 
 export function createWorkerRunMessage(
-  run:Run,input:RunInput,standing:string,{mode,carried,inputOrder}:WorkerPromptPlan,recovery?:{note:string|null},
+  run:Run,input:RunInput,standing:string,{mode,carried,inputOrder}:WorkerPromptPlan,
+  recovery?:{note:string|null},context?:RecoveryWorkContext,
 ):UserMessage {
   const sections = [runHeader(run.id)];
   if (mode === 'full') sections.push(standing);
@@ -66,7 +67,14 @@ export function createWorkerRunMessage(
     sections.push('The user confirmed recovery and requested this new attempt. Check the current files and the prior blocker before proceeding within the same authorized scope.');
     if (recovery.note) sections.push(`Prior recovery reason: ${recovery.note}`);
   }
-  if (input.kind === 'answer' || input.kind === 'rework') {
+  if (context) {
+    sections.push(`Earlier attempt and observed facts (use as evidence): ${JSON.stringify(context)}`);
+    sections.push('Continue the current assignment from the latest applicable user instruction and verified state. If the latest user message only confirms proceeding or selects this task, retain their most recent substantive direction and limits. Treat the standing goal as background for this attempt. Read prior reports and receipts as evidence. Preserve observed effects and uncertainty. If a resource was created but is unready, report both facts. Use waiting for a specific decision or permission the owner must supply. Report a blocked external dependency with the responsible party or condition.');
+    sections.push(context.mode==='read-only'?
+      'Use only the read-only tools available for this continuation and report the actual observations.' :
+      'Perform only the concrete next step the owner authorized within the standing scope. Check current facts first and stop before any action that could duplicate an observed effect.');
+  }
+  if (input.kind === 'answer' || input.kind === 'rework' || input.kind === 'continuation') {
     sections.push(`Task input order: ${inputOrder}.`);
     sections.push(`Additional user input (${input.kind}): ${input.content}`);
     sections.push('Continue from the current state and apply this input within the existing authorized scope. Use waiting if the input requires clarification or exceeds that scope.');

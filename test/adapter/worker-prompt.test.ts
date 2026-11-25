@@ -144,6 +144,23 @@ test('fallback restores only lost prior inputs and preserves their original orde
   assert.ok(restored.indexOf(answer.content)<restored.indexOf(rework.content));
 });
 
+test('a continuation preserves earlier direction and partial effects even if native context was compacted',()=>{
+  const {agent}=fixture();
+  const earlier:WorkerPriorInput={id:'scope',kind:'continuation',content:'镜像升级先只查线上版本。',messageId:'older-native-input',order:1};
+  const latest=input(next,'continuation','继续。');
+  const body=textOf(buildMessage(next,latest,standing,workerPromptPlan(agent,next,standing,[earlier]),undefined,{
+    priorRunId:initial.id,mode:'read-only',effectUncertain:true,probes:[],
+    priorReport:{kind:'blocked',summary:'首启超时；线上 Deployment 已创建但未就绪。',checks:'缺少配置权限。'},
+    priorCheck:{status:'present',message:'Deployment 仍只有 0/1 Ready',observed:{uid:'synthetic',ready:false}},
+  }));
+  assert.match(body,/Previously received task input \(continuation\): 镜像升级先只查线上版本。/);
+  assert.match(body,/Task input order: 2.\n\nAdditional user input \(continuation\): 继续。/);
+  assert.match(body,/Deployment 已创建但未就绪/);
+  assert.match(body,/0\/1 Ready/);
+  assert.match(body,/Use only the read-only tools available for this continuation/);
+  assert.match(body,/Use waiting for a specific decision or permission/);
+});
+
 test('native context refresh restores standing instructions after admission-time loss without rewriting the Run Input',async()=>{
   const {agent,prompt,session,append,replace}=fixture();
   const full=append(createWorkerRunMessage(initial,input(initial),standing,'full'));

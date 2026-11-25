@@ -29,7 +29,7 @@ export async function smokeVerifiedRecovery({ base, configure, launch, call, mak
     await probe(host, 'select-test-model', bot.managerId);
     await probe(host, 'native-prompt', bot.managerId, message);
     const task = await wait(async () => (await call(host, 'task.list', { botId: bot.id })).items
-      .find(item => item.goal === goal && item.status === 'recovery'), `original task enters recovery: ${goal}`);
+      .find(item => item.goal === goal && item.status === 'blocked'), `original task exposes a business blocker after normal settlement: ${goal}`);
     const detail = () => call(host, 'task.detail', { id: task.id, sessionId: bot.managerId });
     const before = await detail();
     const session = before.binding.sessionId;
@@ -42,6 +42,8 @@ export async function smokeVerifiedRecovery({ base, configure, launch, call, mak
     assert.equal(originalStatus, initialClusterStatus ?? 'FS_NOT_FOUND', `preflight must show its actual starting state: ${goal}`);
     assert.ok(worker.events.some(event => event.type === 'turn/end' && event.seq === before.runTurn.endSeq));
     assert.equal(before.run.state, 'failed');
+    assert.equal(before.runHeld, false);
+    assert.equal(before.task.blockingAttention, null);
     assert.equal(before.result, null);
     assert.equal(before.attentions.find(attention => attention.kind === 'recovery').state, 'open');
     return { bot, detail, before, worker, originalStatus, session };
@@ -94,7 +96,7 @@ export async function smokeVerifiedRecovery({ base, configure, launch, call, mak
   assert.ok(recovered.manager.executedTools.includes('bash'));
   const guardErrors = recovered.manager.toolResults.filter(result => result.message.isError).map(result => result.error?.reason
     ?? result.message.content.filter(block => block.type === 'text').map(block => block.text).join(''));
-  assert.ok(guardErrors.some(error => error.includes('恢复通知只允许对同一任务')), JSON.stringify(guardErrors));
+  assert.ok(guardErrors.some(error => /恢复通知只允许.*同一任务/u.test(error)), JSON.stringify(guardErrors));
   assert.ok(guardErrors.some(error => /恢复通知未授权原生工具|tool .*bash.*not found|only the current task’s read-only recovery tools are authorized/i.test(error)), JSON.stringify(guardErrors));
   const dataDir = dirname(dirname(safe.before.binding.cwd));
   await assert.rejects(access(join(dataDir, 'managers', safe.bot.id, 'recovery-guard-probe.txt')), { code: 'ENOENT' });

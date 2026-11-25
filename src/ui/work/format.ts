@@ -20,6 +20,8 @@ const eventLabels: Record<string, string> = {
   'run.stop-requested': '已请求停止', 'run.cancelled': '已核对停止', 'attention.answered': '回答已保存',
   'result.rejected': '返工要求已保存', 'run.recovery-confirmed': '用户完成恢复核对', 'manager.reviewed': 'Bot 检查成果',
   'run.recovery-check-started': 'Bot 开始只读核对', 'run.recovery-observed': 'Bot 记录恢复核对结果',
+  'run.end-verified': 'Bot 已核实上轮结束', 'task.recovery-instruction': '已保存聊天中的后续指示',
+  'run.continued': '已按最新指示续跑',
   'task.cancelled': '用户取消任务', 'session.detached': '解除执行会话关联', 'work.report-stale': '保留已失效报告的审计',
   'approval.asked': '原生工具请求审批', 'approval.decided': '原生审批已有结果', 'workdir.failed': '工作目录准备失败',
   'workdir.cleanup': '工作目录已清理', 'workdir.cleanup-failed': '工作目录自动清理失败',
@@ -89,6 +91,7 @@ export const groupTitles: Record<WorkGroup, string> = {
 export function workGroup(task: Task): WorkGroup {
   if (task.lifecycle === 'cancelled') return 'cancelled';
   if (task.lifecycle === 'review' || task.lifecycle === 'completed') return 'delivered';
+  if (task.waitingForPrerequisite) return 'doing';
   return ['needs-input', 'approval', 'recovery', 'blocked', 'paused', 'manual'].includes(task.status) ? 'needs-you' : 'doing';
 }
 
@@ -113,7 +116,7 @@ const RUNNING = ['running', 'queued', 'stopping'];
 
 function blocker(task: Task): Task['status'] | undefined {
   if (task.blockingAttention) return BLOCKERS[task.blockingAttention];
-  if (task.status === 'blocked') return task.status;
+  if (task.status === 'blocked' && !task.waitingForPrerequisite) return task.status;
   // Older mirrored sources only include the display status.
   if (task.blockingAttention === undefined && Object.values(BLOCKERS).some(status => status === task.status)) return task.status;
 }
@@ -132,6 +135,7 @@ export function stageText(task: Task, readOnly = false): string {
   if (task.activity === 'working' && s === 'done') return 'Bot 正在交付';
   if (task.activity === 'working' && s === 'review') return task.managerReviewed ? 'Bot 正在交付' : 'Bot 跟进中';
   if (task.activity === 'working' && s === 'waiting') return '等待自动跟进';
+  if (s === 'waiting' && task.waitingForPrerequisite) return '任务受阻';
   if (s === 'needs-you') {
     const status = blocker(task) ?? task.status;
     return status === 'needs-input' && readOnly ? '待补充' : labels[status];

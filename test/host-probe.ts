@@ -27,6 +27,12 @@ import { deploymentEffectGoal, deploymentEffectRequest, deploymentProbe, deploym
   effectRecoveryGoal, effectRecoveryRequest,
   permissionProbe, permissionRecoveryGoal, permissionRecoveryRequest, readRecoveryGoal, readRecoveryRequest,
   recoveryEffectName, recoveryEffectText, recoveryFileName, recoveryGoals } from './recovery-host-fixture.ts';
+import { ambiguous, baselineFile, baselineValue, cancelWiring, clarify, imageBlocked, imageGoal, imageRequest, imageResult, imageScope,
+  imageVersion, pauseWiring, pendingContinue, pendingGoal, pendingInitial, pendingRequest, pendingResult, pendingScope,
+  preflightFile, preflightGoal, preflightRequest, preflightResult, preflightValue, receiptFile, receiptValue,
+  req005Goals, startupContinue, startupGoal, startupRequest, startupResult, versionFile,
+  wiringCancelled, wiringGoal, wiringPaused, wiringQuestion,
+  wiringRequest } from './req005-host-fixture.ts';
 
 declare module '@deepseek-ai/dsh-llm' {
   interface MessageSourceMap {
@@ -105,9 +111,13 @@ class ProbeAdapter extends LlmAdapter {
         await new Promise<void>(resolve=>{if(options.signal?.aborted)resolve();else options.signal?.addEventListener('abort',()=>resolve(),{once:true});});
         options.signal?.throwIfAborted();
       }
-      const recoveryNotice=trigger?.source?.kind==='super-bot-manager'&&text.includes('Call inspect-recovery with this exact taskId');
-      const recoveryTask=recoveryNotice&&value?.task?.status==='recovery'&&recoveryGoals.includes(value.task.goal)?value.task:undefined;
-      const pauseForFixture=recoveryTask&&prior?.action==='detail'&&recoveryTask.goal!==effectRecoveryGoal;
+      const recoveryNotice=trigger?.source?.kind==='super-bot-manager'&&text.includes('Call inspect-recovery');
+      const currentTask=value?.task;
+      const recoveryTask=recoveryNotice&&currentTask&&['recovery','blocked'].includes(currentTask.status)
+        &&[...recoveryGoals,...req005Goals].includes(currentTask.goal)?currentTask:undefined;
+      const continuationNotice=trigger?.source?.kind==='super-bot-manager'&&text.includes('already has a saved owner follow-up');
+      const pauseForFixture=recoveryTask&&prior?.action==='detail'&&recoveryGoals.includes(recoveryTask.goal)
+        &&recoveryTask.goal!==effectRecoveryGoal;
       const challengeRecoveryScope=recoveryTask?.goal===readRecoveryGoal;
       const holdKey=`${options.sessionId}:${trigger?.id}`;
       if(!this.heldManagerInputs.has(holdKey)&&(pauseForFixture||value?.task?.goal==='MANAGER_HOLD_PROBE'||value?.task?.goal==='MANAGER_STALE_PROBE'||(value?.task?.goal==='MANAGER_STALE_REVIEW_PROBE'&&value.result))) {
@@ -131,7 +141,37 @@ class ProbeAdapter extends LlmAdapter {
       const convention=text==='现在默认工作约定是什么？';
       const editTarget=trigger?.source?.kind==='user'&&text.startsWith('请更新这项交付 ')
         ? text.match(/#super-bot-task=([a-f0-9-]+)&resultId=([a-f0-9-]+)/) : null;
-      if(trigger?.source?.kind==='user'&&(remember||delegate||decision||convention||workConvention)) {
+      const namedRequest=trigger?.source?.kind==='user'
+        ? [preflightRequest,imageRequest,wiringRequest,startupRequest,pendingRequest].indexOf(text) : -1;
+      const continuationTarget=new Map([[imageScope,imageGoal],[startupContinue,startupGoal],[pendingContinue,pendingGoal],[pendingScope,pendingGoal]]).get(text);
+      const namedFollowup=trigger?.source?.kind==='user' && (continuationTarget||[ambiguous,pauseWiring,cancelWiring].includes(text));
+      const wantedAction=continuationTarget?'continue':text===pauseWiring?'pause':'cancel';
+      const wantedGoal=continuationTarget??wiringGoal;
+      const lastResult=later.findLast(message=>message.role==='tool');
+      const successfulTool=lastResult?.role==='tool'&&!lastResult.isError;
+      if(namedRequest>=0&&!prior) {
+        const goal=req005Goals[namedRequest];
+        const scope=goal===preflightGoal?'只读 preflight.txt':goal===imageGoal?'当前合成任务目录内核对变更和版本':
+          goal===startupGoal?'仅允许合成目录标记一次首启，随后只读核对 fixture 中具名 Deployment':
+          goal===pendingGoal?'仅限只读任务目录中的同步基线及现有回执':'当前合成任务目录内核对接线';
+        plan={action:'create',goal,scope,acceptance:'在原聊天报告实际状态和剩余阻塞'};
+      }else if(namedFollowup&&!prior) {
+        plan={action:'list'};
+      }else if(namedFollowup&&prior?.action==='list') {
+        const tasks=value?.items as {goal:string;id:string}[]|undefined;
+        if(text===ambiguous) {
+          const taskIds=tasks?.filter(item=>[imageGoal,wiringGoal].includes(item.goal)).map(item=>item.id);
+          if(taskIds?.length===2)plan={action:'clarify',taskIds,followUp:'continue'};
+        }else {
+          const target=tasks?.find(item=>item.goal===wantedGoal);
+          if(target)plan={action:'detail',taskId:target.id};
+        }
+      }else if(namedFollowup&&prior?.action==='detail'&&value?.task?.goal===wantedGoal) {
+        plan={action:wantedAction,taskId:value.task.id,expectedRowVersion:value.task.rowVersion,userInstruction:text,
+          ...([imageScope,pendingScope].includes(text)?{continuationMode:'read-only'}:{})};
+      }else if(continuationNotice&&prior?.action==='detail'&&currentTask&&req005Goals.includes(currentTask.goal)) {
+        plan={action:'continue',taskId:currentTask.id,expectedRowVersion:currentTask.rowVersion};
+      }else if(trigger?.source?.kind==='user'&&(remember||delegate||decision||convention||workConvention)) {
         if(!prior) {
           if(remember)plan={action:'memory-save-convention',text:remember[1]};
           else if(delegate)plan={action:'create',goal:`MEMORY_WORK_${delegate[1]}`,...(delegate[2]?{conventionOverride:delegate[2]}:{})};
@@ -152,7 +192,7 @@ class ProbeAdapter extends LlmAdapter {
         plan={action:'inspect-recovery',taskId:recoveryTask.id};
       }else if(recoveryNotice&&prior?.action==='inspect-recovery'&&value?.status==='eligible') {
         plan={action:'recover-preflight',taskId:value.taskId,expectedRowVersion:value.rowVersion};
-      }else if(recoveryNotice&&prior?.action==='recover-preflight'&&value?.status==='readable'
+      }else if(recoveryNotice&&prior?.action==='recover-preflight'&&value?.status==='readable'&&currentTask?.goal===readRecoveryGoal
         &&calls.filter(call=>call.type==='tool-call'&&JSON.parse(call.arguments).action==='recover-preflight').length===1) {
         plan=prior;
       }else if(value?.task?.goal==='MANAGER_STEP_PROBE')plan={action:'detail',taskId:value.task.id};
@@ -212,11 +252,26 @@ class ProbeAdapter extends LlmAdapter {
         yield {type:'block-start',index:0,blockType:'tool-call'};yield {type:'tool-call-delta',index:0,id,name:'super_bot_manage',argumentsDelta:args};
         yield {type:'block-end',index:0,block:{type:'tool-call',id,name:'super_bot_manage',arguments:args}};yield {type:'finish',reason:{kind:'tool-calls'}};return;
       }
-      const detail=later.filter(m=>m.role==='tool').flatMap(m=>m.content.filter(b=>b.type==='text').map(b=>{try{return JSON.parse(b.text);}catch{return null;}})).findLast(v=>v?.delivery);
+      const payloads=later.filter(m=>m.role==='tool').flatMap(m=>m.content.filter(b=>b.type==='text')
+        .map(b=>{try{return JSON.parse(b.text);}catch{return null;}}));
+      const detail=payloads.findLast(v=>v?.delivery);
+      const inspected=payloads.findLast(v=>[imageGoal,pendingGoal].includes(v?.task?.goal)&&v.run?.finishedAt!==null);
+      const reportSummary=inspected?.events?.filter((event:{kind:string})=>event.kind==='work.report')
+        .map((event:{data:string})=>JSON.parse(event.data))
+        .find((report:{runId:string})=>report.runId===inspected.run?.id)?.summary;
       const workerQuestion=value?.pendingQuestions?.[0];
       const clarification=value?.attentions?.find((a:any)=>a.kind==='input'&&a.state==='open'&&!a.id.startsWith('run:'));
       let reply='已核对当前状态。';
-      if(trigger?.source?.kind==='user'&&text.startsWith('CHAT_LINK_MARKDOWN:'))reply=text.slice('CHAT_LINK_MARKDOWN:'.length);
+      if(namedFollowup&&prior?.action==='clarify'&&successfulTool)reply=clarify;
+      else if(namedFollowup&&prior?.action==='cancel'&&successfulTool&&value?.task?.lifecycle==='cancelled')reply=wiringCancelled;
+      else if(namedFollowup&&prior?.action==='pause'&&successfulTool&&value?.task?.controlMode==='paused')reply=wiringPaused;
+      else if((namedFollowup||continuationNotice)&&prior?.action==='continue'&&successfulTool)reply=value?.message??reply;
+      else if(recoveryNotice&&prior?.action==='recover-preflight'&&successfulTool&&value?.excerpt?.includes(preflightValue))reply=preflightResult;
+      else if(recoveryNotice&&prior?.action==='recover-preflight'&&successfulTool&&value?.effectUncertain
+        &&value?.observed?.uid==='fixture-deployment-uid'&&value.observed.ready===false)reply=startupResult;
+      else if([imageBlocked,imageResult,pendingInitial,pendingResult].includes(reportSummary)&&!namedFollowup)reply=reportSummary;
+      else if(value?.task?.goal===wiringGoal&&workerQuestion)reply=workerQuestion.question;
+      else if(trigger?.source?.kind==='user'&&text.startsWith('CHAT_LINK_MARKDOWN:'))reply=text.slice('CHAT_LINK_MARKDOWN:'.length);
       else if(trigger?.source?.kind==='user'&&text.startsWith('FEISHU_SMOKE_'))reply=`已收到 ${text}`;
       else if(prior?.action==='deliver'&&prior.links&&prior.text!==artifactPortProbeText&&prior.text!==artifactRevision.text) {
         reply=later.findLast(m=>m.role==='tool')?.content.filter(b=>b.type==='text').map(b=>b.text).join('\n')??'';
@@ -300,8 +355,53 @@ class ProbeAdapter extends LlmAdapter {
           ...Object.entries(revisedArtifact?artifactRevision.links:artifactLinks).map(([name,url])=>`- [${name}](${url})`)].join('\n') : null;
       const revisedReceipt=goal.startsWith('DF14_RECEIPT_PROBE')&&revised;
       const reports=progressProbe?later.flatMap(m=>m.content.flatMap(b=>b.type==='tool-call'&&b.name==='super_bot_report'?[JSON.parse(b.arguments).kind]:[])):[];
+      if(req005Goals.includes(goal)&&goal!==startupGoal) {
+        let plan:{name:string;args:Record<string,unknown>}|undefined;
+        const first=previous.length===0;
+        const name=goal===imageGoal?versionFile:goal===pendingGoal?(first?baselineFile:receiptFile):preflightFile;
+        const path=join(cwd,name);
+        const read=later.flatMap(message=>message.content)
+          .find(block=>block.type==='tool-call'&&block.name==='read');
+        const receipt=read?.type==='tool-call'
+          ? later.find(message=>message.role==='tool'&&message.toolCallId===read.id) : undefined;
+        const holdKey=`req005:${options.sessionId}:${runId}`;
+        const hold=first&&(([imageGoal,pendingGoal].includes(goal)&&!receipt)||(goal===preflightGoal&&receipt?.role==='tool'&&receipt.isError));
+        if(hold&&!this.heldManagerInputs.has(holdKey)) {
+          assert.ok(options.sessionId);this.heldManagerInputs.add(holdKey);
+          await new Promise<void>(release=>this.stalled.set(options.sessionId!,{release,signal:options.signal}));
+          this.stalled.delete(options.sessionId);options.signal?.throwIfAborted();
+        }
+        if(!calls.includes('super_bot_report')) {
+          if(goal===wiringGoal)plan={name:'super_bot_report',args:{kind:'waiting',summary:wiringQuestion}};
+          else if(!receipt) {
+            if(!first)assert.ok(body.includes(goal===imageGoal?imageScope:pendingScope),body);
+            plan={name:'read',args:{file_path:path}};
+          }else {
+            assert.ok(receipt.role==='tool');
+            const observed=messageText(receipt);
+            if(goal===preflightGoal&&first) {
+              assert.equal(receipt.isError,true,observed);
+              plan={name:'super_bot_report',args:{kind:'failed',summary:'首发预检文件尚不可读，本轮已结束。',checks:observed}};
+            }else {
+              assert.equal(receipt.isError??false,false,observed);
+              const expected=goal===imageGoal?imageVersion:first?baselineValue:receiptValue;
+              assert.ok(observed.includes(expected),observed);
+              const summary=goal===imageGoal?(first?imageBlocked:imageResult):(first?pendingInitial:pendingResult);
+              plan={name:'super_bot_report',args:{kind:'blocked',summary,checks:observed}};
+            }
+          }
+        }
+        if(!plan) {
+          yield {type:'finish',reason:{kind:'stop'}};return;
+        }
+        const id=ToolCallId(randomUUID()),args=JSON.stringify(plan.args);
+        yield {type:'block-start',index:0,blockType:'tool-call'};
+        yield {type:'tool-call-delta',index:0,id,name:plan.name,argumentsDelta:args};
+        yield {type:'block-end',index:0,block:{type:'tool-call',id,name:plan.name,arguments:args}};
+        yield {type:'finish',reason:{kind:'tool-calls'}};return;
+      }
       const recoveryRead=[readRecoveryGoal,effectRecoveryGoal].includes(goal);
-      const clusterProbe=goal===permissionRecoveryGoal?permissionProbe:[deploymentRecoveryGoal,deploymentEffectGoal].includes(goal)?deploymentProbe:null;
+      const clusterProbe=goal===permissionRecoveryGoal?permissionProbe:[deploymentRecoveryGoal,deploymentEffectGoal,startupGoal].includes(goal)?deploymentProbe:null;
       const preflightReport=(()=>{
         if(!recoveryRead&&!clusterProbe)return null;
         const tool=clusterProbe?'super_bot_preflight':'read';
@@ -313,12 +413,19 @@ class ProbeAdapter extends LlmAdapter {
         else assert.equal(result.isError,true,messageText(result));
         return messageText(result);
       })();
-      const planned=[effectRecoveryGoal,deploymentEffectGoal].includes(goal)&&!calls.includes('write')
+      const beforeStartupReport=goal===startupGoal&&preflightReport&&!calls.includes('super_bot_report');
+      const startupBarrier=`req005-startup:${options.sessionId}:${runId}`;
+      if(beforeStartupReport&&!this.heldManagerInputs.has(startupBarrier)) {
+        assert.ok(options.sessionId);this.heldManagerInputs.add(startupBarrier);
+        await new Promise<void>(release=>this.stalled.set(options.sessionId!,{release,signal:options.signal}));
+        this.stalled.delete(options.sessionId);options.signal?.throwIfAborted();
+      }
+      const planned=[effectRecoveryGoal,deploymentEffectGoal,startupGoal].includes(goal)&&!calls.includes('write')
         ?{name:'write',args:{file_path:join(cwd,recoveryEffectName),content:recoveryEffectText}}
         :clusterProbe&&!preflightReport?{name:'super_bot_preflight',args:clusterProbe}
         :recoveryRead&&!preflightReport?{name:'read',args:{file_path:join(cwd,recoveryFileName)}}
         :preflightReport?(calls.includes('super_bot_report')?null:{name:'super_bot_report',args:{kind:clusterProbe?'blocked':'failed',
-          summary:'预检未完成，当前轮结束。',checks:preflightReport}})
+          summary:goal===startupGoal?'合成首启等待超时，首次只读回读未找到实例。':'预检未完成，当前轮结束。',checks:preflightReport}})
         :progressProbe&&!reports.includes('progress')?{name:'super_bot_report',args:{kind:'progress',summary:'MIRROR_NATIVE_PROGRESS'}}:
         localCli&&!calls.includes('bash')?{name:'bash',args:{description:"生成本机 Shell 合成检查结果",command:"printf 'LOCAL_CLI_OK\\n' > result.md"}}:goal.startsWith('STEP_BUDGET_PROBE')?{name:'read',args:{file_path:join(cwd,'missing-budget-probe.txt')}}:approvalProbe&&calls.includes('write')&&!existsSync(file)&&!calls.includes('super_bot_report')?{name:'super_bot_report',args:{kind:'failed',summary:'审批路径结束，写入没有生成文件；请核对原生审批结果。'}}:
         needsAnswer&&!calls.includes('super_bot_report')?{name:'super_bot_report',args:{kind:'waiting',summary:'请说明文档面向谁？'}}:

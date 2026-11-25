@@ -1,5 +1,6 @@
 /** Values crossing the product/host boundary; no DSH or UI types. */
 import type {WorkdirRequest,WorkdirInfo} from './workdir.ts';
+import type {ClusterProbe,ProbeResult} from './read-only-recovery.ts';
 export type {WorkdirRequest,WorkdirInfo};
 export interface WorkspaceStatus {
   product: 'Super Bot';
@@ -64,6 +65,8 @@ export interface Task {
   activityQuestion?: string;
   managerReviewed?:boolean;
   blockingAttention?: 'input' | 'approval' | 'recovery' | null;
+  /** The Worker ended with a blocker and no concrete action is assigned to the owner. */
+  waitingForPrerequisite?: true;
   deliveredAt?: number;
   botConfigRevision:number;
   /** What the Bot asked for when creating the task; null means the configured default. */
@@ -121,7 +124,7 @@ export interface Run {
   createdAt:number; finishedAt:number|null; note:string;
 }
 export interface RunInput {id:string; taskId:string; kind:string; content:string; state:string; messageId:string|null; messageJson:string|null; attentionId:string|null; createdAt:number}
-export type WorkerPriorInput = Pick<RunInput,'id'|'content'|'messageId'> & {kind:'answer'|'rework';order:number};
+export type WorkerPriorInput = Pick<RunInput,'id'|'content'|'messageId'> & {kind:'answer'|'rework'|'continuation';order:number};
 
 export interface ModelRoute {
   provider: string;
@@ -215,6 +218,26 @@ export function optionalText(value: unknown, label: string, max = 10000): string
  * identity is the latest message; text is complete and messages preserves each source.
  */
 export interface ChatSource { sessionId:string; messageId:string; seq:number; text:string; messages?:{messageId:string;seq:number;text:string}[] }
+
+export interface RecoveryInstruction {
+  id: string;
+  source: ChatSource;
+  taskRevision: number;
+  priorRunId: string;
+  mode?: 'read-only' | 'authorized-work';
+  priorDirection?: ChatSource;
+  runId?: string;
+}
+export interface RecoveryWorkContext {
+  priorRunId: string;
+  mode: NonNullable<RecoveryInstruction['mode']>;
+  priorDirection?: string;
+  priorReport?: Pick<WorkReport,'kind'|'summary'|'checks'>;
+  priorCheck?: ProbeResult;
+  observations?: {probe:ClusterProbe;result:ProbeResult}[];
+  effectUncertain: boolean;
+  probes: ClusterProbe[];
+}
 
 /** Why a prepared task is waiting and which earlier task is entitled to the slot, if known. */
 export interface DispatchWait {code:'capacity';scope:'bot';holderTaskId:string|null;holderGoal:string|null}

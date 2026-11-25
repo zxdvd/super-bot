@@ -1,5 +1,6 @@
 import type { DatabaseSync } from 'node:sqlite';
 import { TEST_TASK_PREFIX, type WorkActivity, type BotWorkSummary } from './model.ts';
+import { settledBlockerSql } from './settled-blocker.ts';
 
 // Only the current manager owns sidebar/session decorations. An unattended task without
 // a live run or a durable automatic next step belongs in the waiting group.
@@ -14,12 +15,15 @@ function activities(scoped: boolean) {
       CASE WHEN delivery.state IN ('blocked','unknown') THEN 'attention'
         WHEN m.sessionId IS NOT NULL THEN 'working' END
     WHEN EXISTS (SELECT 1 FROM attentions a WHERE a.taskId=t.id AND a.taskRevision=t.taskRevision
-      AND a.state='open' AND a.kind IN ('input','approval','recovery')) THEN 'attention'
+      AND a.state='open' AND a.kind IN ('input','approval','recovery')
+      AND NOT (a.kind='recovery' AND a.id='run:' || latest.id AND latest.taskRevision=t.taskRevision AND latest.sessionId IS t.sessionId
+        AND (${settledBlockerSql}) IS NOT NULL)) THEN 'attention'
     WHEN EXISTS (SELECT 1 FROM runs r WHERE r.taskId=t.id AND r.finishedAt IS NULL
       AND r.state IN ('queued','running','cancelling')) THEN 'working'
     WHEN t.lifecycle='open' AND t.controlMode='auto' AND (
       json_extract(recovery.value,'$.resolution.status') IN ('denied','missing')
-      OR json_extract(recovery.value,'$.resolution.observed.ready')=0) THEN 'attention'
+      OR json_extract(recovery.value,'$.resolution.observed.ready')=0
+      OR json_extract(recovery.value,'$.effectUncertain')=1) THEN 'attention'
     WHEN t.lifecycle='review' AND delivery.state IN ('pending','sending','entered') AND m.sessionId IS NOT NULL THEN 'working'
     WHEN t.lifecycle='review' AND delivery.id IS NOT NULL THEN 'attention'
     WHEN t.id IN (SELECT taskId FROM outbox WHERE kind='manager.notify' AND (state='blocked' OR

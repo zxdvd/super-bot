@@ -67,8 +67,16 @@ function fixture(t:TestContext,workspace=false,extra:(directory:string)=>Record<
   let execution=new DshExecution(ctx,store,directory,options()),managers=new Managers(ctx,store,execution,directory,()=> 'https://example.test',options());
   const install=()=>{execution.install();managers.install();};install();
   const managerSession={id:manager.requestedSessionId};
+  let managerTurn:number|undefined;
   const emit=async(event:any,sessionId=manager.requestedSessionId)=>{
     const session=agents.get(sessionId)?.session??(sessionId===managerSession.id?managerSession:{id:sessionId});
+    if(sessionId===managerSession.id) {
+      if(event.type==='turn/start')managerTurn=event.data.turn;
+      if(event.type==='turn/end') {
+        event={...event,data:{turn:managerTurn,...event.data}};
+        managerTurn=undefined;
+      }
+    }
     if(sessionId!==manager.requestedSessionId||agents.has(sessionId)) {
       const events=workerEvents.get(sessionId)??[];
       event={...event,seq:events.length,...(event.type==='user/message'?{surfaceOp:'append'}:{})};
@@ -76,7 +84,10 @@ function fixture(t:TestContext,workspace=false,extra:(directory:string)=>Record<
     }
     for(const listener of listeners.get('session/event')??[])await listener(session,event);
   };
-  const native=async(id:string,seq:number,text:string)=>emit({type:'user/message',seq,data:{id,source:{kind:'user',rpcId:`rpc:${id}`},content:[{type:'text',text}]}});
+  const native=async(id:string,seq:number,text:string)=>{
+    if(managerTurn===undefined)await emit({type:'turn/start',data:{turn:1}});
+    await emit({type:'user/message',surfaceOp:'append',seq,data:{id,source:{kind:'user',rpcId:`rpc:${id}`},content:[{type:'text',text}]}});
+  };
   return {get store(){return store;},get execution(){return execution;},bot,manager,directory,tools,emit,native,nativeResult,ctx,agents,get managers(){return managers;},
     schemas:()=>registry.schemas(),
     nativeCall:async(callId:string,args:Record<string,unknown>)=>{const result=await nativeResult(callId,args);assert.ok(!result.isError,JSON.stringify(result.error));return result.value as any;},
@@ -88,7 +99,7 @@ function fixture(t:TestContext,workspace=false,extra:(directory:string)=>Record<
       agents.get(run.sessionId).finish();await new Promise<void>(resolve=>setImmediate(resolve));return report;
     },
     call:(callId:string,args:Record<string,unknown>,signal=new AbortController().signal)=>tools.get('super_bot_manage').execute(args,{agent:{id:manager.requestedSessionId},callId,signal}),
-    reload:async()=>{await managers.dispose();await execution.dispose();registrations.splice(0).forEach(off=>off());listeners.clear();store.close();store=new Store(database);execution=new DshExecution(ctx,store,directory,options());managers=new Managers(ctx,store,execution,directory,()=> 'https://example.test',options());install();},
+    reload:async()=>{await managers.dispose();await execution.dispose();registrations.splice(0).forEach(off=>off());listeners.clear();store.close();store=new Store(database);execution=new DshExecution(ctx,store,directory,options());managers=new Managers(ctx,store,execution,directory,()=> 'https://example.test',options());managerTurn=undefined;install();},
     close:async()=>{await managers.dispose();await execution.dispose();registrations.splice(0).forEach(off=>off());store.close();assert.equal(realpathSync(directory),directory);assert.ok(directory.startsWith(join(root,'.runtime','p2-adapter-')));rmSync(directory,{recursive:true,force:true});t.mock.timers.reset();},
   };
 }
@@ -160,6 +171,7 @@ test('respond native tool keeps source, version, valued-input and invalid-type r
     }
     await f.emit({type:'user/message',seq:3,data:{id:'foreign',source:{kind:'user',rpcId:'foreign'},content:[{type:'text',text:'其他对话'}]}},'other-session');
     await rejected('foreign-source',args,'需要当前对话中的真实用户消息；自动通知不能代替用户提出新工作、回答或返工。');
+    await f.emit({type:'turn/end',data:{reason:{kind:'completed'}}});await f.emit({type:'turn/start',data:{turn:3}});
     await f.native('answer-last',6,'保留背景。');await f.native('answer-first',4,'使用中文。');await f.native('answer-first',8,'重复投递不能覆盖原文。');
     for(const [field,label] of [['scope','任务范围'],['acceptance','验收条件']]){
       for(const [index,value] of [null,false,0,[],{},' \t\n'].entries())await rejected(`invalid:${field}:${index}`,{...args,scope:undefined,acceptance:undefined,[field]:value},`请填写${label}。`);
@@ -218,6 +230,7 @@ test('P2 completion keeps real multi-message sources, versions, existing scope a
     await f.emit({type:'user/message',seq:2,data:{id:'automatic',source:{kind:'super-bot-manager',botId:f.bot.id,managerId:f.manager.id,eventId:'missing'},content:[{type:'text',text:'自动通知不能授权补充'}]}});
     await assert.rejects(f.call('automatic',args),{code:'human-message-required'});
     assert.equal(f.store.getTask(created.task.id).rowVersion,before.task.rowVersion);
+    await f.emit({type:'turn/end',data:{reason:{kind:'completed'}}});await f.emit({type:'turn/start',data:{turn:3}});
     await f.native('answer-first',3,'保持既有范围。');await f.native('answer-last',4,'回读并含结论。');
     const paused=f.store.controlTask('pause',created.task.id,before.task.rowVersion,'paused');
     await assert.rejects(f.call('stale',args),{code:'version-conflict'});
@@ -476,6 +489,29 @@ async function parallelFixture(t:TestContext,botLimit=2){
   await f.native('parallel-request',1,'合成并行任务');
   return {f,root,dir,create,dispatch,pump,notice,openManager,enterManager,endManager};
 }
+
+test('ordinary capacity wake can dispatch a new answer after a previous recovery instruction was consumed',async t=>{
+  const {f,root,create,dispatch,pump,openManager,enterManager,endManager}=await parallelFixture(t);
+  const holder=await create('Holder',root),work=await create('Work with a newer question',root);
+  f.store.setBotCapacity('one-slot',f.bot.id,2,1);
+  await f.finish(work.task.id,[],'waiting');
+  f.store.settleManagerEvent(`manager-event:settled:${work.run.id}`);
+  const question=f.store.taskDetail(work.task.id).pendingQuestions[0]!;
+  const answer=f.store.respondAttention('new-answer',question.id,f.store.getTask(work.task.id).rowVersion,'用中文');
+  f.store.settleManagerEvent(`manager-event:answer:${answer.id}`);
+  f.store.set(`recovery-instruction:${work.task.id}`,JSON.stringify({id:'consumed',runId:work.run.id,
+    taskRevision:work.run.taskRevision,priorRunId:'earlier-run',source:{sessionId:f.manager.sessionId,messageId:'earlier',seq:0,text:'Old request'}}));
+  assert.equal((await dispatch('queued-answer',work.task.id)).deferred,true);
+  await f.finish(holder.task.id,[],'waiting');
+  f.store.settleManagerEvent(`manager-event:settled:${holder.run.id}`);
+  const manager=await openManager();
+  await pump();
+  assert.match(manager.messages.at(-1).source.eventId,/^manager-event:capacity:/);
+  await enterManager(manager);
+  const restarted=await dispatch('capacity-answer',work.task.id);
+  assert.equal(restarted.run.inputId,answer.id);
+  await endManager(manager,'已把新的回答交给 Worker。');
+});
 
 for(const waiters of [1,12]){
   test(`DF-13 pump skips ${waiters} older capacity waits for independent Worker notification`,async t=>{

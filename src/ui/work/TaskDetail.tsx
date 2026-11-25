@@ -42,7 +42,9 @@ function AttentionBox({ w, detail, attention }: { w: WorkspaceState; detail: Det
 }
 
 function Attentions({ w, detail }: { w: WorkspaceState; detail: Detail }) {
-  return <>{detail.attentions.filter(a => a.id !== detail.recovery?.attentionId && (a.state === 'open' || a.state === 'responding'))
+  const settledItem = detail.settledBlocker && detail.run ? `run:${detail.run.id}` : undefined;
+  return <>{detail.attentions.filter(a => a.id !== detail.recovery?.attentionId && a.id !== settledItem
+    && (a.state === 'open' || a.state === 'responding'))
     .map(attention =>
     <AttentionBox key={attention.id} w={w} detail={detail} attention={attention}/>)}</>;
 }
@@ -153,11 +155,14 @@ function Audit({ detail, readOnly = false }: { detail: Pick<Detail, 'task'> & { 
 function RecoveryFinding({ detail }: { detail: Detail }) {
   const { task, recoveryCheck } = detail;
   const message = recoveryCheck?.resolution?.message;
+  if (!message && task.status === 'blocked' && detail.settledBlocker && detail.run?.note) {
+    return <section className="attention-box"><strong>上轮已结束，任务受阻</strong>
+      <p className="full-text">{detail.run.note}</p></section>;
+  }
   if (!message || !['blocked', 'recovery'].includes(task.status)) return null;
   return <section className="attention-box" aria-label="只读核对结果">
-    <strong>{task.status === 'blocked' ? 'Bot 已确认前提未满足' : 'Bot 已记录核对结果'}</strong>
+    <strong>{task.status === 'blocked' && !task.waitingForPrerequisite ? 'Bot 已确认前提未满足' : 'Bot 已记录核对结果'}</strong>
     <p className="full-text">{message}</p>
-    {task.status === 'blocked' && <p>处理前提后，可以在原对话请 Bot 继续安排。</p>}
   </section>;
 }
 

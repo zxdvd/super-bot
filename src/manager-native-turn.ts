@@ -3,7 +3,7 @@ import type { UserMessage } from '@deepseek-ai/dsh-llm';
 import type { SessionEvent } from '@deepseek-ai/dsh-session';
 import type { ResolvedToolSet, ToolExecution } from '@deepseek-ai/dsh-tools';
 import { isDeepStrictEqual } from 'node:util';
-import { isFeishuSource, isNativeOwner } from './dsh-chat-events.ts';
+import { isFeishuSource, isHostContext, isNativeOwner } from './dsh-chat-events.ts';
 import type { FeishuInput } from './feishu-inputs.ts';
 
 type InputKind = 'host' | 'feishu';
@@ -27,20 +27,12 @@ function inputKind(message: UserMessage): InputKind | undefined {
   }
   // Both supported controllers publish these fields for a normal owner-transport or trusted local prompt.
   // This includes the ordinary in-process API. Retry, share and unrecognized source variants stay restricted.
-  if (isNativeOwner(message) && 'rpcId' in source && typeof source.rpcId === 'string' && source.rpcId.length > 0 &&
-      Object.keys(source).every(key => key === 'kind' || key === 'rpcId' || key === 'clientTimeZone') &&
-      (!('clientTimeZone' in source) || typeof source.clientTimeZone === 'string')) return 'host';
+  if (isNativeOwner(message)) return 'host';
 }
 
 function isRuntimeContext(message: UserMessage): boolean {
   const kind: string = message.source.kind;
   return kind === 'runtime-context';
-}
-
-function isHostContext(message: UserMessage): boolean {
-  const kind: string = message.source.kind;
-  // DSH adds these contexts in its pre-step waterfall after claiming inbox input.
-  return isRuntimeContext(message) || kind === 'agent-instructions' || kind === 'time-context' || kind === 'skill-catalog';
 }
 
 /** Process-local evidence for one attached Manager; nothing is restored from its log. */

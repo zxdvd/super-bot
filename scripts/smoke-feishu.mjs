@@ -8,6 +8,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import { setTimeout as delay } from 'node:timers/promises';
 import { build } from 'esbuild';
 import { authenticateHost } from './host-client.mjs';
+import { smokeReq005 } from './smoke-req005.mjs';
 import { alternateCredentials, existingGroup, fixtureCredentials } from '../test/feishu-host-transport.ts';
 import { artifactDeliveryText, artifactEditReply, artifactGoal, artifactLinks, artifactReference,
   replacementMr, supplementalDoc } from '../test/delivery-link-fixture.ts';
@@ -64,12 +65,12 @@ async function configure(name) {
   await symlink(bundle, join(dir, 'node_modules/@zxdvd/super-bot'));
   await writeFile(join(dir, 'package.json'), JSON.stringify({ name: `super-bot-${name}`, private: true,
     dsh: { profile: { bundles: ['@deepseek-ai/dsh-base', '@deepseek-ai/dsh-web-app', '@zxdvd/super-bot'] } } }));
-  await configurePatch(name, false, data);
+  await configurePatch(name, false, { data });
 }
-async function configurePatch(name, enabled, data = join(home, 'super-bot', name)) {
+async function configurePatch(name, enabled, { data = join(home, 'super-bot', name), fullAccess = false } = {}) {
   await writeFile(patchFile(name), JSON.stringify([
     { id: 'hmr', disabled: true },
-    { id: 'super-bot', config: { dataDir: data, fullAccess: false, ...(enabled ? { feishu: { enabled: true } } : {}) } },
+    { id: 'super-bot', config: { dataDir: data, fullAccess, ...(enabled ? { feishu: { enabled: true } } : {}) } },
     { insert: [{ id: 'super-bot-contract-probe', name: '@zxdvd/super-bot/feishu-probe-model' }] },
   ]));
 }
@@ -86,11 +87,11 @@ async function wait(query, label, attempts = 230) {
   }
   assert.fail(`Timed out: ${label} (see ${base})`);
 }
-async function launch(name, generation) {
+async function launch(name, generation, pathOverride) {
   const path = join(base, `${name}-${generation}.log`);
   const file = await open(path, 'wx', 0o600);
   const child = spawn(process.execPath, [cli, '--profile', name, '--host', '127.0.0.1', '--no-open', '--port', '0'],
-    { cwd: root, env, stdio: ['ignore', file.fd, file.fd] });
+    { cwd: root, env: pathOverride ? { ...env, PATH: pathOverride } : env, stdio: ['ignore', file.fd, file.fd] });
   const state = { child, file, path, exited: false, error: undefined };
   state.exit = new Promise(resolve => {
     child.once('error', error => { state.error = error; });
@@ -320,7 +321,51 @@ async function openFeishuFromSettings(panel, bot) {
 
 let ui;
 
-try {
+async function openRecoveryChat(host, ownerBot, sessionId) {
+  ui = await launchBrowser(host);
+  if (!ui) return {
+    entry: 'native Web Host session controller', submit: text => prompt(host, sessionId, text),
+    see: async () => {}, close: async () => {},
+  };
+  const { page } = ui;
+  const row = await openBotRow(page, ownerBot);
+  await row.locator('.bot-open').click({ timeout: 10000 });
+  const composer = page.locator('[data-composer-input]');
+  return {
+    entry: 'Web composer',
+    submit: async text => {
+      await composer.click({ timeout: 10000 });
+      await page.keyboard.insertText(text);
+      await composer.press('Enter');
+    },
+    see: text => page.locator('[data-slot="conversation.chat.flow"]').getByText(text, { exact: false }).last()
+      .waitFor({ timeout: 20000 }),
+    close: async () => { await ui.browser.close(); ui = undefined; },
+  };
+}
+
+async function runRecoverySmoke() {
+  await configure(primary);
+  await configurePatch(primary, true, { fullAccess: true });
+  await writeLegacy(primary, fixtureCredentials);
+  const bin = join(base, 'bin');
+  const deploymentFlag = join(base, 'synthetic-deployment');
+  const readLog = join(base, 'synthetic-kubectl.jsonl');
+  await mkdir(bin);
+  const kubectl = await readFile(new URL('../test/kubectl-host-fixture.mjs', import.meta.url), 'utf8');
+  await writeFile(join(bin, 'kubectl'), `#!${process.execPath}\n${kubectl
+    .replace('__READ_LOG__', JSON.stringify(readLog)).replace('__DEPLOYMENT_READY__', JSON.stringify(deploymentFlag))}`, { mode: 0o700 });
+  const safePath = `${bin}:/usr/bin:/bin:/usr/sbin:/sbin`;
+  const initialHost = await launch(primary, 'req005-first', safePath);
+  const restart = async () => {
+    await stop(primary);
+    return launch(primary, 'req005-restart', safePath);
+  };
+  await smokeReq005({ base, initialHost, restart, openChat: openRecoveryChat, call, bot, manager, model,
+    events, feishuInput, receive, sent, wait, deploymentFlag, readLog });
+}
+
+async function runFeishuSmoke() {
   await Promise.all([configure(primary), configure(secondary)]);
   await writeLegacy(secondary, alternateCredentials);
   let [host, other] = await Promise.all([launch(primary, 'first'), launch(secondary, 'disabled')]);
@@ -850,6 +895,11 @@ try {
     console.log('PASS browser first Bot creation, one-Bot direct navigation and legacy identity details');
   }
   console.log(`PASS profile isolation, both legacy modes, application isolation, group retention, reconnect, restart and rebind (evidence ${base})`);
+}
+
+try {
+  if (process.argv.includes('--req005')) await runRecoverySmoke();
+  else await runFeishuSmoke();
 } catch (error) {
   if (ui) {
     await writeFile(join(base, 'browser-visible.txt'), await ui.page.locator('body').innerText()).catch(() => {});
