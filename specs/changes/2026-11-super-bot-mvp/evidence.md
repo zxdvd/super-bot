@@ -813,5 +813,5 @@ ELECTRON_RUN_AS_NODE=1 '/Applications/DeepSeek Harness.app/Contents/MacOS/DeepSe
 
 ## 2026-11-26 · Bot 工作状态计数
 
-- 在隔离 DSH Web rc.1 和 Desktop rc.5 中用 Edge 切换两个 Bot。给同一个 Bot 留下一项正在运行的任务、一项待补充的任务和一份待验收成果，核对侧栏、首页、聊天工作按钮和收件箱。收起侧栏后能看到进行中数量，悬停可读三项计数。两份成果都交付后只显示「待验收 2」，逐项接受后标记消失。[浏览器回归](../../../scripts/smoke-work-activity.mjs)
+- 在隔离 DSH Web rc.1 和 Desktop rc.5 中用 Edge 切换两个 Bot。给同一个 Bot 留下一项正在运行的任务、一项待补充的任务和一份待验收成果，侧栏、首页和聊天工作按钮显示「进行中 1」「需处理 1」，收起侧栏后只显示进行中数量。只剩两份待验收成果时，外层徽标消失，打开工作面板可查看待验收数量和成果。[浏览器回归](../../../scripts/smoke-work-activity.mjs)
 - 合成账本中有 106 项待验收时，Bot 汇总和收件箱分组均显示 106。另核对了 Bot 仍在自动审查、通知送达不确定，以及折叠测试任务等情况。[账本回归](../../../test/work-activity.test.ts)

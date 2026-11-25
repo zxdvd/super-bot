@@ -61,8 +61,9 @@ const statuses = [
     icon: 'M5.5 3H4a1 1 0 0 0-1 1v9a1 1 0 0 0 1 1h8a1 1 0 0 0 1-1V4a1 1 0 0 0-1-1h-1.5M6 2h4v3H6zM5.5 9l1.6 1.6L10.5 7' },
 ] as const;
 
-function entries(counts?: WorkCounts) {
+function entries(counts?: WorkCounts, includeReview = false) {
   return counts ? statuses.flatMap(status => {
+    if (status.key === 'review' && !includeReview) return [];
     const count = counts[status.key];
     return count > 0 ? [{ ...status, count }] : [];
   }) : [];
@@ -79,10 +80,10 @@ const chipStyle: CSSProperties = {
   background: 'color-mix(in srgb, currentColor 10%, transparent)',
 };
 
-export function WorkBadges({ counts, showLabels = false, primaryOnly = false }: {
-  counts?: WorkCounts; showLabels?: boolean; primaryOnly?: boolean;
+export function WorkBadges({ counts, showLabels = false, primaryOnly = false, includeReview = false }: {
+  counts?: WorkCounts; showLabels?: boolean; primaryOnly?: boolean; includeReview?: boolean;
 }) {
-  const badges = entries(counts), label = countsLabel(badges);
+  const badges = entries(counts, includeReview), label = countsLabel(badges);
   if (!label) return null;
   return <span className="sb-work-counts" role="img" title={label} aria-label={label}
     style={{ display: 'inline-flex', flexWrap: 'wrap', alignItems: 'center', gap: 4 }}>

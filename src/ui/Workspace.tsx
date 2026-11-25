@@ -22,7 +22,7 @@ function Summary({ w }: { w: WorkspaceState }) {
   if (w.view === 'list' || w.view === 'settings' || !w.page) return null;
   const groups = inboxGroups(w.page.items, w.seen, w.now);
   return <WorkBadges counts={{ working: groups.active.length, attention: groups.attentionCount,
-    review: w.page.reviewTotal ?? groups.review.length }} showLabels/>;
+    review: w.page.reviewTotal ?? groups.review.length }} showLabels includeReview/>;
 }
 
 function Header({ w, compact, onReturn }: { w: WorkspaceState; compact: boolean; onReturn?: () => void }) {
