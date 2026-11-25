@@ -256,7 +256,7 @@ test('when group visibility retries are exhausted, the original name resumes the
     return remote.transport.inspectGroup(chatId);
   } });
   await assert.rejects(groups.create(first, '仍待确认的群', 'original'), {
-    code: 'feishu-created-not-visible', message: /核对机器人已入群，再用原群名称重试/,
+    code: 'feishu-created-not-visible', message: /用原群名称重试可继续绑定同一个群/,
   });
   const [createdId] = remote.creationCalls;
   const created = remote.creations.get(createdId!)!;

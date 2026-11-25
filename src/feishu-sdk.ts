@@ -312,7 +312,7 @@ export function createFeishuTransport(config: FeishuConfig, options: TransportOp
       botMentionProof: lookupBotIdentity().then(identity => identity !== undefined && openIds.includes(identity)) };
   }
 
-  async function robotInGroup(chatId: string): Promise<boolean> {
+  async function robotMembership(chatId: string): Promise<boolean | undefined> {
     const path = { chat_id: chatId };
     const membership = await im.chatMembers.isInChat({ path }).catch(error => {
       if (scopeDeniedBy(error, `/im/v1/chats/${chatId}/members/is_in_chat`)) {
@@ -320,7 +320,11 @@ export function createFeishuTransport(config: FeishuConfig, options: TransportOp
       }
       throw error;
     });
-    if (membership?.code !== MISSING_FEISHU_SCOPE) return dataFrom(membership, inspectError)?.is_in_chat === true;
+    if (membership?.code === MISSING_FEISHU_SCOPE) return undefined;
+    return dataFrom(membership, inspectError)?.is_in_chat === true;
+  }
+
+  function robotInJoinedGroups(chatId: string): Promise<boolean> {
     // This app-token endpoint lists only chats the calling bot belongs to.
     return hasPageItem(pageToken => im.chat.list({ params: { page_size: 100, page_token: pageToken } }), item => item.chat_id === chatId);
   }
@@ -414,13 +418,22 @@ export function createFeishuTransport(config: FeishuConfig, options: TransportOp
       current.socket?.close({ force: true });
       if (current.state !== 'stopped') current.handlers.onConnection('stopped');
     },
-    inspectGroup(chatId): Promise<FeishuGroup> {
+    inspectGroup(chatId, source): Promise<FeishuGroup> {
       return rest(async () => {
         if (!ownerOpenId) throw new AppError('feishu-self-unbound', '请先在飞书连接设置中绑定本人身份。');
         assertChatId(chatId);
         const path = { chat_id: chatId };
-        if (!await robotInGroup(chatId)) throw new AppError('feishu-bot-not-in-group', '请先将此飞书应用的机器人加入群聊。');
-        const group = dataFrom(await im.chat.get({ path, params: { user_id_type: 'open_id' } }), inspectError);
+        const getGroup = async () => dataFrom(await im.chat.get({ path, params: { user_id_type: 'open_id' } }), inspectError);
+        const membership = await robotMembership(chatId);
+        const createdGroupLookup = membership === undefined && source === 'created' ? getGroup() : undefined;
+        // If the details are unavailable, the joined list still determines whether to retry membership.
+        const details = await createdGroupLookup?.catch(() => undefined);
+        // Feishu omits owner_id for nonmembers. Exact details for a created group can precede the joined list.
+        const memberDetails = details?.owner_id === ownerOpenId
+          && details.chat_mode === 'group' && details.chat_status === 'normal';
+        const botInGroup = membership ?? (memberDetails || await robotInJoinedGroups(chatId));
+        if (!botInGroup) throw new AppError('feishu-bot-not-in-group', '请先将此飞书应用的机器人加入群聊。');
+        const group = details ?? await (createdGroupLookup ?? getGroup());
         if ((group.chat_mode !== 'group' && group.chat_mode !== 'topic') || (group.chat_status && group.chat_status !== 'normal')) {
           throw new AppError('feishu-not-group', '该 chat_id 对应的会话不是可用的飞书群。');
         }

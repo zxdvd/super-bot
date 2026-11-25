@@ -1,8 +1,10 @@
 import assert from 'node:assert/strict';
 import { setTimeout as delay } from 'node:timers/promises';
 import { test } from 'node:test';
+import { FeishuGroups } from '../src/feishu-groups.ts';
 import { checkFeishuConfig, createFeishuTransport } from '../src/feishu-sdk.ts';
 import type { FeishuConnectionState, FeishuGroupTextMessage, FeishuPrivateTextMessage } from '../src/feishu-types.ts';
+import { Store } from '../src/store.ts';
 
 const config = { appId: 'cli_fixture', appSecret: 'SYNTHETIC_PRIVATE_SECRET', ownerOpenId: 'ou_fixture' };
 const token = 'SYNTHETIC_PRIVATE_TOKEN';
@@ -273,7 +275,7 @@ test('uses the calling robot’s paginated joined groups only for the is_in_chat
       return { code: 0, data: { items: scenario === 'missing' ? [] : [{ chat_id: 'oc_target' }], has_more: false } };
     }
     assert.ok(url.endsWith('/chats/oc_target'));
-    return { code: 0, data: { name: '群主已授权', chat_mode: 'group', owner_id: config.ownerOpenId } };
+    return { code: 0, data: { name: '群主已授权', chat_mode: 'group', chat_status: 'normal', owner_id: config.ownerOpenId } };
   });
   t.after(() => f.transport.stop());
   assert.deepEqual(await f.transport.inspectGroup('oc_target'), { chatId: 'oc_target', name: '群主已授权' });
@@ -290,6 +292,57 @@ test('uses the calling robot’s paginated joined groups only for the is_in_chat
   assert.equal(f.calls.filter(call => call.url?.endsWith('/members')).length, 0);
   assert.equal(f.calls.filter(call => call.url?.endsWith('/chats/oc_target')).length, 2);
 });
+
+for (const [scenario, description] of [
+  ['ready', 'new group binds from member-only details while the joined list is stale'],
+  ['sparse', 'limited new group details cannot bind, and retry uses the saved chat ID'],
+  ['unavailable', 'new group binds on retry when details are briefly unavailable'],
+  ['not-a-member', 'new group member details cannot override an explicit negative membership check'],
+] as const) {
+  test(description, async t => {
+    const chatId = 'oc_created';
+    const name = '新建测试群';
+    const chatsUrl = 'https://open.feishu.cn/open-apis/im/v1/chats';
+    const groupUrl = `${chatsUrl}/${chatId}`;
+    let state: 'ready' | 'sparse' | 'unavailable' | 'not-a-member' = scenario;
+    const f = fixture(request => {
+      if (request.url === chatsUrl && request.method === 'post') return { code: 0, data: { chat_id: chatId } };
+      if (request.url === chatsUrl) return { code: 0, data: { items: [{ chat_id: 'oc_unrelated' }] } };
+      if (request.url === `${groupUrl}/members/is_in_chat`) {
+        if (state === 'not-a-member') return { code: 0, data: { is_in_chat: false } };
+        throw Object.assign(Error('Forbidden'), { config: request, response: { status: 400, data: { code: 99991672 } } });
+      }
+      assert.equal(request.url, groupUrl);
+      assert.equal(request.method, 'get');
+      assert.equal(request.headers.Authorization, `Bearer ${token}`);
+      assert.equal(request.params.user_id_type, 'open_id');
+      if (state === 'unavailable') {
+        state = 'ready';
+        return { code: 232006 };
+      }
+      return { code: 0, data: { name, chat_status: 'normal', bot_count: '1', user_count: '1',
+        ...(state !== 'sparse' ? { chat_mode: 'group', owner_id: config.ownerOpenId } : {}),
+      } };
+    });
+    t.after(() => f.transport.stop());
+    const store = new Store(':memory:');
+    t.after(() => store.close());
+    const bot = store.createBot('bot:create-feishu', { name, instructions: '合成测试 Bot' });
+    const groups = new FeishuGroups(store, config, f.transport);
+    const resume = scenario === 'sparse' || scenario === 'not-a-member';
+    if (resume) {
+      await assert.rejects(groups.create(bot.id, name, 'initial'), { code: 'feishu-created-not-visible' });
+      assert.equal(groups.get(bot.id), null);
+      state = 'ready';
+    }
+    const resumed = resume ? new FeishuGroups(store, config, f.transport) : groups;
+    const binding = await resumed.create(bot.id, name, 'bind');
+    assert.equal(binding.chatId, chatId);
+    assert.equal(binding.name, name);
+    assert.deepEqual(resumed.get(bot.id), binding);
+    assert.equal(f.calls.filter(call => call.url === chatsUrl && call.method === 'post').length, 1);
+  });
+}
 
 test('joined groups cannot prove the configured user is a member when someone else owns the chat', async t => {
   const f = fixture(request => {

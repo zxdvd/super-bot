@@ -151,8 +151,8 @@ export class FeishuGroups {
     }
   }
 
-  private async inspectGroup(chatId: string): Promise<FeishuGroup> {
-    const group = await this.transport.inspectGroup(chatId);
+  private async inspectGroup(chatId: string, source?: 'created'): Promise<FeishuGroup> {
+    const group = await this.transport.inspectGroup(chatId, source);
     this.assertActive();
     if (group.chatId !== chatId || !group.name?.trim()) {
       throw new AppError('feishu-group-unknown', '未能核对飞书群信息，请重新预览。');
@@ -165,13 +165,13 @@ export class FeishuGroups {
       if (delayMs) await delay(delayMs);
       this.assertActive();
       try {
-        return await this.inspectGroup(chatId);
+        return await this.inspectGroup(chatId, 'created');
       } catch (error) {
         if (!(error instanceof AppError) || error.code !== 'feishu-bot-not-in-group') throw error;
         this.assertActive();
       }
     }
-    throw new AppError('feishu-created-not-visible', '飞书已建群，但暂时无法确认机器人在群。请在飞书核对机器人已入群，再用原群名称重试绑定。');
+    throw new AppError('feishu-created-not-visible', '飞书已建群，暂时无法确认机器人在群。用原群名称重试可继续绑定同一个群。');
   }
 
   private pending(botId: string): Creation | undefined {
