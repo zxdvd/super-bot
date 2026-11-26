@@ -130,4 +130,28 @@ export function stageConditionText(condition: StageCondition): string {
     : `GitLab ${condition.project} 流水线 #${condition.number} 成功`;
 }
 
-export const STAGE_GUIDANCE = `Use stage reports for concrete milestone evidence while the same task has outstanding acceptance work. In detail, stage is a settled Worker checkpoint. Use advance_stage with taskId, current expectedRowVersion, stage.runId, and one concrete nextStep within the original owner authorization and acceptance criteria. Use the same Task and Worker. This consumes no corrective rework allowance. Only the overall deliverable enters normal review. When current facts show a necessary dependency, save its exact GitLab object and sourceOrigin from known evidence. The host tracks the exact object independently of model turns until the persisted deadline, including when the trusted reader is temporarily unavailable. Explain the actual wait or blocker and who can resolve it. Use block_stage only while stage.state is awaiting-decision, if the dependency identity is unknown or the next step needs permission. When an owner wants to hold a stage after a plan was already saved, use pause. Use continue with stageFollowUp:replace or stageFollowUp:revoke only when the owner actually changes or withdraws the saved step. Keep an unchanged wait quiet. For an explicit owner addition that leaves the plan intact, use continue with stageFollowUp:append, the current owner text and continuationMode. The new note accompanies the saved step, even when the note itself requests a read-only check. If the owner narrows the whole task, changes the execution direction or withdraws the planned step, use continue with stageFollowUp:replace or stageFollowUp:revoke. For a replacement with a new precise prerequisite, use advance_stage with stageFollowUp:replace and the complete current owner message in userInstruction. Explicit owner requests may retry the same expired wait using advance_stage with its unchanged step and condition. A failed business check or external condition needs a new owner decision. Do not use advance_stage to repeat a write or expand permission.`;
+export const STAGE_GUIDANCE = [
+  `Use stage reports for concrete milestone evidence while the same task has outstanding acceptance work.`,
+  `In detail, stage is a settled Worker checkpoint.`,
+  `Use advance_stage with taskId, current expectedRowVersion, stage.runId, and one concrete nextStep within the original owner authorization and acceptance criteria.`,
+  `Use the same Task and Worker.`,
+  `This consumes no corrective rework allowance.`,
+  `Only the overall deliverable enters normal review.`,
+
+  `When current facts show a necessary dependency, save its exact GitLab object and sourceOrigin from known evidence.`,
+  `The host tracks the exact object independently of model turns until the persisted deadline, including when the trusted reader is temporarily unavailable.`,
+  `Explain the actual wait or blocker and who can resolve it.`,
+  `Use block_stage only while stage.state is awaiting-decision, if the dependency identity is unknown or the next step needs permission.`,
+
+  `When an owner wants to hold a stage after a plan was already saved, use pause.`,
+  `Use continue with stageFollowUp:replace or stageFollowUp:revoke only when the owner actually changes or withdraws the saved step.`,
+  `Keep an unchanged wait quiet.`,
+  `For an explicit owner addition that leaves the plan intact, use continue with stageFollowUp:append, the current owner text and continuationMode.`,
+  `The new note accompanies the saved step, even when the note itself requests a read-only check.`,
+  `If the owner narrows the whole task, changes the execution direction or withdraws the planned step, use continue with stageFollowUp:replace or stageFollowUp:revoke.`,
+  `For a replacement with a new precise prerequisite, use advance_stage with stageFollowUp:replace and the complete current owner message in userInstruction.`,
+
+  `Explicit owner requests may retry the same expired wait using advance_stage with its unchanged step and condition.`,
+  `A failed business check or external condition needs a new owner decision.`,
+  `Do not use advance_stage to repeat a write or expand permission.`,
+].join(' ');

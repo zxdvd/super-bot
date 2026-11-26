@@ -3283,9 +3283,28 @@ export class Managers {
   private recoveryNoticeInstructions(event: ManagerEvent): string {
     const instruction = this.pendingRecoveryInstruction(event.taskId!);
     if (instruction) {
-      return 'This task already has a saved owner follow-up. Read detail for its current rowVersion, then call continue for this exact task without userInstruction. It may resume the saved next step when the previous execution is reconciled. If it reports blocked, use inspect-recovery and recover-preflight for an eligible, previously authorized read-only check. Report the actual outcome here. Do not ask the user to repeat their instruction or authorize the task again. Finish without any action if this notice was already handled.';
+      return [
+        `This task already has a saved owner follow-up.`,
+        `Read detail for its current rowVersion, then call continue for this exact task without userInstruction.`,
+        `It may resume the saved next step when the previous execution is reconciled.`,
+        `If it reports blocked, use inspect-recovery and recover-preflight for an eligible, previously authorized read-only check.`,
+        `Report the actual outcome here.`,
+        `Do not ask the user to repeat their instruction or authorize the task again.`,
+        `Finish without any action if this notice was already handled.`,
+      ].join(' ');
     }
-    return 'Call inspect-recovery for this exact task before reporting a blocker. If eligible, call recover-preflight with the returned rowVersion. That performs the known authorized read-only next step. Use the observed outcome and prior receipts as evidence, and keep credentials private. Report any actual missing dependency, permission or uncertainty. State when the prior attempt already ended. A successful check covers the measured condition. Do not dispatch the original task or claim that it passed. Ask here only for a specific necessary human decision. Finish quietly when the check was already handled or the blocker is unchanged.';
+    return [
+      `Call inspect-recovery for this exact task before reporting a blocker.`,
+      `If eligible, call recover-preflight with the returned rowVersion.`,
+      `That performs the known authorized read-only next step.`,
+      `Use the observed outcome and prior receipts as evidence, and keep credentials private.`,
+      `Report any actual missing dependency, permission or uncertainty.`,
+      `State when the prior attempt already ended.`,
+      `A successful check covers the measured condition.`,
+      `Do not dispatch the original task or claim that it passed.`,
+      `Ask here only for a specific necessary human decision.`,
+      `Finish quietly when the check was already handled or the blocker is unchanged.`,
+    ].join(' ');
   }
   private workerQuestionEvent(eventId?: string): string | undefined {
     const runId = eventId?.match(/^manager-event:settled:([a-f0-9-]{36})$/)?.[1];

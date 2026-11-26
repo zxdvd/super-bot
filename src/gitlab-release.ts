@@ -8,8 +8,25 @@ import {
 } from './work-stage.ts';
 
 export const GITLAB_PLAY_TOOL = 'super_bot_gitlab_play';
-export const GITLAB_RELEASE_GUIDANCE =
-  'For an affirmative owner authorization to publish after an exact GitLab MR checkpoint, use advance_stage with gitLabRelease.intent publish, current rowVersion and the exact merge condition referenced in stage.evidenceRef. Copy the complete current owner message to userInstruction. For an exact MR URL and publication already explicitly delegated with the original task, specify the same gitLabRelease intent and reference during create, so the saved grant can be used after the checkpoint. If the next step has no clear release target or the owner asks for a particular environment, set requiresJobName true. Pass jobName when the owner named it. When detail returns gitLabReleaseQuestion, use that compact question verbatim in the visible answer once. Interpret the next owner reply in context and use intent select with the exact name of their chosen displayed job and the recorded version. An explicit new delegation naming a verified exact job can use publish directly. A status question or quoted text grants no write. When a possible delegation is ambiguous, use intent clarify so the host identifies the job and waits for an affirmative choice in the original chat. Use detail.gitLabRelease for observed status and its exact job link. If the owner asks for a fresh status check, call detail with refreshGitLabRelease and expectedRowVersion. After explicit owner recovery of a permission denial, use intent retry and detail.gitLabRelease.condition from the earlier job. Never use general continuation, Bash or another job for this action. The host follows the exact job until the receipt or deadline.';
+export const GITLAB_RELEASE_GUIDANCE = [
+  `For an affirmative owner authorization to publish after an exact GitLab MR checkpoint, use advance_stage with gitLabRelease.intent publish, current rowVersion and the exact merge condition referenced in stage.evidenceRef.`,
+  `Copy the complete current owner message to userInstruction.`,
+  `For an exact MR URL and publication already explicitly delegated with the original task, specify the same gitLabRelease intent and reference during create, so the saved grant can be used after the checkpoint.`,
+  `If the next step has no clear release target or the owner asks for a particular environment, set requiresJobName true.`,
+  `Pass jobName when the owner named it.`,
+
+  `When detail returns gitLabReleaseQuestion, use that compact question verbatim in the visible answer once.`,
+  `Interpret the next owner reply in context and use intent select with the exact name of their chosen displayed job and the recorded version.`,
+  `An explicit new delegation naming a verified exact job can use publish directly.`,
+  `A status question or quoted text grants no write.`,
+  `When a possible delegation is ambiguous, use intent clarify so the host identifies the job and waits for an affirmative choice in the original chat.`,
+
+  `Use detail.gitLabRelease for observed status and its exact job link.`,
+  `If the owner asks for a fresh status check, call detail with refreshGitLabRelease and expectedRowVersion.`,
+  `After explicit owner recovery of a permission denial, use intent retry and detail.gitLabRelease.condition from the earlier job.`,
+  `Never use general continuation, Bash or another job for this action.`,
+  `The host follows the exact job until the receipt or deadline.`,
+].join(' ');
 export const RELEASE_CHECK_MS = 30_000;
 export const RELEASE_WAIT_MS = 30 * 60_000;
 

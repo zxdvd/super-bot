@@ -31,11 +31,35 @@ declare module '@deepseek-ai/dsh-llm' {
   }
 }
 
-const CODE_DELIVERY = `For code work, after reading the applicable project instructions and before editing, record the opening Git HEAD and relevant staged, unstaged, and untracked changes. Keep the baseline scoped to the files you expect to touch. Preserve existing work, including changes in files you edit. If Git or the baseline is unavailable, state what you could verify.
-When preparing a change for review, assess whether reviewers can use it now. Keep pending merge checks in the report and preserve a reviewable change’s review status.
-In ready, use summary for what changed and checks for commands actually run, their outcomes, and what remains unverified. Make the opening HEAD, relevant existing changes, and this run's attributable diff visible in the summary or a concise attachment. Compare with the opening state, including for files you both found dirty and edited. Treat the full diff against HEAD as worktree context. If you cannot attribute a change, say so. Attach a scoped diff when useful and include actual changed source where available. For any relevant host, identify a matching native load receipt for this result and build, or say that loading there is unverified. Only reload when authorized.
-For ordinary non-code work, keep the report brief and use the checks and files relevant to that task.
-In super_bot_report ready, register each actual external deliverable in links as a distinct display name mapped to its full HTTP(S) URL. Register each URL once and use its display name in summary and checks. When one deliverable is the user's main next action, set primaryLink to its exact registered display name. Keep references in the report. If a requested openable deliverable is missing, explain what is missing and why. Omit links for local-only work. Include file evidence and checks even when a document is the only deliverable.`;
+const CODE_DELIVERY = [
+  [
+    `For code work, after reading the applicable project instructions and before editing, record the opening Git HEAD and relevant staged, unstaged, and untracked changes.`,
+    `Keep the baseline scoped to the files you expect to touch.`,
+    `Preserve existing work, including changes in files you edit.`,
+    `If Git or the baseline is unavailable, state what you could verify.`,
+  ].join(' '),
+  `When preparing a change for review, assess whether reviewers can use it now. Keep pending merge checks in the report and preserve a reviewable change’s review status.`,
+  [
+    `In ready, use summary for what changed and checks for commands actually run, their outcomes, and what remains unverified.`,
+    `Make the opening HEAD, relevant existing changes, and this run's attributable diff visible in the summary or a concise attachment.`,
+    `Compare with the opening state, including for files you both found dirty and edited.`,
+    `Treat the full diff against HEAD as worktree context.`,
+    `If you cannot attribute a change, say so.`,
+    `Attach a scoped diff when useful and include actual changed source where available.`,
+    `For any relevant host, identify a matching native load receipt for this result and build, or say that loading there is unverified.`,
+    `Only reload when authorized.`,
+  ].join(' '),
+  `For ordinary non-code work, keep the report brief and use the checks and files relevant to that task.`,
+  [
+    `In super_bot_report ready, register each actual external deliverable in links as a distinct display name mapped to its full HTTP(S) URL.`,
+    `Register each URL once and use its display name in summary and checks.`,
+    `When one deliverable is the user's main next action, set primaryLink to its exact registered display name.`,
+    `Keep references in the report.`,
+    `If a requested openable deliverable is missing, explain what is missing and why.`,
+    `Omit links for local-only work.`,
+    `Include file evidence and checks even when a document is the only deliverable.`,
+  ].join(' '),
+].join('\n');
 
 export function workerStandingPrompt(
   task: Task,
@@ -48,8 +72,22 @@ export function workerStandingPrompt(
     ? `\nWork convention recorded for this task (${convention.source}). Follow it within the current task scope and authorization:\n${convention.text}`
     : '';
   const permissions = fullAccess
-    ? 'This Worker uses the native Full Access preset. Use super_bot_query with kind git-working-tree-status for the opening Git HEAD and working tree status and later status checks. It provides a verified read receipt; report if it cannot read the worktree. Use native tools including shell to implement and test the requested work. Keep work scoped to this task. Do not modify unrelated projects or credentials. Change host configuration only when this task explicitly authorizes that change. Report actual changed source files and test results.'
-    : 'Use only read/write/edit in this directory, always with absolute file_path values. Do not change working directories. Worker 完整权限未开启：当前 fullAccess: false。Shell and external CLI tools are unavailable in files mode; report this limitation, never ask for a tool channel. To enable them, set fullAccess: true in the Super Bot config of the active profile cordis.patch.yml and reload when idle.';
+    ? [
+        `This Worker uses the native Full Access preset.`,
+        `Use super_bot_query with kind git-working-tree-status for the opening Git HEAD and working tree status and later status checks.`,
+        `It provides a verified read receipt; report if it cannot read the worktree.`,
+        `Use native tools including shell to implement and test the requested work.`,
+        `Keep work scoped to this task.`,
+        `Do not modify unrelated projects or credentials.`,
+        `Change host configuration only when this task explicitly authorizes that change.`,
+        `Report actual changed source files and test results.`,
+      ].join(' ')
+    : [
+        `Use only read/write/edit in this directory, always with absolute file_path values.`,
+        `Do not change working directories.`,
+        `Worker 完整权限未开启：当前 fullAccess: false。Shell and external CLI tools are unavailable in files mode; report this limitation, never ask for a tool channel.`,
+        `To enable them, set fullAccess: true in the Super Bot config of the active profile cordis.patch.yml and reload when idle.`,
+      ].join(' ');
   return [
     `Bot configuration revision: ${task.botConfigRevision}`,
     `Bot responsibility: ${context.instructions}${materialPrompt(context.materials)}${conventionPrompt}`,
@@ -60,7 +98,13 @@ export function workerStandingPrompt(
     'If task inputs conflict, follow the higher input order within the authorized scope.',
     permissions,
     CODE_DELIVERY,
-    'Use stage with a distinct stage name, a stable evidenceRef, and checks when you verified a new milestone but the overall goals are incomplete. Include actual evidence and the outstanding condition and authorized next step in summary. For GitLab waits, include the exact project and merge request IID or pipeline ID in the report. Do not wait in shell, treat acceptance failure as ready, or resubmit a prior milestone. Use blocked or failed for a business check that did not pass and waiting for a specific owner decision.',
+    [
+      `Use stage with a distinct stage name, a stable evidenceRef, and checks when you verified a new milestone but the overall goals are incomplete.`,
+      `Include actual evidence and the outstanding condition and authorized next step in summary.`,
+      `For GitLab waits, include the exact project and merge request IID or pipeline ID in the report.`,
+      `Do not wait in shell, treat acceptance failure as ready, or resubmit a prior milestone.`,
+      `Use blocked or failed for a business check that did not pass and waiting for a specific owner decision.`,
+    ].join(' '),
     'Use super_bot_report(progress) at meaningful checkpoints, such as written changes or a focused failing or passing test. State what was actually observed. For reloads, report a matching host receipt when available. Use waiting to ask a necessary question. For ready provide files and checks explaining every acceptance criterion. Never claim the task is accepted; the user decides.',
   ].join('\n');
 }
@@ -107,11 +151,28 @@ export function createWorkerRunMessage(
       sections.push(...priorDirections.map(({ text }) => `Retained owner direction:\n${text}`));
     else if (priorDirection) sections.push(`Retained owner direction:\n${priorDirection}`);
     sections.push(
-      'Continue the current assignment from all applicable owner directions in order and the verified state. Retain the substantive directions and limits when the latest message only confirms proceeding or selects this task. Treat the standing goal as background for this attempt. Read prior reports and receipts as evidence. Preserve observed effects and uncertainty. If a resource was created but is unready, report both facts. Use waiting for a specific decision or permission the owner must supply. Report a blocked external dependency with the responsible party or condition.',
+      [
+        `Continue the current assignment from all applicable owner directions in order and the verified state.`,
+        `Retain the substantive directions and limits when the latest message only confirms proceeding or selects this task.`,
+        `Treat the standing goal as background for this attempt.`,
+        `Read prior reports and receipts as evidence.`,
+        `Preserve observed effects and uncertainty.`,
+        `If a resource was created but is unready, report both facts.`,
+        `Use waiting for a specific decision or permission the owner must supply.`,
+        `Report a blocked external dependency with the responsible party or condition.`,
+      ].join(' '),
     );
     if (context.lateJobs)
       sections.push(
-        `The old attempt ended before these background Job results were consumed. Use the saved progress, original native Job result messages and current files as evidence. Prior external effects remain unverified. Preserve the materials already collected. Continue only with reading existing regular files and writing the requested report under ${context.outputDirectory}. Do not repeat background work, modify existing inputs, perform an external action or claim an unverified external effect succeeded. If the task specifically needs an external action or unavailable evidence, report the remaining business requirement and the exact missing evidence.`,
+        [
+          `The old attempt ended before these background Job results were consumed.`,
+          `Use the saved progress, original native Job result messages and current files as evidence.`,
+          `Prior external effects remain unverified.`,
+          `Preserve the materials already collected.`,
+          `Continue only with reading existing regular files and writing the requested report under ${context.outputDirectory}.`,
+          `Do not repeat background work, modify existing inputs, perform an external action or claim an unverified external effect succeeded.`,
+          `If the task specifically needs an external action or unavailable evidence, report the remaining business requirement and the exact missing evidence.`,
+        ].join(' '),
       );
     else
       sections.push(
