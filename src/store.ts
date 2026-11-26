@@ -1,9 +1,8 @@
 import { inboxActivity } from './work-activity.ts';
-import { isOwnerApproval } from './chat-work-actions.ts';
 import { settledBlockerSql } from './settled-blocker.ts';
 import { readStageCondition, stageConditionText, stageReadyKey, STAGE_OBSERVE_MS, STAGE_WAIT_MS,
   type DueStage, type StageFollowUp, type StageObservation, type WorkStage } from './work-stage.ts';
-import { exactMergeReference, isDirectiveReleaseSource, namesReleaseAction, releaseKey, releaseUrl, RELEASE_CHECK_MS, RELEASE_WAIT_MS,
+import { exactMergeReference, mergeReferences, releaseKey, releaseUrl, RELEASE_CHECK_MS, RELEASE_WAIT_MS,
   type ReleaseAuthorization, type ReleasePlan, type ReleaseReceipt, type ReleaseTarget } from './gitlab-release.ts';
 import type { StageCondition } from './work-stage.ts';
 import { DatabaseSync } from 'node:sqlite';
@@ -810,11 +809,10 @@ export class Store {
     if (!['human', 'bot'].includes(payload.reviewPolicy)) throw new AppError('invalid-input', '请选择有效的验收方式。');
     // Native provenance, not a model-provided call ID, identifies one human request.
     // Keep the normal call receipt too: reusing a call ID with changed content must still fail.
-    if(release&&(!source||!isDirectiveReleaseSource(source.text)||!namesReleaseAction(source.text)||
-      this.botForSession(source.sessionId)?.id!==input.botId||
-      !source.text.includes(release.reference)||!exactMergeReference(release.reference)||
-      release.jobName&&!source.text.includes(release.jobName))) {
-      throw new AppError('gitlab-release-scope','创建任务时需保留原聊天已经明确授权的 GitLab MR 链接和作业名称。');
+    const reference=release&&exactMergeReference(release.reference);
+    if(release&&(!source||this.botForSession(source.sessionId)?.id!==input.botId||
+      !reference||!mergeReferences(source.text).some(item=>JSON.stringify(item)===JSON.stringify(reference)))) {
+      throw new AppError('gitlab-release-scope','创建任务时需要原聊天中的确切 GitLab MR 链接。');
     }
     const intent = { ...payload, ...(conventionOverride===undefined?{}:{conventionOverride}), ...(release?{release}:{}) };
     const intentHash=source?createHash('sha256').update(JSON.stringify({action:'task.create-intent',payload:intent,source:{sessionId:source.sessionId,messages:(source.messages??[source]).map(({messageId,seq})=>({messageId,seq})).sort((a,b)=>a.seq-b.seq)}})).digest('hex'):undefined;
@@ -1737,31 +1735,23 @@ export class Store {
     return source&&release?.reference===reference?{source,intent:'publish',jobName:release.jobName,requiresJobName:release.requiresJobName}:null;
   }
   private saveGitLabRelease(task:Task,stage:WorkStage,condition:StageCondition|undefined,authorization:ReleaseAuthorization):void {
-    const {source,jobName,intent}=authorization;
+    const {source,jobName,intent,selection}=authorization;
     const prior=this.gitLabReleaseDetail(task);
-    const canRetry=intent==='retry'&&prior?.state==='needs-permission'&&stage.evidenceRef===prior.url&&
-      /(?:继续|重试|\b(?:retry|resume|continue|proceed)\b)/iu.test(source.text);
+    const canRetry=intent==='retry'&&prior?.state==='needs-permission'&&stage.evidenceRef===prior.url;
     const earlierAuthorization=canRetry&&this.gitLabReleaseForStage(prior.stageRunId);
     const checked=earlierAuthorization?earlierAuthorization.condition:exactMergeReference(stage.evidenceRef);
-    const choices=stage.observation?.releaseChoices;
-    const shortApproval=isOwnerApproval(source.text)||
-      /^(?:(?:对|好|可以)[ ，,]+)?(?:按(?:此|这个)(?:发布|发版|部署)|(?:publish|deploy|release)\s+(?:it|this one))[。.!！]*$/iu.test(source.text.trim());
-    const sameJobChoice=!!jobName&&choices?.includes(jobName)&&
-      (choices.length===1&&shortApproval||source.text.includes(jobName));
     const previous=this.gitLabReleaseForStage(stage.runId);
-    if(!condition||condition.kind!=='gitlab-merge'||intent!=='clarify'&&!isDirectiveReleaseSource(source.text)||
+    const chosen=intent==='select'&&selection&&previous?.source.sessionId===source.sessionId&&previous.source.seq<source.seq&&
+      selection.observedAt===stage.observation?.at&&selection.target.name===jobName&&
+      stage.observation.releaseChoices?.some(option=>JSON.stringify(option)===JSON.stringify(selection.target))?selection.target:undefined;
+    if(!condition||condition.kind!=='gitlab-merge'||
       this.botForSession(source.sessionId)?.id!==task.botId||
       !checked||JSON.stringify(checked)!==JSON.stringify(condition)||
-      !(intent==='publish'&&namesReleaseAction(source.text)||intent==='clarify'&&!jobName||
-        intent==='select'&&sameJobChoice&&previous||earlierAuthorization)) {
+      !(intent==='publish'||intent==='clarify'&&!jobName||chosen||earlierAuthorization)) {
       throw new AppError('gitlab-release-scope','需要当前任务的可信 GitLab MR 引用和原聊天中明确的发布授权。若意图不清楚，请在原聊天点明该合并请求并询问是否执行发布。');
     }
-    if(jobName&&!source.text.includes(jobName)&&!(canRetry&&jobName===prior.target.name)&&!(intent==='select'&&sameJobChoice)) {
-      throw new AppError('gitlab-job-name','请选择已在原聊天中明确的发布作业名称。');
-    }
     const subjects=[...source.text.matchAll(/!(\d+)\b/g)].map(match=>Number(match[1]));
-    const urls=[...source.text.matchAll(/https:\/\/[^\s<>()，。]+/gu)]
-      .map(match=>exactMergeReference(match[0])).filter(Boolean);
+    const urls=mergeReferences(source.text);
     if((subjects.length>0&&!subjects.includes(condition.number))||
       (urls.length>0&&!urls.some(item=>JSON.stringify(item)===JSON.stringify(condition)))) {
       throw new AppError('gitlab-release-scope','用户指令中的合并请求与此阶段不匹配。');
@@ -1770,10 +1760,11 @@ export class Store {
       throw new AppError('gitlab-release-tracked','此任务已登记正式作业。请读取该作业的已核对状态。');
     }
     const requiresJobName=intent==='clarify'||authorization.requiresJobName===true||previous?.requiresJobName===true;
-    if(prior&&(prior.target.origin!==condition.sourceOrigin||prior.target.project!==condition.project||
+    if(prior&&(JSON.stringify(prior.condition??this.gitLabReleaseForStage(prior.stageRunId)?.condition)!==JSON.stringify(condition)||
       jobName&&jobName!==prior.target.name)) throw new AppError('gitlab-release-tracked','请继续核对已登记的同一作业。');
+    const boundTarget=chosen??(intent==='clarify'?undefined:prior?.target);
     const plan={source,jobName,requiresJobName,condition,
-      ...(prior?{retryTarget:prior.target}:{})};
+      ...(boundTarget?{retryTarget:boundTarget}:{})};
     this.db.prepare(`INSERT INTO gitlab_release_plans VALUES (?,?)
       ON CONFLICT(stageRunId) DO UPDATE SET authorization=excluded.authorization`).run(stage.runId,JSON.stringify(plan));
   }
@@ -1985,8 +1976,9 @@ export class Store {
       if(source&&this.botForSession(source.sessionId)?.id!==botId)throw new AppError('manager-scope','只能在任务当前 Bot 对话替换阶段。');
       const retry=stage.state==='blocked'&&ownerRetry&&(stage.expired||stage.observation?.state==='unavailable')&&
         stage.nextStep===nextStep&&JSON.stringify(stage.condition)===JSON.stringify(condition);
-      const releaseSelection=stage.state==='blocked'&&!!options?.release&&!!stage.observation?.releaseChoices?.length;
-      if(stage.state!=='awaiting-decision'&&!retry&&!source&&!releaseSelection) {
+      const releaseSelection=stage.state==='blocked'&&options?.release?.intent==='select'&&!!stage.observation?.releaseChoices?.length;
+      const releaseDirected=stage.state==='blocked'&&options?.release?.intent==='publish'&&!!options.release.jobName;
+      if(stage.state!=='awaiting-decision'&&!retry&&!source&&!releaseSelection&&!releaseDirected) {
         throw new AppError('stage-decided','此阶段已有处理决定。请读取当前任务。');
       }
       if(source&&['awaiting-decision','dispatched'].includes(stage.state)) {
@@ -2009,7 +2001,7 @@ export class Store {
       const details:WorkStage={...stage,nextStep,condition,observation:undefined,reason:undefined,expired:undefined,
         releaseOpenedAt:JSON.stringify(stage.condition)===JSON.stringify(condition)?stage.releaseOpenedAt:undefined,
         deadlineAt:repeated?undefined:now+STAGE_WAIT_MS,
-        ...(source||retry||releaseSelection?{planVersion:task.rowVersion+1}:{}),...(source?{planSource:source}:{})};
+        ...(source||retry||releaseSelection||releaseDirected?{planVersion:task.rowVersion+1}:{}),...(source?{planSource:source}:{})};
       const decision:WorkStage['state']=repeated?'blocked':condition?'waiting':'ready';
       if(repeated)details.reason='已经核对过同一外部条件。请确认下一阶段需要的具体前提。';
       else if(condition&&condition.sourceOrigin!==origin) {
@@ -2139,7 +2131,8 @@ export class Store {
       this.db.prepare('UPDATE work_stages SET state=?,details=?,nextCheckAt=?,failures=? WHERE runId=?')
         .run(state,JSON.stringify({...details,state:undefined}),next,failures,due.runId);
       if(stage.observation?.stateLabel!==outcome.stateLabel||stage.observation?.state!==outcome.state) {
-        this.event('stage.observed',task.id,{runId:due.runId,condition:stage.condition,...outcome});
+        const {releaseChoices:_choices,...observed}=outcome;
+        this.event('stage.observed',task.id,{runId:due.runId,condition:stage.condition,...observed});
       }
       const unavailableKey=`stage-unavailable:${stage.runId}:${stage.planVersion??0}`;
       if(outcome.state==='unavailable') {
@@ -2595,21 +2588,23 @@ export class Store {
       return {};
     });
   }
-  resolveRunRecovery(requestId:string,taskId:string,expectedRowVersion:number,source?:ChatSource):Task {
-    return this.command(requestId,'run.resolve-recovery',{taskId,expectedRowVersion,...(source?{source}:{})},()=>{
+  resolveRunRecovery(requestId:string,taskId:string,expectedRowVersion:number,source?:ChatSource,ownerFact?:string):Task {
+    return this.command(requestId,'run.resolve-recovery',{taskId,expectedRowVersion,...(source?{source,ownerFact}:{})},()=>{
       const target=this.recoveryTarget(taskId,expectedRowVersion);
-      this.closeRecovery(target,'paused',undefined,source);
+      this.closeRecovery(target,'paused',undefined,source,ownerFact);
       return this.getTask(taskId);
     });
   }
-  continueRunRecovery(requestId:string,taskId:string,expectedRowVersion:number,continuation:RecoveryContinuation,expectedModel?:WorkerModelPlan,source?:ChatSource):Run {
-    return this.command(requestId,'run.continue-recovery',{taskId,expectedRowVersion,...continuation,...(source?{source}:{})},()=>{
+  continueRunRecovery(requestId:string,taskId:string,expectedRowVersion:number,continuation:RecoveryContinuation,
+    expectedModel?:WorkerModelPlan,source?:ChatSource,ownerFact?:string):Run {
+    return this.command(requestId,'run.continue-recovery',{taskId,expectedRowVersion,...continuation,...(source?{source,ownerFact}:{})},()=>{
       const target=this.recoveryTarget(taskId,expectedRowVersion,continuation);
-      this.closeRecovery(target,'auto',undefined,source);
+      this.closeRecovery(target,'auto',undefined,source,ownerFact);
       return this.allocateRun(this.getTask(taskId),target.binding,true,expectedModel);
     });
   }
-  private closeRecovery({task,run,attentions}:ReturnType<Store['recoveryTarget']>,mode:'paused'|'auto',checked?:{managerId:string;result:ProbeResult;performed:boolean},source?:ChatSource):void {
+  private closeRecovery({task,run,attentions}:ReturnType<Store['recoveryTarget']>,mode:'paused'|'auto',
+    checked?:{managerId:string;result:ProbeResult;performed:boolean},source?:ChatSource,ownerFact?:string):void {
     if(run) {
       this.db.prepare('DELETE FROM resources WHERE runId=?').run(run.id);
       this.db.prepare("UPDATE inputs SET state='discarded' WHERE id=? AND state IN ('accepted','unknown','enqueued')").run(run.inputId);
@@ -2624,7 +2619,7 @@ export class Store {
     this.db.prepare("UPDATE attentions SET state='stale' WHERE taskId=? AND kind='approval' AND state='open'").run(task.id);
     this.db.prepare('UPDATE tasks SET controlMode=?,rowVersion=rowVersion+1,updatedAt=? WHERE id=?').run(mode,Date.now(),task.id);
     this.event('run.recovery-confirmed',task.id,{runId:run?.id??null,
-      ...(checked?{actor:'manager',...checked}:{actor:'user',source})});
+      ...(checked?{actor:'manager',...checked}:{actor:'user',source,ownerFact})});
   }
   managerReview(requestId:string,botId:string,taskId:string,expectedRowVersion:number,resultId:string,verdict:'accept'|'rework'|'human',text:string,requested?:{verdict:'accept';note:string},chatReview?:{reviewSessionId:string;reviewCallId:string}):Task {
     const note=requiredText(text,'验收判断');

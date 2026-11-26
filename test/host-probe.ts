@@ -22,9 +22,9 @@ import { Managers } from '../src/manager.ts';
 import { SessionId } from '@deepseek-ai/dsh-session/types';
 import type {SessionStore} from '@deepseek-ai/dsh-session';
 import { closeTask, ownerAcceptance, ownerAcceptanceConfirm, ownerConfirm, ownerDetach, ownerInspect, ownerNewGoal, ownerOldGoal, ownerPrepare,
-  ownerRefuse, ownerRevise, ownerSessionTitle, stageArtifacts, stageGoal, stageRevoke, stageSupplement, stoppableGoal } from './stage-host-fixture.ts';
+  ownerRevise, ownerSessionTitle, stageArtifacts, stageGoal, stageRevoke, stageSupplement, stoppableGoal } from './stage-host-fixture.ts';
 import { approveFixtureDeployment, approveRelease, confirmReleaseChoice, prepareRelease, releaseFixtureGoal,
-  releaseStatusQuestion, restoreReleasePermission } from './gitlab-release-fixture.ts';
+  releaseStatusQuestion, restoreReleasePermission, showReleaseChoices } from './gitlab-release-fixture.ts';
 import { artifactDeliveryText, artifactEditReply, artifactGoal, artifactLinks, artifactPrimary, artifactPortProbeGoal, artifactPortProbeText, artifactReference,
   artifactRevision, replacementMr, supplementalDoc } from './delivery-link-fixture.ts';
 import { deploymentEffectGoal, deploymentEffectRequest, deploymentProbe, deploymentRecoveryGoal, deploymentRecoveryRequest,
@@ -174,7 +174,7 @@ class ProbeAdapter extends LlmAdapter {
       }
       let plan:Record<string,unknown>|null=null;
       const releaseFollowup=trigger?.source?.kind==='user'&&
-        [approveRelease,approveFixtureDeployment,confirmReleaseChoice,releaseStatusQuestion,restoreReleasePermission].includes(text);
+        [approveRelease,approveFixtureDeployment,confirmReleaseChoice,releaseStatusQuestion,restoreReleasePermission,showReleaseChoices].includes(text);
       if(releaseFollowup) {
         if(!prior){yield* probeTool('super_bot_manage',{action:'list'});return;}
         if(prior.action==='list') {
@@ -183,6 +183,9 @@ class ProbeAdapter extends LlmAdapter {
           yield* probeTool('super_bot_manage',{action:'detail',taskId:target.id});return;
         }
         if(prior.action==='detail'&&value?.stage) {
+          if(text===showReleaseChoices) {
+            yield* probeText(value.gitLabReleaseQuestion??'当前没有待选择的作业。');return;
+          }
           if(text===releaseStatusQuestion) {
             if(value.gitLabRelease&&!value.gitLabCurrentStatus&&prior.refreshGitLabRelease!==true) {
               yield* probeTool('super_bot_manage',{action:'detail',taskId:value.task.id,refreshGitLabRelease:true,
@@ -193,6 +196,7 @@ class ProbeAdapter extends LlmAdapter {
           }
           const retry=text===restoreReleasePermission;
           const select=text===confirmReleaseChoice;
+          if(select)assert.equal(value.stage.observation.releaseChoices,undefined,'choice identity stays in the application ledger');
           const evidence=retry?value.gitLabRelease?.condition:undefined;
           const url=retry?null:new URL(value.stage.evidenceRef);
           const condition=evidence??{kind:'gitlab-merge',sourceOrigin:url!.origin,
@@ -200,7 +204,7 @@ class ProbeAdapter extends LlmAdapter {
           yield* probeTool('super_bot_manage',{action:'advance_stage',taskId:value.task.id,runId:value.stage.runId,
             expectedRowVersion:value.task.rowVersion,nextStep:'运行已授权的正式发布作业',condition,userInstruction:text,
             gitLabRelease:{intent:retry?'retry':select?'select':'publish',
-              ...(select?{jobName:value.stage.observation.releaseChoices[0]}:{}),
+              ...(select?{jobName:value.gitLabReleaseChoices[0]}:{}),
               ...(text===approveFixtureDeployment?{requiresJobName:true}:{})}});
           return;
         }
@@ -223,7 +227,7 @@ class ProbeAdapter extends LlmAdapter {
       const lastResult=later.findLast(message=>message.role==='tool');
       const successfulTool=lastResult?.role==='tool'&&!lastResult.isError;
       const ownerAction=trigger?.source?.kind==='user'&&new Map([[ownerAcceptance,'accept'],[ownerAcceptanceConfirm,'accept'],[ownerRevise,'revise'],
-        [ownerInspect,'session-inspect'],[ownerRefuse,'session-attach'],[ownerConfirm,'session-attach'],
+        [ownerInspect,'session-inspect'],[ownerConfirm,'session-attach'],
         [ownerDetach,'session-detach'],[ownerPrepare,'session-prepare']]).get(text);
       if(ownerAction&&!prior) {
         plan={action:'list'};
@@ -234,7 +238,7 @@ class ProbeAdapter extends LlmAdapter {
         if(selected)plan={action:'detail',taskId:selected.id};
       }else if(ownerAction&&prior?.action==='detail'&&value?.task) {
         plan={action:ownerAction,taskId:value.task.id,expectedRowVersion:value.task.rowVersion,userInstruction:text,
-          ...(ownerAction==='accept'?{resultId:value.result.id}:ownerAction==='revise'?{goal:ownerNewGoal}:
+          ...(ownerAction==='accept'?{resultId:value.result.id,decision:text===ownerAcceptance?'ask':'confirm'}:ownerAction==='revise'?{goal:ownerNewGoal}:
             ownerAction==='session-inspect'?{sessionQuery:ownerSessionTitle}:{})};
       }else if(namedRequest>=0&&!prior) {
         const goal=req005Goals[namedRequest];
@@ -256,6 +260,7 @@ class ProbeAdapter extends LlmAdapter {
       }else if(namedFollowup&&prior?.action==='detail'&&value?.task?.goal===wantedGoal) {
         plan={action:wantedAction,taskId:value.task.id,expectedRowVersion:value.task.rowVersion,userInstruction:text,
           ...(stageFollowUp?{stageFollowUp,...(stageFollowUp==='append'?{continuationMode:'read-only'}:{})}:{}),
+          ...([startupContinue,pendingContinue].includes(text)?{useLatestDirection:true}:{}),
           ...([imageScope,pendingScope,appendixScope].includes(text)?{continuationMode:'read-only'}:{})};
       }else if(continuationNotice&&prior?.action==='detail'&&currentTask&&req005Goals.includes(currentTask.goal)) {
         plan={action:'continue',taskId:currentTask.id,expectedRowVersion:currentTask.rowVersion};
@@ -363,11 +368,13 @@ class ProbeAdapter extends LlmAdapter {
       const clarification=value?.attentions?.find((a:any)=>a.kind==='input'&&a.state==='open'&&!a.id.startsWith('run:'));
       let reply='已核对当前状态。';
       if(value?.gitLabRelease)reply=value.gitLabRelease.detail+'\n'+value.gitLabRelease.url;
-      else if(value?.task?.goal?.startsWith(releaseFixtureGoal)&&value.stage?.observation?.releaseChoices)reply=value.stage.observation.detail;
+      else if(value?.task?.goal?.startsWith(releaseFixtureGoal)&&value.gitLabReleaseQuestion) {
+        reply=value.task.goal.endsWith('/18')?'已核对该流水线。':value.gitLabReleaseQuestion;
+      }
       else if(ownerAction&&prior?.action==='session-inspect'&&typeof value?.confirmationText==='string')reply=value.confirmationText;
       else if(ownerAction&&prior?.action===ownerAction&&typeof value?.confirmationText==='string')reply=value.confirmationText;
       else if(ownerAction&&prior?.action===ownerAction&&successfulTool)reply=ownerAction==='accept'?'已接受该成果。':'已完成此次操作。';
-      else if(namedFollowup&&prior?.action==='clarify'&&successfulTool)reply=clarify;
+      else if(namedFollowup&&prior?.action==='clarify'&&typeof value?.confirmationText==='string')reply=`${clarify}\n${value.confirmationText}`;
       else if(namedFollowup&&prior?.action==='cancel'&&successfulTool&&value?.task?.lifecycle==='cancelled')reply=wiringCancelled;
       else if(namedFollowup&&prior?.action==='pause'&&successfulTool&&value?.task?.controlMode==='paused')reply=wiringPaused;
       else if((namedFollowup||continuationNotice)&&prior?.action==='continue'&&successfulTool)reply=value?.message??reply;

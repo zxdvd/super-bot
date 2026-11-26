@@ -45,7 +45,10 @@ test('discovery asks once for distinct selectable names but never swaps to a ret
   const discover=(jobs:unknown[])=>discoverRelease(condition,{},async(path)=>({code:200,data:path.includes('merge_requests')?
     {iid:11,project_id:21,target_project_id:21,web_url:mr,state:'merged',merge_commit_sha:sha,target_branch:'main'}:
     path.includes('/jobs?')?jobs:[pipeline]}),signal);
-  assert.deepEqual((await discover([job,{...job,id:46,name:'deploy-preview'}])).releaseChoices,['publish-artifact','deploy-preview']);
+  const named={...job,id:46,name:'blue',stage:'check',web_url:origin+'/fixture/release/-/jobs/46'};
+  const alreadyDone={...job,id:50,name:'deploy-latest',status:'success',web_url:origin+'/fixture/release/-/jobs/50'};
+  const observed=await discover([job,named,alreadyDone]);
+  assert.deepEqual(observed.releaseChoices?.map(({jobId,name})=>({jobId,name})),[{jobId:44,name:job.name},{jobId:46,name:'blue'}]);
   assert.equal((await discover([job,{...job,id:46}])).releaseJob,undefined);
 });
 
@@ -56,7 +59,13 @@ test('a Job name or deploy stage alone cannot prove a deployment and exact selec
     path.includes('merge_requests')?merger:path.includes('/jobs?')?[cleanup]:path.includes('/ci/lint')?
       {...lint,merged_yaml:'release-cleanup:\n  environment:\n    name: fixture\n    action: stop\n'}:[pipeline]}),signal);
   assert.equal(unsafe.releaseJob,undefined);
-  assert.deepEqual(unsafe.releaseChoices,['release-cleanup']);
+  assert.deepEqual(unsafe.releaseChoices?.map(choice=>choice.name),['release-cleanup']);
+  const blue={...job,id:46,name:'blue',stage:'check',status:'running',web_url:origin+'/fixture/release/-/jobs/46'};
+  const actualDeployment=await discoverRelease(condition,{},async(path)=>({code:200,data:
+    path.includes('merge_requests')?merger:path.includes('/jobs?')?[cleanup,blue]:path.includes('/ci/lint')?
+      {...lint,merged_yaml:'blue:\n  environment:\n    name: 合成环境\n    action: start\n'}:[pipeline]}),signal);
+  assert.equal(actualDeployment.releaseJob?.jobId,46);
+  assert.equal(actualDeployment.stateLabel,'running');
   let pages=0;
   const named=await discoverRelease(condition,{jobName:job.name},async(path)=>({code:200,data:
     path.includes('merge_requests')?merger:path.includes('/jobs?')?(++pages===1?
@@ -171,27 +180,39 @@ test('formal authorization cannot move between bots, stage versions or MR refere
   assert.equal(store.gitLabReleaseForStage(old.id),null);
 });
 
-test('even an erroneous publish or select tool call cannot authorize a read-only message or unrelated reply',t=>{
+test('structured release choices require a current observed object and preserve the real owner message',t=>{
   const store=new Store(':memory:');
   t.after(()=>store.close());
   const {bot,task,old,source}=arrange(store,'intent');
-  const attempt=(text:string,intent:'publish'|'select',seq:number,jobName?:string)=>
+  const second=arrange(store,'foreign');
+  const attempt=(seq:number,selection?:{observedAt:number;target:ReleaseTarget},sessionId=source.sessionId)=>
     store.advanceStage('intent-'+seq,bot.id,task.id,store.getTask(task.id).rowVersion,old.id,'Publish',condition,origin,false,
-      {release:{source:{...source,seq,text},intent,jobName}});
-  for (const [n,text] of [
-    '只查 !11 现在能不能发布，先不要发布',
-    '发布完了吗',
-    '如果现在发布会怎样',
-    '引述“现在发布”',
-    '谢谢，收到',
-  ].entries()) assert.throws(()=>attempt(text,'publish',20+n),{code:'gitlab-release-scope'});
+      {release:{source:{...source,seq,sessionId,text:'Dann bitte diese Variante.'},intent:'select',jobName:job.name,selection}});
   assert.throws(()=>store.createTask('bad-grant',{botId:bot.id,goal:'Publish',scope:'Fixture',acceptance:'Result',reviewPolicy:'human'},
-    {...source,text:'只查，先不要发布 '+mr},undefined,{reference:mr}),{code:'gitlab-release-scope'});
-  attempt(source.text,'publish',30);
+    {...source,text:'The exact link is '+mr+'1'},undefined,{reference:mr}),{code:'gitlab-release-scope'});
+  const created=store.createTask('exact-grant',{botId:bot.id,goal:'Publish',scope:'Fixture',acceptance:'Result',reviewPolicy:'human'},
+    {...source,text:'この件をお願いします '+mr},undefined,{reference:mr,jobName:job.name});
+  assert.equal(store.gitLabTaskAuthorization(created.id,mr)?.jobName,job.name);
+  store.advanceStage('discover',bot.id,task.id,store.getTask(task.id).rowVersion,old.id,'Publish',condition,origin,false,
+    {release:{source,intent:'clarify'}});
   const due=store.dueStages(4)[0]!;
-  store.recordStageObservation(due,{state:'unsatisfied',detail:'Please select',releaseChoices:[job.name]},due.checkAt);
-  for(const [n,text] of ['谢谢，收到','不，这个先不要','先查看 '+job.name].entries()) {
-    assert.throws(()=>attempt(text,'select',31+n,job.name),{code:'gitlab-release-scope'});
-  }
-  assert.equal(attempt('对，按这个发布。','select',36,job.name).stage.state,'waiting');
+  store.recordStageObservation(due,{state:'unsatisfied',detail:'Please select',releaseChoices:[target]},due.checkAt);
+  assert.throws(()=>attempt(20),{code:'gitlab-release-scope'});
+  assert.throws(()=>attempt(21,{observedAt:due.checkAt-1,target}),{code:'gitlab-release-scope'});
+  assert.throws(()=>attempt(22,{observedAt:due.checkAt,target:{...target,jobId:45}}),{code:'gitlab-release-scope'});
+  assert.throws(()=>attempt(23,{observedAt:due.checkAt,target},second.source.sessionId),{code:'gitlab-release-scope'});
+  assert.equal(attempt(24,{observedAt:due.checkAt,target}).stage.state,'waiting');
+  const saved=store.gitLabReleaseForStage(old.id);
+  assert.equal(saved?.source.text,'Dann bitte diese Variante.');
+  assert.equal(saved?.retryTarget?.jobId,target.jobId);
+
+  store.advanceStage('foreign-discover',second.bot.id,second.task.id,store.getTask(second.task.id).rowVersion,second.old.id,
+    'Publish',condition,origin,false,{release:{source:second.source,intent:'clarify'}});
+  const secondDue=store.dueStages(4).find(item=>item.runId===second.old.id)!;
+  store.recordStageObservation(secondDue,{state:'unsatisfied',detail:'Please select',releaseChoices:[target]},secondDue.checkAt);
+  const direct=store.advanceStage('foreign-directed',second.bot.id,second.task.id,store.getTask(second.task.id).rowVersion,
+    second.old.id,'Publish',condition,origin,false,{release:{source:{...second.source,seq:30,text:'Run the artifact entry I named.'},
+      intent:'publish',jobName:job.name}});
+  assert.equal(direct.stage.state,'waiting','a new explicit request for an exact job needs no displayed option');
+  assert.equal(store.gitLabReleaseForStage(second.old.id)?.jobName,job.name);
 });

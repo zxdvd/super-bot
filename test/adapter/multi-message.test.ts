@@ -117,7 +117,8 @@ test('same-turn active Worker additions preserve exact same-task sources in orde
     await assert.rejects(f.call('earlier-replace',{...separate,directionChange:'replace'}),{code:'direction-stale'});
     await assert.rejects(f.call('earlier-inactive',{...separate,taskId:inactive.id,userInstruction:'Inspect Inactive release.',
       expectedRowVersion:f.store.getTask(inactive.id).rowVersion}),{code:'direction-stale'});
-    await assert.rejects(f.call('earlier-unclear',{...separate,userInstruction:staging.trim()}),{code:'direction-target'});
+    await assert.rejects(f.call('earlier-linked-elsewhere',{...separate,taskId:task.id,
+      expectedRowVersion:f.store.getTask(task.id).rowVersion}),{code:'control-task-link'});
     const receipt=await f.call('separate-task',separate);
     assert.equal(receipt.directionStatus,'next-run');
     assert.deepEqual(await f.call('repeat-separate',separate),receipt);
@@ -195,11 +196,14 @@ test('a named task selection carries the original direction once and leaves the 
     const choices=await f.call('clarify',{action:'clarify',taskIds:[image.id,checks.id],followUp:'continue'});
     assert.deepEqual(choices.choices,['现有实例镜像升级','首发资源预检']);
     assert.doesNotMatch(JSON.stringify(choices),/https?:|[a-f0-9-]{36}/);
-    f.emit({type:'turn/end',data:{turn:1,reason:{kind:'completed'}}});
+    f.emit({type:'assistant/message',seq:4,surfaceOp:'append',data:{turn:1,
+      message:{source:{kind:'model'},content:[{type:'text',text:choices.confirmationText}]},
+      stream:[{type:'chunk',chunk:{type:'finish',reason:{kind:'stop'}}}]}});
+    f.emit({type:'turn/end',seq:5,data:{turn:1,reason:{kind:'completed'}}});
     f.emit({type:'turn/start',data:{turn:2}});
     f.native('selection',7,'先处理镜像升级。');
     const args={action:'continue',taskId:image.id,expectedRowVersion:f.store.getTask(image.id).rowVersion,
-      userInstruction:'先处理镜像升级。',useClarification:true,selectionText:'镜像升级',continuationMode:'read-only'};
+      userInstruction:'先处理镜像升级。',choice:1,continuationMode:'read-only'};
     await assert.rejects(f.call('wrong-selection',{...args,taskId:checks.id,
       expectedRowVersion:f.store.getTask(checks.id).rowVersion}),{code:'clarification-selection'});
     assert.equal((await f.call('continue',args)).status,'waiting');
@@ -212,7 +216,7 @@ test('a named task selection carries the original direction once and leaves the 
     f.emit({type:'turn/end',data:{turn:2,reason:{kind:'completed'}}});
     f.emit({type:'turn/start',data:{turn:3}});
     f.native('later',11,'首发资源预检');
-    await assert.rejects(f.call('later-selection',{...args,taskId:checks.id,userInstruction:'首发资源预检',selectionText:'首发资源预检'}),
+    await assert.rejects(f.call('later-selection',{...args,taskId:checks.id,userInstruction:'首发资源预检',choice:2}),
       {code:'clarification-stale'});
     assert.equal(f.store.recoveryInstruction(checks.id),null);
   } finally {await f.close();}
@@ -231,10 +235,13 @@ test('a one-character exact name resolves overlapping task names and uses the or
     f.emit({type:'turn/start',data:{turn:1}});f.native('answer',3,'用中文。');
     const choices=await f.call('clarify',{action:'clarify',taskIds:[a.task.id,b.task.id],followUp:'respond'});
     assert.deepEqual(choices.choices,['甲','甲项目']);
-    f.emit({type:'turn/end',data:{turn:1,reason:{kind:'completed'}}});
+    f.emit({type:'assistant/message',seq:4,surfaceOp:'append',data:{turn:1,
+      message:{source:{kind:'model'},content:[{type:'text',text:choices.confirmationText}]},
+      stream:[{type:'chunk',chunk:{type:'finish',reason:{kind:'stop'}}}]}});
+    f.emit({type:'turn/end',seq:5,data:{turn:1,reason:{kind:'completed'}}});
     f.emit({type:'turn/start',data:{turn:2}});f.native('select',6,'甲。');
     const applied=await f.call('respond',{action:'respond',taskId:a.task.id,attentionId:a.pendingQuestions[0]!.id,
-      expectedRowVersion:a.task.rowVersion,useClarification:true});
+      expectedRowVersion:a.task.rowVersion,choice:1});
     assert.equal(applied.input.content,'用中文。\n\n甲。');
     assert.equal(f.store.pendingInput(b.task.id),null);
     assert.equal(f.store.taskDetail(b.task.id).pendingQuestions.length,1);
@@ -264,7 +271,8 @@ test('an explicit scoped resume is atomic and a later generic confirmation keeps
     assert.equal(f.store.getTask(task.id).controlMode,'auto');
     f.emit({type:'turn/end',data:{turn:2,reason:{kind:'completed'}}});
     f.emit({type:'turn/start',data:{turn:3}});f.native('continue',7,'继续。');
-    const confirmation={action:'continue',taskId:task.id,userInstruction:'继续。',expectedRowVersion:f.store.getTask(task.id).rowVersion};
+    const confirmation={action:'continue',taskId:task.id,userInstruction:'继续。',expectedRowVersion:f.store.getTask(task.id).rowVersion,
+      useLatestDirection:true};
     await assert.rejects(f.call('attempt-to-broaden',{...confirmation,continuationMode:'authorized-work'}),{code:'recovery-scope'});
     assert.equal((await f.call('confirm-existing',confirmation)).status,'waiting');
     const saved=f.store.recoveryInstruction(task.id)!;

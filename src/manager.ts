@@ -12,8 +12,9 @@ import { join } from 'node:path';
 import { createHash } from 'node:crypto';
 import { AppError,requiredText,optionalText,type ChatSource,type ManagerBinding,type ManagerEvent,type NewBot,type Bot,type Task,type Run,type Result,type RecoveryDirection,type RecoveryDirectionChange,type RecoveryInstruction,botDraft } from './model.ts';
 import type { BotDeletionReceipt, Store } from './store.ts';
-import { gitLabObservationOrigin, stageReadyKey, STAGE_CONDITION_SCHEMA, STAGE_GUIDANCE } from './work-stage.ts';
-import { GITLAB_RELEASE_GUIDANCE, exactJobStatus, releaseJobName, releaseJobPath, type ReleaseAuthorization } from './gitlab-release.ts';
+import { gitLabObservationOrigin, stageReadyKey, STAGE_CONDITION_SCHEMA, STAGE_GUIDANCE, type WorkStage } from './work-stage.ts';
+import { GITLAB_RELEASE_GUIDANCE, exactJobStatus, releaseJobName, releaseJobPath,
+  type ReleaseAuthorization, type ReleaseTarget } from './gitlab-release.ts';
 import { gitLabReader } from './gitlab-client.ts';
 import { selectedModel,modelFailureNote,type DshExecution } from './dsh.ts';
 import { previewEvidence,verifyEvidence } from './evidence.ts';
@@ -30,7 +31,7 @@ import type {Attention} from './model.ts';
 import { ReloadAdmission } from './reload-admission.ts';
 import { finalAssistantText, isFeishuSource, isHostContext, isNativeOwner, messageText } from './dsh-chat-events.ts';
 import { FeishuInputs, untilFeishuAbort, type FeishuInput } from './feishu-inputs.ts';
-import { CHAT_WORK_GUIDANCE, CLARIFICATION_ACTIONS, OWNER_WORK_ACTIONS, isOwnerApproval, isOwnerWorkAction, requireOwnerIntent,
+import { CHAT_WORK_GUIDANCE, CLARIFICATION_ACTIONS, OWNER_WORK_ACTIONS, isOwnerWorkAction,
   type ClarificationAction, type OwnerWorkAction } from './chat-work-actions.ts';
 
 declare module '@deepseek-ai/dsh-llm' {
@@ -74,52 +75,52 @@ const WORK_CONTROLS = `Use work controls only for an explicit affirmative reques
 Use pause or resume for automatic management. Use stop with the exact current runId when the user wants to stop this attempt and keep the task resumable. Use close when the user explicitly wants to end the whole task, whether it is still running or has settled. The close action saves the request and arranges any necessary Worker stop and safety checks. Each action requires its own explicit request.
 If a user explicitly resumes the same paused late Job plan and detail.lateJobRecovery is waiting or ready, use resume to keep the plan and its evidence. Host evidence and the next Worker input determine what has actually resumed.
 Report the actual effect. Confirm closure only when task.lifecycle is cancelled. When closeRequest exists, say the closure request is saved and give its current blocker if present. Keep the task paused and keep its history. Do not ask the user to repeat the same closure request after the Worker stops.`;
-const CHAT_RECOVERY = `Keep the whole recovery conversation here. List work and read current detail before routing a follow-up. Select the task and, if applicable, the current Worker question using its name, the pending question and the meaning of the user's message. Never ask the user to provide an ID, link, confirmation checkbox or a copy for the Worker. A link they already supplied limits the target. When multiple tasks genuinely match an affirmative follow-up or answer, call clarify with their taskIds and followUp (continue or respond). Ask which task, by name, and wait. When the user chooses, call the appropriate action with useClarification:true and selectionText (the exact part of their current message that names the selected task). The tool preserves their original words. If the question is stale or the user changed subjects or gave a new direction, reassess from current detail and the latest message.
+const CHAT_RECOVERY = `Keep the recovery conversation here. List work and read current detail before routing a follow-up. Use task names, pending questions and the whole owner message to determine the target. A supplied work link limits the target. Ask which item only when more than one remains plausible. Follow the task-selection and confirmation rules below.
 Use continue with the current version and userInstruction copied from the latest owner message to add directions to an active or blocked task or proceed after a failed or uncertain attempt. Pending directions accumulate in order. Only set directionChange when the owner explicitly replaces or revokes a pending direction. Use the matching detail.recoveryInstruction.directions IDs, or omit directionIds only when the owner expressly means all pending directions. Replacing requires a concrete new direction. Revoking takes no continuationMode. Ask one specific question if the requested target is ambiguous. Use directionStatus and message to distinguish recorded, next-run, queued, entered and delivery-unknown. Say that the Worker received the directions only when directionStatus is entered.
 If several owner messages entered this same Manager turn, include any earlier concrete additions for the same task in earlierDirections in their original order, with their exact text and scope. Leave unrelated messages and messages directing a different task out of it. A separate earlier message that identifies a different still-active task by name or work link can be saved with useEarlierDirection:true and its exact userInstruction. Both options are only for additive submissions.
 Set continuationMode to read-only when the owner specifically asks for inspection. Use authorized-work only for a concrete, affirmative request within the saved authorization. Leave it unset and useLatestDirection:true when the owner simply confirms the pending directions. When the same message explicitly resumes a paused task and names a concrete next step, set resumeManagement:true on continue. Use respond for an answer to a current question and close to honor an explicit request to end the task. An explicit request to continue does not expand permissions, reopen a cancelled task or prove that an external operation did not occur. Do not use dispatch to replay the original goal. State what ended, what actually happened, what is still blocked, and who can supply the specific missing decision or permission. Preserve even partial observed external effects. A prior approval, a notice, a failed write or a tool denial cannot authorize a new external action. Do not ask someone to recheck execution evidence the Bot can establish, or repeat an unchanged request for help.`;
 
 type OwnerSource = ChatSource & {feishu?:FeishuInput};
-type Clarification = {
+type DisplayedQuestion = {
   turn:number;
-  action:ClarificationAction;
   source:ChatSource;
-  options:{taskId:string;name:string;rowVersion:number;attentionId?:string;resultId?:string;label?:string}[];
+  question?:string;
+  finalSeq?:number;
+  shown?:true;
   selectionTurn?:number;
+  noticeMessageId?:string;
+};
+type Clarification = DisplayedQuestion & {
+  action:ClarificationAction;
+  options:{taskId:string;name:string;rowVersion:number;attentionId?:string;resultId?:string;label?:string}[];
 };
 
 type SessionChoice = { sessionId:string; title:string; cwd:string; updatedAt:number };
-type SessionConversation = {
-  taskId:string; rowVersion:number; turn:number; source:ChatSource; selectionTurn?:number;
+type SessionConversation = DisplayedQuestion & {
+  taskId:string; rowVersion:number;
   choices:SessionChoice[]; preview?:{title:string;sessionId:string;cwd:string;shown?:true};
 };
-type WorkConfirmation = {
+type WorkConfirmation = DisplayedQuestion & {
   action:'accept'|'recover-and-continue'; taskId:string; rowVersion:number; targetId:string; attentionId?:string;
-  turn:number; source:ChatSource; question:string; finalSeq?:number; shown?:true; selectionTurn?:number;
+  ownerFact?:string;
+};
+type GitLabQuestion = DisplayedQuestion & {
+  taskId:string; rowVersion:number; stageRunId:string; observedAt:number; choices:ReleaseTarget[];
 };
 
 function chatSource({sessionId,messageId,seq,text}:OwnerSource):ChatSource {
   return {sessionId,messageId,seq,text};
 }
 
-function choiceName(text:string):string {
-  return text.normalize('NFKC').toLowerCase().replace(/[\p{P}\p{Z}\s]/gu,'');
+function combineChatSources(previous:ChatSource,current:ChatSource):ChatSource {
+  return {...current,text:`${previous.text}\n\n${current.text}`,messages:[
+    ...(previous.messages??[previous]).map(({messageId,seq,text})=>({messageId,seq,text})),
+    {messageId:current.messageId,seq:current.seq,text:current.text},
+  ]};
 }
 
-function selectionIndex(name:string):number {
-  const names=['一','二','三','四','五','六','七','八'];
-  const chinese=/^第([一二三四五六七八1-8])(?:个|项|版)?$/u.exec(name)?.[1];
-  if(chinese)return /^\d$/.test(chinese)?Number(chinese)-1:names.indexOf(chinese);
-  if(/^[1-8]$/.test(name))return Number(name)-1;
-  return ['first','second','third','fourth','fifth','sixth','seventh','eighth'].indexOf(name);
-}
-
-function isChoiceReply(text:string,selection:string):boolean {
-  const start=text.indexOf(selection);
-  if(start<0||/[?？]/u.test(text))return false;
-  const before=choiceName(text.slice(0,start)),after=choiceName(text.slice(start+selection.length));
-  return /^(?:我(?:说的)?(?:是|选)|就(?:是|选|用)|是|选|用|请选|先处理|ichoose|pick|choose|imean)?$/u.test(before)&&
-    /^(?:吧|这个|那个|这项|那项|这份|那份|这个任务|那个任务)?$/u.test(after);
+function selectedOption<T>(options:readonly T[],choice:unknown):T|undefined {
+  return typeof choice==='number'&&Number.isSafeInteger(choice)&&choice>=1?options[choice-1]:undefined;
 }
 
 function matchesContinuationNotice(eventId:string,instructionId:string):boolean {
@@ -127,9 +128,6 @@ function matchesContinuationNotice(eventId:string,instructionId:string):boolean 
   return eventId===original||eventId===`${original}:restart`||eventId===`${original}:settled`;
 }
 
-function simpleContinuation(text:string):boolean {
-  return /^(?:请|那就|好的?)?继续(?:吧|做|执行)?$|^(?:please)?(?:continue|proceed)(?:please)?$/.test(choiceName(text));
-}
 const DELIVERY_GUIDANCE = `If a result is ready, read detail to inspect the relevant file content and check the task's acceptance criteria, then review only if needed. If already delivered, finish without repeating the handoff for a stale notice. After a review that is not rework, call deliver with taskId, resultId and a short text reporting the outcome and any material remaining gap or needed user action. Reply in this conversation with the returned delivery.markdown. It supplies one exact result link covering the whole delivery. Keep that link verbatim. Attachments, named deliverables, full review evidence and acceptance controls are available from the result. Human acceptance is the default. Never claim human acceptance yourself. For a code load claim, check detail.progress.reload and identify the host with a matching receipt for this version.`;
 const DELIVERY_ARTIFACTS = `The Worker can register named external deliverables with ready.links and mark one primaryLink. Omit both fields from deliver to use those defaults. Set primaryLink to the exact registered display name when the user's main next action is clear. Keep evidence and reference URLs in the report. Leave attachment paths and individual URLs out of the short final reply. State the outcome, what the user needs to do, and why any requested openable deliverable is missing. Register an actual deliverable from an older report only if its exact URL appears there. An explicit links map replaces the Worker defaults for this result. For an explicit owner request to change links from a formally delivered current result, read detail for deliveredResult.id and task.rowVersion. Call update_delivery_links with taskId, resultId, expectedRowVersion and only the affected link names, using null to remove a key. Set primaryLink to the new display name or null to clear it. Confirm the update briefly.`;
 const MEMORY_GUIDANCE = 'For questions about saved conventions or past project decisions, start with super_bot_manage memory-index, then use memory-read only for the relevant entry. Cite the returned source Markdown for decisions. Treat decision text as reference. Use memory-save-convention only when the current human explicitly asks to save or replace the Bot’s default for future tasks. Copy only the convention verbatim from that message, and confirm what was saved. A one-time instruction does not change memory. Tasks automatically snapshot the saved default. For an explicit one-time replacement or opt-out, copy the current user’s exact directive into create.conventionOverride. For existing tasks, use the convention in detail.botContext.';
@@ -258,10 +256,46 @@ export class Managers {
     const saved=this.store.get(this.workConfirmationKey(manager));
     if(saved)return JSON.parse(saved) as WorkConfirmation;
   }
-  private nextOwnerSelection<T extends {turn:number;selectionTurn?:number}>(key:string,saved:T|undefined,turn:number):void {
-    if(saved&&turn>saved.turn&&saved.selectionTurn!==turn) {
-      this.store.set(key,saved.selectionTurn===undefined?JSON.stringify({...saved,selectionTurn:turn}):'');
+  private gitLabQuestionKey(manager:ManagerBinding):string {return `manager-gitlab-choice:${manager.id}`;}
+  private getGitLabQuestion(manager:ManagerBinding):GitLabQuestion|undefined {
+    const saved=this.store.get(this.gitLabQuestionKey(manager));
+    if(saved)return JSON.parse(saved) as GitLabQuestion;
+  }
+  private offerGitLabChoices(manager:ManagerBinding,task:Task,stage:WorkStage|null):string|undefined {
+    const observation=stage?.state==='blocked'?stage.observation:undefined;
+    const choices=observation?.releaseChoices?.filter(choice=>!!choice.jobId);
+    if(!stage||!observation||!choices?.length||!manager.sessionId)return;
+    const sessionId=manager.sessionId,question=observation.detail;
+    const previous=this.getGitLabQuestion(manager);
+    const same=previous?.taskId===task.id&&previous.rowVersion===task.rowVersion&&previous.stageRunId===stage.runId&&
+      previous.observedAt===observation.at;
+    if(same&&previous.shown)return question;
+    const turn=this.nativeTurns.get(sessionId);
+    const notice=this.notificationTurns.get(sessionId),owner=this.currentOwner(sessionId);
+    const exactNotice=notice&&notice.turn===turn&&notice.eventId.startsWith(`manager-event:stage-blocked:${stage.runId}:`)&&
+      this.store.managerEventTargets(notice.eventId,notice.messageId,manager.botId,task.id)?notice:undefined;
+    const source=owner?chatSource(owner):exactNotice?this.store.gitLabReleaseForStage(stage.runId)?.source:undefined;
+    if(turn===undefined||!source||source.sessionId!==sessionId||!owner&&previous?.shown)return;
+    this.store.set(this.gitLabQuestionKey(manager),JSON.stringify({
+      turn,source,question,taskId:task.id,rowVersion:task.rowVersion,stageRunId:stage.runId,observedAt:observation.at,choices,
+      ...(exactNotice?{noticeMessageId:exactNotice.messageId}:{}),
+    } satisfies GitLabQuestion));
+    return question;
+  }
+  private shownGitLabChoice(manager:ManagerBinding,task:Task,stage:WorkStage,jobName:string|undefined,owner:OwnerSource) {
+    const shown=this.getGitLabQuestion(manager),target=shown?.choices.find(choice=>choice.name===jobName);
+    if(!shown?.shown||!target||shown.taskId!==task.id||shown.rowVersion!==task.rowVersion||shown.stageRunId!==stage.runId||
+      shown.selectionTurn!==this.nativeTurns.get(owner.sessionId)||shown.source.sessionId!==owner.sessionId||
+      shown.source.seq>=owner.seq||!this.feishuInputs.hasCurrentSource(shown.source,task.botId)) {
+      throw new AppError('gitlab-choice-stale','请在原聊天展示当前作业选项，再按用户的回答选择。');
     }
+    return {observedAt:shown.observedAt,target};
+  }
+  private ownerQuestions(manager:ManagerBinding):[string,DisplayedQuestion|undefined][] {
+    return [[this.clarificationKey(manager),this.getClarification(manager)],
+      [this.sessionConversationKey(manager),this.getSessionConversation(manager)],
+      [this.workConfirmationKey(manager),this.getWorkConfirmation(manager)],
+      [this.gitLabQuestionKey(manager),this.getGitLabQuestion(manager)]];
   }
   private recordOwner(manager:ManagerBinding,turn:number,source:OwnerSource):void {
     if(source.seq<=(this.turnStartSeqs.get(source.sessionId)??-1)||
@@ -270,13 +304,12 @@ export class Managers {
     const previous=this.ownerSources.get(source.sessionId);
     if(previous&&!!previous.feishu!==!!source.feishu)this.mixedOwnerTurns.add(source.sessionId);
     if(!previous||source.seq>previous.seq)this.ownerSources.set(source.sessionId,source);
-    this.nextOwnerSelection(this.clarificationKey(manager),this.getClarification(manager),turn);
-    this.nextOwnerSelection(this.sessionConversationKey(manager),this.getSessionConversation(manager),turn);
-    const workPrompt=this.getWorkConfirmation(manager),key=this.workConfirmationKey(manager);
-    if(workPrompt) {
-      if(turn===workPrompt.turn&&source.seq>workPrompt.source.seq||turn>workPrompt.turn&&(!workPrompt.shown||!isOwnerApproval(source.text))) {
-        this.store.set(key,'');
-      }else this.nextOwnerSelection(key,workPrompt,turn);
+    for(const [key,saved] of this.ownerQuestions(manager)) {
+      if(!saved)continue;
+      if(turn===saved.turn&&source.seq>saved.source.seq)this.store.set(key,'');
+      else if(turn>saved.turn&&saved.selectionTurn!==turn) {
+        this.store.set(key,saved.selectionTurn===undefined?JSON.stringify({...saved,selectionTurn:turn}):'');
+      }
     }
   }
   private retainOwnerInputs(agent:Agent):void {
@@ -288,25 +321,18 @@ export class Managers {
   }
   private clarifiedSource(manager:ManagerBinding,task:Task,data:Record<string,unknown>,owner:OwnerSource):ChatSource {
     const receipt=this.getClarification(manager),source=chatSource(owner);
-    const option=receipt?.options.find(item=>item.taskId===task.id&&(data.action!=='accept'||item.resultId===data.resultId));
-    if(!receipt||!option||receipt.action!==data.action||receipt.selectionTurn!==this.nativeTurns.get(owner.sessionId)||
+    if(!receipt?.shown||receipt.action!==data.action||receipt.selectionTurn!==this.nativeTurns.get(owner.sessionId)||
       receipt.source.sessionId!==source.sessionId||receipt.source.seq>=source.seq||
-      option.rowVersion!==data.expectedRowVersion||
-      !this.feishuInputs.hasCurrentSource(receipt.source,manager.botId)||
-      (data.action==='respond'&&option.attentionId!==data.attentionId)) {
+      !this.feishuInputs.hasCurrentSource(receipt.source,manager.botId)) {
       throw new AppError('clarification-stale','先前的聊天问题或候选任务已改变，请核对当前任务后再向用户提问。');
     }
-    const selection=requiredText(data.selectionText??source.text,'用户选择的任务名称');
-    const name=choiceName(selection);
-    const exact=receipt.options.filter(item=>name&&choiceName(item.name)===name);
-    const matches=exact.length?exact:receipt.options.filter(item=>name.length>=2&&choiceName(item.name).includes(name));
-    const ordinal=selectionIndex(name);
-    if(!isChoiceReply(source.text,selection)||
-      (matches.length!==1||matches[0]!==option)&&receipt.options[ordinal]!==option) {
-      throw new AppError('clarification-selection','请在原聊天请用户用任务名称选定一个候选任务。');
+    const option=selectedOption(receipt.options,data.choice);
+    if(!option||option.taskId!==task.id||data.action==='respond'&&option.attentionId!==data.attentionId||
+      data.action==='accept'&&option.resultId!==data.resultId) {
+      throw new AppError('clarification-selection','所选项目与已展示的候选不一致。');
     }
-    const {messageId,seq,text}=receipt.source;
-    return {...source,text:`${text}\n\n${source.text}`,messages:[{messageId,seq,text},{messageId:source.messageId,seq:source.seq,text:source.text}]};
+    if(option.rowVersion!==data.expectedRowVersion)throw new AppError('clarification-stale','所选任务版本已改变。');
+    return combineChatSources(receipt.source,source);
   }
   private checkWorkLinks(text:string,taskId:string,attentionId?:string,resultId?:string):void {
     for(const url of chatUrls(text.replace(/[，。；、！？「」『』]/gu,' '))) {
@@ -325,28 +351,26 @@ export class Managers {
     turn:number,authorize:()=>void,signal:AbortSignal) {
     const key=this.sessionConversationKey(manager);
     let selected:SessionChoice,requestSource=source;
-    if(data.sessionChoice!==undefined) {
-      const prior=this.getSessionConversation(manager),selection=requiredText(data.selectionText,'用户的选择');
-      const index=selectionIndex(choiceName(selection));
-      if(!prior||prior.preview||prior.taskId!==task.id||prior.rowVersion!==task.rowVersion||prior.selectionTurn!==turn||
-        prior.source.seq>=source.seq||!this.feishuInputs.hasCurrentSource(prior.source,task.botId)||
-        !isChoiceReply(source.text,selection)||index<0||data.sessionChoice!==index+1||!prior.choices[index]) {
+    if(data.choice!==undefined&&data.sessionQuery===undefined) {
+      const prior=this.getSessionConversation(manager),option=prior&&selectedOption(prior.choices,data.choice);
+      if(!prior?.shown||prior.preview||prior.taskId!==task.id||prior.rowVersion!==task.rowVersion||prior.selectionTurn!==turn||
+        prior.source.sessionId!==source.sessionId||prior.source.seq>=source.seq||!this.feishuInputs.hasCurrentSource(prior.source,task.botId)||!option) {
         throw new AppError('session-choice-stale','先前列出的会话或任务版本已经改变，请核对新的会话选择。');
       }
-      selected=prior.choices[index]!;
-      requestSource=prior.source;
+      selected=option;
+      requestSource=combineChatSources(prior.source,source);
     }else {
-      const query=requiredText(data.sessionQuery,'用户提到的会话名称或链接',500);
-      if(!source.text.includes(query))throw new AppError('session-query-source','请用实际用户消息里已有的会话标题或链接。');
+      const query=requiredText(data.sessionQuery,'原生会话的标题或链接',500);
       const url=chatUrls(query)[0];
       const explicitId=url&&url.pathname==='/'&&url.origin===this.webOrigin()&&
         (url.searchParams.get('sessionId')??url.searchParams.get('session'));
+      if(explicitId&&!source.text.includes(query))throw new AppError('session-query-source','链接须来自当前用户消息。');
       const {items}=await this.ctx.sessionController.list({},signal);
       authorize();
       const choices=items.flatMap(item=>{
         const title=item.projections?.values.title;
         if(typeof title!=='string'||!item.cwd||item.origin==='subagent'||item.formatStatus==='migration-required'||
-          (explicitId?item.sessionId!==explicitId:choiceName(title)!==choiceName(query)))return [];
+          (explicitId?item.sessionId!==explicitId:title!==query))return [];
         try{this.store.assertSessionAttachable(task.id,item.sessionId);}
         catch(error){if(error instanceof AppError&&error.code==='session-owned')return [];throw error;}
         return [{sessionId:item.sessionId,title,cwd:item.cwd,updatedAt:item.updatedAt}];
@@ -355,9 +379,10 @@ export class Managers {
       if(!choices.length)throw new AppError('session-unavailable','找不到标题相符且可以关联的原生会话。请核对会话标题或已有链接。');
       if(choices.length>1) {
         if(this.store.getTask(task.id).rowVersion!==task.rowVersion)throw new AppError('version-conflict','任务已经更新，请重新核对。');
-        this.store.set(key,JSON.stringify({taskId:task.id,rowVersion:task.rowVersion,turn,source:requestSource,choices} satisfies SessionConversation));
+        const question=`请选定要关联的会话。\n${choices.map(({title,cwd,updatedAt},i)=>`${i+1}. ${title} · ${cwd} · ${new Date(updatedAt).toISOString()}`).join('\n')}`;
+        this.store.set(key,JSON.stringify({taskId:task.id,rowVersion:task.rowVersion,turn,source:requestSource,choices,question} satisfies SessionConversation));
         return {choices:choices.map(({title,cwd,updatedAt},index)=>({number:index+1,title,cwd,updatedAt})),
-          instruction:'请一次列出序号、目录和时间，让用户在原聊天选择一个会话。'};
+          confirmationText:question};
       }
       selected=choices[0]!;
     }
@@ -366,43 +391,46 @@ export class Managers {
     if(this.store.getTask(task.id).rowVersion!==task.rowVersion)throw new AppError('version-conflict','任务已经更新，请重新核对。');
     if(!preview.quiet)return {title:selected.title,cwd:preview.cwd,quiet:false,reason:preview.reason};
     const next={title:selected.title,sessionId:preview.sessionId,cwd:preview.cwd};
-    this.store.set(key,JSON.stringify({taskId:task.id,rowVersion:task.rowVersion,turn,source:requestSource,choices:[],preview:next} satisfies SessionConversation));
-    return {title:next.title,cwd:next.cwd,quiet:true,confirmationText:
-      `关联「${next.title}」后，本任务的模型可读取完整会话历史，并按任务范围在 ${next.cwd} 读取、写入和编辑文件。关联后保持暂停。你同意上述范围并关联吗？`};
+    const question=`关联「${next.title}」后，本任务的模型可读取完整会话历史，并按任务范围在 ${next.cwd} 读取、写入和编辑文件。关联后保持暂停。你同意上述范围并关联吗？`;
+    this.store.set(key,JSON.stringify({taskId:task.id,rowVersion:task.rowVersion,turn,source:requestSource,choices:[],preview:next,question} satisfies SessionConversation));
+    return {title:next.title,cwd:next.cwd,quiet:true,confirmationText:question};
   }
 
   private async ownerWorkAction(action:OwnerWorkAction,manager:ManagerBinding,task:Task,source:ChatSource,
     data:Record<string,unknown>,authorize:()=>void,signal:AbortSignal) {
     const version=data.expectedRowVersion as number;
-    const ownerText=source.messages?.[0]?.text??source.text;
     const turn=this.nativeTurns.get(source.sessionId)!;
-    const canConfirm=action==='accept'||action==='recover-and-continue';
+    const decision=data.decision;
+    if(decision!==undefined&&((decision!=='ask'&&decision!=='confirm')||!(action==='accept'||action==='recover-and-continue')||
+      decision==='confirm'&&data.choice!==undefined)) {
+      throw new AppError('invalid-input','请选择适用于当前动作的确认方式。');
+    }
+    if(data.ownerFact!==undefined&&action!=='recover'&&action!=='recover-and-continue') {
+      throw new AppError('invalid-input','旧执行的事实只能用于恢复核对。');
+    }
     const targetId=action==='accept'?data.resultId:data.runId;
     const attentionId=action==='recover-and-continue'?data.attentionId:undefined;
-    const key=this.workConfirmationKey(manager),pending=canConfirm?this.getWorkConfirmation(manager):undefined;
-    const confirmed=!data.useClarification&&pending?.selectionTurn===turn&&isOwnerApproval(ownerText)?pending:undefined;
-    if(confirmed&&(!confirmed.shown||confirmed.action!==action||confirmed.taskId!==task.id||confirmed.rowVersion!==version||
-      confirmed.targetId!==targetId||confirmed.attentionId!==attentionId||confirmed.source.seq>=source.seq)) {
+    const key=this.workConfirmationKey(manager),pending=decision===undefined?undefined:this.getWorkConfirmation(manager);
+    const confirmed=decision==='confirm'?pending:undefined;
+    if(decision==='confirm'&&(!confirmed?.shown||confirmed.selectionTurn!==turn||confirmed.action!==action||confirmed.taskId!==task.id||
+      confirmed.rowVersion!==version||confirmed.targetId!==targetId||confirmed.attentionId!==attentionId||
+      confirmed.source.sessionId!==source.sessionId||confirmed.source.seq>=source.seq)) {
       throw new AppError('work-confirmation-stale','刚才询问的操作、目标或版本已经改变。请核对原聊天。');
     }
-    const intent=confirmed?'proceed':requireOwnerIntent(action,ownerText,data.notificationResolution);
-    const fullSource=confirmed?{...source,text:`${confirmed.source.text}\n\n${source.text}`,messages:[
-      ...(confirmed.source.messages??[confirmed.source]).map(({messageId,seq,text})=>({messageId,seq,text})),
-      {messageId:source.messageId,seq:source.seq,text:source.text},
-    ]}:source;
+    const fullSource=confirmed?combineChatSources(confirmed.source,source):source;
     const check=()=>{
       authorize();
       if(confirmed&&!this.feishuInputs.hasCurrentSource(fullSource,task.botId)) {
         throw new AppError('work-confirmation-stale','原确认问题或当前回答的本人来源已经改变。');
       }
     };
-    const ask=(question:string,exactId:string,exactAttention?:string)=>{
-      if(!canConfirm||task.rowVersion!==version)throw new AppError('version-conflict','任务或候选版本已经改变，请重新核对。');
+    const ask=(action:WorkConfirmation['action'],question:string,exactId:string,exactAttention?:string,ownerFact?:string)=>{
+      if(task.rowVersion!==version)throw new AppError('version-conflict','任务或候选版本已经改变，请重新核对。');
       if(pending?.turn===turn&&(pending.action!==action||pending.taskId!==task.id||pending.targetId!==exactId||pending.attentionId!==exactAttention)) {
         throw new AppError('clarification-required','本轮已有一个待确认目标，请在原聊天完成该项核对。');
       }
       this.store.set(key,JSON.stringify({action,taskId:task.id,rowVersion:version,targetId:exactId,attentionId:exactAttention,
-        turn,source,question} satisfies WorkConfirmation));
+        turn,source,question,ownerFact} satisfies WorkConfirmation));
       return {status:'confirmation-required',confirmationText:question};
     };
     const requestId=`chat-work:${createHash('sha256').update(JSON.stringify([source.sessionId,source.messageId,action,task.id])).digest('hex')}`;
@@ -414,19 +442,7 @@ export class Managers {
       if(receipt)return {task:receipt,resultId};
       const detail=this.store.taskDetail(task.id);
       if(task.lifecycle!=='review'||detail.result?.id!==resultId)throw new AppError('result-stale','只能接受该任务当前待验收的成果。');
-      const links=chatUrls(ownerText).filter(url=>url.pathname==='/'&&parseWorkLink(url.hash)?.taskId===task.id);
-      if(!confirmed&&!data.useClarification&&!links.length) {
-        const reviewing=this.store.listTasks({botId:task.botId,lifecycle:'review',limit:100});
-        const named=reviewing.items.filter(item=>choiceName(ownerText).includes(choiceName(item.goal)));
-        if(named.length>0?!named.some(item=>item.id===task.id)||named.length>1:reviewing.total>1) {
-          throw new AppError('clarification-required','有多个待验收成果，请在原聊天列出对应任务并请用户选定。');
-        }
-      }
-      if(detail.deliveredResult?.id&&detail.deliveredResult.id!==resultId&&!confirmed&&!data.useClarification&&
-        !links.some(url=>new URLSearchParams(url.hash.slice(1)).get('resultId')===resultId)) {
-        throw new AppError('result-stale','刚交付的成果已有更新。请在聊天核对最新具体版本再接受。');
-      }
-      if(intent==='confirm')return ask(`是否接受「${task.goal}」的这份成果？${deliveryResultLink(workUrl({kind:'result',taskId:task.id,resultId}),this.webOrigin())}`,resultId);
+      if(decision==='ask')return ask(action,`是否接受「${task.goal}」的这份成果？${deliveryResultLink(workUrl({kind:'result',taskId:task.id,resultId}),this.webOrigin())}`,resultId);
       return {task:await this.execution.accept(requestId,task.id,version,resultId,check,fullSource),resultId};
     }
     if(task.rowVersion!==version)throw new AppError('version-conflict','任务或候选版本已经改变，请重新核对。');
@@ -437,6 +453,13 @@ export class Managers {
       acceptance:data.acceptance===undefined?task.acceptance:optionalText(data.acceptance,'验收条件'),
     },source)};
     if(action==='recover'||action==='recover-and-continue') {
+      const original=confirmed?.source??source;
+      const claim=confirmed?confirmed.ownerFact:data.ownerFact;
+      if(typeof claim!=='string'||!claim.trim()||claim.length>32_000||
+        !(original.messages??[original]).some(message=>message.text.includes(claim))||
+        confirmed&&data.ownerFact!==undefined&&data.ownerFact!==claim) {
+        throw new AppError('recovery-fact','请引用可归属到当前恢复事项的本人事实原文。');
+      }
       const target=this.store.recoveryTarget(task.id,version);
       const runId=requiredText(data.runId,'当前待核对的执行标识',200);
       if(target.run?.id!==runId)throw new AppError('recovery-stale','原执行已经改变，请核对当前确切任务。');
@@ -447,24 +470,22 @@ export class Managers {
       if(action==='recover-and-continue'&&!continuation)throw new AppError('binding-stale','当前会话关联不能续跑。');
       if(continuation) {
         this.store.recoveryTarget(task.id,version,continuation);
-        if(intent==='confirm')return ask(`你对「${task.goal}」上一轮的说明是「${ownerText}」。是否按此完成核对并立即派发下一轮？`,
-          runId,continuation.attentionId);
+        if(decision==='ask')return ask('recover-and-continue',`你对「${task.goal}」上一轮的说明是「${claim}」。是否完成核对并立即派发下一轮？`,
+          runId,continuation.attentionId,claim);
       }
-      const recovered=await this.execution.recover(requestId,task.id,version,true,continuation,check,fullSource);
+      const recovered=await this.execution.recover(requestId,task.id,version,true,continuation,check,fullSource,claim);
       return {task:this.store.getTask(task.id),...('inputId' in recovered?{run:recovered}:{})};
     }
     if(action==='session-prepare')return {binding:await this.execution.prepareSession(requestId,task.id,version,undefined,authorize)};
     if(action==='session-inspect')return this.inspectChatSession(manager,task,source,data,turn,authorize,signal);
     if(action==='session-attach') {
       const conversation=this.getSessionConversation(manager),preview=conversation?.preview;
-      if(!conversation||!preview?.shown||conversation.selectionTurn!==turn||conversation.taskId!==task.id||
-        conversation.rowVersion!==version||conversation.source.seq>=source.seq||
+      if(!conversation||!preview||!(conversation.shown||preview.shown)||conversation.selectionTurn!==turn||conversation.taskId!==task.id||
+        conversation.rowVersion!==version||conversation.source.sessionId!==source.sessionId||conversation.source.seq>=source.seq||
         !this.feishuInputs.hasCurrentSource(conversation.source,task.botId)) {
         throw new AppError('session-preview-stale','请先在原聊天展示当前会话的完整历史和目录授权范围，再接收本人确认。');
       }
-      const previously=conversation.source;
-      const fullSource={...source,messages:[...(previously.messages??[previously]).map(({messageId,seq,text})=>({messageId,seq,text})),
-        {messageId:source.messageId,seq:source.seq,text:source.text}]};
+      const fullSource=combineChatSources(conversation.source,source);
       const binding=await this.execution.attachExistingSession(requestId,{taskId:task.id,expectedRowVersion:version,
         sessionId:preview.sessionId,cwd:preview.cwd,fullHistoryApproved:true,directoryApproved:true,source:fullSource},()=>{
           authorize();
@@ -505,7 +526,7 @@ export class Managers {
       const text=requiredText(item?.text,'用户指令原文',32_000),mode=item?.continuationMode;
       if(mode!=='read-only'&&mode!=='authorized-work')throw new AppError('invalid-input','请核对具体补充指示的授权范围。');
       const source=candidates.find(candidate=>candidate.seq>lastSeq&&candidate.text.trim()===text);
-      if(!source||simpleContinuation(text)||!this.feishuInputs.hasCurrentSource(source,task.botId)) {
+      if(!source||!this.feishuInputs.hasCurrentSource(source,task.botId)) {
         throw new AppError('control-human-text','请按顺序使用本轮中对同一任务的真实补充原文。');
       }
       this.checkWorkLinks(source.text,task.id);
@@ -541,7 +562,9 @@ export class Managers {
          followUp:{type:'string',enum:CLARIFICATION_ACTIONS,description:'Only for clarify. The action the owner is trying to take.'},
          resultIds:{type:'array',items:{type:'string'},minItems:2,maxItems:8,description:'For clarify with followUp accept, exact candidate result IDs when otherwise ambiguous.'},
          sessionQuery:{type:'string',description:'For session-inspect, the session title or existing native link from the owner message.'},
-         sessionChoice:{type:'integer',minimum:1,maximum:8,description:'For session-inspect after owner selects a returned numbered session.'},
+         choice:{type:'integer',minimum:1,maximum:8,description:'The selected index in the options shown to this owner on the previous question. Set only for an actual selection.'},
+         decision:{type:'string',enum:['ask','confirm'],description:'For accept or recover-and-continue. Omit for a clear direct request. Ask only if the decision is unclear. Confirm only in response to the exact question already shown.'},
+         ownerFact:{type:'string',description:'For recover or recover-and-continue, an exact excerpt of the authenticated owner message stating the specific unverified outcome of the prior run. A continuation request alone supplies no fact.'},
          notificationId:{type:'string',description:'For notification-resolve, the current task notification identified in detail.'},
          notificationResolution:{type:'string',enum:['handled','retry-unsent']},
          continuationMode:{type:'string',enum:['read-only','authorized-work'],description:'Only for a concrete current owner instruction. Leave unset for a general request to continue.'},
@@ -554,14 +577,13 @@ export class Managers {
          useEarlierDirection:{type:'boolean',description:'Select an exact earlier owner message in this turn as userInstruction. Only for an additive direction naming or linking its still-active task.'},
          useLatestDirection:{type:'boolean',description:'When the current owner confirms the pending directions without giving a new one.'},
          resumeManagement:{type:'boolean',description:'Only when the current owner expressly resumes a paused task and authorizes a concrete next step in the same message.'},
-         useClarification:{type:'boolean',description:'Only for a direct owner selection after you asked which task they meant. Carry the original request forward.'},
-         selectionText:{type:'string',description:'Exact words that identify the selected task in the current owner message.'},
          links:{type:'object',additionalProperties:{type:['string','null']},description:'Named external deliverables. For deliver supply URLs only. For update_delivery_links send changed keys and null for removals.'},
          primaryLink:{type:['string','null'],description:'For deliver or update_delivery_links. Exact registered display name of the main deliverable, or null to clear it.'},
-         runId:{type:'string',description:'For stop, advance_stage or block_stage. Exact current Run ID from detail.'},
+         runId:{type:'string',description:'Required for stop, advance_stage, block_stage, recover and recover-and-continue. The exact Run ID from detail.run.id. block_stage applies only when stage.state is awaiting-decision. Pause an existing plan with pause.'},
+         attentionId:{type:'string',description:'For respond or recover-and-continue, the exact open question or recovery attention from detail.'},
          entry:{type:'string',description:'Exact relative Markdown entry from memory-index, for memory-read.'},
          conventionOverride:{type:'string',description:'Only for create with a current, explicit one-time replacement or opt-out. Copy that directive verbatim.'},
-         text:{type:'string',description:'Delivery message, or the exact convention to remember from the current user message for memory-save-convention.'},dispatch:{type:'boolean'},taskId:{type:'string'},attentionId:{type:'string'},goal:{type:'string'},scope:{type:'string'},acceptance:{type:'string'},expectedRowVersion:{type:'integer'},resultId:{type:'string'},verdict:{type:'string',enum:['accept','rework','human']},note:{type:'string'},offset:{type:'integer'},query:{type:'string'},workdir:{type:'object',properties:{mode:{type:'string',enum:['existing','isolated','worktree','hook']},path:{type:'string'},repo:{type:'string'},name:{type:'string'},base:{type:'string'},branch:{type:'string'},under:{type:'string'},args:{type:'object',additionalProperties:{type:'string'}}},required:['mode'],additionalProperties:false}},required:['action'],additionalProperties:false},
+         text:{type:'string',description:'Delivery message, or the exact convention to remember from the current user message for memory-save-convention.'},dispatch:{type:'boolean'},taskId:{type:'string'},goal:{type:'string'},scope:{type:'string'},acceptance:{type:'string'},expectedRowVersion:{type:'integer'},resultId:{type:'string'},verdict:{type:'string',enum:['accept','rework','human']},note:{type:'string'},offset:{type:'integer'},query:{type:'string'},workdir:{type:'object',properties:{mode:{type:'string',enum:['existing','isolated','worktree','hook']},path:{type:'string'},repo:{type:'string'},name:{type:'string'},base:{type:'string'},branch:{type:'string'},under:{type:'string'},args:{type:'object',additionalProperties:{type:'string'}}},required:['mode'],additionalProperties:false}},required:['action'],additionalProperties:false},
       output:{schema:{type:'object',additionalProperties:true},render:(_args,value)=>[{type:'text',text:typeof (value as {delivery?:{markdown?:unknown}})?.delivery?.markdown==='string'?String((value as {delivery:{markdown:string}}).delivery.markdown):JSON.stringify(value)}]},
       execute:async(args,exec)=>{
         if(!exec.agent)throw new AppError('manager-scope','缺少管理身份。');
@@ -642,7 +664,7 @@ export class Managers {
           const source=human();
           const override=data.conventionOverride===undefined?undefined:conventionExcerpt(data.conventionOverride,source.messages?.at(-1)??source);
           const releaseFields=data.gitLabRelease as Record<string,unknown>|undefined;
-          let authorizedRelease;
+          let authorizedRelease, releaseSource;
           if(releaseFields!==undefined) {
             const {owner}=ownerAction();
             if(!releaseFields||releaseFields.intent!=='publish'||data.userInstruction!==owner.text.trim()||
@@ -651,8 +673,9 @@ export class Managers {
             }
             authorizedRelease={reference:requiredText(releaseFields.reference,'GitLab 合并请求链接',1000),
               jobName:releaseJobName(releaseFields.jobName),requiresJobName:releaseFields.requiresJobName===true};
+            releaseSource=chatSource(owner);
           }
-          const created=this.store.createTask(requestId,{botId:bot.id,goal:requiredText(data.goal,'目标'),scope,acceptance,reviewPolicy:'human',...(workdir?{workdir}:{})},source,override,authorizedRelease);
+          const created=this.store.createTask(requestId,{botId:bot.id,goal:requiredText(data.goal,'目标'),scope,acceptance,reviewPolicy:'human',...(workdir?{workdir}:{})},releaseSource??source,override,authorizedRelease);
           if(!oneStep)return {task:created};
           authorize();const started=await this.startCreated(requestId,created.id,exec.agent,authorize);
           return {task:this.store.getTask(created.id),...started};
@@ -666,7 +689,6 @@ export class Managers {
             chatUrls(owner.text).some(url=>url.pathname==='/'&&new URLSearchParams(url.hash.slice(1)).has('super-bot-task'))) {
             throw new AppError('clarification-scope','请选择当前 Bot 中确实可能对应这条消息的候选任务。');
           }
-          if(action==='accept')requireOwnerIntent(action,owner.text);
           const options=ids.map(id=>{
             const result=exactResults?this.store.resultById(requiredText(id,'候选成果标识',200)):null;
             if(exactResults&&!result)throw new AppError('result-stale','该候选成果已经无法核对。');
@@ -684,10 +706,11 @@ export class Managers {
               ...(action==='accept'&&candidateResult?{resultId:candidateResult.id,
                 label:`${candidate.goal} · ${candidateResult.id===detail.result?.id?'当前':'历史'}成果 · ${candidateResult.summary.slice(0,100)}`}:{})};
           });
-          const receipt:Clarification={turn,action,source:chatSource(owner),options};
+          const numberedChoices=options.map((item,index)=>({number:index+1,label:item.label??item.name}));
+          const question=`请选定要处理的项目。\n${numberedChoices.map(({number,label})=>`${number}. ${label}`).join('\n')}`;
+          const receipt:Clarification={turn,action,source:chatSource(owner),options,question};
           this.store.set(this.clarificationKey(manager),JSON.stringify(receipt));
-          return {choices:options.map(item=>item.name),numberedChoices:options.map((item,index)=>({number:index+1,label:item.label??item.name})),
-            instruction:'按给定顺序列出编号和名称，请用户在原聊天选定一项。'};
+          return {choices:options.map(item=>item.name),numberedChoices,confirmationText:question};
         }
         const task=this.store.getTask(requiredText(data.taskId,'任务标识',200));
         if(task.botId!==bot.id)throw new AppError('manager-scope','只能查看或管理自己负责的任务。');
@@ -701,7 +724,8 @@ export class Managers {
           if(!Number.isSafeInteger(data.expectedRowVersion)||Number(data.expectedRowVersion)<1) {
             throw new AppError('version-conflict','请使用当前任务的版本。');
           }
-          const source=data.useClarification?this.clarifiedSource(manager,task,data,owner):chatSource(owner);
+          const sessionChoice=data.action==='session-inspect'&&data.sessionQuery===undefined;
+          const source=data.choice!==undefined&&!sessionChoice?this.clarifiedSource(manager,task,data,owner):chatSource(owner);
           const authorizeOwner=()=>{
             check();
             if(this.store.getTask(task.id).botId!==bot.id||!this.feishuInputs.hasCurrentSource(source,bot.id)) {
@@ -750,13 +774,20 @@ export class Managers {
             }
             const recorded=this.store.taskDetail(task.id).stage;
             const jobName=releaseJobName(fields.jobName);
-            release=actionOwner?{source:chatSource(actionOwner.owner),intent,jobName,requiresJobName:fields.requiresJobName===true}:
+            if(intent==='select'&&(!actionOwner||!recorded||recorded.runId!==runId||task.rowVersion!==version)) {
+              throw new AppError('gitlab-choice-stale','该作业选项、任务版本或原聊天已经改变。');
+            }
+            const selection=intent==='select'?this.shownGitLabChoice(manager,task,recorded!,jobName,actionOwner!.owner):undefined;
+            check();
+            release=actionOwner?{source:chatSource(actionOwner.owner),intent,jobName,requiresJobName:fields.requiresJobName===true,
+              ...(selection?{selection}:{})}:
               intent==='publish'&&recorded?this.store.gitLabTaskAuthorization(task.id,recorded.evidenceRef)??undefined:undefined;
             if(!release)throw new AppError('gitlab-release-scope','需要原 Bot 对话对当前任务版本的明确发布授权。');
           }
           const saved=this.store.advanceStage(requestId,bot.id,task.id,version,runId,data.nextStep,data.condition,
             gitLabObservationOrigin(this.options.gitLabObserverOrigin),retrying,
             replacing||release?{...(replacing?{source:chatSource(actionOwner!.owner)}:{}),...(release?{release}:{})}:undefined);
+          if(release?.selection)this.store.set(this.gitLabQuestionKey(manager),'');
           if(saved.stage.state!=='ready')return saved;
           const latest=this.store.taskDetail(task.id);
           if(latest.task.rowVersion!==saved.task.rowVersion) {
@@ -793,7 +824,7 @@ export class Managers {
             checkRecoveryNotice();
             if(data.userInstruction!==undefined||data.continuationMode!==undefined||data.directionChange!==undefined||data.stageFollowUp!==undefined||data.lateJobFollowUp!==undefined||
               data.directionIds!==undefined||data.earlierDirections!==undefined||data.useEarlierDirection!==undefined||
-              data.useClarification||data.useLatestDirection||data.resumeManagement) {
+              data.choice!==undefined||data.ownerFact!==undefined||data.useLatestDirection||data.resumeManagement) {
               throw new AppError('recovery-scope','自动通知不能补充用户指令。');
             }
             const instruction=this.pendingRecoveryInstruction(task.id);
@@ -813,6 +844,9 @@ export class Managers {
             return {...outcome,directionStatus:current?.id===instruction.id?this.store.recoveryDirectionStatus(current):'archived'};
           }
           const {owner,check}=ownerAction();
+          if(data.ownerFact!==undefined||data.decision!==undefined) {
+            throw new AppError('recovery-scope','沿用授权不会核对旧执行的外部效果。');
+          }
           const instruction=requiredText(data.userInstruction,'用户指令原文');
           const mode=data.continuationMode;
           if(mode!==undefined&&mode!=='read-only'&&mode!=='authorized-work')throw new AppError('invalid-input','请核对当前具体指示的授权范围。');
@@ -829,24 +863,22 @@ export class Managers {
           }
           const change:RecoveryDirectionChange|undefined=changeKind?{kind:changeKind,...(ids?{ids:ids as string[]}:{})}:undefined;
           const useEarlier=data.useEarlierDirection===true;
-          if(useEarlier&&(!mode||change||data.earlierDirections!==undefined||data.useClarification||data.useLatestDirection||data.resumeManagement)) {
+          if(useEarlier&&(!mode||change||data.earlierDirections!==undefined||data.choice!==undefined||data.useLatestDirection||data.resumeManagement)) {
             throw new AppError('direction-stale','同轮较早的指示只能用于追加正在执行的工作。');
           }
           if(!useEarlier&&instruction!==owner.text.trim())throw new AppError('control-human-text','请使用当前用户消息的完整原文。');
           this.checkWorkLinks(instruction,task.id);
           const source=useEarlier?this.earlierDirections([{text:instruction,continuationMode:mode}],owner,task)![0]!.source
-            :data.useClarification?this.clarifiedSource(manager,task,data,owner):chatSource(owner);
-          const taskName=useEarlier?choiceName(task.goal):'';
-          if(useEarlier&&!(taskName&&choiceName(source.text).includes(taskName))&&
-            !chatUrls(source.text).some(url=>url.pathname==='/'&&parseWorkLink(url.hash)?.taskId===task.id)) {
-            throw new AppError('direction-target','同轮较早的独立指示需要包含任务名称或工作链接。');
-          }
-          if(data.earlierDirections!==undefined&&(change||data.useClarification)) {
+            :data.choice!==undefined?this.clarifiedSource(manager,task,data,owner):chatSource(owner);
+          if(data.earlierDirections!==undefined&&(change||data.choice!==undefined)) {
             throw new AppError('invalid-input','合并同轮的补充消息仅适用于已确定任务的追加指示。');
           }
           const earlier=this.earlierDirections(data.earlierDirections,owner,task);
-          const keepDirection=data.useLatestDirection===true||simpleContinuation(source.messages?.[0]?.text??source.text);
+          const keepDirection=data.useLatestDirection===true;
           if(mode&&keepDirection)throw new AppError('recovery-scope','用户确认继续时沿用上一条具体指示，请勿添加新的授权范围。');
+          if(!mode&&!keepDirection&&!change&&stageFollowUp!=='revoke') {
+            throw new AppError('invalid-input','请选择新指示的工作范围，或明确沿用已有授权。');
+          }
           if(keepDirection&&!stageFollowUp&&!data.resumeManagement&&['awaiting-decision','waiting','ready'].includes(task.stageState??'')) {
             const detail=this.store.taskDetail(task.id);
             if(task.rowVersion!==data.expectedRowVersion)throw new AppError('version-conflict','任务或阶段已经更新。');
@@ -902,7 +934,7 @@ export class Managers {
           authorizeControl();
           const instruction=requiredText(data.userInstruction,'用户指令原文');
           if(instruction!==owner.text.trim())throw new AppError('control-human-text','请提供当前用户消息的完整原文，包括其中的链接。');
-          const targetSource=data.useClarification?this.clarifiedSource(manager,task,data,owner):chatSource(owner);
+          const targetSource=data.choice!==undefined?this.clarifiedSource(manager,task,data,owner):chatSource(owner);
           this.checkWorkLinks(targetSource.text,task.id);
           const rowVersion=data.expectedRowVersion as number;
           if(data.action==='stop') {
@@ -918,7 +950,7 @@ export class Managers {
         if(data.action==='respond'||data.action==='rework') {
           const currentInput=human();
           const {owner}=ownerAction();
-          const source=data.useClarification?this.clarifiedSource(manager,task,data,owner):currentInput;
+          const source=data.choice!==undefined?this.clarifiedSource(manager,task,data,owner):currentInput;
           if(data.action==='respond') {
             const attentionId=requiredText(data.attentionId,'问题标识',200);
             if(!this.store.taskDetail(task.id).attentions.some(item=>item.id===attentionId))throw new AppError('manager-scope','问题不属于当前任务。');
@@ -970,7 +1002,10 @@ export class Managers {
           const pendingQuestions=current.pendingQuestions.filter(question=>!questionEvent||question.id===questionEvent);
           const result=current.result,humanAcceptanceRequired=current.task.lifecycle==='review';
           const links=result?deliveryLinks(task.id,result.id,result.evidence.map(file=>file.path)):null;
-          const {stages:_stageHistory,...snapshot}=current;
+          const {stages:_stageHistory,stage,...snapshot}=current;
+          const gitLabReleaseQuestion=this.offerGitLabChoices(manager,current.task,current.stage);
+          const {releaseChoices,...observation}=stage?.observation??{};
+          const visibleStage=releaseChoices&&stage?{...stage,observation}:stage;
           const notifications=this.store.managerNotifications(bot.id,50).filter(item=>item.taskId===task.id&&['unknown','blocked'].includes(item.state))
             .map(item=>{
               const {reason,resultId,preflightFailures,messageId}=JSON.parse(item.payload);
@@ -978,7 +1013,8 @@ export class Managers {
                 ...(typeof resultId==='string'?{resultId}:{}),at:item.createdAt,
                 retryable:item.state==='blocked'&&Number(preflightFailures)===5&&messageId==null};
             });
-          return {...snapshot,stageObserver:{provider:'gitlab',origin:gitLabObservationOrigin(this.options.gitLabObserverOrigin)},
+          return {...snapshot,stage:visibleStage,stageObserver:{provider:'gitlab',origin:gitLabObservationOrigin(this.options.gitLabObserverOrigin)},
+            ...(gitLabReleaseQuestion?{gitLabReleaseQuestion,gitLabReleaseChoices:releaseChoices!.map(choice=>choice.name)}:{}),
             ...(gitLabCurrentStatus?{gitLabCurrentStatus}:{}),
             notifications,
             pendingQuestions:pendingQuestions.map(question=>questionLink(question,origin)),
@@ -1098,36 +1134,26 @@ export class Managers {
       }
       if(event.type==='assistant/message') {
         const manager=this.store.managerForSession(_session.id);
-        const receipt=manager&&this.getSessionConversation(manager),preview=receipt?.preview;
-        const workPrompt=manager&&this.getWorkConfirmation(manager);
-        const text=(preview||workPrompt)&&finalAssistantText(event);
-        if(manager&&receipt&&preview&&!preview.shown&&event.data.turn===receipt.turn&&text&&text.includes(preview.title)&&text.includes(preview.cwd)&&
-          text.includes('完整会话历史')&&text.includes('读取、写入和编辑')&&text.includes('保持暂停')) {
-          this.store.set(this.sessionConversationKey(manager),JSON.stringify({...receipt,preview:{...preview,shown:true}}));
-        }
-        if(manager&&workPrompt&&event.data.turn===workPrompt.turn&&text?.includes(workPrompt.question)&&
-          this.currentOwner(_session.id)?.messageId===workPrompt.source.messageId&&event.seq>workPrompt.source.seq) {
-          this.store.set(this.workConfirmationKey(manager),JSON.stringify({...workPrompt,finalSeq:event.seq}));
+        const text=manager&&finalAssistantText(event),source=text&&this.currentOwner(_session.id);
+        const notice=this.notificationTurns.get(_session.id);
+        if(manager&&text)for(const [key,question] of this.ownerQuestions(manager)) {
+          const sameInput=question?.noticeMessageId
+            ?notice?.messageId===question.noticeMessageId&&!this.userMessages.get(_session.id)?.length
+            :source&&source.messageId===question?.source.messageId;
+          if(question?.question&&event.data.turn===question.turn&&text.includes(question.question)&&
+            sameInput&&event.seq>question.source.seq) {
+            this.store.set(key,JSON.stringify({...question,finalSeq:event.seq}));
+          }
         }
       }
       if(event.type==='turn/end') {
         if(scope&&event.data.reason.kind!=='completed')this.retainOwnerInputs(scope.agent);
         const manager=this.store.managerForSession(_session.id);
-        if(manager&&this.getClarification(manager)?.selectionTurn===event.data.turn) {
-          this.store.set(this.clarificationKey(manager),'');
-        }
-        const sessionConversation=manager&&this.getSessionConversation(manager);
-        if(manager&&sessionConversation&&(sessionConversation.selectionTurn===event.data.turn||
-          sessionConversation.turn===event.data.turn&&event.data.reason.kind!=='completed')) {
-          this.store.set(this.sessionConversationKey(manager),'');
-        }
-        const workPrompt=manager&&this.getWorkConfirmation(manager);
-        if(manager&&workPrompt) {
-          const key=this.workConfirmationKey(manager);
-          if(workPrompt.selectionTurn===event.data.turn)this.store.set(key,'');
-          else if(workPrompt.turn===event.data.turn) {
-            this.store.set(key,event.data.reason.kind==='completed'&&workPrompt.finalSeq!==undefined&&workPrompt.finalSeq<event.seq
-              ?JSON.stringify({...workPrompt,shown:true}):'');
+        if(manager)for(const [key,question] of this.ownerQuestions(manager)) {
+          if(question?.selectionTurn===event.data.turn)this.store.set(key,'');
+          else if(question?.turn===event.data.turn) {
+            this.store.set(key,event.data.reason.kind==='completed'&&question.finalSeq!==undefined&&question.finalSeq<event.seq
+              ?JSON.stringify({...question,shown:true}):'');
           }
         }
         const own=this.notificationTurns.get(_session.id);

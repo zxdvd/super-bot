@@ -1681,10 +1681,10 @@ export class DshExecution {
     }finally{releaseGuard();releaseApproval();}
   }
   async recover(requestId:string,taskId:string,rowVersion:number,acknowledged:unknown,continuation?:RecoveryContinuation,
-    authorize=()=>{},source?:import('./model.ts').ChatSource) {
+    authorize=()=>{},source?:import('./model.ts').ChatSource,ownerFact?:string) {
     if(acknowledged!==true)throw new AppError('confirmation-required','请先检查原生会话、文件和外部效果，再确认核对完成。');
     const action=continuation?'run.continue-recovery':'run.resolve-recovery';
-    const payload={taskId,expectedRowVersion:rowVersion,...continuation,...(source?{source}:{})};
+    const payload={taskId,expectedRowVersion:rowVersion,...continuation,...(source?{source,ownerFact}:{})};
     const receipt=()=>{
       const saved=this.store.commandReceipt<Task|Run>(requestId,action,payload);
       if(!saved||'inputId' in saved)return saved;
@@ -1698,7 +1698,7 @@ export class DshExecution {
     return this.reloadAdmission.run(`Worker task ${taskId} recovery`,async()=>{
       const binding=target.binding;
       if(!binding?.sessionId) {
-        this.store.resolveRunRecovery(requestId,taskId,rowVersion,source);
+        this.store.resolveRunRecovery(requestId,taskId,rowVersion,source,ownerFact);
         await this.advanceClose(taskId,true);
         return this.store.getTask(taskId);
       }
@@ -1723,7 +1723,7 @@ export class DshExecution {
       if(tree!==originalService(this.nativeSubagents()))throw new AppError('child-unknown','原生子树服务已改变，请重新核对。');
       this.assertRecoveryQuiet(agent,target.run?.id);
       if(!continuation) {
-        this.store.resolveRunRecovery(requestId,taskId,rowVersion,source);
+        this.store.resolveRunRecovery(requestId,taskId,rowVersion,source,ownerFact);
         await this.advanceClose(taskId,true);
         return this.store.getTask(taskId);
       }
@@ -1732,7 +1732,7 @@ export class DshExecution {
       const selected=selectedModel(this.ctx,agent);
       const plan=workerModelPlan(selected?modelRoute(selected):null,this.options.workerModel);
       if(!plan)throw modelRequired();
-      const run=this.store.continueRunRecovery(requestId,taskId,rowVersion,continuation,plan,source);
+      const run=this.store.continueRunRecovery(requestId,taskId,rowVersion,continuation,plan,source,ownerFact);
       try {
         configureRole(this.ctx,agent,'worker',this.options);
         if(!selectedModel(this.ctx,agent))throw modelRequired();

@@ -4,12 +4,13 @@ import type { GitLabReply, GitLabRequest } from './gitlab-client.ts';
 import { gitLabObservationOrigin, type StageCondition, type StageObservation } from './work-stage.ts';
 
 export const GITLAB_PLAY_TOOL = 'super_bot_gitlab_play';
-export const GITLAB_RELEASE_GUIDANCE = 'For an affirmative owner authorization to publish after an exact GitLab MR checkpoint, use advance_stage with gitLabRelease.intent publish, current rowVersion and the exact merge condition referenced in stage.evidenceRef. Copy the complete current owner message to userInstruction. For an exact MR URL and publication already explicitly delegated with the original task, specify the same gitLabRelease intent and reference during create, so the saved grant can be used after the checkpoint. If the next step has no clear release target or the owner asks for a particular environment, set requiresJobName true. Pass jobName when the owner named it. When the stage reports a choice, ask once in the original chat, then use intent select and the owner-selected name with the recorded version. A status question or quoted text grants no write. When a possible delegation is ambiguous, use intent clarify so the host identifies the job and waits for an affirmative choice in the original chat. Use detail.gitLabRelease for observed status and its exact job link. If the owner asks for a fresh status check, call detail with refreshGitLabRelease and expectedRowVersion. After explicit owner recovery of a permission denial, use intent retry and detail.gitLabRelease.condition from the earlier job. Never use general continuation, Bash or another job for this action. The host follows the exact job until the receipt or deadline.';
+export const GITLAB_RELEASE_GUIDANCE = 'For an affirmative owner authorization to publish after an exact GitLab MR checkpoint, use advance_stage with gitLabRelease.intent publish, current rowVersion and the exact merge condition referenced in stage.evidenceRef. Copy the complete current owner message to userInstruction. For an exact MR URL and publication already explicitly delegated with the original task, specify the same gitLabRelease intent and reference during create, so the saved grant can be used after the checkpoint. If the next step has no clear release target or the owner asks for a particular environment, set requiresJobName true. Pass jobName when the owner named it. When detail returns gitLabReleaseQuestion, use that compact question verbatim in the visible answer once. Interpret the next owner reply in context and use intent select with the exact name of their chosen displayed job and the recorded version. An explicit new delegation naming a verified exact job can use publish directly. A status question or quoted text grants no write. When a possible delegation is ambiguous, use intent clarify so the host identifies the job and waits for an affirmative choice in the original chat. Use detail.gitLabRelease for observed status and its exact job link. If the owner asks for a fresh status check, call detail with refreshGitLabRelease and expectedRowVersion. After explicit owner recovery of a permission denial, use intent retry and detail.gitLabRelease.condition from the earlier job. Never use general continuation, Bash or another job for this action. The host follows the exact job until the receipt or deadline.';
 export const RELEASE_CHECK_MS = 30_000;
 export const RELEASE_WAIT_MS = 30 * 60_000;
 
 export interface ReleaseAuthorization {
   source: ChatSource; intent: 'publish' | 'select' | 'retry' | 'clarify'; jobName?: string; requiresJobName?: boolean;
+  selection?: { observedAt: number; target: ReleaseTarget };
 }
 export type ReleasePlan = Pick<ReleaseAuthorization, 'jobName'> & { requiresJobName?: boolean; retryTarget?: ReleaseTarget };
 export interface ReleaseTarget {
@@ -52,18 +53,11 @@ export function releaseJobName(value: unknown): string | undefined {
   return value;
 }
 
-export function isDirectiveReleaseSource(text:string):boolean {
-  const source=text.normalize('NFKC').replace(/https:\/\/[^\s<>()]+/gu,'').trim();
-  if(!source||/[?？"“”「」『』`]/u.test(source))return false;
-  const alternative=/不(?:要|用|能|准|允许)|先别|先不|暂不|取消|撤回|引用|转述|\b(?:do not|don't|never|no thanks|quote|cancel|revoke)\b/iu;
-  const inspection=/(?:只|仅)(?:要)?\s*(?:读|查|看|核对|确认)|^(?:请|先|帮我)?\s*(?:查|检查|看看|查看)|\b(?:only check|check only|read[- ]only|lookup only|status)\b/iu;
-  const query=/(?:是否|能不能|怎么办|怎么发布|如果.*(?:怎样|如何|什么)|(?:吗|状态)[。！!\s]*$|\b(?:whether|what if)\b)/iu;
-  const decline=/^(?:不|否|(?:please\s+)?(?:no|check|inspect|show)\b)/iu;
-  return ![alternative,inspection,query,decline].some(pattern=>pattern.test(source));
-}
-export function namesReleaseAction(text:string):boolean {
-  const prose=text.replace(/https:\/\/[^\s<>()]+/gu,'');
-  return /发布|发版|部署|公開|展開|リリース|\b(?:publish|deploy|release|roll\s*out|publier|déployer|publicar|desplegar|veröffentlichen)\b/iu.test(prose);
+export function mergeReferences(prose:string):StageCondition[] {
+  return [...prose.matchAll(/https:\/\/[^\s<>()，。]+/gu)].flatMap(match=>{
+    const reference=exactMergeReference(match[0].replace(/[.,;:!?]+$/u,''));
+    return reference?[reference]:[];
+  });
 }
 
 const object = (value: unknown): Record<string, unknown> =>
@@ -87,7 +81,7 @@ function declaredEnvironments(reply: GitLabReply): Map<string,string> {
       if(job.extends!==undefined||job.parallel!==undefined||
         environment.action!==undefined&&environment.action!=='start')continue;
       const target=typeof job.environment==='string'?job.environment:environment.name;
-      if(typeof target==='string'&&target.length<=120&&/^[\w][\w./ -]*$/u.test(target))result.set(name,target);
+      if(typeof target==='string'&&/^[^\p{Cc}\p{Cf}$]{1,120}$/u.test(target))result.set(name,target);
     }
   }catch{/* Unverifiable configuration can still be corroborated by the owner's exact job choice. */}
   return result;
@@ -118,8 +112,12 @@ export async function discoverRelease(
     return { ...pending(`等待 ${project} !${iid} 合并。`), stateLabel: String(mr.state), releaseMergeOpen: true };
   }
   if (mr.state !== 'merged') return { state: 'unsatisfied', detail: `GitLab 合并请求 !${iid} 状态为 ${String(mr.state)}。` };
+  const sha = mr.merge_commit_sha ?? mr.squash_commit_sha, ref = mr.target_branch, projectId = mr.project_id;
   if (plan.retryTarget) {
     const target = plan.retryTarget;
+    if(target.origin!==origin||target.project!==project||target.projectId!==projectId||target.sha!==sha||target.ref!==ref) {
+      return unavailable(`合并请求 !${iid} 的当前归属或提交与原作业 #${target.jobId} 不匹配。`);
+    }
     const checked = await read(releaseJobPath(target), signal);
     if (!good(checked)) return missing(checked, `先前的发布作业 #${target.jobId}`);
     const status = exactJobStatus(checked.data, target);
@@ -127,7 +125,6 @@ export async function discoverRelease(
     return { state: 'satisfied', stateLabel: status, detail: `已核对原发布作业 #${target.jobId}（${status}）。`,
       url: releaseUrl(target), releaseJob: target };
   }
-  const sha = mr.merge_commit_sha ?? mr.squash_commit_sha, ref = mr.target_branch, projectId = mr.project_id;
   if (typeof sha !== 'string' || !shaPattern.test(sha) || typeof ref !== 'string' || !ref || ref.length > 255) {
     return unavailable(`合并请求 !${iid} 缺少确切合并提交或目标分支，无法核对该次发布流水线。`);
   }
@@ -159,41 +156,38 @@ export async function discoverRelease(
   }
   const deployments=plan.jobName?new Map<string,string>():declaredEnvironments(
     await read(`${base}/ci/lint?content_ref=${sha}`,signal));
-  const possible = jobs.filter(job => {
-    if (typeof job.name !== 'string' || !jobNamePattern.test(job.name)) return false;
-    if (plan.jobName) return job.name === plan.jobName;
-    if (deployments.has(job.name)) return true;
-    const isRelease = typeof job.stage === 'string' && /^(?:deploy(?:ment)?|release|publish|发布|部署)(?:$|[-_ :])/i.test(job.stage) ||
-      /(?:^|[-_ :])(?:deploy|release|publish|发布|部署)(?:$|[-_ :])/i.test(job.name);
-    return isRelease&&job.status==='manual';
-  });
-  const proven=plan.jobName?possible:possible.filter(job=>deployments.has(String(job.name)));
-  const candidates=proven.length?proven:possible;
-  if (!candidates.length) {
-    if (jobs.length === 0) return pending(`等待流水线 #${pipelineId} 创建发布作业。`);
-    return {state:'unsatisfied',detail:`流水线 #${pipelineId} 缺少与已授权范围匹配的发布作业。请提供确切作业名称。`};
-  }
-  if (candidates.length !== 1 || !proven.length || (plan.requiresJobName && !plan.jobName)) {
-    const names = [...new Set(candidates.map(job => String(job.name)))].slice(0, 10);
-    if (names.length !== candidates.length) {
-      return unavailable(`流水线 #${pipelineId} 有同名或重试作业，无法唯一核对本次发布。`);
-    }
-    const labels=names.map(name=>deployments.has(name)?`${name}（${deployments.get(name)}）`:name);
-    return { state: 'unsatisfied', detail: `流水线 #${pipelineId} 需要选定发布作业。请在原聊天确认作业名称：${labels.join('、')}。`,
-      releaseChoices: names };
-  }
-  const job = candidates[0]!, { id: jobId, name } = job;
-  if (!positive(jobId) || typeof name !== 'string') return unavailable(`流水线 #${pipelineId} 的作业身份无效。`);
   const mergedAt=typeof mr.merged_at==='string'?Date.parse(mr.merged_at):NaN;
   const pipelineCreatedAt=typeof pipeline.created_at==='string'?Date.parse(pipeline.created_at):NaN;
-  const jobCreatedAt=typeof job.created_at==='string'?Date.parse(job.created_at):NaN;
-  const newAfterMerge=pipelineCreatedAt>=mergedAt&&jobCreatedAt>=pipelineCreatedAt;
-  const target:ReleaseTarget={ origin, project, projectId, pipelineId, jobId, name, sha, ref,
-    ...(newAfterMerge?{newAfterMerge:true}:{}) };
-  const status = exactJobStatus(job, target);
-  if (!status) return unavailable(`GitLab 未返回流水线 #${pipelineId} 中发布作业 #${jobId} 的匹配身份。`);
-  if (status === 'created') return pending(`等待发布作业 #${jobId} 进入可确认状态。`);
-  return { state: 'satisfied', stateLabel: status, detail: `已核对 ${project} !${iid} 的发布作业 #${jobId}（${status}）。`,
+  const possible=jobs.filter(job=>typeof job.name==='string'&&jobNamePattern.test(job.name)&&
+    (plan.jobName?job.name===plan.jobName:deployments.has(job.name)||job.status==='manual'));
+  const proven=plan.jobName?possible:possible.filter(job=>deployments.has(String(job.name)));
+  const candidates=proven.length?proven:possible;
+  if(!candidates.length) {
+    if(!jobs.length)return pending(`等待流水线 #${pipelineId} 创建发布作业。`);
+    return {state:'unsatisfied',detail:`流水线 #${pipelineId} 缺少与当前范围匹配的手动作业。可提供确切作业名称供核对。`};
+  }
+  if(new Set(candidates.map(job=>job.name)).size!==candidates.length) {
+    return unavailable(`流水线 #${pipelineId} 有同名或重试作业，无法唯一核对本次发布。`);
+  }
+  const verified:{target:ReleaseTarget;status:string}[]=[];
+  for(const job of candidates.slice(0,10)) {
+    if(!positive(job.id)||typeof job.name!=='string')return unavailable(`流水线 #${pipelineId} 的作业身份无效。`);
+    const jobCreatedAt=typeof job.created_at==='string'?Date.parse(job.created_at):NaN;
+    const target:ReleaseTarget={origin,project,projectId,pipelineId,jobId:job.id,name:job.name,sha,ref,
+      ...(pipelineCreatedAt>=mergedAt&&jobCreatedAt>=pipelineCreatedAt?{newAfterMerge:true}:{})};
+    const status=exactJobStatus(job,target);
+    if(!status)return unavailable(`GitLab 未返回流水线 #${pipelineId} 中作业 #${job.id} 的匹配身份。`);
+    verified.push({target,status});
+  }
+  if(candidates.length!==1||!proven.length||plan.requiresJobName&&!plan.jobName) {
+    const labels=verified.map(({target})=>deployments.has(target.name)?`${target.name}（${deployments.get(target.name)}）`:target.name);
+    const more=candidates.length>verified.length?' 也可以提供其他确切作业名称。':'';
+    return {state:'unsatisfied',detail:`流水线 #${pipelineId} 的作业选项 · ${labels.join('、')}。${more}`,
+      releaseChoices:verified.map(item=>item.target)};
+  }
+  const {target,status}=verified[0]!;
+  if(status==='created')return pending(`等待发布作业 #${target.jobId} 进入可确认状态。`);
+  return { state: 'satisfied', stateLabel: status, detail: `已核对 ${project} !${iid} 的发布作业 #${target.jobId}（${status}）。`,
     url: releaseUrl(target), releaseJob: target };
 }
 

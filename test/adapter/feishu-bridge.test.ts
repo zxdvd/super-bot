@@ -383,7 +383,9 @@ test('a saved Feishu clarification loses authority when the current identity cha
   f.incoming('old-owner-direction','先只查线上版本。');
   await tick();
   await a.agent.enter();
-  assert.deepEqual((await f.runTool(a.agent,{action:'clarify',followUp:'continue',taskIds:[first.id,second.id]})).choices,['甲','乙']);
+  const shown=await f.runTool(a.agent,{action:'clarify',followUp:'continue',taskIds:[first.id,second.id]});
+  assert.deepEqual(shown.choices,['甲','乙']);
+  await a.agent.assistant(shown.confirmationText);
   await a.agent.endTurn();
   await f.switchIdentity({appId:'cli_syntheticNew',ownerOpenId:'ou_newOwner'});
   assert.equal(store.db.prepare('SELECT id FROM feishu_group_bindings WHERE botId=?').get(a.bot.id)?.id,f.aa.id);
@@ -391,7 +393,7 @@ test('a saved Feishu clarification loses authority when the current identity cha
   a.agent.followup(f.web('甲。'));
   await a.agent.enter();
   await assert.rejects(f.runTool(a.agent,{action:'continue',taskId:first.id,expectedRowVersion:first.rowVersion,
-    userInstruction:'甲。',continuationMode:'read-only',useClarification:true}),{code:'clarification-stale'});
+    userInstruction:'甲。',continuationMode:'read-only',choice:1}),{code:'clarification-stale'});
   assert.equal(store.recoveryInstruction(first.id),null);
   await a.agent.endTurn();
 });

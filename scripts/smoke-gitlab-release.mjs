@@ -5,7 +5,7 @@ import { chmod, mkdir, readFile, writeFile } from 'node:fs/promises';
 import { createServer } from 'node:https';
 import { delimiter, join } from 'node:path';
 import { approveFixtureDeployment, approveRelease, confirmReleaseChoice, prepareRelease, releaseFixtureGoal,
-  releaseProject, releaseSha, releaseStatusQuestion, restoreReleasePermission } from '../test/gitlab-release-fixture.ts';
+  releaseProject, releaseSha, releaseStatusQuestion, restoreReleasePermission, showReleaseChoices } from '../test/gitlab-release-fixture.ts';
 
 export async function smokeGitLabRelease({ base, configure, launch, stop, call, makeBot, probe, wait }) {
   const cert = join(base, 'gitlab-ca.pem'), key = join(base, 'gitlab-ca.key'), conf = join(base, 'gitlab-ca.conf');
@@ -20,6 +20,7 @@ export async function smokeGitLabRelease({ base, configure, launch, stop, call, 
     [15, { mr: 'merged', job: 'manual', outcome: 'deny' }],
     [16, { mr: 'merged', job: 'manual', outcome: 'success' }],
     [17, { mr: 'merged', job: 'manual', outcome: 'success', readFailures: 1 }],
+    [18, { mr: 'merged', job: 'manual', outcome: 'success' }],
   ]);
   const seen = [], token = 'glpat-isolated-fixture-token';
   let origin;
@@ -93,7 +94,7 @@ export async function smokeGitLabRelease({ base, configure, launch, stop, call, 
       assert.equal((await taskDetail(task)).stage.state, 'awaiting-decision');
       assert.equal(posts(id).length, 0, 'a status question and explicit read-only direction did not authorize release');
     }
-    await probe(host, 'native-prompt', bot.managerId, id === 16 ? approveFixtureDeployment : approveRelease);
+    await probe(host, 'native-prompt', bot.managerId, [16,18].includes(id) ? approveFixtureDeployment : approveRelease);
     return { task, bot, inspect };
   }
   async function reported(test, state, attempts = 400) {
@@ -143,7 +144,10 @@ export async function smokeGitLabRelease({ base, configure, launch, stop, call, 
     await reported(denied, 'success');
     assert.equal(posts(15).length, 2, 'affirmative same-chat recovery follows a definitive provider denial');
     const choice = await fresh(16);
-    await wait(async () => (await choice.inspect()).assistantTexts.some(text => text.includes('确认作业名称：publish-release')),
+    await wait(async () => {
+      const state=await choice.inspect();
+      return state.status==='idle'&&state.assistantTexts.some(text=>text.includes('作业选项 · publish-release'));
+    },
       'original chat distinguishes a proposed deployment scope and requests one business choice');
     assert.equal(posts(16).length, 0);
     await probe(host, 'native-prompt', choice.bot.managerId, confirmReleaseChoice);
@@ -155,6 +159,22 @@ export async function smokeGitLabRelease({ base, configure, launch, stop, call, 
     const released = await reported(recovered, 'success', 550);
     assert.equal(posts(17).length, 1, 'trusted read recovery reclaimed the retained job authorization once');
     assert.equal(beforeClaim.gitLabRelease.deadlineAt, released.gitLabRelease.deadlineAt);
+    const hiddenChoice=await fresh(18);
+    await wait(async () => {
+      const chat=await hiddenChoice.inspect();
+      return chat.status==='idle'&&chat.assistantTexts.includes('已核对该流水线。');
+    },'provider option is recorded but has not appeared to the owner');
+    await probe(host,'native-prompt',hiddenChoice.bot.managerId,confirmReleaseChoice);
+    const rejected=await hiddenChoice.inspect();
+    assert.ok(rejected.toolResults.some(result=>result.message.isError&&
+      result.message.content.some(block=>block.type==='text'&&block.text.includes('请在原聊天展示当前作业选项'))));
+    assert.equal(posts(18).length,0);
+    await probe(host,'native-prompt',hiddenChoice.bot.managerId,showReleaseChoices);
+    await wait(async ()=>(await hiddenChoice.inspect()).assistantTexts.some(text=>text.includes('作业选项 · publish-release')),
+      'explicit question shows the compact choice in the same chat');
+    await probe(host,'native-prompt',hiddenChoice.bot.managerId,confirmReleaseChoice);
+    await reported(hiddenChoice,'success');
+    assert.equal(posts(18).length,1);
     assert.ok(seen.every(item => item.token === token));
     console.log('PASS original DSH chat, same login observation, counted formal job, restart readback, prior effects, and permission recovery');
   } finally {
