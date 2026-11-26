@@ -11,6 +11,8 @@ import { LinkedTaskContent, TaskDefinition, TaskDetailHeader } from '../../src/u
 import { ResultFiles, ResultLinks, ResultLoadReceipt, ResultReport, ResultSummary } from '../../src/ui/work/ResultCard.tsx';
 import { SessionControls } from '../../src/ui/work/SessionControls.tsx';
 import { ReplyForm } from '../../src/ui/work/forms.tsx';
+import { RecoveryPanel } from '../../src/ui/work/RecoveryPanel.tsx';
+import type { Detail } from '../../src/ui/work/types.ts';
 import { WorkMarkdown } from '../../src/ui/work/WorkMarkdown.tsx';
 import { BotPanel } from '../../src/ui/work/BotPanel.tsx';
 import type { WorkspaceState } from '../../src/ui/work/useWorkspace.ts';
@@ -47,6 +49,26 @@ function source(initial?: string) {
 function apiWith(call: WorkspaceApi['call'], opened: string[] = []): WorkspaceApi {
   return { call, openSession: id => { opened.push(id); }, beginNavigation: () => new AbortController().signal, openBot: async () => {} };
 }
+
+test('late Job progress shows the actual wait and only offers manual confirmation when automation is blocked', () => {
+  const f = fixture();
+  try {
+    const w = { locked: false } as WorkspaceState;
+    const recovery = { attentionId: 'run:fixture', canContinue: true, worker: null, jobs: [],
+      subtree: { state: 'clear' as const, children: [] } };
+    const waiting = { ids: ['bash-fixture'], rowVersion: f.ta.rowVersion, deadline: 10, state: 'waiting' as const };
+    const detail = { task: f.ta, attentions: [], lateJobRecovery: waiting } as unknown as Detail;
+    const diagnostics = (state: Detail['lateJobRecovery']) => RecoveryPanel({ w, recovery,
+      detail: { ...detail, lateJobRecovery: state } }).props.children;
+    const [title, , , , manual] = diagnostics(waiting);
+    assert.equal(title.props.children, '等待后台结束');
+    assert.equal(manual, false);
+    assert.equal(diagnostics({ ...waiting, terminalObserved: true })[0].props.children, '等待消费后台结果');
+    assert.equal(diagnostics({ ...waiting, state: 'ready', proof: { jobs: [], lastSeq: 13 } })[0].props.children, '准备接续原任务');
+    assert.equal(diagnostics({ ...waiting, state: 'ready', proof: { jobs: [], lastSeq: 13 } })[4], false);
+    assert.equal(diagnostics({ ...waiting, state: 'blocked', reason: '缺少原生消费回执' })[4].type.name, 'ManualRecoveryActions');
+  } finally { f.store.close(); }
+});
 
 test('chat work settings give each Bot panel a distinct React key', () => {
   const f = fixture();

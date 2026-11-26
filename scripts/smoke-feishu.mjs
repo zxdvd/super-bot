@@ -376,6 +376,77 @@ async function runRecoverySmoke() {
     events, feishuInput, receive, sent, wait, deploymentFlag, readLog });
 }
 
+async function runReceiptSmoke() {
+  await configure(primary);
+  await configurePatch(primary, true);
+  await writeLegacy(primary, fixtureCredentials);
+  let host = await launch(primary, 'req008-first');
+  const owner = await bot(host, '飞书原消息回执');
+  const chat = await manager(host, owner);
+  const { binding: group } = await call(host, 'feishu.create', { botId: owner.id, name: '表情夹具群', requestId: randomUUID() });
+  const reactions = async messageId => (await feishu(host, 'sent')).reactions.filter(item => item.messageId === messageId);
+  await call(host, 'bot.capacity.set', {
+    botId: owner.id, requestId: randomUUID(), expectedMaxRunningTasks: null, maxRunningTasks: 1,
+  });
+  const holder = await call(host, 'task.create', { botId: owner.id, requestId: randomUUID(),
+    goal: 'STOP_PROBE', scope: '合成 Worker 名额占用', acceptance: '保留本轮等待', reviewPolicy: 'human' });
+  await wait(async () => (await call(host, 'task.detail', { id: holder.id })).run?.state === 'running', 'only Worker slot is occupied');
+  const request = '请写一份简短的说明，包含两项事实，完成后给我文件。';
+  const messageId = 'om_req008_original', rejectedId = 'om_req008_rejected', reboundId = 'om_req008_rebound';
+  await receive(host, group, request, { messageId: rejectedId, senderOpenId: 'ou_fixtureOther' });
+  await feishu(host, 'fail-reaction', { fail: true });
+  await receive(host, group, request, { messageId });
+  await receive(host, group, request, { messageId });
+  await wait(async () => (await reactions(messageId)).length === 1, 'one original reaction attempt despite failure and repeat');
+  const original = await wait(async () => {
+    const record = (await events(host, chat)).find(event => feishuInput(event) && event.data.source.feishuMessageId === messageId);
+    return record?.surfaceOp === 'append' && record;
+  }, 'the owner input enters its original DSH chat');
+  assert.deepEqual(await reactions(messageId), [{ messageId, failed: true }]);
+  assert.deepEqual(await reactions(rejectedId), []);
+  assert.equal((await status(host, owner)).error, undefined);
+  await hasSent(host, group, '已经开始处理');
+  const queued = await wait(async () => {
+    const items = (await call(host, 'task.list', { botId: owner.id })).items;
+    const task = items.find(item => item.id !== holder.id);
+    if (!task) return;
+    const detail = await call(host, 'task.detail', { id: task.id });
+    return detail.wait?.code === 'capacity' && detail;
+  }, 'second task is queued, receipt reaction already attempted');
+  assert.equal(queued.run, null);
+
+  const hold = prompt(host, chat, 'LATE_JOB_MANAGER_HOLD').catch(() => {});
+  await wait(async () => (await model(host, 'inspect-session', { sessionId: chat })).stalled, 'native Manager temporarily busy');
+  const revokedId = 'om_req008_revoked';
+  await receive(host, group, '排队但未进入原生聊天', { messageId: revokedId });
+  assert.deepEqual(await reactions(revokedId), []);
+  await call(host, 'feishu.unbind', { botId: owner.id, bindingId: group.id });
+  const preview = await call(host, 'feishu.preview', { botId: owner.id, chatId: group.chatId });
+  await call(host, 'feishu.bind', { botId: owner.id, confirmationToken: preview.confirmationToken });
+  const rebound = (await status(host, owner)).binding;
+  assert.notEqual(rebound.id, group.id);
+  await model(host, 'release-stalled-model', { sessionId: chat });
+  await hold;
+  await feishu(host, 'fail-reaction', { fail: false });
+  await receive(host, rebound, 'FEISHU_SMOKE_REACTION_REBOUND', { messageId: reboundId });
+  await hasSent(host, rebound, '已收到 FEISHU_SMOKE_REACTION_REBOUND');
+  assert.deepEqual(await reactions(reboundId), [{ messageId: reboundId, failed: false }]);
+  assert.deepEqual(await reactions(revokedId), []);
+  assert.equal((await events(host, chat)).filter(event => feishuInput(event) && event.data.source.feishuMessageId === revokedId).length, 0);
+
+  await stop(primary);
+  host = await launch(primary, 'req008-restart');
+  await receive(host, rebound, request, { messageId });
+  await receive(host, rebound, 'FEISHU_SMOKE_REACTION_NEW', { messageId: 'om_req008_after_restart' });
+  await hasSent(host, rebound, '已收到 FEISHU_SMOKE_REACTION_NEW');
+  assert.deepEqual(await reactions(messageId), []);
+  assert.deepEqual(await reactions('om_req008_after_restart'), [{ messageId: 'om_req008_after_restart', failed: false }]);
+  await writeFile(join(base, 'req008-proof.json'), JSON.stringify({ nativeSeq: original.seq,
+    originalReactionAttempts: 1, originalReactionFailed: true, assistantReplyAfterFailure: true, queuedTaskId: queued.task.id,
+    rejectedReactionAttempts: 0, revokedReactionAttempts: 0, duplicateAfterRestart: 0, reboundReactionAttempts: 1 }, null, 2));
+  console.log(`PASS native Feishu receipt reaction with queued Worker, failure, dedupe, rebind and restart (${base})`);
+}
+
 async function runFeishuSmoke() {
   await Promise.all([configure(primary), configure(secondary)]);
   await writeLegacy(secondary, alternateCredentials);
@@ -910,6 +981,7 @@ async function runFeishuSmoke() {
 
 try {
   if (process.argv.includes('--req005')) await runRecoverySmoke();
+  else if (process.argv.includes('--req008')) await runReceiptSmoke();
   else await runFeishuSmoke();
 } catch (error) {
   if (ui) {

@@ -111,6 +111,7 @@ export interface Binding {
 export interface ExistingSessionGrant {
   taskId:string;expectedRowVersion:number;sessionId:string;cwd:string;
   fullHistoryApproved:boolean;directoryApproved:boolean;
+  source?: ChatSource;
 }
 export interface ExistingSessionPreview {sessionId:string;cwd:string;quiet:boolean;reason:string}
 export interface ManagerBinding {id:string;botId:string;generation:number;configRevision:number;requestedSessionId:string;sessionId:string|null;cwd:string;state:'creating'|'ready'|'recovery'|'released';createdAt:number}
@@ -251,6 +252,7 @@ export interface RecoveryInstruction {
   priorDirection?: ChatSource;
   directions?: RecoveryDirection[];
   change?: {kind:RecoveryDirectionChange['kind'];removedIds:string[]};
+  stageRunId?: string;
   runId?: string;
 }
 export interface RecoveryWorkContext {
@@ -263,6 +265,8 @@ export interface RecoveryWorkContext {
   priorCheck?: ProbeResult;
   observations?: {probe:ClusterProbe;result:ProbeResult}[];
   priorReadQueries?: PriorTools['queries'];
+  lateJobs?: string[];
+  priorProgress?: string;
   effectUncertain: boolean;
   probes: ClusterProbe[];
 }
@@ -290,3 +294,15 @@ export interface RunTurn {
   runId:string; turn:number|null; startSeq:number|null; inputSeq:number|null;
   endSeq:number|null; endKind:string|null; quiet:number; reportId:string|null;
 }
+export type LateJobProof = {
+  jobs: { id: string; registeredSeq: number; settledSeq: number; noticeSeq: number; consumedEndSeq: number }[];
+  lastSeq: number;
+};
+export type LateJobRecovery = {
+  ids: string[]; rowVersion: number; deadline: number; instructionId?: string;
+} & (
+  { state: 'waiting'; terminalObserved?: boolean } |
+  { state: 'blocked'; reason: string } |
+  { state: 'ready'; proof: LateJobProof } |
+  { state: 'continued'; proof: LateJobProof; nextRunId: string }
+);

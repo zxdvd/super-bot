@@ -26,6 +26,7 @@ function fixture(t: TestContext, checkFeishuConfig: Sdk['checkFeishuConfig'], le
     start(next) { handlers = next; next.onConnection('ready'); },
     stop() { handlers = undefined; },
     async sendText() {},
+    async reactReceived() {},
     async createGroup() { return group; },
     async inspectGroup() { return group; },
     async diagnoseGroup() { diagnoses++; return { ordinaryTextGrant: 'missing', receiveSubscription: 'missing' }; },

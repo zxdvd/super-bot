@@ -6,7 +6,7 @@ import { join } from 'node:path';
 import type { Run } from '../src/model.ts';
 import { Store } from '../src/store.ts';
 import { observeGitLabStage, startStageObservation } from '../src/gitlab-observer.ts';
-import { gitLabObservationOrigin, readStageCondition, type StageCondition } from '../src/work-stage.ts';
+import { gitLabObservationOrigin, readStageCondition, STAGE_WAIT_MS, type StageCondition } from '../src/work-stage.ts';
 
 const origin = 'https://gitlab.example.invalid';
 const pipeline = { kind:'gitlab-pipeline', sourceOrigin:origin, project:'group/subgroup/repo', number:42 } satisfies StageCondition;
@@ -121,6 +121,8 @@ test('a GitLab wait frees the slot and survives restart, pause, old observations
   let store = new Store(db);
   t.after(() => {store.close();rmSync(directory,{recursive:true,force:true});});
   const { bot,task,binding } = createBound(store,'pipeline');
+  const manager = store.beginManager('pipeline-owner',bot.id,'/tmp/manager-fixture');
+  store.confirmManager(manager.id,manager.requestedSessionId);
   store.setBotCapacity('capacity',bot.id,null,1);
   const run = enter(store,task.id,'release-start');
   checkpoint(store,run,'release-mr-42');
@@ -130,6 +132,16 @@ test('a GitLab wait frees the slot and survives restart, pause, old observations
   assert.equal(store.botCapacity(bot.id).botHeld,0);
   const other = createBound(store,'other',bot.id);
   const otherRun = enter(store,other.task.id,'other-work');
+  const staleAddition = store.dueStages(1)[0]!;
+  const appendix = {sessionId:manager.requestedSessionId,messageId:'add-note',seq:15,text:'Only read the relevant logs as an extra appendix; keep the original step.'};
+  const add = () => store.saveRecoveryInstruction(task.id,store.getTask(task.id).rowVersion,appendix,
+    'read-only',false,false,undefined,{stageFollowUp:'append'});
+  assert.equal(add().instruction.stageRunId,run.id);
+  assert.equal(add().instruction.directions?.length,1);
+  assert.equal(store.taskDetail(task.id).directionStatus,'next-run');
+  assert.equal(store.taskDetail(task.id).stage?.deadlineAt,decision.stage.deadlineAt);
+  store.recordStageObservation(staleAddition,{state:'satisfied',detail:'arrived after the note'},staleAddition.checkAt);
+  assert.equal(store.taskDetail(task.id).stage?.state,'waiting');
   const due = store.dueStages(1)[0]!;
   store.recordStageObservation(due,{state:'pending',detail:'running',stateLabel:'running'},due.checkAt);
   store.recordStageObservation(due,{state:'satisfied',detail:'stale second response',stateLabel:'success'},due.checkAt);
@@ -151,6 +163,7 @@ test('a GitLab wait frees the slot and survives restart, pause, old observations
   store.recordStageObservation(current,{state:'unavailable',detail:'late duplicate'},current.checkAt);
   assert.equal(store.taskDetail(task.id).stage?.state,'ready');
   assert.equal(store.taskDetail(task.id).stage?.observation?.stateLabel,'success');
+  assert.equal(store.taskDetail(task.id).wait?.code,'capacity');
   const readyId = `manager-event:stage-ready:${run.id}`;
   assert.notEqual(store.nextManagerEvent(bot.id)?.id,readyId);
   assert.throws(() => store.reserveRun('no-capacity',task.id,store.getTask(task.id).rowVersion),{code:'capacity'});
@@ -159,23 +172,33 @@ test('a GitLab wait frees the slot and survives restart, pause, old observations
   assert.equal(store.nextManagerEvent(bot.id)?.id,readyId);
   const next = enter(store,task.id,'authorized-next');
   assert.equal(next.sessionId,binding.requestedSessionId);
-  assert.match(store.getRunInput(next.id).content,/exact pipeline succeeded/);
+  const content=store.getRunInput(next.id).content;
+  assert.match(content,/exact pipeline succeeded/);
+  assert.match(content,/Verify the exact deployment/);
+  assert.equal(content.split(appendix.text).length-1,1);
+  assert.equal(store.taskDetail(task.id).directionStatus,'entered');
+  assert.equal(store.recoveryWorkPlan(next.id),null);
   assert.notEqual(store.nextManagerEvent(bot.id)?.id,readyId);
 });
 
-test('absent observers, terminal failed checks and cancellation do not dispatch', t => {
+test('an unavailable observer can recover the original plan; terminal failed checks and cancellation do not dispatch', t => {
   const store = new Store(':memory:');
   t.after(() => store.close());
   const { bot,task } = createBound(store,'blocked');
   const run = enter(store,task.id,'release');
   checkpoint(store,run,'release-fixture');
-  const register = (request:string, configured:string|null, ownerRetry=false) => store.advanceStage(request,
-    bot.id,task.id,store.getTask(task.id).rowVersion,run.id,'Verify the deployment',pipeline,configured,ownerRetry);
-  assert.equal(register('unsupported',null).stage.observation?.state,'unavailable');
-  assert.throws(() => register('not-authorized',origin),{code:'stage-decided'});
-  assert.equal(register('authorized-retry',origin,true).stage.state,'waiting');
+  const registered = store.advanceStage('no-reader',bot.id,task.id,store.getTask(task.id).rowVersion,run.id,
+    'Verify the deployment',pipeline,null);
+  assert.equal(registered.stage.observation?.state,'unavailable');
+  assert.equal(registered.stage.state,'waiting');
   const due = store.dueStages(1)[0]!;
-  store.recordStageObservation(due,{state:'unsatisfied',detail:'pipeline failed',stateLabel:'failed'});
+  store.recordStageObservation(due,{state:'unavailable',detail:'HTTP 403'},due.checkAt);
+  assert.equal(store.dueStages(1,due.checkAt+299_999).length,0);
+  const recovered = store.dueStages(1,due.checkAt+300_000)[0]!;
+  assert.equal(recovered.runId,run.id);
+  assert.equal(recovered.origin,origin);
+  assert.equal(store.taskDetail(task.id).stage?.deadlineAt,registered.stage.deadlineAt);
+  store.recordStageObservation(recovered,{state:'unsatisfied',detail:'pipeline failed',stateLabel:'failed'},recovered.checkAt);
   const blocked = store.taskDetail(task.id);
   assert.equal(blocked.stage?.reason,'pipeline failed');
   assert.equal(blocked.task.status,'blocked');
@@ -188,13 +211,13 @@ test('absent observers, terminal failed checks and cancellation do not dispatch'
   assert.throws(() => store.reserveRun('cancelled-dispatch',task.id,store.getTask(task.id).rowVersion));
 });
 
-test('transient reads back off and stop with a concrete reason after five failures', t => {
+test('transient reads back off and wait only until the original deadline', t => {
   const store = new Store(':memory:');
   t.after(() => store.close());
   const { bot,task } = createBound(store,'retry');
   const run = enter(store,task.id,'prepare');
   checkpoint(store,run,'fixture');
-  store.advanceStage('wait',bot.id,task.id,store.getTask(task.id).rowVersion,run.id,'Continue',pipeline,origin);
+  const {stage:plan}=store.advanceStage('wait',bot.id,task.id,store.getTask(task.id).rowVersion,run.id,'Continue',pipeline,origin);
   let now = Date.now();
   for (let attempt=0; attempt<5; attempt++) {
     const due = store.dueStages(1,now)[0]!;
@@ -205,10 +228,18 @@ test('transient reads back off and stop with a concrete reason after five failur
     now = next;
   }
   assert.equal(store.dueStages(1,now).length,0);
+  assert.equal(store.taskDetail(task.id).stage?.state,'waiting');
+  assert.equal(store.taskDetail(task.id).stage?.observation?.state,'unavailable');
+  assert.equal(store.managerNotifications(bot.id).filter(event=>event.id.startsWith('manager-event:stage-unavailable:')).length,1);
+  const last = store.dueStages(1,plan.deadlineAt!-1)[0]!;
+  store.superviseStages(plan.deadlineAt!);
+  store.superviseStages(plan.deadlineAt!+1);
+  store.recordStageObservation(last,{state:'satisfied',detail:'late success'},plan.deadlineAt!+2);
+  assert.equal(store.dueStages(1,plan.deadlineAt!+STAGE_WAIT_MS).length,0);
   const stage = store.taskDetail(task.id).stage;
   assert.equal(stage?.state,'blocked');
-  assert.equal(stage?.observation?.state,'unavailable');
-  assert.match(stage!.reason!,/五次/);
+  assert.equal(stage?.expired,true);
+  assert.match(stage!.reason!,/HTTP 503/);
   assert.equal(store.managerNotifications(bot.id).filter(event=>event.id.startsWith('manager-event:stage-blocked:')).length,1);
 });
 
@@ -225,8 +256,74 @@ test('a newer pending owner instruction takes priority over a ready stage', t =>
     {sessionId:manager.requestedSessionId,messageId:'owner-message',seq:15,text:'Pause the automatic next step and only read the test logs'},
     'read-only');
   assert.equal(store.taskDetail(task.id).task.status,'blocked');
+  assert.equal(store.taskDetail(task.id).stage?.state,'superseded');
   assert.throws(() => store.reserveRun('unexpected',task.id,store.getTask(task.id).rowVersion),{code:'work-blocked'});
   assert.match(store.nextManagerEvent(bot.id)?.id??'',/^manager-event:continuation:/);
+});
+
+test('an exact replacement invalidates the old observation and owner revocation prevents either plan from running', t => {
+  const store=new Store(':memory:');
+  t.after(()=>store.close());
+  const {bot,task}=createBound(store,'replace');
+  const manager=store.beginManager('replacement-manager',bot.id,'/tmp/stage-manager');
+  store.confirmManager(manager.id,manager.requestedSessionId);
+  const run=enter(store,task.id,'replacement-start');
+  checkpoint(store,run,'replacement-evidence');
+  const advance=(request:string,condition:StageCondition,source?:{sessionId:string;messageId:string;seq:number;text:string})=>
+    store.advanceStage(request,bot.id,task.id,store.getTask(task.id).rowVersion,run.id,'Verify the release',condition,origin,false,{source});
+  advance('original',pipeline);
+  const old=store.dueStages(1)[0]!;
+  const next={...pipeline,number:43};
+  assert.throws(()=>advance('unproven',next),{code:'stage-decided'});
+  const source={sessionId:manager.requestedSessionId,messageId:'replace-forty-two',seq:1,text:'Wait for pipeline 43 instead.'};
+  assert.throws(()=>advance('foreign',next,{...source,sessionId:'another-session'}),{code:'manager-scope'});
+  const replacement=advance('replace-plan',next,source);
+  assert.deepEqual(replacement.stage.planSource,source);
+  store.recordStageObservation(old,{state:'satisfied',detail:'old pipeline success'},old.checkAt);
+  assert.equal(store.taskDetail(task.id).stage?.state,'waiting');
+  const due=store.dueStages(1)[0]!;
+  assert.deepEqual(due.condition,next);
+  const revoke={...source,messageId:'revoke-step',seq:2,text:'Withdraw the release step and keep the checkpoint.'};
+  const saved=store.saveRecoveryInstruction(task.id,store.getTask(task.id).rowVersion,revoke,
+    undefined,false,false,undefined,{stageFollowUp:'revoke'});
+  assert.equal(store.recoveryDirectionStatus(saved.instruction),'revoked');
+  store.recordStageObservation(due,{state:'satisfied',detail:'new pipeline success'},due.checkAt);
+  assert.equal(store.taskDetail(task.id).stage?.state,'superseded');
+  assert.equal(store.dueStages(1,due.checkAt).length,0);
+  assert.equal(store.managerNotifications(bot.id).some(event=>event.id.startsWith('manager-event:stage-ready:')),false);
+  assert.throws(()=>store.reserveRun('withdrawn',task.id,store.getTask(task.id).rowVersion),{code:'work-blocked'});
+});
+
+test('a capacity wait expires once across restart and frees its FIFO place', t => {
+  const directory=mkdtempSync(join(tmpdir(),'super-bot-stage-capacity-'));
+  const path=join(directory,'ledger.sqlite');
+  let store=new Store(path);
+  t.after(()=>{store.close();rmSync(directory,{recursive:true,force:true});});
+  const {bot,task}=createBound(store,'capacity-stage');
+  store.setBotCapacity('stage-capacity',bot.id,null,1);
+  const run=enter(store,task.id,'capacity-stage-start');
+  checkpoint(store,run,'capacity-evidence');
+  const other=createBound(store,'capacity-incumbent',bot.id);
+  const otherRun=enter(store,other.task.id,'capacity-incumbent-start');
+  const {stage}=store.advanceStage('needs-slot',bot.id,task.id,store.getTask(task.id).rowVersion,run.id,'Complete the release',undefined,origin);
+  assert.equal(store.taskDetail(task.id).wait?.code,'capacity');
+  assert.equal(store.botCapacity(bot.id).botHeld,1);
+  store.close();
+  store=new Store(path);
+  store.superviseStages(stage.deadlineAt!-1);
+  assert.equal(store.taskDetail(task.id).stage?.state,'ready');
+  store.superviseStages(stage.deadlineAt!);
+  store.superviseStages(stage.deadlineAt!+1);
+  const detail=store.taskDetail(task.id);
+  assert.equal(detail.stage?.expired,true);
+  assert.match(detail.stage!.reason!,/执行名额等待期限/);
+  assert.equal(detail.wait,null);
+  assert.equal(store.managerNotifications(bot.id).filter(event=>event.id.startsWith('manager-event:stage-blocked:')).length,1);
+  store.workerReport(otherRun.id,'capacity-finish',finalReport);
+  store.settleRun(otherRun.id);
+  const later=createBound(store,'waiter-after-expiry',bot.id);
+  assert.equal(enter(store,later.task.id,'later-dispatch').state,'queued');
+  assert.equal(store.latestRun(task.id)?.id,run.id);
 });
 
 test('the reader uses exact GitLab IDs with a fixed HTTPS origin and fails closed on unknown states', async () => {
@@ -266,7 +363,7 @@ test('the reader uses exact GitLab IDs with a fixed HTTPS origin and fails close
   assert.equal(wrongOrigin.state,'unavailable');
 });
 
-test('condition on a different GitLab instance stays blocked even with an exact matching project and ID', t => {
+test('condition on a different GitLab instance keeps its exact origin even with a matching project and ID', t => {
   const store = new Store(':memory:');
   t.after(() => store.close());
   const { bot,task } = createBound(store,'different-origin');
@@ -274,9 +371,9 @@ test('condition on a different GitLab instance stays blocked even with an exact 
   checkpoint(store,run,'fixture');
   const condition = {...pipeline,sourceOrigin:'https://elsewhere.invalid'};
   const receipt = store.advanceStage('wait',bot.id,task.id,store.getTask(task.id).rowVersion,run.id,'Continue',condition,origin);
-  assert.equal(receipt.stage.state,'blocked');
+  assert.equal(receipt.stage.state,'waiting');
   assert.match(receipt.stage.reason!,/https:\/\/elsewhere\.invalid/);
-  assert.equal(store.dueStages(1).length,0);
+  assert.equal(store.dueStages(1)[0]?.origin,condition.sourceOrigin);
 });
 
 test('observer configuration changes never redirect an outstanding wait to another host', async t => {
@@ -290,6 +387,8 @@ test('observer configuration changes never redirect an outstanding wait to anoth
     assert.fail('An old wait must not send a request to a replacement host');
   });
   t.after(stop);
+  await new Promise<void>(resolve=>setImmediate(resolve));
   assert.equal(store.taskDetail(task.id).stage?.observation?.state,'unavailable');
+  assert.equal(store.taskDetail(task.id).stage?.state,'waiting');
   assert.equal(store.dueStages(1).length,0);
 });

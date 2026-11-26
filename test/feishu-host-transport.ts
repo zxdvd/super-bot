@@ -9,11 +9,14 @@ export const alternateCredentials = {
 };
 export const existingGroup = { chatId: 'oc_fixtureExisting', name: '飞书测试已有群' };
 export const sent: { chatId: string; text: string; uuid: string }[] = [];
+export const reactions: { messageId: string; failed: boolean }[] = [];
 export let starts = 0, handlers: FeishuHandlers | undefined, failSend = false;
 export let checks = 0, stops = 0, creations = 0, inspections = 0, diagnoses = 0;
 let unknownDiagnosis = false;
+let failReaction = false;
 
 export function setFailure(value: boolean) { failSend = value; }
+export function setReactionFailure(value: boolean) { failReaction = value; }
 export function setUnknownDiagnosis(value: boolean) { unknownDiagnosis = value; }
 
 function valid(config: FeishuCredentials): boolean {
@@ -42,6 +45,11 @@ export function createFeishuTransport(config: FeishuConfig): FeishuTransport {
       assert.notEqual(canDispatch?.(), false);
       if (failSend) throw Error(`Mock failure with a credential ${config.appSecret}`);
       sent.push({ chatId, text, uuid });
+    },
+    async reactReceived(messageId, canDispatch) {
+      assert.equal(canDispatch(), true);
+      reactions.push({ messageId, failed: failReaction });
+      if (failReaction) throw Error('Synthetic reaction permission failure');
     },
     async inspectGroup(chatId) {
       inspections++;

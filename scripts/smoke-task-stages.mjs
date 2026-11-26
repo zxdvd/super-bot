@@ -5,7 +5,8 @@ import { readFile, writeFile } from 'node:fs/promises';
 import { createServer } from 'node:https';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
-import { closeTask, stageArtifacts, stageGoal, stoppableGoal } from '../test/stage-host-fixture.ts';
+import { closeTask, ownerAcceptance, ownerAcceptanceConfirm, ownerConfirm, ownerDetach, ownerInspect, ownerNewGoal, ownerOldGoal, ownerPrepare,
+  ownerRefuse, ownerRevise, ownerSessionTitle, stageArtifacts, stageGoal, stageRevoke, stageSupplement, stoppableGoal } from '../test/stage-host-fixture.ts';
 
 async function verifyStageInBrowser(host, bot, task) {
   const playwright = process.env.SUPER_BOT_TEST_PLAYWRIGHT;
@@ -35,14 +36,19 @@ export async function smokeTaskStages({ base, configure, launch, stop, call, mak
   execFileSync('openssl', ['req', '-x509', '-newkey', 'rsa:2048', '-nodes', '-days', '1', '-subj', '/CN=Local Stage Test',
     '-config', config, '-keyout', key, '-out', cert], { stdio: 'ignore' });
   let pipelineStatus = 'running';
+  let heldRead;
   const observations = [];
   const server = createServer({ cert: await readFile(cert), key: await readFile(key) }, (req, res) => {
     if (req.url !== '/api/v4/projects/fixture%2Fdocs/pipelines/42' || req.method !== 'GET') {
       res.writeHead(404).end();
       return;
     }
-    observations.push(pipelineStatus);
-    res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify({ id: 42, status: pipelineStatus }));
+    const respond = status => {
+      observations.push(status);
+      res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify({ id: 42, status }));
+    };
+    if (heldRead && !heldRead.respond) heldRead.respond = respond;
+    else respond(pipelineStatus);
   });
   server.listen(0, '127.0.0.1');
   await once(server, 'listening');
@@ -67,7 +73,18 @@ export async function smokeTaskStages({ base, configure, launch, stop, call, mak
     assert.equal(waiting.runHeld, false);
     assert.equal(waiting.result, null);
     await verifyStageInBrowser(host, bot, task);
+    await probe(host, 'native-prompt', bot.managerId, stageSupplement);
+    const supplemented = await wait(async () => {
+      const detail = await call(host, 'task.detail', { id: task.id, sessionId: bot.managerId });
+      return detail.directionStatus === 'next-run' && detail.recoveryInstruction?.source.text === stageSupplement && detail;
+    }, 'the original chat saves one additive directive');
+    assert.equal(supplemented.stage.state, 'waiting');
+    assert.equal(supplemented.stage.deadlineAt, waiting.stage.deadlineAt);
+    assert.equal(supplemented.stage.nextStep, waiting.stage.nextStep);
     const firstManager = await probe(host, 'inspect-session', bot.managerId);
+    const ownerInput = firstManager.events.find(event => event.type === 'user/message' &&
+      event.data.id === supplemented.recoveryInstruction.source.messageId);
+    assert.equal(ownerInput?.seq, supplemented.recoveryInstruction.source.seq);
     await stop('web');
     pipelineStatus = 'success';
     host = await launch('web', 'task-stages-restarted', { testCa: cert });
@@ -84,6 +101,12 @@ export async function smokeTaskStages({ base, configure, launch, stop, call, mak
     assert.equal(inputs.length, stageArtifacts.length + 1);
     assert.equal(new Set(inputs.map(event => event.data.source.runId)).size, inputs.length);
     assert.ok(inputs.every(event => event.data.source.taskId === task.id));
+    const augmentedInputs = inputs.filter(event => event.data.content.some(block => block.text?.includes(stageSupplement)));
+    assert.equal(augmentedInputs.length, 1);
+    assert.equal(augmentedInputs[0].data.source.runId, inputs[2].data.source.runId);
+    const augmentedText = augmentedInputs[0].data.content.map(block => block.text).join('');
+    assert.ok(augmentedText.includes(stageArtifacts[1].nextStep));
+    assert.equal(augmentedText.split(stageSupplement).length - 1, 1);
     const attempts = [...firstManager.managerAttempts, ...manager.managerAttempts];
     const nextSteps = attempts.filter(attempt => attempt.action === 'advance_stage');
     assert.deepEqual(nextSteps.map(attempt => attempt.nextStep), stageArtifacts.map(item => item.nextStep));
@@ -92,6 +115,39 @@ export async function smokeTaskStages({ base, configure, launch, stop, call, mak
     assert.equal(attempts.filter(attempt => attempt.action === 'rework').length, 0);
     assert.equal(done.deliveredResult.id, done.result.id);
     assert.equal((await tasks()).total, 1);
+    await probe(host, 'native-prompt', bot.managerId, ownerAcceptance);
+    const pendingAcceptance = await call(host, 'task.detail', { id: task.id, sessionId: bot.managerId });
+    assert.equal(pendingAcceptance.task.lifecycle, 'review');
+    const question = (await probe(host, 'inspect-session', bot.managerId)).assistantTexts.at(-1);
+    assert.ok(question.includes('是否接受') && question.includes(done.result.id));
+    await probe(host, 'native-prompt', bot.managerId, ownerAcceptanceConfirm);
+    const accepted = await call(host, 'task.detail', { id: task.id, sessionId: bot.managerId });
+    assert.equal(accepted.task.lifecycle, 'completed');
+    const ownerReceipt = accepted.events.filter(event => event.kind === 'result.accepted').map(event => JSON.parse(event.data));
+    assert.equal(ownerReceipt.length, 1);
+    assert.equal(ownerReceipt[0].resultId, done.result.id);
+    assert.deepEqual(ownerReceipt[0].source.messages.map(message => message.text), [ownerAcceptance, ownerAcceptanceConfirm]);
+    pipelineStatus = 'running';
+    heldRead = {};
+    await probe(host, 'native-prompt', bot.managerId, stageGoal);
+    const withdrawn = await wait(async () => {
+      const item = (await tasks()).items.find(item => item.goal === stageGoal && item.id !== task.id);
+      if (!item || !heldRead.respond) return;
+      const detail = await call(host, 'task.detail', { id: item.id });
+      return detail.stage?.state === 'waiting' && detail;
+    }, 'a fresh stage is waiting with its GitLab read in flight');
+    await probe(host, 'native-prompt', bot.managerId, stageRevoke);
+    await wait(async () => {
+      const detail = await call(host, 'task.detail', { id: withdrawn.task.id });
+      return detail.stage?.state === 'superseded' && detail.directionStatus === 'revoked' && detail;
+    }, 'the original chat withdraws the stage');
+    heldRead.respond('success');
+    await new Promise(resolve => setTimeout(resolve, 1300));
+    const afterWithdrawal = await call(host, 'task.detail', { id: withdrawn.task.id });
+    assert.equal(afterWithdrawal.stage.state, 'superseded');
+    assert.equal(afterWithdrawal.stage.observation, undefined);
+    assert.equal(afterWithdrawal.run.id, withdrawn.run.id);
+    assert.equal(afterWithdrawal.runHeld, false);
     await probe(host, 'native-prompt', bot.managerId, stoppableGoal);
     const stoppable = await wait(async () => {
       const item = (await tasks()).items.find(item => item.goal === stoppableGoal);
@@ -108,8 +164,56 @@ export async function smokeTaskStages({ base, configure, launch, stop, call, mak
     }, 'one owner chat message stops and closes a working task');
     assert.equal(closed.run.id, stoppable.run.id);
     assert.equal(closed.pendingQuestions.length, 0);
-    assert.equal((await tasks()).total, 2);
+    assert.equal((await tasks()).total, 3);
+    await exerciseOwnerSessionActions(host, bot);
     console.log('PASS running task closed from its owner chat with one request');
-    console.log('PASS one native owner message, three checkpoints, restart during external HTTPS wait, four runs on one Worker, one final delivery');
+    console.log('PASS an in-flight HTTPS success after owner chat withdrawal did not reach a Worker');
+    console.log('PASS stage addition from the original chat survived restart and entered exactly one of four runs on the same Worker; one final chat delivery');
+  }
+
+  async function exerciseOwnerSessionActions(host, bot) {
+    const draft = await call(host, 'task.create', { requestId: 'chat-owner-fixture', botId: bot.id, goal: ownerOldGoal,
+      scope: '只修改合成资料文件', acceptance: '会话已关联或已准备', reviewPolicy: 'human', startPaused: true });
+    const session = await probe(host, 'create-attach-session', undefined, ownerSessionTitle);
+    const original = await probe(host, 'inspect-session', session.sessionId);
+    const prompt = text => probe(host, 'native-prompt', bot.managerId, text);
+    const detail = () => call(host, 'task.detail', { id: draft.id, sessionId: bot.managerId });
+    await prompt(ownerRevise);
+    assert.equal((await detail()).task.goal, ownerNewGoal);
+    await prompt(ownerInspect);
+    const preview = (await probe(host, 'inspect-session', bot.managerId)).assistantTexts.at(-1);
+    assert.ok(preview.includes(ownerSessionTitle) && preview.includes(session.cwd), preview);
+    assert.match(preview, /完整会话历史.*读取、写入和编辑.*保持暂停/);
+    assert.equal((await detail()).binding, null);
+    await prompt(ownerRefuse);
+    await prompt(ownerConfirm);
+    assert.equal((await detail()).binding, null, 'confirmation after rejecting the preview cannot attach');
+    await prompt(ownerInspect);
+    const beforeRace = await detail();
+    await call(host, 'task.control', { requestId: 'owner-session-stale', id: draft.id,
+      sessionId: bot.managerId, expectedRowVersion: beforeRace.task.rowVersion, mode: 'paused' });
+    await prompt(ownerConfirm);
+    assert.equal((await detail()).binding, null, 'confirmation naming the previous task version cannot attach');
+    await prompt(ownerInspect);
+    await prompt(ownerConfirm);
+    const attached = await detail();
+    assert.equal(attached.binding.sessionId, session.sessionId);
+    assert.equal(attached.task.controlMode, 'paused');
+    assert.equal(attached.run, null);
+    const approval = JSON.parse(attached.events.find(event => event.kind === 'session.attached').data);
+    assert.deepEqual(approval.source.messages.map(message => message.text), [ownerInspect, ownerConfirm]);
+    const history = await probe(host, 'inspect-session', session.sessionId);
+    assert.equal(history.historyMessageIds.filter(id => id === session.historyMessageId).length, 1);
+    assert.equal(history.modelSteps, original.modelSteps);
+    assert.equal(history.events.some(event => event.type === 'user/message' && event.data.source.kind === 'super-bot'), false);
+    await prompt(ownerDetach);
+    assert.equal((await detail()).binding, null);
+    await prompt(ownerPrepare);
+    const prepared = await detail();
+    assert.equal(prepared.binding.state, 'ready');
+    assert.notEqual(prepared.binding.sessionId, session.sessionId);
+    assert.equal(prepared.run, null);
+    assert.equal(prepared.task.controlMode, 'paused');
+    console.log('PASS original owner chat accepted the delivered result, revised a goal, inspected an existing session, rejected stale/declined consent, attached on a short reply, detached and prepared a new Worker');
   }
 }

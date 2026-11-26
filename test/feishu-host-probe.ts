@@ -3,7 +3,7 @@ import type { Context } from '@deepseek-ai/cordis';
 import { SessionId } from '@deepseek-ai/dsh-session/types';
 import { apply as applyProduct } from '../src/index.ts';
 import type { FeishuConnectionState, FeishuGroupTextMessage, FeishuPrivateTextMessage } from '../src/feishu-types.ts';
-import { checks, creations, diagnoses, handlers, inspections, sent, setFailure,
+import { checks, creations, diagnoses, handlers, inspections, reactions, sent, setFailure, setReactionFailure,
   setUnknownDiagnosis, starts, stops } from './feishu-host-transport.ts';
 
 export { Config, inject, name } from '../src/index.ts';
@@ -20,6 +20,7 @@ export async function apply(ctx: Context, config: Parameters<typeof applyProduct
         if (body.action === 'receive') await handlers?.onMessage(body.message!);
         if (body.action === 'receive-private') handlers?.onPrivateMessage?.(body.privateMessage!);
         if (body.action === 'fail-send') setFailure(body.fail === true);
+        if (body.action === 'fail-reaction') setReactionFailure(body.fail === true);
         if (body.action === 'unknown-diagnosis') setUnknownDiagnosis(true);
         if (body.action === 'events') {
           assert.ok(body.sessionId);
@@ -27,7 +28,7 @@ export async function apply(ctx: Context, config: Parameters<typeof applyProduct
           const page = await ctx.sessionController.events({ address, maxMessages: 200 }, request.signal);
           return Response.json({ ok: true, page });
         }
-        return Response.json({ ok: true, starts, stops, checks, creations, inspections, diagnoses, sent });
+        return Response.json({ ok: true, starts, stops, checks, creations, inspections, diagnoses, sent, reactions });
       } catch (error) {
         return Response.json({ ok: false, error: error instanceof Error ? error.message : 'Fixture failed' });
       }

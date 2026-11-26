@@ -102,6 +102,7 @@ export interface FeishuTransport {
   start(handlers: FeishuHandlers): void;
   stop(): void;
   sendText(chatId: string, text: string, uuid: string, canDispatch?: () => boolean): Promise<void>;
+  reactReceived(messageId: string, canDispatch: () => boolean): Promise<void>;
   inspectGroup(chatId: string, source?: 'created'): Promise<FeishuGroup>;
   createGroup(name: string, uuid: string): Promise<FeishuGroup>;
   diagnoseGroup(): Promise<FeishuGroupDiagnosis>;

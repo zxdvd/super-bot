@@ -15,6 +15,8 @@ const MISSING_FEISHU_SCOPE = 99991672;
 const ALL_GROUP_TEXT_SCOPES = new Set(['im:message.group_msg', 'im:message.group_msg:readonly']);
 const SEND_THROTTLED_CODES = new Set([230020, 99991400]);
 const MONTHLY_QUOTA_CODE = 99991403;
+const GROUP_MESSAGE_ID = /^om_[A-Za-z0-9_]{1,125}$/;
+const RECEIVED_EMOJI = 'THUMBSUP';
 const noop = () => {};
 // SDK diagnostics can include credentials, request payloads and message bodies.
 const logger = { error: noop, warn: noop, info: noop, debug: noop, trace: noop };
@@ -88,7 +90,7 @@ function humanText(event: Record<string, unknown>): FeishuTextMessage | null {
     create_time: createTime, content, mentions } = object(message);
   if (senderType !== 'user' || !isFeishuOpenId(senderOpenId)) return null;
   if (messageType !== 'text' || !isFeishuChatId(chatId)) return null;
-  if (typeof messageId !== 'string' || !/^om_[A-Za-z0-9_]{1,125}$/.test(messageId) || typeof content !== 'string') return null;
+  if (typeof messageId !== 'string' || !GROUP_MESSAGE_ID.test(messageId) || typeof content !== 'string') return null;
   const createdAt = typeof createTime === 'string' && /^\d+$/.test(createTime) ? Number(createTime) : createTime;
   if (typeof createdAt !== 'number' || !Number.isSafeInteger(createdAt) || createdAt < 0) return null;
   if (Buffer.byteLength(content) > MAX_FEISHU_TEXT_BODY_BYTES) return null;
@@ -251,7 +253,8 @@ export function createFeishuTransport(config: FeishuConfig, options: TransportOp
       const budget = requests.getStore();
       request.signal = AbortSignal.any([signal ?? lifetime.signal, budget?.signal ?? AbortSignal.timeout(requestTimeoutMs)]);
       // The SDK may asynchronously fetch a tenant token before sending the message request.
-      if (request.url?.endsWith('/im/v1/messages') && budget?.allowSend?.() === false) {
+      if (request.url && (request.url.endsWith('/im/v1/messages') || /\/im\/v1\/messages\/om_[A-Za-z0-9_]+\/reactions$/.test(request.url)) &&
+          budget?.allowSend?.() === false) {
         throw new AppError('feishu-binding-changed', '飞书绑定或连接已变更，消息发送已取消。');
       }
       return request;
@@ -473,6 +476,17 @@ export function createFeishuTransport(config: FeishuConfig, options: TransportOp
         }
         if (response?.code !== 0 || !response.data?.message_id) throw sendRetryable();
       }, sendHttpError, () => isReady(connection) && (canDispatch?.() ?? true));
+    },
+    reactReceived(messageId, canDispatch): Promise<void> {
+      const allowed = () => isReady(connection) && canDispatch();
+      const failure = () => new AppError('feishu-reaction-failed', '飞书收到表情未确认。');
+      return rest(async () => {
+        if (!allowed() || !GROUP_MESSAGE_ID.test(messageId)) throw failure();
+        const response = await im.messageReaction.create({
+          path: { message_id: messageId }, data: { reaction_type: { emoji_type: RECEIVED_EMOJI } },
+        });
+        if (response?.code !== 0) throw failure();
+      }, failure, allowed);
     },
   };
 }

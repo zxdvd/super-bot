@@ -1,4 +1,5 @@
-import { AppError, requiredText } from './model.ts';
+import { AppError, requiredText, type ChatSource } from './model.ts';
+import type { ReleaseTarget } from './gitlab-release.ts';
 
 /** Narrow condition contracts. Each provider supplies the readback, never a command from the model. */
 export type StageCondition = {
@@ -13,6 +14,9 @@ export type StageObservation = {
   detail: string;
   stateLabel?: string;
   url?: string;
+  releaseJob?: ReleaseTarget;
+  releaseChoices?: string[];
+  releaseMergeOpen?: true;
 };
 
 export interface WorkStage {
@@ -27,6 +31,11 @@ export interface WorkStage {
   condition?: StageCondition;
   observation?: StageObservation & { at: number };
   reason?: string;
+  deadlineAt?: number;
+  expired?: boolean;
+  planVersion?: number;
+  planSource?: ChatSource;
+  releaseOpenedAt?: number;
   at: number;
 }
 
@@ -38,6 +47,15 @@ export type DueStage = {
   condition: StageCondition;
   origin: string;
 };
+
+export type StageFollowUp = 'append' | 'replace' | 'revoke';
+
+export const STAGE_WAIT_MS = 24 * 60 * 60 * 1000;
+export const STAGE_OBSERVE_MS = 30_000;
+
+export function stageReadyKey(stage: Pick<WorkStage, 'runId' | 'planVersion'>): string {
+  return `stage-ready:${stage.runId}${stage.planVersion === undefined ? '' : `:${stage.planVersion}`}`;
+}
 
 export const STAGE_CONDITION_SCHEMA = {
   type: 'object',
@@ -86,4 +104,4 @@ export function stageConditionText(condition: StageCondition): string {
     : `GitLab ${condition.project} 流水线 #${condition.number} 成功`;
 }
 
-export const STAGE_GUIDANCE = `Use stage reports for concrete milestone evidence while the same task has outstanding acceptance work. In detail, stage is a settled Worker checkpoint. Use advance_stage with taskId, current expectedRowVersion, stage.runId, and one concrete nextStep only after verifying that it follows the original owner authorization and acceptance criteria. Use the same Task and Worker. This consumes no corrective rework allowance. Do not use it to repeat a failed check or write, expand permission, or treat a milestone as final delivery. When current facts show a necessary dependency, include condition for the exact GitLab merge request IID or exact pipeline ID. Set condition.sourceOrigin based on the known evidence for that object and compare it with detail.stageObserver.origin. Never substitute the configured source for an unknown or different source. The host checks only the matching configured source and dispatches the saved next step after a matching observation. If no observer is configured, saving the exact condition records the unavailable capability. If the result says blocked, explain the actual obstacle and who can resolve it. If the dependency source is unknown or unsupported or the next step requires permission, use block_stage with runId and a specific note. Keep an unchanged pending condition quiet. Only after an explicit owner request to retry observing an unavailable condition call advance_stage again with the identical condition and nextStep. A failed business check or failed external condition is a blocker. Only the overall deliverable enters normal review.`;
+export const STAGE_GUIDANCE = `Use stage reports for concrete milestone evidence while the same task has outstanding acceptance work. In detail, stage is a settled Worker checkpoint. Use advance_stage with taskId, current expectedRowVersion, stage.runId, and one concrete nextStep within the original owner authorization and acceptance criteria. Use the same Task and Worker. This consumes no corrective rework allowance. Only the overall deliverable enters normal review. When current facts show a necessary dependency, save its exact GitLab object and sourceOrigin from known evidence. The host tracks the exact object independently of model turns until the persisted deadline, including when the trusted reader is temporarily unavailable. Explain the actual wait or blocker and who can resolve it. Use block_stage when the dependency identity is unknown or the next step needs permission. Keep an unchanged wait quiet. For an explicit owner addition that leaves the plan intact, use continue with stageFollowUp:append, the current owner text and continuationMode. The new note accompanies the saved step, even when the note itself requests a read-only check. If the owner narrows the whole task, changes the execution direction or withdraws the planned step, use continue with stageFollowUp:replace or stageFollowUp:revoke. For a replacement with a new precise prerequisite, use advance_stage with stageFollowUp:replace and the complete current owner message in userInstruction. Explicit owner requests may retry the same expired wait using advance_stage with its unchanged step and condition. A failed business check or external condition needs a new owner decision. Do not use advance_stage to repeat a write or expand permission.`;

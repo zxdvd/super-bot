@@ -23,11 +23,11 @@ export function runtimeLimits(options:RuntimeOptions) {
 }
 export function fullAccessEnabled(options:RuntimeOptions):boolean { return options.fullAccess!==false; }
 
-export function configureRole(ctx:Context,agent:Agent,role:'manager'|'worker',options:RuntimeOptions):void {
+export function configureRole(ctx:Context,agent:Agent,role:'manager'|'worker',options:RuntimeOptions,keepPermissions=false):void {
   const model=role==='manager'?options.managerModel:options.workerModel;
   // A missing projection cannot establish that the session has no recorded selection.
   if(model&&(role==='worker'||ctx.sessionProjections.snapshot(agent.session,['modelSelection']).values.modelSelection?.next===null)) {
     agent.model.select(model);
   }
-  if(fullAccessEnabled(options))ctx.permissionPresets.set(agent.session,'danger-full-access');
+  if(fullAccessEnabled(options)&&!keepPermissions)ctx.permissionPresets.set(agent.session,'danger-full-access');
 }

@@ -21,7 +21,10 @@ import { DshExecution } from '../src/dsh.ts';
 import { Managers } from '../src/manager.ts';
 import { SessionId } from '@deepseek-ai/dsh-session/types';
 import type {SessionStore} from '@deepseek-ai/dsh-session';
-import { closeTask, stageArtifacts, stageGoal, stoppableGoal } from './stage-host-fixture.ts';
+import { closeTask, ownerAcceptance, ownerAcceptanceConfirm, ownerConfirm, ownerDetach, ownerInspect, ownerNewGoal, ownerOldGoal, ownerPrepare,
+  ownerRefuse, ownerRevise, ownerSessionTitle, stageArtifacts, stageGoal, stageRevoke, stageSupplement, stoppableGoal } from './stage-host-fixture.ts';
+import { approveFixtureDeployment, approveRelease, confirmReleaseChoice, prepareRelease, releaseFixtureGoal,
+  releaseStatusQuestion, restoreReleasePermission } from './gitlab-release-fixture.ts';
 import { artifactDeliveryText, artifactEditReply, artifactGoal, artifactLinks, artifactPrimary, artifactPortProbeGoal, artifactPortProbeText, artifactReference,
   artifactRevision, replacementMr, supplementalDoc } from './delivery-link-fixture.ts';
 import { deploymentEffectGoal, deploymentEffectRequest, deploymentProbe, deploymentRecoveryGoal, deploymentRecoveryRequest,
@@ -41,12 +44,28 @@ declare module '@deepseek-ai/dsh-llm' {
   }
 }
 export const name = 'super-bot-probe';
-export const inject = ['sessionPersistence','sessions','llm','tools','sessionController','workspaceRegistry','connection','agents','jobs','workingDirectory','sessionProjections'];
+export const inject = ['sessionPersistence','sessions','llm','tools','sessionController','workspaceRegistry','connection','agents','jobs','workingDirectory','sessionProjections','sessionTitle'];
 const provider = 'super-bot-probe';
 const toolName = 'super_bot_probe_report';
 const scopedToolName='super_bot_scoped_probe';
 type RequestMessage=GenerateOptions['messages'][number];
 const messageText=(message:RequestMessage)=>message.content.flatMap(block=>block.type==='text'?[block.text]:[]).join('');
+const lateJobGoal='LATE_JOB_RESEARCH_';
+const lateJobProgress='已记录现状调研的基线。';
+const lateJobReport='已读取原 Job 结果并写出选型报告，旧轮外部效果仍待核实。';
+async function* probeText(text:string):AsyncIterable<StreamChunk> {
+  yield {type:'block-start',index:0,blockType:'text'};
+  yield {type:'text-delta',index:0,text};
+  yield {type:'block-end',index:0,block:{type:'text',text}};
+  yield {type:'finish',reason:{kind:'stop'}};
+}
+async function* probeTool(name:string,payload:Record<string,unknown>):AsyncIterable<StreamChunk> {
+  const id=ToolCallId(randomUUID()),args=JSON.stringify(payload);
+  yield {type:'block-start',index:0,blockType:'tool-call'};
+  yield {type:'tool-call-delta',index:0,id,name,argumentsDelta:args};
+  yield {type:'block-end',index:0,block:{type:'tool-call',id,name,arguments:args}};
+  yield {type:'finish',reason:{kind:'tool-calls'}};
+}
 type WorkerInput=Extract<RequestMessage,{role:'user'}> & {source:Extract<UserMessage['source'],{kind:'super-bot'}>};
 const isWorkerInput=(message:RequestMessage):message is WorkerInput=>message.role==='user'&&message.source?.kind==='super-bot';
 
@@ -86,7 +105,13 @@ class ProbeAdapter extends LlmAdapter {
     if(options.tools?.some(tool=>tool.name==='super_bot_manage')) {
       const trigger=options.messages.findLast(m=>m.role==='user'&&(m.source?.kind==='user'||m.source?.kind==='super-bot-manager'));
       const text=trigger?.content.filter(b=>b.type==='text').map(b=>b.text).join('')??'';
+      const lateAppend=trigger?.source?.kind==='user'?text.match(/^LATE_JOB_APPEND ([a-f0-9-]{36}) /):null;
       const later=trigger?options.messages.slice(options.messages.indexOf(trigger)+1):[];
+      if(text==='LATE_JOB_MANAGER_HOLD'&&options.sessionId) {
+        await new Promise<void>(release=>this.stalled.set(options.sessionId!,{release,signal:options.signal}));
+        this.stalled.delete(options.sessionId);options.signal?.throwIfAborted();
+        yield* probeText('原生 Manager 测试暂停已解除。');return;
+      }
       // These fixtures exercise the actual scoped native executor, not a mocked Shell result.
       const query=trigger?.source?.kind==='user'&&text==='请用 Shell 做一次只读查询，直接告诉我结果，不创建任务。';
       const noWait=trigger?.source?.kind==='user'&&text==='BOT_NOWAIT_PROBE';
@@ -107,6 +132,19 @@ class ProbeAdapter extends LlmAdapter {
       const last=calls.at(-1);const prior=last?.type==='tool-call'?JSON.parse(last.arguments) as Record<string,unknown>:null;
       let value:Record<string,any>|undefined;
       for(const message of later.filter(m=>m.role==='tool'))for(const block of message.content)if(block.type==='text')try{value=JSON.parse(block.text);}catch{}
+      const lateControl=trigger?.source?.kind==='user'&&/^请(暂停|恢复|关闭)「(LATE_JOB_RESEARCH_[A-Z]+)」的原计划。$/.exec(text);
+      if(lateControl) {
+        const verb=lateControl[1]!,goal=lateControl[2]!;
+        const action=verb==='暂停'?'pause':verb==='恢复'?'resume':'close';
+        const target=prior?.action==='list'&&value?.items?.find((item:{goal:string})=>item.goal===goal);
+        if(!prior)yield* probeTool('super_bot_manage',{action:'list'});
+        else if(target)yield* probeTool('super_bot_manage',{action:'detail',taskId:target.id});
+        else if(prior.action==='detail'&&value?.task?.goal===goal)yield* probeTool('super_bot_manage',{
+          action,taskId:value.task.id,expectedRowVersion:value.task.rowVersion,userInstruction:text,
+        });
+        else yield* probeText(value?.task?`已记录${verb}原任务的请求。`:'当前任务控制请求待核对。');
+        return;
+      }
       if(value?.task?.goal==='MANAGER_MODEL_FAILURE_PROBE')throw new LlmError('Synthetic missing credential; no provider request was made','MISSING_CREDENTIAL');
       if(value?.task?.goal==='MANAGER_TIME_PROBE') {
         await new Promise<void>(resolve=>{if(options.signal?.aborted)resolve();else options.signal?.addEventListener('abort',()=>resolve(),{once:true});});
@@ -135,6 +173,38 @@ class ProbeAdapter extends LlmAdapter {
         yield {type:'finish',reason:{kind:'tool-calls'}};return;
       }
       let plan:Record<string,unknown>|null=null;
+      const releaseFollowup=trigger?.source?.kind==='user'&&
+        [approveRelease,approveFixtureDeployment,confirmReleaseChoice,releaseStatusQuestion,restoreReleasePermission].includes(text);
+      if(releaseFollowup) {
+        if(!prior){yield* probeTool('super_bot_manage',{action:'list'});return;}
+        if(prior.action==='list') {
+          const target=value?.items.find((item:{goal:string})=>item.goal.startsWith(releaseFixtureGoal));
+          assert.ok(target);
+          yield* probeTool('super_bot_manage',{action:'detail',taskId:target.id});return;
+        }
+        if(prior.action==='detail'&&value?.stage) {
+          if(text===releaseStatusQuestion) {
+            if(value.gitLabRelease&&!value.gitLabCurrentStatus&&prior.refreshGitLabRelease!==true) {
+              yield* probeTool('super_bot_manage',{action:'detail',taskId:value.task.id,refreshGitLabRelease:true,
+                expectedRowVersion:value.task.rowVersion});return;
+            }
+            yield* probeText(value.gitLabCurrentStatus?.detail??'正在核对阶段，正式作业尚未登记。');
+            return;
+          }
+          const retry=text===restoreReleasePermission;
+          const select=text===confirmReleaseChoice;
+          const evidence=retry?value.gitLabRelease?.condition:undefined;
+          const url=retry?null:new URL(value.stage.evidenceRef);
+          const condition=evidence??{kind:'gitlab-merge',sourceOrigin:url!.origin,
+            project:url!.pathname.slice(1).split('/-/')[0],number:Number(url!.pathname.split('/').at(-1))};
+          yield* probeTool('super_bot_manage',{action:'advance_stage',taskId:value.task.id,runId:value.stage.runId,
+            expectedRowVersion:value.task.rowVersion,nextStep:'运行已授权的正式发布作业',condition,userInstruction:text,
+            gitLabRelease:{intent:retry?'retry':select?'select':'publish',
+              ...(select?{jobName:value.stage.observation.releaseChoices[0]}:{}),
+              ...(text===approveFixtureDeployment?{requiresJobName:true}:{})}});
+          return;
+        }
+      }
       const remember=text.match(/^请把「(.+)」保存为以后的默认工作约定。$/);
       const delegate=text.match(/^请写一份合成说明 ([ABC])。(?:这一次请(.+))?$/);
       const workConvention=text.match(/^请核对这项任务的实际工作约定：([a-f0-9-]+)$/);
@@ -144,13 +214,29 @@ class ProbeAdapter extends LlmAdapter {
         ? text.match(/#super-bot-task=([a-f0-9-]+)&resultId=([a-f0-9-]+)/) : null;
       const namedRequest=trigger?.source?.kind==='user'
         ? [preflightRequest,imageRequest,wiringRequest,startupRequest,pendingRequest].indexOf(text) : -1;
-      const continuationTarget=new Map([[imageScope,imageGoal],[startupContinue,startupGoal],[pendingContinue,pendingGoal],[pendingScope,pendingGoal],[appendixScope,pendingGoal]]).get(text);
+      const stageFollowUp=trigger?.source?.kind==='user'&&(text===stageSupplement?'append':text===stageRevoke?'revoke':undefined);
+      const continuationTarget=stageFollowUp?stageGoal:
+        new Map([[imageScope,imageGoal],[startupContinue,startupGoal],[pendingContinue,pendingGoal],[pendingScope,pendingGoal],[appendixScope,pendingGoal]]).get(text);
       const namedFollowup=trigger?.source?.kind==='user' && (continuationTarget||[ambiguous,pauseWiring,cancelWiring,closeTask].includes(text));
       const wantedAction=continuationTarget?'continue':text===pauseWiring?'pause':text===closeTask?'close':'cancel';
       const wantedGoal=continuationTarget??(text===closeTask?stoppableGoal:wiringGoal);
       const lastResult=later.findLast(message=>message.role==='tool');
       const successfulTool=lastResult?.role==='tool'&&!lastResult.isError;
-      if(namedRequest>=0&&!prior) {
+      const ownerAction=trigger?.source?.kind==='user'&&new Map([[ownerAcceptance,'accept'],[ownerAcceptanceConfirm,'accept'],[ownerRevise,'revise'],
+        [ownerInspect,'session-inspect'],[ownerRefuse,'session-attach'],[ownerConfirm,'session-attach'],
+        [ownerDetach,'session-detach'],[ownerPrepare,'session-prepare']]).get(text);
+      if(ownerAction&&!prior) {
+        plan={action:'list'};
+      }else if(ownerAction&&prior?.action==='list') {
+        const goal=ownerAction==='accept'?stageGoal:ownerAction==='revise'?ownerOldGoal:ownerNewGoal;
+        const tasks=value?.items as {goal:string;id:string;lifecycle:string}[]|undefined;
+        const selected=tasks?.find(item=>item.goal===goal&&(ownerAction!=='accept'||item.lifecycle==='review'));
+        if(selected)plan={action:'detail',taskId:selected.id};
+      }else if(ownerAction&&prior?.action==='detail'&&value?.task) {
+        plan={action:ownerAction,taskId:value.task.id,expectedRowVersion:value.task.rowVersion,userInstruction:text,
+          ...(ownerAction==='accept'?{resultId:value.result.id}:ownerAction==='revise'?{goal:ownerNewGoal}:
+            ownerAction==='session-inspect'?{sessionQuery:ownerSessionTitle}:{})};
+      }else if(namedRequest>=0&&!prior) {
         const goal=req005Goals[namedRequest];
         const scope=goal===preflightGoal?'只读 preflight.txt':goal===imageGoal?'当前合成任务目录内核对变更和版本':
           goal===startupGoal?'仅允许合成目录标记一次首启，随后只读核对 fixture 中具名 Deployment':
@@ -159,16 +245,17 @@ class ProbeAdapter extends LlmAdapter {
       }else if(namedFollowup&&!prior) {
         plan={action:'list'};
       }else if(namedFollowup&&prior?.action==='list') {
-        const tasks=value?.items as {goal:string;id:string}[]|undefined;
+        const tasks=value?.items as {goal:string;id:string;lifecycle:string}[]|undefined;
         if(text===ambiguous) {
           const taskIds=tasks?.filter(item=>[imageGoal,wiringGoal].includes(item.goal)).map(item=>item.id);
           if(taskIds?.length===2)plan={action:'clarify',taskIds,followUp:'continue'};
         }else {
-          const target=tasks?.find(item=>item.goal===wantedGoal);
+          const target=tasks?.find(item=>item.goal===wantedGoal&&(!stageFollowUp||item.lifecycle==='open'));
           if(target)plan={action:'detail',taskId:target.id};
         }
       }else if(namedFollowup&&prior?.action==='detail'&&value?.task?.goal===wantedGoal) {
         plan={action:wantedAction,taskId:value.task.id,expectedRowVersion:value.task.rowVersion,userInstruction:text,
+          ...(stageFollowUp?{stageFollowUp,...(stageFollowUp==='append'?{continuationMode:'read-only'}:{})}:{}),
           ...([imageScope,pendingScope,appendixScope].includes(text)?{continuationMode:'read-only'}:{})};
       }else if(continuationNotice&&prior?.action==='detail'&&currentTask&&req005Goals.includes(currentTask.goal)) {
         plan={action:'continue',taskId:currentTask.id,expectedRowVersion:currentTask.rowVersion};
@@ -199,11 +286,16 @@ class ProbeAdapter extends LlmAdapter {
       }else if(value?.task?.goal==='MANAGER_STEP_PROBE')plan={action:'detail',taskId:value.task.id};
       else if(!prior) {
         const foreign=text.match(/CROSS_BOT:([^\s]+)/)?.[1];
-        if(trigger?.source?.kind==='user'&&text===readRecoveryRequest)plan={action:'create',goal:readRecoveryGoal,scope:`只读当前任务目录的 ${recoveryFileName}`,acceptance:'报告实际读取结果'};
+        if(lateAppend)plan={action:'detail',taskId:lateAppend[1]};
+        else if(trigger?.source?.kind==='user'&&text.startsWith(lateJobGoal))plan={action:'create',goal:text,scope:'核实现状，形成选型报告。只在任务目录写合成报告。',acceptance:'报告来自原 Job 的确切结果和已保存基线。'};
+        else if(trigger?.source?.kind==='user'&&text===readRecoveryRequest)plan={action:'create',goal:readRecoveryGoal,scope:`只读当前任务目录的 ${recoveryFileName}`,acceptance:'报告实际读取结果'};
         else if(trigger?.source?.kind==='user'&&text===effectRecoveryRequest)plan={action:'create',goal:effectRecoveryGoal,scope:`写入合成标记 ${recoveryEffectName}，并只读检查 ${recoveryFileName}`,acceptance:'报告已执行操作与实际读取结果'};
         else if(trigger?.source?.kind==='user'&&text===permissionRecoveryRequest)plan={action:'create',goal:permissionRecoveryGoal,scope:'只读核对 Kubernetes context synthetic 的 namespace fixture 中 get persistentvolumeclaims 权限',acceptance:'报告实际共享身份与权限结果'};
         else if(trigger?.source?.kind==='user'&&text===deploymentRecoveryRequest)plan={action:'create',goal:deploymentRecoveryGoal,scope:'只读核对 Kubernetes context synthetic 的 namespace fixture 下 Deployment fixture-deployment',acceptance:'报告实际共享身份与指定 Deployment 的最新状态'};
         else if(trigger?.source?.kind==='user'&&text===deploymentEffectRequest)plan={action:'create',goal:deploymentEffectGoal,scope:`在任务目录写入 ${recoveryEffectName}，并只读核对 Kubernetes context synthetic 的 namespace fixture 下 Deployment fixture-deployment`,acceptance:'报告已执行操作与指定 Deployment 的最新状态'};
+        else if(trigger?.source?.kind==='user'&&text.startsWith(prepareRelease))plan={action:'create',
+          goal:releaseFixtureGoal+' '+text.slice(prepareRelease.length),scope:'只操作该合成合并请求的发布作业',
+          acceptance:'核对合成发布作业，在原聊天报告准确链接和已确认状态'};
         else if(trigger?.source?.kind==='user'&&text===stoppableGoal)plan={action:'create',goal:stoppableGoal,scope:'合成资料任务目录',acceptance:'资料整理完成'};
         else if(trigger?.source?.kind==='user'&&text===stageGoal)plan={action:'create',goal:stageGoal,scope:'在当前任务目录中生成目录、引用、附录和最终说明，只读核对 fixture/docs 的 42 号引用检查流水线',acceptance:'最终说明已生成并回读'};
         else if(foreign)plan={action:'detail',taskId:foreign};
@@ -229,7 +321,9 @@ class ProbeAdapter extends LlmAdapter {
         if(links)plan={action:'update_delivery_links',taskId:value.task.id,resultId:editTarget[2],expectedRowVersion:value.task.rowVersion,links};
       }
       else if(prior.action==='detail'&&value?.task?.controlMode==='auto') {
-        if(trigger?.source?.kind==='user'&&text==='再加一句结论。'&&value.result)plan={action:'rework',taskId:value.task.id,expectedRowVersion:value.task.rowVersion,resultId:value.result.id};
+        if(lateAppend&&value.task.goal.startsWith(lateJobGoal))plan={action:'continue',taskId:value.task.id,
+          expectedRowVersion:value.task.rowVersion,userInstruction:text,continuationMode:'authorized-work',lateJobFollowUp:'append'};
+        else if(trigger?.source?.kind==='user'&&text==='再加一句结论。'&&value.result)plan={action:'rework',taskId:value.task.id,expectedRowVersion:value.task.rowVersion,resultId:value.result.id};
         else if(trigger?.source?.kind==='user'&&text==='读者是新同事，保持简短。'&&value.pendingQuestions?.[0])plan={action:'respond',taskId:value.task.id,expectedRowVersion:value.task.rowVersion,attentionId:value.pendingQuestions[0].id};
         else if(value.task.goal===stageGoal&&value.stage?.state==='awaiting-decision') {
           const completed=stageArtifacts.find(item=>item.name===value.stage.name);
@@ -268,7 +362,12 @@ class ProbeAdapter extends LlmAdapter {
       const workerQuestion=value?.pendingQuestions?.[0];
       const clarification=value?.attentions?.find((a:any)=>a.kind==='input'&&a.state==='open'&&!a.id.startsWith('run:'));
       let reply='已核对当前状态。';
-      if(namedFollowup&&prior?.action==='clarify'&&successfulTool)reply=clarify;
+      if(value?.gitLabRelease)reply=value.gitLabRelease.detail+'\n'+value.gitLabRelease.url;
+      else if(value?.task?.goal?.startsWith(releaseFixtureGoal)&&value.stage?.observation?.releaseChoices)reply=value.stage.observation.detail;
+      else if(ownerAction&&prior?.action==='session-inspect'&&typeof value?.confirmationText==='string')reply=value.confirmationText;
+      else if(ownerAction&&prior?.action===ownerAction&&typeof value?.confirmationText==='string')reply=value.confirmationText;
+      else if(ownerAction&&prior?.action===ownerAction&&successfulTool)reply=ownerAction==='accept'?'已接受该成果。':'已完成此次操作。';
+      else if(namedFollowup&&prior?.action==='clarify'&&successfulTool)reply=clarify;
       else if(namedFollowup&&prior?.action==='cancel'&&successfulTool&&value?.task?.lifecycle==='cancelled')reply=wiringCancelled;
       else if(namedFollowup&&prior?.action==='pause'&&successfulTool&&value?.task?.controlMode==='paused')reply=wiringPaused;
       else if((namedFollowup||continuationNotice)&&prior?.action==='continue'&&successfulTool)reply=value?.message??reply;
@@ -289,6 +388,9 @@ class ProbeAdapter extends LlmAdapter {
       }else if(workerQuestion)reply=`${workerQuestion.question}\n${workerQuestion.markdown}`;
       else if(clarification)reply=clarification.question;
       else if(prior?.action==='dispatch'||(prior?.action==='create'&&(value?.run||value?.deferred)))reply='已经开始处理，完成后我会回到这里交付。';
+      else if(lateAppend&&prior?.action==='continue')reply=value?.message??reply;
+      else if(value?.lateJobRecovery)reply=value.attentions.find((item:any)=>item.kind==='recovery'&&item.state==='open')?.question??reply;
+      else if(value?.lateJobPriorEffects)reply=value.lateJobPriorEffects;
       else if(recoveryNotice&&prior?.action==='inspect-recovery'&&value?.status==='needs-human')reply=value.message;
       else if(recoveryNotice&&prior?.action==='recover-preflight') {
         reply=value?.message??value?.result?.message??reply;
@@ -346,7 +448,63 @@ class ProbeAdapter extends LlmAdapter {
       const cwd=context.match(/^Working directory: (.+?)(?: \([^)]*\)|\. Work only inside it;|$)/m)?.[1];assert.ok(cwd);
       const later=options.messages.slice(options.messages.indexOf(workInput)+1);
       const calls=later.flatMap(m=>m.content.filter(b=>b.type==='tool-call').map(b=>b.name));
+      if(goal.startsWith(releaseFixtureGoal)) {
+        const mr=goal.slice(releaseFixtureGoal.length+1);
+        if(body.includes('Call super_bot_gitlab_play with no arguments')) {
+          assert.ok(options.tools?.some(tool=>tool.name==='super_bot_gitlab_play'));
+          assert.ok(!options.tools?.some(tool=>tool.name==='bash'));
+          yield* probeTool('super_bot_gitlab_play',{});return;
+        }
+        const possiblyPlayed=new URL(mr).pathname.endsWith('/14');
+        const executeOldShell=new URL(mr).pathname.endsWith('/11')||possiblyPlayed;
+        if(executeOldShell&&!calls.includes('bash')) {
+          const command=possiblyPlayed?'glab api --method POST projects/914/jobs/214/play':'printf "fixture\\n"';
+          yield* probeTool('bash',{description:'普通合成工作',command,timeoutMs:1000});return;
+        }
+        yield* probeTool('super_bot_report',{kind:'stage',stage:'合成合并请求',evidenceRef:mr,
+          summary:'合并请求准备完毕，等待正式发布授权。',checks:'已核对合成 MR 引用。'});return;
+      }
       const file=join(cwd,'result.md');
+      if(goal.startsWith(lateJobGoal)&&options.sessionId) {
+        const latest=options.messages.findLast(message=>message.role==='user'&&
+          ['tool-jobs','user','super-bot'].includes(String(message.source?.kind)));
+        if(latest&&String(latest.source?.kind)==='tool-jobs') {
+          await new Promise<void>(release=>this.stalled.set(options.sessionId!,{release,signal:options.signal}));
+          this.stalled.delete(options.sessionId);options.signal?.throwIfAborted();
+          yield* probeText('原生通知已消费。');return;
+        }
+        const marker=join(cwd,'job-marker.txt');
+        if(!previous.length) {
+          if(!calls.includes('super_bot_report')) {
+            yield* probeTool('super_bot_report',{kind:'progress',summary:lateJobProgress});return;
+          }
+          if(!calls.includes('bash')) {
+            yield* probeTool('bash',{description:'合成资料读取等待',run_in_background:true,
+              command:"i=0; while [ ! -f release-late-job ]; do i=$((i+1)); [ $i -ge 1000 ] && exit 8; sleep .03; done; printf 'JOB_EFFECT_ONCE\\n' >> job-marker.txt; printf 'BASELINE_NATIVE_RESULT\\n'"});return;
+          }
+          await new Promise<void>(release=>this.stalled.set(options.sessionId!,{release,signal:options.signal}));
+          this.stalled.delete(options.sessionId);options.signal?.throwIfAborted();
+          yield* probeText('旧轮测试完成。');return;
+        }
+        assert.match(body,/effectUncertain":true/);
+        assert.ok(body.includes(lateJobProgress));
+        if(goal.endsWith('_RESTART'))assert.ok(body.includes('报告附上部署限制'));
+        assert.ok(options.messages.some(message=>messageText(message).includes('BASELINE_NATIVE_RESULT')));
+        assert.ok(!options.tools?.some(tool=>tool.name==='bash'));
+        const folder=JSON.parse(body.split('Earlier attempt and observed facts (use as evidence): ')[1]!.split('\n')[0]!).outputDirectory;
+        const output=join(folder,'research-report.md');
+        if(!calls.includes('read')){yield* probeTool('read',{file_path:marker});return;}
+        const writes=calls.filter(name=>name==='write').length;
+        if(writes===0){yield* probeTool('write',{file_path:marker,content:'MUST NOT OVERWRITE'});return;}
+        if(writes===1){
+          assert.ok(later.some(message=>message.role==='tool'&&message.isError===true));
+          yield* probeTool('write',{file_path:output,content:lateJobProgress+'\n'+lateJobReport+'\n'});return;
+        }
+        if(!calls.includes('super_bot_report')){
+          yield* probeTool('super_bot_report',{kind:'ready',summary:lateJobReport,checks:'已回读原资料并生成选型报告。',files:[output]});return;
+        }
+        yield* probeText(lateJobReport);return;
+      }
       if(goal.startsWith('READY_WITH_JOB_PROBE')&&options.sessionId)this.readyWithJob.add(options.sessionId);
       const approvalProbe=goal.startsWith('APPROVAL_PROBE');
       if(approvalProbe&&!calls.includes('write')&&options.sessionId)this.approvalWrites.add(options.sessionId);
@@ -706,6 +864,20 @@ export function apply(ctx:Context) {
   ctx.effect(()=>ctx.connection.fetch.register({path:'/api/super-bot-probe',methods:['POST'],requestBody:'buffered',
     fetch:async request=>{try{
       const body=await request.json() as {action?:string;sessionId?:string;text?:string;itemId?:string};
+      if(body.action==='late-job-events'||body.action==='late-job-abort'||body.action==='late-job-duplicate-terminal') {
+        assert.ok(body.sessionId);const agent=ctx.agents.get(SessionId(body.sessionId));assert.ok(agent);
+        assert.ok(agent.session.header.cwd?.startsWith(join(home!,'super-bot')+'/'));
+        if(body.action==='late-job-abort') {
+          agent.cancel({kind:'user'},{keepInbox:true});
+          adapter.stalled.get(agent.id)?.release();
+        }
+        const events=agent.session.snapshotEvents();
+        if(body.action==='late-job-duplicate-terminal') {
+          const terminal=events.findLast(event=>event.type==='job/settled');assert.ok(terminal);
+          agent.session.append('job/settled',terminal.data);
+        }
+        return Response.json({ok:true,status:agent.status,stalled:adapter.stalled.has(agent.id),events});
+      }
       if(body.action==='ready-job-status'||body.action==='ready-job-cancel'||body.action==='ready-job-finish') {
         assert.ok(body.sessionId);const job=readyJobs.get(body.sessionId);assert.ok(job);
         if(body.action==='ready-job-cancel')ctx.jobs.kill(job.id,SessionId(body.sessionId),'Synthetic late settlement');
@@ -762,6 +934,7 @@ export function apply(ctx:Context) {
         const resolved=await ctx.sessionController.resolveAgent(created.sessionId);assert.ok('agent' in resolved);const agent=resolved.agent;
         agent.model.select({provider,model:'deterministic'});
         const history=input('已有会话的合成历史材料：只供当前授权关联测试，不访问网络。');agent.followup(history);await bounded(agent.whenIdle(),'attachment history');
+        if(body.text===ownerSessionTitle)ctx.sessionTitle.rename(agent.session,ownerSessionTitle);
         if(body.text==='fork') {
           const fork=await ctx.sessionController.fork({sessionId:agent.id});return Response.json({ok:true,sessionId:fork.sessionId,cwd,historyMessageId:history.id});
         }

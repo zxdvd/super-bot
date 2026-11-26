@@ -220,6 +220,268 @@ test('P2 incomplete unbound task can be completed by a real chat answer and disp
   }finally{await f.close();}
 });
 
+test('owner chat accepts only the numbered exact result and audits both authenticated messages',async t=>{
+  const f=fixture(t);try {
+    const ready=async(key:string)=>{
+      const task=f.store.createTask(key,{botId:f.bot.id,goal:'同名说明',scope:'合成文档',acceptance:'回读',reviewPolicy:'human'});
+      const binding=await f.execution.prepareSession(`${key}:prepare`,task.id,task.rowVersion);
+      const path=join(binding.cwd,`${key}.md`);writeFileSync(path,key);
+      await f.execution.dispatch(`${key}:dispatch`,task.id,f.store.getTask(task.id).rowVersion);
+      await f.finish(task.id,[path],'ready',{summary:key,checks:'已回读'});
+      return f.store.taskDetail(task.id);
+    };
+    const first=await ready('alpha'),second=await ready('beta');
+    const args=(detail:typeof first,text:string)=>({action:'accept',taskId:detail.task.id,resultId:detail.result!.id,
+      expectedRowVersion:detail.task.rowVersion,userInstruction:text});
+    await assert.rejects(f.call('notice-cannot-sign',args(first,'接受成果。')),{code:'human-message-required'});
+    const request='我接受刚才的成果。';await f.native('initial-accept',1,request);
+    await assert.rejects(f.call('ambiguous-accept',args(first,request)),{code:'clarification-required'});
+    const mismatch=`我接受 http://example.test/#super-bot-task=${second.task.id}&resultId=${second.result!.id}`;
+    await f.native('explicit-foreign',2,mismatch);
+    await assert.rejects(f.call('wrong-link',args(first,mismatch)),{code:'result-stale'});
+    await f.native('clarification-request',3,request);
+    const options=await f.nativeCall('clarify-results',{action:'clarify',followUp:'accept',resultIds:[first.result!.id,second.result!.id]});
+    assert.deepEqual(options.numberedChoices.map((choice:any)=>choice.number),[1,2]);
+    assert.match(options.numberedChoices[0].label,/alpha/);assert.match(options.numberedChoices[1].label,/beta/);
+    await f.emit({type:'turn/end',data:{reason:{kind:'completed'}}});
+    const choice={useClarification:true,selectionText:'第二项'};
+    await f.emit({type:'turn/start',seq:4,data:{turn:2}});
+    for(const [index,text] of ['第二项先不要接受','第二项，先查看这版的状态。','第二项或第一项？'].entries()) {
+      await f.native(`selection-rejected-${index}`,5+index,text);
+      await assert.rejects(f.call(`misread-selection-${index}`,{...args(second,text),...choice}),{code:'clarification-selection'});
+      assert.equal(f.store.taskDetail(second.task.id).result?.humanAcceptedAt,null);
+    }
+    const selected='就选第二项吧。';await f.native('select-result',8,selected);
+    await assert.rejects(f.call('wrong-selection',{...args(first,selected),...choice}),{code:'clarification-selection'});
+    const accepted=await f.nativeCall('right-selection',{...args(second,selected),...choice});
+    assert.equal(accepted.task.lifecycle,'completed');assert.equal(accepted.resultId,second.result!.id);
+    assert.deepEqual(await f.nativeCall('duplicate-selection',{...args(second,selected),...choice}),accepted);
+    assert.equal(f.store.taskDetail(first.task.id).result?.humanAcceptedAt,null);
+    const events=f.store.taskDetail(second.task.id).events.filter(event=>event.kind==='result.accepted');
+    assert.equal(events.length,1);
+    assert.deepEqual(JSON.parse(events[0]!.data).source.messages.map((entry:any)=>entry.messageId),['clarification-request','select-result']);
+  }finally{await f.close();}
+});
+
+test('a newer revision or rejected selection prevents an earlier acceptance from escaping its version',async t=>{
+  const f=fixture(t);try {
+    const reviewed=[];
+    for(const key of ['old-a','old-b']) {
+      const task=f.store.createTask(key,{botId:f.bot.id,goal:key,scope:'合成',acceptance:'回读',reviewPolicy:'human'});
+      const binding=await f.execution.prepareSession(key+':prepare',task.id,task.rowVersion);
+      const path=join(binding.cwd,'file.md');writeFileSync(path,key);
+      await f.execution.dispatch(key+':dispatch',task.id,f.store.getTask(task.id).rowVersion);
+      await f.finish(task.id,[path]);reviewed.push(f.store.taskDetail(task.id));
+    }
+    const [first,second]=reviewed;
+    await f.native('initial',1,'请接受成果。');
+    await f.nativeCall('clarify-stale',{action:'clarify',followUp:'accept',taskIds:[first!.task.id,second!.task.id]});
+    await f.emit({type:'turn/end',data:{reason:{kind:'completed'}}});
+    f.store.controlTask('touch-version',second!.task.id,second!.task.rowVersion,'paused');
+    await f.emit({type:'turn/start',seq:2,data:{turn:2}});await f.native('stale-select',3,'第二个');
+    const stale={action:'accept',taskId:second!.task.id,resultId:second!.result!.id,userInstruction:'第二个',selectionText:'第二个',
+      useClarification:true,expectedRowVersion:second!.task.rowVersion};
+    await assert.rejects(f.call('stale',stale),{code:'version-conflict'});
+    const current=f.store.getTask(second!.task.id);
+    await assert.rejects(f.call('current-row',{...stale,expectedRowVersion:current.rowVersion}),{code:'clarification-stale'});
+    await f.native('rejection',4,'不是第二个，我另外有事。');
+    await assert.rejects(f.call('reject-choose',{...stale,userInstruction:'不是第二个，我另外有事。'}),{code:'clarification-selection'});
+    assert.equal(f.store.taskDetail(second!.task.id).result?.humanAcceptedAt,null);
+  }finally{await f.close();}
+});
+
+async function ownerReviewFixture(f:ReturnType<typeof fixture>) {
+  const task=f.store.createTask('owner-review',{botId:f.bot.id,goal:'成果说明',scope:'合成文档',acceptance:'回读',reviewPolicy:'human'});
+  const binding=await f.execution.prepareSession('owner-review:prepare',task.id,task.rowVersion);
+  const path=join(binding.cwd,'result.md');writeFileSync(path,'Synthetic evidence');
+  await f.execution.dispatch('owner-review:dispatch',task.id,f.store.getTask(task.id).rowVersion);
+  await f.finish(task.id,[path]);
+  const detail=f.store.taskDetail(task.id);
+  return { taskId:task.id, resultId:detail.result!.id, expectedRowVersion:detail.task.rowVersion };
+}
+
+async function showOwnerQuestion(f:ReturnType<typeof fixture>,turn:number,seq:number,text:string) {
+  await f.emit({type:'assistant/message',seq,surfaceOp:'append',data:{turn,
+    message:{source:{kind:'model'},content:[{type:'text',text}]},
+    stream:[{type:'chunk',chunk:{type:'finish',reason:{kind:'stop'}}}]} });
+}
+
+test('mistaken acceptance tool calls leave negative, uncertain, and status-only owner messages untouched',async t=>{
+  const f=fixture(t);try {
+    const target=await ownerReviewFixture(f);
+    const rejected=['我还没接受这份成果。','我没有验收通过。','不要接受这版。',
+      '请看看这份成果的验收状态。','目前的验收状态','可以接受吗','接受后会发生什么？','我本来打算接受，但现在取消。'];
+    for(const [i,text] of rejected.entries()) {
+      await f.native(`negative-${i}`,i+1,text);
+      await assert.rejects(f.call(`wrong-accept-${i}`,{action:'accept',...target,userInstruction:text}),{code:'confirmation-required'});
+      assert.equal(f.store.taskDetail(target.taskId).result?.humanAcceptedAt,null);
+    }
+    const userInstruction='可以收下这版了。';
+    await f.native('natural-accept',25,userInstruction);
+    const accepted=await f.nativeCall('natural-accept',{action:'accept',...target,userInstruction});
+    assert.equal(accepted.task.lifecycle,'completed');
+    assert.equal(f.store.taskDetail(target.taskId).events.filter(event=>event.kind==='result.accepted').length,1);
+  }finally{await f.close();}
+});
+
+test('a confirmed recovery fact does not launch another run until the owner agrees to that exact displayed action',async t=>{
+  const f=fixture(t);try {
+    const task=f.store.createTask('recovery-confirmation',{botId:f.bot.id,goal:'待复核旧轮',scope:'合成检查',acceptance:'回读',reviewPolicy:'human'});
+    await f.execution.prepareSession('recovery-confirmation:prepare',task.id,task.rowVersion);
+    const run=await f.execution.dispatch('recovery-confirmation:prior',task.id,f.store.getTask(task.id).rowVersion);
+    f.agents.get(run.sessionId).cancel();f.store.runRecovery(run.id,'上轮外部操作尚待核对');
+    const target={action:'recover-and-continue',taskId:task.id,runId:run.id,attentionId:`run:${run.id}`,
+      expectedRowVersion:f.store.getTask(task.id).rowVersion};
+    const fact='上次没有触发外部操作。';
+    const open=async(turn:number,seq:number,text:string)=>{
+      await f.emit({type:'turn/start',seq,data:{turn}});await f.native(`fact-${seq+1}`,seq+1,text);
+    };
+    await open(1,10,fact);
+    const unseen=await f.nativeCall('stage-question',{...target,userInstruction:fact});
+    assert.equal(unseen.status,'confirmation-required');assert.match(unseen.confirmationText,/没有触发外部操作.*派发下一轮/);
+    await showOwnerQuestion(f,1,12,'可以继续吗？'); // Neither the fact nor the exact dispatch scope was shown.
+    await f.emit({type:'turn/end',seq:13,data:{reason:{kind:'completed'}}});
+    await open(2,20,'行');
+    await assert.rejects(f.call('ambiguous-short',{...target,userInstruction:'行'}),{code:'confirmation-required'});
+    await f.emit({type:'turn/end',seq:23,data:{reason:{kind:'completed'}}});
+    await open(3,30,fact);
+    const shown=await f.nativeCall('stage-question-again',{...target,userInstruction:fact});
+    await showOwnerQuestion(f,3,32,shown.confirmationText);
+    await f.emit({type:'turn/end',seq:33,data:{reason:{kind:'completed'}}});
+    await open(4,40,'行');
+    await assert.rejects(f.call('wrong-attention',{...target,attentionId:'wrong',userInstruction:'行'}),{code:'work-confirmation-stale'});
+    const continued=await f.nativeCall('resume-confirmed',{...target,userInstruction:'行'});
+    assert.notEqual(continued.run.id,run.id);assert.equal(f.store.latestRun(task.id)?.id,continued.run.id);
+    const events=f.store.taskDetail(task.id).events.filter(event=>event.kind==='run.recovery-confirmed');
+    assert.equal(events.length,1);
+    assert.deepEqual(JSON.parse(events[0]!.data).source.messages.map((item:any)=>item.text),[fact,'行']);
+  }finally{await f.close();}
+});
+
+test('a short approval executes only the exact action shown in the last completed owner exchange',async t=>{
+  const f=fixture(t);try {
+    const target=await ownerReviewFixture(f);
+    const text='这版成果看着不错。';
+    const args=(userInstruction:string)=>({action:'accept',...target,userInstruction});
+    const openTurn=async(turn:number,seq:number,userInstruction:string)=>{
+      await f.emit({type:'turn/start',seq,data:{turn}});await f.native(`owner-${seq+1}`,seq+1,userInstruction);
+    };
+    const endTurn=(seq:number)=>f.emit({type:'turn/end',seq,data:{reason:{kind:'completed'}}});
+    const pending=async(call:string,source=text)=>{
+      const reply=await f.nativeCall(call,args(source));
+      assert.equal(reply.status,'confirmation-required');assert.match(reply.confirmationText,/是否接受/);
+      assert.ok(reply.confirmationText.includes(target.resultId));
+      assert.equal(f.store.taskDetail(target.taskId).result?.humanAcceptedAt,null);
+      return reply.confirmationText as string;
+    };
+    await openTurn(1,10,text);
+    await pending('unshown');await endTurn(13);
+    await openTurn(2,20,'可以');await pending('unshown-short','可以');await endTurn(23);
+    await openTurn(3,30,text);await showOwnerQuestion(f,3,32,await pending('shown-before-cancel'));await endTurn(33);
+    const changed='取消，先查验收状态。';await openTurn(4,40,changed);
+    await assert.rejects(f.call('changed',args(changed)),{code:'confirmation-required'});await endTurn(43);
+    await openTurn(5,50,'好的');await pending('old-question-gone','好的');await endTurn(53);
+    await openTurn(6,60,text);await showOwnerQuestion(f,6,62,await pending('shown'));await endTurn(63);
+    await f.reload();
+    const reply='好，就这么办。';await openTurn(7,70,reply);
+    await assert.rejects(f.call('wrong-result',{...args(reply),resultId:'wrong-result'}),{code:'work-confirmation-stale'});
+    await assert.rejects(f.call('wrong-version',{...args(reply),expectedRowVersion:target.expectedRowVersion+1}),{code:'work-confirmation-stale'});
+    const accepted=await f.nativeCall('approved',args(reply));
+    assert.equal(accepted.resultId,target.resultId);assert.equal(accepted.task.lifecycle,'completed');
+    const record=f.store.taskDetail(target.taskId).events.filter(event=>event.kind==='result.accepted');
+    assert.equal(record.length,1);
+    assert.deepEqual(JSON.parse(record[0]!.data).source.messages.map((item:any)=>item.text),[text,reply]);
+  }finally{await f.close();}
+});
+
+test('misrouted recovery questions and partial facts leave the old run for review and a hold never dispatches',async t=>{
+  const f=fixture(t);try {
+    const task=f.store.createTask('manual-hold',{botId:f.bot.id,goal:'旧轮待核对',scope:'合成检查',acceptance:'核对',reviewPolicy:'human'});
+    await f.execution.prepareSession('manual-hold:prepare',task.id,task.rowVersion);
+    const run=await f.execution.dispatch('manual-hold:prior',task.id,f.store.getTask(task.id).rowVersion);
+    f.agents.get(run.sessionId).cancel();f.store.runRecovery(run.id,'上轮外部操作尚待核对');
+    const target={taskId:task.id,runId:run.id,attentionId:`run:${run.id}`,expectedRowVersion:f.store.getTask(task.id).rowVersion};
+    const rejected=['上次已完成一半，先看看能否继续。','上次可能没有触发外部操作，继续。','上次没有产生报告，继续。',
+      '上次没有触发外部操作，先看看能否继续。','取消继续。','可以。'];
+    for(const [i,text] of rejected.entries()) {
+      await f.native(`no-recovery-${i}`,i+1,text);
+      for(const action of ['recover','recover-and-continue']) {
+        await assert.rejects(f.call(`wrong-recovery-${i}`,{action,...target,userInstruction:text}),{code:'confirmation-required'});
+      }
+      assert.equal(f.store.latestRun(task.id)?.id,run.id);
+      assert.equal(f.store.taskDetail(task.id).runHeld,true);
+    }
+    const userInstruction='上次没有触发外部操作，先不要继续';
+    await f.native('hold-recovery',20,userInstruction);
+    await assert.rejects(f.call('wrong-continue',{action:'recover-and-continue',...target,userInstruction}),{code:'recovery-hold'});
+    assert.equal(f.store.taskDetail(task.id).runHeld,true);
+    const paused=await f.nativeCall('hold-recovery',{action:'recover',...target,userInstruction});
+    assert.equal(paused.task.controlMode,'paused');
+    assert.equal(f.store.latestRun(task.id)?.id,run.id);
+    assert.equal(f.store.taskDetail(task.id).runHeld,false);
+  }finally{await f.close();}
+});
+
+test('owner chat revises an unbound goal, prepares without running, and keeps recovery fact confirmation distinct',async t=>{
+  const f=fixture(t);try {
+    const created=f.store.createTask('owner-actions',{botId:f.bot.id,goal:'旧目标',scope:'合成',acceptance:'回读',reviewPolicy:'human',startPaused:true});
+    await f.native('revise-goal',1,'目标改为简短说明。');
+    const revised=await f.nativeCall('revise-goal',{action:'revise',taskId:created.id,expectedRowVersion:created.rowVersion,
+      userInstruction:'目标改为简短说明。',goal:'简短说明'});
+    assert.equal(revised.task.goal,'简短说明');assert.equal(revised.task.scope,created.scope);
+    await f.native('prepare-session',2,'先准备执行会话。');
+    const prepared=await f.nativeCall('prepare-session',{action:'session-prepare',taskId:created.id,expectedRowVersion:revised.task.rowVersion,
+      userInstruction:'先准备执行会话。'});
+    assert.equal(prepared.binding.state,'ready');assert.equal(f.store.latestRun(created.id),null);
+    const open=f.store.controlTask('resume-for-fixture',created.id,f.store.getTask(created.id).rowVersion,'auto');
+    const run=await f.execution.dispatch('fixture-run',created.id,open.rowVersion);
+    const agent=f.agents.get(run.sessionId);agent.cancel();f.store.runRecovery(run.id,'合成旧轮待核对');
+    const version=f.store.getTask(created.id).rowVersion;
+    const check={action:'recover',taskId:created.id,runId:run.id,expectedRowVersion:version};
+    await f.native('ordinary-continue',3,'继续');
+    await assert.rejects(f.call('no-proof',{...check,userInstruction:'继续'}),{code:'confirmation-required'});
+    await f.native('manual-fact',4,'上次没有触发外部操作，也没有后台作业。');
+    const recovered=await f.nativeCall('confirm-recovery',{...check,userInstruction:'上次没有触发外部操作，也没有后台作业。'});
+    assert.equal(recovered.task.controlMode,'paused');assert.equal(f.store.latestRun(created.id)?.id,run.id);
+    const receipt=f.store.taskDetail(created.id).events.find(event=>event.kind==='run.recovery-confirmed');
+    assert.equal(JSON.parse(receipt!.data).source.messageId,'manual-fact');
+  }finally{await f.close();}
+});
+
+test('owner chat resolves only the named task notification and cleans only an ended task directory',async t=>{
+  const f=fixture(t,true);try {
+    const task=(key:string)=>f.store.createTask(key,{botId:f.bot.id,goal:key,scope:'合成',acceptance:'回读',reviewPolicy:'human',
+      startPaused:true,workdir:{mode:'isolated',name:key}});
+    const first=task('owned-workdir'),other=task('separate-workdir');
+    const binding=await f.execution.prepareSession('clean-prepare',first.id,first.rowVersion);
+    const otherBinding=await f.execution.prepareSession('other-prepare',other.id,other.rowVersion);
+    const notify=(taskId:string,key:string)=>{
+      f.store.enqueueManager(f.bot.id,key,'合成送达情况待核对',taskId);
+      const id=`manager-event:${key}`;
+      f.store.claimManagerEvent(id,`message-${key}`,'{}');f.store.managerEventUnknown(id);return id;
+    };
+    const ownNotice=notify(first.id,'current-notice'),foreignNotice=notify(other.id,'other-notice');
+    await f.native('retry-unknown',1,'重试这条通知。');
+    const args=()=>({action:'notification-resolve',taskId:first.id,notificationId:ownNotice,expectedRowVersion:f.store.getTask(first.id).rowVersion});
+    await assert.rejects(f.call('retry-unknown',{...args(),notificationResolution:'retry-unsent',userInstruction:'重试这条通知。'}),{code:'notification-uncertain'});
+    await f.native('handled-fact',2,'我已查过送达记录，把这条通知标记为已处理。');
+    const resolution={...args(),notificationResolution:'handled',userInstruction:'我已查过送达记录，把这条通知标记为已处理。'};
+    await assert.rejects(f.call('foreign-notice',{...resolution,notificationId:foreignNotice}),{code:'not-found'});
+    assert.equal((await f.nativeCall('handle-notification',resolution)).notification,'handled');
+    assert.equal(f.store.managerEvent(foreignNotice)?.state,'unknown');
+    const prior=f.store.getTask(first.id);
+    const cleanup={action:'workdir-cleanup',taskId:first.id,expectedRowVersion:prior.rowVersion,userInstruction:'清理这个任务的工作目录。'};
+    await f.native('cleanup-active',3,cleanup.userInstruction);
+    await assert.rejects(f.call('cleanup-while-open',cleanup),{code:'task-active'});
+    const cancelled=f.store.cancelTask('cancelled-fixture',first.id,prior.rowVersion);
+    await f.native('cleanup-ended',4,cleanup.userInstruction);
+    const cleaned=await f.nativeCall('cleanup-stopped',{...cleanup,expectedRowVersion:cancelled.rowVersion});
+    assert.equal(cleaned.binding.workdir.state,'removed');
+    assert.equal(existsSync(binding.cwd),false);
+    assert.equal(existsSync(otherBinding.cwd),true);
+  }finally{await f.close();}
+});
+
 test('P2 completion keeps real multi-message sources, versions, existing scope and paused control across reopen',async t=>{
   const f=fixture(t);try {
     await f.native('request',1,'请写介绍，仅在已有范围内；验收要求稍后补充。');

@@ -160,8 +160,10 @@ async function fixture(t: TestContext) {
   }
   const a = provision('Alpha'), b = provision('Beta');
   const sent: { chatId: string; text: string; uuid: string }[] = [];
+  const reactions: string[] = [];
   let handlers: FeishuHandlers;
   let send: (_: (typeof sent)[number]) => Promise<void> = async () => {};
+  let react: (messageId: string) => Promise<void> = async () => {};
   const transport: FeishuTransport = {
     async diagnoseGroup() { return { ordinaryTextGrant: 'unknown', receiveSubscription: 'unknown' }; },
     start(next) { handlers = next; },
@@ -172,6 +174,13 @@ async function fixture(t: TestContext) {
       const item = { chatId, text, uuid };
       sent.push(item);
       await send(item);
+    },
+    async reactReceived(messageId, canDispatch) {
+      assert.equal(canDispatch(), true);
+      const receipt = store.db.prepare('SELECT nativeSeq FROM feishu_inbound_receipts WHERE messageId=?').get(messageId);
+      assert.equal(typeof receipt?.nativeSeq, 'number');
+      reactions.push(messageId);
+      await react(messageId);
     },
   };
   const admission = new ReloadAdmission();
@@ -210,9 +219,10 @@ async function fixture(t: TestContext) {
     rmSync(dir, { force: true, recursive: true });
   });
   return {
-    a, b, aa, bb, sent, advance, connection, incoming, bind, web, runTool, receipt, admission,
+    a, b, aa, bb, sent, reactions, advance, connection, incoming, bind, web, runTool, receipt, admission,
     emit, get store() { return store; }, get groups() { return groups; }, get bridge() { return bridge; },
     setSend(fn: typeof send) { send = fn; },
+    setReact(fn: typeof react) { react = fn; },
     setModel(enabled: boolean) { model = enabled ? { provider: 'synthetic', model: 'synthetic' } : null; },
     delayResolve(promise?: Promise<void>) { delayedResolve = promise; },
     async deleteBot(botId: string, force: boolean) {
@@ -547,6 +557,31 @@ test('authorized input without a selected model receives one actionable response
   await tick();
   assert.equal(f.a.agent.inbox.nextTurn.length, 0);
   assert.equal(f.sent.length, 1);
+  assert.deepEqual(f.reactions, []);
+});
+
+test('a receipt reaction follows native entry, never delays the response and is never retried', async t => {
+  const f = await fixture(t), { a } = f;
+  f.setReact(async () => { throw Error('synthetic missing reaction permission'); });
+  f.incoming('first-reaction', 'Original message');
+  f.incoming('first-reaction', 'Duplicate event');
+  await tick();
+  assert.equal(a.agent.inbox.nextTurn.length, 1);
+  assert.deepEqual(f.reactions, []);
+  assert.equal(f.receipt('first-reaction')!.nativeSeq, null);
+  await a.agent.enter();
+  await tick();
+  assert.deepEqual(f.reactions, ['first-reaction']);
+  assert.equal(f.sent.length, 0, 'reaction failure stays separate from inbound diagnostics');
+  await a.agent.assistant('Original answer');
+  await a.agent.endTurn();
+  await tick();
+  assert.equal(f.sent[0]?.text, 'Original answer');
+  assert.equal(f.bridge.status(a.bot.id).error, undefined);
+  await f.reopen();
+  f.incoming('first-reaction', 'Duplicate after restart');
+  await tick();
+  assert.deepEqual(f.reactions, ['first-reaction']);
 });
 
 test('unknown send receipt retries only the same UUID and preserves the order of the group', async t => {

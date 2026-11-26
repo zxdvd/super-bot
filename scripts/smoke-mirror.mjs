@@ -283,6 +283,9 @@ try {
   if (process.env.SUPER_BOT_TEST_TASK_STAGES === '1') {
     const { smokeTaskStages } = await import('./smoke-task-stages.mjs');
     await smokeTaskStages({ base, configure, launch, stop, call, makeBot, probe, wait });
+  } else if (process.env.SUPER_BOT_TEST_GITLAB_RELEASE === '1') {
+    const { smokeGitLabRelease } = await import('./smoke-gitlab-release.mjs');
+    await smokeGitLabRelease({ base, configure, launch, stop, call, makeBot, probe, wait });
   } else if (process.env.SUPER_BOT_TEST_WORKER_CONTEXT === '1') {
     const { smokeWorkerContext } = await import('./smoke-worker-context.mjs');
     await smokeWorkerContext({ base, configure, launch, call, makeBot, probe, wait });

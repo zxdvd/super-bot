@@ -19,9 +19,10 @@ import { freezeMessage,ToolCallId,type UserMessage } from '@deepseek-ai/dsh-llm'
 import type {Session,SessionStore} from '@deepseek-ai/dsh-session';
 import type {} from '@deepseek-ai/dsh-session-persistence';
 import {verifyRunTurn} from './run-proof.ts';
+import {verifyLateJobs,verifyLateJobScope} from './dsh-late-job-proof.ts';
 import { SessionId } from '@deepseek-ai/dsh-session/types';
 import { realpath } from 'node:fs/promises';
-import { realpathSync } from 'node:fs';
+import { lstatSync,mkdirSync,realpathSync,statSync } from 'node:fs';
 import { setTimeout as delay } from 'node:timers/promises';
 import { join,isAbsolute,basename } from 'node:path';
 import {cleanupWorkdir,provisionWorkdir,workdirPolicy,type WorkdirPolicy,type WorkdirRequest} from './workdir.ts';
@@ -35,6 +36,8 @@ import { captureEvidence,containedPath,verifyEvidence,evidencePaths,type Capture
 import {configureRole,fullAccessEnabled,type RuntimeOptions} from './runtime.ts';
 import { createWorkerRunMessage,registerWorkerContext,workerPromptPlan,workerStandingPrompt } from './worker-prompt.ts';
 import { ReloadAdmission } from './reload-admission.ts';
+import { gitLabReader, glabGitLab } from './gitlab-client.ts';
+import { exactJobStatus, GITLAB_PLAY_TOOL, releaseJobPath, releaseReadback, type ReleaseTarget } from './gitlab-release.ts';
 
 /** Host defaults are not a model selection made for this conversation. */
 export function selectedModel(ctx:Context,agent:Agent) {
@@ -114,11 +117,13 @@ interface TreeCheck {
 
 export class DshExecution {
   private creating=new Map<string,Promise<Binding>>();
-  private running=new Map<string,{agent:Agent;release:()=>void;done:Promise<void>;finishTurn:(endSeq?:number,endKind?:string,endTime?:number)=>void}>();
+  private running=new Map<string,{agent:Agent;release:()=>void;done:Promise<void>;finishTurn:(endSeq?:number,endKind?:string,endTime?:number,endNote?:string)=>void}>();
   private autoTurns=new Set<string>();
   private treeChecks=new Map<string,TreeCheck>();
   private turnStarts=new WeakMap<Session,{turn:number;seq:number}>();
   private finishing=new Map<string,Promise<void>>();
+  private lateJobTimers=new Map<string,ReturnType<typeof setTimeout>>();
+  private lateJobChecks=new Map<string,Promise<void>>();
   private closing=new Map<string,Promise<void>>();
   private pendingHuman=new Map<string,string[]>();
   private recoveryTreeChecks=new WeakMap<Agent,Promise<boolean>>();
@@ -168,7 +173,17 @@ export class DshExecution {
         if((report.kind==='ready'||report.kind==='stage')&&this.store.recoveryWorkPlan(run.id)?.context.mode==='read-only') {
           throw new AppError('continuation-scope','本次只读核对只覆盖指定的后续步骤。请用 blocked 或 waiting 报告实际观察及余下事项。');
         }
-        if(report.kind==='ready')report.requestedFiles=evidencePaths(data.files);
+        if(this.store.recoveryWorkPlan(run.id)?.context.lateJobs&&
+          (this.store.getTask(run.taskId).controlMode!=='auto'||report.kind==='stage')) {
+          throw new AppError('continuation-scope','后台恢复续轮只报告已核实的本地成果或具体缺口。');
+        }
+        if(report.kind==='ready') {
+          report.requestedFiles=evidencePaths(data.files);
+          if(this.store.recoveryWorkPlan(run.id)?.context.lateJobs) {
+            const folder=join(binding.cwd,`.super-bot-reports-${run.id}`);
+            for(const path of report.requestedFiles)containedPath(folder,path);
+          }
+        }
         exec.signal.throwIfAborted();
         const receipt=this.store.workerReportReceipt(run.id,exec.callId,report);
         const treeCheck=this.treeChecks.get(run.id);
@@ -267,6 +282,57 @@ export class DshExecution {
     },{when:({agent})=>this.store.heldRuns().some(run=>run.sessionId===agent.id&&run.finishedAt===null&&
       !this.store.isBotDeleted(this.store.getTask(run.taskId).botId))}));
     if(fullAccessEnabled(this.options))this.ctx.effect(()=>this.ctx.tools.register({
+      name:GITLAB_PLAY_TOOL,
+      description:'Execute the one already authorized GitLab manual job for this run, or follow the same job by readback. Host verifies the saved target and reports the actual outcome. No arguments.',
+      parameters:{type:'object',properties:{},additionalProperties:false},
+      output:{schema:{type:'object',additionalProperties:true},render:(_args,value)=>[{type:'text',text:JSON.stringify(value)}]},
+      execute:async(args,exec)=>{
+        const agent=exec.agent,run=agent&&this.store.heldRuns().find(item=>item.sessionId===agent.id&&item.state==='running');
+        if(!agent||!run||!args||typeof args!=='object'||Array.isArray(args)||Object.keys(args).length||
+          !this.autoTurns.has(run.id)||this.store.runTurn(run.id)?.inputSeq==null) {
+          throw new AppError('gitlab-release-scope','没有与本轮 Worker 绑定的正式 GitLab 作业授权。');
+        }
+        const binding=this.store.getBinding(run.bindingId);
+        let confirmedPreset:string|undefined;
+        const authorize=()=>{
+          exec.signal.throwIfAborted();
+          const current=this.store.getRun(run.id),task=this.store.getTask(run.taskId);
+          if(this.disposed||!this.autoTurns.has(run.id)||current.state!=='running'||task.controlMode!=='auto'||
+            this.store.activeBinding(task.id)?.id!==binding.id||this.store.finalReport(run.id)||
+            agent.inbox.nextStep.length||agent.inbox.nextTurn.length||!this.store.gitLabReleaseForRun(run)||
+            (confirmedPreset&&this.ctx.permissionPresets.current(agent.session)!==confirmedPreset)) {
+            throw new AppError('gitlab-release-stale','Worker 轮次或原任务授权已改变。');
+          }
+          this.assertDirectory(agent,binding.cwd);
+          this.assertExternalQuiet(agent);
+        };
+        authorize();
+        const receipt=await this.runGitLabRelease(agent,run,exec.signal,authorize,async target=>{
+          const preset=this.ctx.permissionPresets.current(agent.session);
+          if(preset==='custom')return false;
+          const permission=this.ctx.permissionPresets.resolve(preset);
+          if(permission.approval!=='ask') {
+            if(permission.sandbox!=='danger-full-access'||preset==='auto')return false;
+            confirmedPreset=preset;return true;
+          }
+          const approval=this.ctx.get?.('approval');
+          const outcome=await approval?.request({agent,signal:exec.signal,callId:exec.callId,toolName:GITLAB_PLAY_TOOL,
+            reason:`允许当前 Worker 启动 ${target.project} 流水线 #${target.pipelineId} 的作业 #${target.jobId}？`});
+          if(outcome!=='allowed-once')return false;
+          confirmedPreset=preset;return true;
+        });
+        authorize();
+        const treeCheck=this.treeChecks.get(run.id);
+        this.assertObservedTreeQuiet(treeCheck);
+        if(hasPendingChildResult(agent))throw new AppError('gitlab-release-stale','原生子任务结果等待处理，已保留发布作业的实际回执。');
+        this.store.workerReport(run.id,exec.callId,{ kind:'stage',stage:'GitLab 正式作业',
+          summary:receipt.detail,evidenceRef:receipt.url,checks:`GitLab 流水线 #${receipt.target.pipelineId}，作业 #${receipt.target.jobId}，${receipt.state}` });
+        if(treeCheck)treeCheck.reportRevision=treeCheck.revision;
+        exec.concludeTurn();
+        return receipt;
+      },
+    },{when:({agent})=>this.store.heldRuns().some(run=>run.sessionId===agent.id&&!!this.store.gitLabReleaseForRun(run))}));
+    if(fullAccessEnabled(this.options))this.ctx.effect(()=>this.ctx.tools.register({
       name:WORKER_QUERY_TOOL,
       description:'Read-only Git working tree status in the bound task directory. Reports available HEAD and staged, unstaged and untracked paths. Use for the opening Git baseline and working tree checks. No shell, path or flags.',
       parameters:{type:'object',properties:{kind:{type:'string',enum:[GIT_STATUS_QUERY]}},required:['kind'],additionalProperties:false},
@@ -347,11 +413,12 @@ export class DshExecution {
         for(const run of this.store.heldRuns()) {
           const active=this.running.get(run.id);
           if(active?.agent.session!==session||!this.autoTurns.has(run.id)||this.store.runTurn(run.id)?.turn!==event.data.turn)continue;
-          if(event.data.reason.kind==='error'&&run.finishedAt===null)this.store.runRecovery(run.id,modelFailureNote(event.data.reason.error.code));
-          active.finishTurn(event.seq,event.data.reason.kind,event.time);
+          const note=event.data.reason.kind==='error'?modelFailureNote(event.data.reason.error.code):undefined;
+          active.finishTurn(event.seq,event.data.reason.kind,event.time,note);
         }
         if(this.turnStarts.get(session)?.turn===event.data.turn)this.turnStarts.delete(session);
       }
+      if(event.type==='job/settled'||event.type==='turn/end')this.scheduleLateJobForSession(session.id);
       // Queue/steer must not look like takeover. Only a human user/message that
       // starts a new turn while no automatic turn is running marks intervention.
       // Do not cancel: that would abort the user's own turn. Release immediately;
@@ -364,11 +431,17 @@ export class DshExecution {
         if(changed&&previous){this.running.get(previous.id)?.release();this.running.delete(previous.id);}
       }
     });
-    // No Agent is resolved or woken. Only old-process certificates plus durable log facts may settle.
-    for(const run of this.store.heldRuns())if(run.finishedAt===null&&!this.store.isBotDeleted(this.store.getTask(run.taskId).botId)) {
+    this.ctx.on('agent/status',({agent,status})=>{
+      if(status==='idle')this.scheduleLateJobForSession(agent.id);
+    });
+    // Startup checks durable facts without opening or waking any Agent.
+    for(const run of this.store.heldRuns())if(!this.store.isBotDeleted(this.store.getTask(run.taskId).botId)) {
       const proof=this.store.runTurn(run.id);
-      if(!proof?.quiet||proof.endSeq===null)this.store.runRecovery(run.id,proof?'重启后缺少原进程的归属结束/后台收敛证据，保留占用；没有自动重投。':'旧版 Run 没有持久轮次证据，请人工核对；没有自动重投。',false);
-      else this.scheduleReconciliation(run.id);
+      if(run.finishedAt===null) {
+        if(!proof?.quiet||proof.endSeq===null)this.store.runRecovery(run.id,proof?'重启后缺少原进程的归属结束/后台收敛证据，保留占用；没有自动重投。':'旧版 Run 没有持久轮次证据，请人工核对；没有自动重投。',false);
+        else this.scheduleReconciliation(run.id);
+      }
+      this.scheduleLateJobCheck(run.id);
     }
     for(const taskId of this.store.pendingTaskCloses()) {
       const runId=this.store.taskClose(taskId)?.runId;
@@ -410,6 +483,180 @@ export class DshExecution {
       if(handle.header.id!==run.sessionId)throw new AppError('run-proof','持久会话身份不符。');
       return (await handle.read()).events;
     }finally{await handle.close();}
+  }
+  private scheduleLateJobForSession(sessionId:string):void {
+    if(this.disposed)return;
+    const taskId=this.store.workerTaskForSession(sessionId);
+    const run=taskId?this.store.latestRun(taskId):null;
+    if(run?.sessionId===sessionId)this.scheduleLateJobCheck(run.id);
+  }
+  private scheduleLateJobCheck(runId:string,waitMs=0):void {
+    if(this.disposed||this.store.lateJobRecovery(runId)?.state!=='waiting'||this.lateJobChecks.has(runId))return;
+    clearTimeout(this.lateJobTimers.get(runId));
+    const timer=setTimeout(()=>{
+      this.lateJobTimers.delete(runId);
+      const checking=this.inspectLateJob(runId).catch(()=>{}).finally(()=>{
+        this.lateJobChecks.delete(runId);
+        if(!this.disposed&&this.store.lateJobTarget(runId,true))this.scheduleLateJobCheck(runId,30000);
+      });
+      this.lateJobChecks.set(runId,checking);
+    },waitMs);
+    timer.unref();this.lateJobTimers.set(runId,timer);
+  }
+  private async inspectLateJob(runId:string):Promise<void> {
+    const target=this.store.lateJobTarget(runId,true);
+    if(!target||target.pending.state!=='waiting')return;
+    const {run,proof,pending}=target;
+    const agent=this.ctx.agents.get(SessionId(run.sessionId));
+    let reason:string;
+    try {
+      const events=await this.readRunEvents(run,agent?.session);
+      if(this.disposed||!this.store.lateJobTarget(runId,true))return;
+      const late=verifyLateJobs(run,this.store.getRunInput(run.id),proof,pending.ids,events);
+      verifyLateJobScope(events,proof);
+      if(late) { this.store.updateLateJob(runId,{proof:late});return; }
+      const terminal=new Set<string>(events.flatMap(event=>event.type==='job/settled'&&event.seq>proof.endSeq!
+        ?[event.data.jobId]:[]));
+      if(pending.ids.every(id=>terminal.has(id))) {
+        this.store.observeLateJobTerminal(runId);
+        reason='旧轮的 Job 已进入终态，缺少独立原生轮次消费结果的回执。可以在原聊天请 Bot 核对该 Job 的输出和报告余项。';
+      }else reason='旧轮已结束，仍缺少对应 Job 的生产者终态回执。可以在原聊天请 Bot 核对原作业状态。';
+    }catch(error) {
+      if(this.disposed)return;
+      if(error instanceof AppError&&error.code==='late-job-unproven') {
+        this.store.updateLateJob(runId,{reason:error.message});return;
+      }
+      reason='宿主无法读取旧轮的 Job 与通知回执。可以在原聊天请 Bot 核对原生会话访问状态。';
+    }
+    if(!this.disposed&&Date.now()>=pending.deadline&&this.store.lateJobTarget(runId))this.store.updateLateJob(runId,{reason});
+  }
+  async continueLateJob(runId:string,manager:Agent,authorize:()=>void):Promise<void> {
+    await this.reloadAdmission.run(`late Job continuation ${runId}`,async()=>{
+      const target=this.store.lateJobTarget(runId);
+      if(!target||target.pending.state!=='ready'||!this.store.lateJobCanDispatch(runId))return;
+      const {run,binding,pending,proof,task}=target;
+      const validate=()=>{
+        authorize();
+        if(this.disposed||!this.store.lateJobCanDispatch(runId)||this.store.botForSession(manager.id)?.id!==task.botId) {
+          throw new AppError('recovery-stale','任务授权或执行名额已变更。');
+        }
+      };
+      try {
+        validate();
+        const resolved=await this.ctx.sessionController.resolveAgent(SessionId(run.sessionId));
+        validate();
+        if('error' in resolved||resolved.agent.id!==binding.sessionId)throw new AppError('session-unavailable','无法检查原 Worker 会话。');
+        const agent=resolved.agent,tree=originalService(this.nativeSubagents());
+        this.assertRecoveryQuiet(agent,run.id);this.assertDirectory(agent,binding.cwd);
+        await this.confirmRecoveryTree(agent);
+        const events=await this.readRunEvents(run,agent.session);
+        validate();
+        this.assertRecoveryQuiet(agent,run.id);this.assertDirectory(agent,binding.cwd);
+        if(tree!==originalService(this.nativeSubagents()))throw new AppError('child-unknown','子树服务已变更。');
+        const fresh=verifyLateJobs(run,this.store.getRunInput(run.id),proof,pending.ids,events);
+        if(JSON.stringify(fresh)!==JSON.stringify(pending.proof))throw new AppError('late-job-unproven','签收 Job 结果后出现了新的会话活动。');
+        verifyLateJobScope(events,proof);
+        const model=selectedModel(this.ctx,agent);
+        const inherited=!this.options.workerModel&&!model?selectedModel(this.ctx,manager):undefined;
+        const plan=workerModelPlan(model?modelRoute(model):null,this.options.workerModel,
+          inherited?{sessionId:manager.id,model:modelRoute(inherited)}:undefined);
+        if(!plan)throw new AppError('model-required','原 Worker 缺少可核实的模型。');
+        const next=this.store.reserveLateJobContinuation(runId,pending.proof,plan);
+        try {
+          configureRole(this.ctx,agent,'worker',this.options);
+          if(inherited)agent.model.select(inherited);
+          this.deliverRun(next,agent,binding);
+        }catch{this.store.runRecovery(next.id,'续轮投递待核对，保留占用。');}
+      }catch(error) {
+        if(this.disposed)return;
+        if(!(error instanceof AppError))throw error;
+        if(error.code==='late-job-unproven'||Date.now()>=pending.deadline) {
+          this.store.updateLateJob(runId,{reason:`${error.message} 原任务仍待继续，Bot 保留原执行占用。`});
+        } else if(!['recovery-stale','capacity'].includes(error.code)) {
+          this.store.deferManagerEvent(`manager-event:late-job-ready:${runId}`,error.message,Date.now()+30000);
+        }
+      }
+    });
+  }
+  private async priorGitLabTools(agent:Agent,run:Run):Promise<boolean> {
+    const release=this.store.gitLabReleaseForRun(run);
+    if(!release)return false;
+    try {
+      const events=await this.readRunEvents(run,agent.session);
+      const here=this.store.runTurn(run.id);
+      if(here?.startSeq==null)return false;
+      const history=this.store.taskRuns(run.taskId).filter(item=>item.id!==run.id&&item.taskRevision===run.taskRevision);
+      for(const previous of history) {
+        if(previous.sessionId!==run.sessionId||previous.bindingId!==run.bindingId)return false;
+        const proof=this.store.runTurn(previous.id);
+        if(!proof||proof.startSeq==null||proof.endSeq==null||proof.endSeq>=here.startSeq)return false;
+        if(verifyRunTurn(previous,this.store.getRunInput(previous.id),proof,events.slice(0,here.startSeq),true).length)return false;
+        if(release.target.newAfterMerge&&release.stage.releaseOpenedAt!==undefined&&
+          previous.finishedAt!==null&&previous.finishedAt<=release.stage.releaseOpenedAt)continue;
+        const segment=events.slice(proof.startSeq+1,proof.endSeq);
+        if(segment.some(event=>event.type==='job/registered'||event.type==='working-directory/change'||
+          event.type==='user/message'&&event.seq!==proof.inputSeq&&
+          !['runtime-context','time-context','skill-catalog'].includes(event.data.source?.kind)))return false;
+        const calls=segment.filter(event=>event.type==='tool/call');
+        const results=segment.filter(event=>event.type==='tool/result');
+        if(calls.length!==results.length)return false;
+        for(const call of calls) {
+          const matches=results.filter(result=>result.seq>call.seq&&result.data.step===call.data.step&&
+            result.data.message?.toolCallId===call.data.callId);
+          if(matches.length!==1)return false;
+          const {name}=call.data;
+          if(['super_bot_report','read','write','edit',WORKER_QUERY_TOOL].includes(name))continue;
+          const formal=name===GITLAB_PLAY_TOOL&&release.plan.retryTarget&&this.store.gitLabReleaseForRun(previous);
+          const receipt=formal&&this.store.gitLabReleaseReceipt(formal.stage.runId);
+          if(receipt&&['unsubmitted','needs-permission'].includes(receipt.state))continue;
+          return false;
+        }
+      }
+      return history.some(item=>item.id===release.stage.runId);
+    } catch {return false;}
+  }
+  private async runGitLabRelease(agent:Agent,run:Run,signal:AbortSignal,authorize:()=>void,
+    permitted:(target:ReleaseTarget)=>Promise<boolean>) {
+    let receipt=this.store.beginGitLabRelease(run.id);
+    const path=releaseJobPath(receipt.target);
+    const reader=await gitLabReader(receipt.target.origin,this.options.gitLabObserverOrigin,signal);
+    const response=await reader(path,signal);
+    authorize();
+    let outcome=releaseReadback(receipt,response);
+    if(outcome.state!=='unsubmitted'||outcome.nextCheckAt!==null)return this.store.recordGitLabRelease(receipt,outcome,true);
+    if(!await this.priorGitLabTools(agent,run)) {
+      authorize();
+      outcome=releaseReadback({...receipt,state:'unknown'},response);
+      return this.store.recordGitLabRelease(receipt,{...outcome,
+        detail:`无法排除旧轮中可能影响 ${receipt.target.project} 发布作业 #${receipt.target.jobId} 的外部操作。将只读跟踪原作业。`},true);
+    }
+    authorize();
+    const writer=await glabGitLab(receipt.target.origin,signal);
+    const missing=(detail:string)=>this.store.recordGitLabRelease(receipt,{...receipt,state:'needs-permission',detail},true);
+    if(!writer)return missing(`当前 Worker 缺少 ${receipt.target.origin} 的同实例 glab 登录，无法运行作业 #${receipt.target.jobId}。请由有权运行该作业的人恢复本机 Worker 登录。`);
+    if(!await permitted(receipt.target)) {
+      return missing(`当前 Worker 的原生权限或审批未允许启动作业 #${receipt.target.jobId}。请在原生审批入口处理这个作业。`);
+    }
+    const lastRead=await writer(path,signal);
+    authorize();
+    if([401,403,404].includes(lastRead.code))return missing(`GitLab 无法以 Worker 身份访问作业 #${receipt.target.jobId}（HTTP ${lastRead.code}）。请由项目负责人核对访问权限。`);
+    if(exactJobStatus(lastRead.data,receipt.target)!=='manual') {
+      return this.store.recordGitLabRelease(receipt,releaseReadback(receipt,lastRead),true);
+    }
+    if(!this.store.claimGitLabRelease(run.id)) {
+      receipt=this.store.gitLabReleaseReceipt(receipt.stageRunId)??receipt;
+      return this.store.recordGitLabRelease(receipt,releaseReadback({...receipt,state:'unknown'},lastRead),true);
+    }
+    receipt=this.store.gitLabReleaseReceipt(receipt.stageRunId)!;
+    const submitted=await writer(path+'/play',signal,'POST');
+    const result=releaseReadback(receipt,submitted,true);
+    if(result.state==='unknown'&&submitted.code>=200&&submitted.code<300&&!signal.aborted) {
+      // The play endpoint may omit the pipeline coordinates. Use its exact
+      // job GET representation rather than inferring status from the write.
+      const readback=await reader(path,signal);
+      return this.store.recordGitLabRelease(receipt,releaseReadback(receipt,readback),true);
+    }
+    return this.store.recordGitLabRelease(receipt,result,true,true);
   }
   private nativeSubagents():NativeSubagents|undefined {
     return this.ctx.get?.('subagents') as NativeSubagents|undefined;
@@ -590,7 +837,8 @@ export class DshExecution {
     try{this.assertQuiet(agent);}catch(error){return {sessionId,cwd,quiet:false,reason:error instanceof AppError?error.message:'会话活动暂无法确认。'};}
     return {sessionId,cwd,quiet:true,reason:''};
   }
-  async attachExistingSession(requestId:string,grant:ExistingSessionGrant):Promise<Binding> {
+  async attachExistingSession(requestId:string,grant:ExistingSessionGrant,authorize=()=>{}):Promise<Binding> {
+    authorize();
     const receipt=this.store.commandReceipt<Binding>(requestId,'session.attach',grant);
     if(receipt)return this.store.getBinding(receipt.id);
     if(grant.fullHistoryApproved!==true||grant.directoryApproved!==true)throw new AppError('confirmation-required','请明确授权读取整个会话历史，以及在所示目录内执行文件任务。');
@@ -598,6 +846,7 @@ export class DshExecution {
     if(!preview.quiet)throw new AppError('session-busy',preview.reason);
     if(preview.cwd!==grant.cwd)throw new AppError('working-directory-changed','会话当前目录已改变，请重新检查后授权。');
     const resolved=await this.ctx.sessionController.resolveAgent(SessionId(grant.sessionId));
+    authorize();
     if('error' in resolved)throw new AppError('session-unavailable','会话暂不可用。');
     this.assertQuiet(resolved.agent);this.assertDirectory(resolved.agent,grant.cwd);
     return this.store.attachExistingSession(requestId,grant);
@@ -631,7 +880,7 @@ export class DshExecution {
     if(!plan)throw new AppError('model-required','请先打开任务会话，明确选择并配置模型，再回来开始执行。宿主默认路由不算已选择。');
     const run=this.store.reserveRun(requestId,taskId,rowVersion,plan);
     try {
-      configureRole(this.ctx,agent,'worker',this.options);
+      configureRole(this.ctx,agent,'worker',this.options,!!this.store.gitLabReleaseForRun(run));
       if(inherited)agent.model.select(inherited);
     } catch {
       this.store.runRecovery(run.id,'配置本次执行会话时失败，尚未投递。请核对原生会话。');
@@ -644,28 +893,47 @@ export class DshExecution {
     const taskId=run.taskId,task=this.store.getTask(taskId);
     const work=this.store.recoveryWorkPlan(run.id);
     const readOnly=work?.context.mode==='read-only';
-    const fullAccess=fullAccessEnabled(this.options);
-    const standing=workerStandingPrompt(task,b,this.store.taskBotContext(taskId),fullAccess);
+    const nativeFullAccess=fullAccessEnabled(this.options),lateContinuation=!!work?.context.lateJobs;
+    const fullAccess=nativeFullAccess&&!lateContinuation;
+    const standing=workerStandingPrompt(task,b,this.store.taskBotContext(taskId),nativeFullAccess);
+    const folder=lateContinuation?join(b.cwd,`.super-bot-reports-${run.id}`):undefined;
+    if(folder)mkdirSync(folder,{mode:0o700});
     let input=this.store.getRunInput(run.id);
     const previous=this.store.previousWorkerInputs(run);
     if(!input.messageJson) {
       const prompt=workerPromptPlan(agent,run,standing,previous);
-      const message=createWorkerRunMessage(run,input,standing,prompt,recovery,work?.context);
+      const context=folder?{...work!.context,outputDirectory:folder}:work?.context;
+      const message=createWorkerRunMessage(run,input,standing,prompt,recovery,context);
       input=this.store.saveRunMessage(run.id,message.id,JSON.stringify(message));
     }
-    const allowed=readOnly?['read','super_bot_report',...(fullAccess?[WORKER_QUERY_TOOL]:[]),
+    const releaseAction=this.store.gitLabReleaseForRun(run);
+    const allowed=releaseAction?[GITLAB_PLAY_TOOL,'super_bot_report']:readOnly?['read','super_bot_report',...(fullAccess?[WORKER_QUERY_TOOL]:[]),
       ...(work.authorizedProbes.length?['super_bot_preflight']:[])]:['read','write','edit','super_bot_report'];
-    const releaseMask=fullAccess&&!readOnly?()=>{}:agent.ctx.tools.restrict({allow:allowed});
+    const releaseMask=fullAccess&&!readOnly&&!releaseAction?()=>{}:agent.ctx.tools.restrict({allow:allowed});
     const releaseGuard=agent.ctx.tools.guard(exec=>{
       const current=this.store.getRun(run.id);
       if(current.finishedAt!==null||current.state==='cancelling'||this.store.getTask(taskId).controlMode==='manual'||this.store.isBotDeleted(task.botId))return 'This automatic run no longer has task authority.';
+      if(lateContinuation&&(this.store.getTask(taskId).controlMode!=='auto'||this.store.getTask(taskId).taskRevision!==run.taskRevision))return 'This continuation no longer has task authority.';
       if(exec.name!=='super_bot_report'&&this.store.finalReport(run.id))return 'A final report has been submitted; no new tool work is authorized in this run.';
+      if(releaseAction&&!allowed.includes(exec.name))return 'Only the verified GitLab action and reporting are authorized for this stage.';
       if(readOnly&&(this.store.getTask(taskId).controlMode!=='auto'||!allowed.includes(exec.name)))return 'This continuation authorizes only the available read-only checks and a report.';
       if(!fullAccess&&!allowed.includes(exec.name))return 'Only task file tools and super_bot_report are authorized for this run.';
       if(fullAccess&&!readOnly)return;
       try{this.assertDirectory(agent,b.cwd);}catch(error){return error instanceof Error?error.message:'Working directory changed';}
       if(!['read','write','edit'].includes(exec.name))return;
-      try{const args=exec.arguments as {file_path?:unknown};if(typeof args.file_path!=='string'||!isAbsolute(args.file_path))return 'Use an absolute file_path inside the task working directory.';containedPath(b.cwd,args.file_path);}catch(error){return error instanceof Error?error.message:'File path refused';}
+      try {
+        const {file_path:path}=exec.arguments as {file_path?:unknown};
+        if(typeof path!=='string'||!isAbsolute(path))return 'Use an absolute file_path inside the task working directory.';
+        const canonical=containedPath(b.cwd,path);
+        if(folder&&exec.name==='read'&&!statSync(canonical).isFile())return 'Read only regular files.';
+        if(folder&&exec.name!=='read') {
+          if(realpathSync(folder)!==folder||containedPath(folder,path)!==path||canonical!==path) {
+            return 'Write only new report files in the isolated report directory.';
+          }
+          const current=lstatSync(path,{throwIfNoEntry:false});
+          if(current&&(!current.isFile()||current.nlink!==1))return 'The report must be a regular single-link file.';
+        }
+      }catch(error){return error instanceof Error?error.message:'File path refused';}
     });
     let steps=0;let deadline:ReturnType<typeof setTimeout>|undefined;
     const releaseBudget=fullAccess&&!readOnly?()=>{}:agent.ctx.on('agent/pre-step',async(_payload,next)=>{
@@ -715,23 +983,29 @@ export class DshExecution {
         throw error;
       }
     });
-    const finishTurn=(endSeq?:number,endKind?:string,endTime?:number)=>{
+    const finishTurn=(endSeq?:number,endKind?:string,endTime?:number,endNote?:string)=>{
       if(finalized||this.disposed)return;
       finalized=true;this.autoTurns.delete(run.id);
       try {
         for(const wait of treeCheck.waits.values())wait.finish(endKind==='aborted'?'cancelled':'unknown',endTime??null);
-        let quiet=true,note='';
+        let quiet=true,note='',jobIds:string[]|undefined;
         try {
-          this.assertExternalQuiet(agent);
+          this.assertChildrenQuiet(agent);
           this.assertObservedTreeQuiet(treeCheck);
           if(endKind==='completed'&&(treeCheck.service||this.nativeSubagents())&&
             (!stoppingProof||stoppingProof.turn!==this.store.runTurn(run.id)?.turn||stoppingProof.revision!==treeCheck.revision)) {
             throw new AppError('child-unknown','原进程结束前没有同轮子树安静证明；不会用稍后空闲补成功。');
           }
+          const activeJobs=this.ctx.jobs.list(agent.id).filter(job=>job.owner===agent.id&&['running','stopping'].includes(job.status));
+          if(activeJobs.length) {
+            jobIds=activeJobs.map(job=>job.id);
+            throw new AppError('job-active','后台工作尚未停止，不能开始或确认执行结束。');
+          }
         }catch(error){quiet=false;note=error instanceof AppError?error.message:'后台效果尚未核对。';}
-        if(endSeq!==undefined&&endKind)this.store.observeRunEnd(run.id,endSeq,endKind,quiet);
+        if(endSeq!==undefined&&endKind)this.store.observeRunEnd(run.id,endSeq,endKind,quiet,jobIds);
         if(this.store.getRun(run.id).finishedAt!==null||this.store.isBotDeleted(task.botId))return;
         if(!quiet)throw new AppError('run-proof',note);
+        if(endNote)throw new AppError('run-proof',endNote);
         if(endSeq===undefined)throw new AppError('run-proof','没有可归属的自动轮次结束事件；仅会话空闲不足以补成功。');
         this.scheduleReconciliation(run.id,agent.session);
       }catch(error){this.store.runRecovery(run.id,error instanceof AppError?error.message:'执行状态待核对，请打开原生会话检查。');}
@@ -782,16 +1056,18 @@ export class DshExecution {
       await this.stop(`budget-stop:${runId}`,task.id,task.rowVersion);
     }catch{this.store.runRecovery(runId,'执行预算已用尽，停止结果需要核对；没有自动重试。');}
   }
-  async accept(requestId:string,taskId:string,rowVersion:number,resultId:string,authorize?:()=>void) {
-    const receipt=this.store.commandReceipt<import('./model.ts').Task>(requestId,'result.accept',{taskId,expectedRowVersion:rowVersion,resultId});
+  async accept(requestId:string,taskId:string,rowVersion:number,resultId:string,authorize?:()=>void,source?:import('./model.ts').ChatSource) {
+    authorize?.();
+    const receipt=this.store.commandReceipt<Task>(requestId,'result.accept',{taskId,expectedRowVersion:rowVersion,resultId,...(source?{source}:{})});
     if(receipt)return receipt;
     await this.verifyResult(taskId,resultId);
     authorize?.();
-    const task=this.store.acceptResult(requestId,taskId,rowVersion,resultId);
+    const task=this.store.acceptResult(requestId,taskId,rowVersion,resultId,source);
     await this.autoCleanup(taskId);return task;
   }
   /** Removes a finished task's provisioned directory. Existing directories and running tasks are refused. */
-  async cleanupWorkdir(taskId:string):Promise<Binding> {
+  async cleanupWorkdir(taskId:string,authorize=()=>{}):Promise<Binding> {
+    authorize();
     const task=this.store.getTask(taskId),binding=this.store.latestBinding(taskId);
     if(!binding)throw new AppError('not-found','任务还没有工作目录。');
     if(!['completed','cancelled'].includes(task.lifecycle)&&binding.state!=='released')throw new AppError('task-active','任务结束（完成或取消）或解除会话关联后才能清理工作目录。');
@@ -1218,6 +1494,7 @@ export class DshExecution {
   canWakeRecoveryContinuation(taskId:string):boolean {
     const run=this.store.latestRun(taskId),binding=this.store.activeBinding(taskId);
     if(!run||run.finishedAt===null||this.running.has(run.id)||this.finishing.has(run.id))return false;
+    if(this.store.lateJobTarget(run.id))return false;
     if(this.store.verifiedBlocker(run)&&this.store.dispatchBlocker(taskId))return false;
     if(!binding?.sessionId)return true;
     const agent=this.ctx.agents.get(SessionId(binding.sessionId));
@@ -1237,6 +1514,9 @@ export class DshExecution {
       const saved=this.store.recoveryInstruction(taskId);
       if(!saved)return {status:'blocked',message:'上一轮状态已记录，当前没有新的已授权后续指示。'};
       if(saved.runId)return {status:'already-started',run:this.store.getRun(saved.runId),message:'这条用户指示已有执行记录。'};
+      if(this.store.lateJobTarget(saved.priorRunId))return {
+        status:'waiting',message:'后台 Job 的原生结果仍在核对或等待接续，Bot 会继续跟进。',
+      };
       try {
         const {task,run,binding,instruction}=validate();
         const resolved=await this.ctx.sessionController.resolveAgent(SessionId(binding.sessionId));
@@ -1400,10 +1680,11 @@ export class DshExecution {
       return {result:{status:'unavailable',message:'原生 Worker 未返回可验证的读取结果。'}};
     }finally{releaseGuard();releaseApproval();}
   }
-  async recover(requestId:string,taskId:string,rowVersion:number,acknowledged:unknown,continuation?:RecoveryContinuation,authorize=()=>{}) {
+  async recover(requestId:string,taskId:string,rowVersion:number,acknowledged:unknown,continuation?:RecoveryContinuation,
+    authorize=()=>{},source?:import('./model.ts').ChatSource) {
     if(acknowledged!==true)throw new AppError('confirmation-required','请先检查原生会话、文件和外部效果，再确认核对完成。');
     const action=continuation?'run.continue-recovery':'run.resolve-recovery';
-    const payload={taskId,expectedRowVersion:rowVersion,...continuation};
+    const payload={taskId,expectedRowVersion:rowVersion,...continuation,...(source?{source}:{})};
     const receipt=()=>{
       const saved=this.store.commandReceipt<Task|Run>(requestId,action,payload);
       if(!saved||'inputId' in saved)return saved;
@@ -1417,7 +1698,7 @@ export class DshExecution {
     return this.reloadAdmission.run(`Worker task ${taskId} recovery`,async()=>{
       const binding=target.binding;
       if(!binding?.sessionId) {
-        this.store.resolveRunRecovery(requestId,taskId,rowVersion);
+        this.store.resolveRunRecovery(requestId,taskId,rowVersion,source);
         await this.advanceClose(taskId,true);
         return this.store.getTask(taskId);
       }
@@ -1442,7 +1723,7 @@ export class DshExecution {
       if(tree!==originalService(this.nativeSubagents()))throw new AppError('child-unknown','原生子树服务已改变，请重新核对。');
       this.assertRecoveryQuiet(agent,target.run?.id);
       if(!continuation) {
-        this.store.resolveRunRecovery(requestId,taskId,rowVersion);
+        this.store.resolveRunRecovery(requestId,taskId,rowVersion,source);
         await this.advanceClose(taskId,true);
         return this.store.getTask(taskId);
       }
@@ -1451,7 +1732,7 @@ export class DshExecution {
       const selected=selectedModel(this.ctx,agent);
       const plan=workerModelPlan(selected?modelRoute(selected):null,this.options.workerModel);
       if(!plan)throw modelRequired();
-      const run=this.store.continueRunRecovery(requestId,taskId,rowVersion,continuation,plan);
+      const run=this.store.continueRunRecovery(requestId,taskId,rowVersion,continuation,plan,source);
       try {
         configureRole(this.ctx,agent,'worker',this.options);
         if(!selectedModel(this.ctx,agent))throw modelRequired();
@@ -1580,20 +1861,25 @@ export class DshExecution {
   }
   async dispose():Promise<void> {
     this.disposed=true;this.autoTurns.clear();
+    for(const timer of this.lateJobTimers.values())clearTimeout(timer);
+    this.lateJobTimers.clear();
     for(const controller of this.deletedRuns.values())controller.abort();
     for(const [id,{agent}]of this.running){this.store.runRecovery(id,'插件退出时执行尚未核对，重新启用后请核对原生会话。');const input=this.store.getRunInput(id);if(input.messageId)agent.inbox.remove(input.messageId as UserMessage['id']);agent.cancel({kind:'user'},{keepInbox:true});}
     await Promise.allSettled([...this.running.values()].map(r=>r.done));
     await this.whenReconciled();
+    await Promise.allSettled(this.lateJobChecks.values());
   }
-  async prepareSession(requestId:string,taskId:string,rowVersion:number,workdir?:WorkdirRequest):Promise<Binding> {
+  async prepareSession(requestId:string,taskId:string,rowVersion:number,workdir?:WorkdirRequest,authorize=()=>{}):Promise<Binding> {
+    authorize();
     const receipt=this.store.bindingReceipt(requestId,taskId,rowVersion);
     if(receipt?.state==='ready'||receipt?.state==='released')return receipt;
-    return this.reloadAdmission.run(`Worker task ${taskId} session preparation`,()=>this.prepareWorker(requestId,taskId,rowVersion,workdir));
+    return this.reloadAdmission.run(`Worker task ${taskId} session preparation`,()=>this.prepareWorker(requestId,taskId,rowVersion,workdir,authorize));
   }
-  private async prepareWorker(requestId:string,taskId:string,rowVersion:number,workdir?:WorkdirRequest):Promise<Binding> {
+  private async prepareWorker(requestId:string,taskId:string,rowVersion:number,workdir:WorkdirRequest|undefined,authorize:()=>void):Promise<Binding> {
     // Validate the ID through the ledger before using it as a directory segment.
     const task=this.store.getTask(taskId);
     const assertLive=()=>{
+      authorize();
       if(this.store.isBotDeleted(task.botId))throw new AppError('not-found','Bot 已删除。');
     };
     assertLive();
@@ -1610,36 +1896,45 @@ export class DshExecution {
         this.store.set(key,JSON.stringify({cwd,info}));
       }
     }
-    const b=this.store.beginBinding(requestId,taskId,rowVersion,await realpath(cwd),info);
+    const path=await realpath(cwd);
+    assertLive();
+    const b=this.store.beginBinding(requestId,taskId,rowVersion,path,info);
     const current=this.store.getBinding(b.id);if(current.state==='ready')return current;
     const active=this.creating.get(b.id);if(active)return active;
-    if(!this.store.claimBindingCreation(b.id))return this.reconcileBinding(b.id);
+    if(!this.store.claimBindingCreation(b.id))return this.reconcileBinding(b.id,authorize);
     const promise=(async()=>{
       try {
         const workspace=await this.ctx.workspaceRegistry.create(b.cwd,basename(b.cwd));
         assertLive();
         const result=await this.ctx.sessionController.create({workspaceId:workspace.id,sessionId:SessionId(b.requestedSessionId)});
         if(result.sessionId!==b.requestedSessionId){this.store.set(`native-create-mismatch:${b.id}`,result.sessionId);throw new AppError('session-mismatch','宿主返回了不同会话，尚未命名或关联。');}
-        return await this.reconcileBinding(b.id);
+        return await this.reconcileBinding(b.id,authorize);
       }catch(error){this.store.bindingRecovery(b.id);throw error instanceof AppError?error:new AppError('session-recovery','会话创建结果暂未确认，请在任务详情核对。');}
       finally{this.creating.delete(b.id);}
     })();this.creating.set(b.id,promise);return promise;
   }
-  async reconcileBinding(id:string):Promise<Binding> {
+  async reconcileBinding(id:string,authorize=()=>{}):Promise<Binding> {
+    authorize();
     const b=this.store.getBinding(id);
     if(b.state==='ready'||b.state==='released')return b;
     if(this.store.get(`native-create-mismatch:${id}`))throw new AppError('session-mismatch','宿主已返回不同会话，保留待人工核对，不能自动关联原请求 ID。');
     const resolved=await this.ctx.sessionController.resolveAgent(SessionId(b.requestedSessionId));
+    authorize();
     if('error' in resolved){this.store.bindingRecovery(id);throw new AppError('session-recovery','尚未找到已申请的会话；保持待核对，没有重复创建。');}
     const header=resolved.agent.session.header;
-    if(resolved.agent.session.id!==b.requestedSessionId||header.origin==='subagent'||header.isSeeded||!header.cwd||await realpath(header.cwd)!==b.cwd){this.store.bindingRecovery(id);throw new AppError('session-mismatch','会话目录或归属不一致，尚未关联。');}
+    const cwd=header.cwd&&await realpath(header.cwd);
+    authorize();
+    if(resolved.agent.session.id!==b.requestedSessionId||header.origin==='subagent'||header.isSeeded||cwd!==b.cwd){this.store.bindingRecovery(id);throw new AppError('session-mismatch','会话目录或归属不一致，尚未关联。');}
     if(this.store.getBinding(id).state==='released')return this.store.getBinding(id);
     const workspace=await this.ctx.workspaceRegistry.create(b.cwd,basename(b.cwd));
+    authorize();
     if(this.store.getBinding(id).state==='released')return this.store.getBinding(id);
     await workspace.attachSession(SessionId(b.requestedSessionId));
+    authorize();
     if(this.store.getBinding(id).state==='released')return this.store.getBinding(id);
     if(this.store.getTask(b.taskId).taskRevision!==b.taskRevision)throw new AppError('binding-stale','任务版本已改变，尚未命名旧会话。');
     await nameAutomaticSession(this.ctx,resolved.agent.session,workerTitle(this.store.getTask(b.taskId)));
+    authorize();
     return this.store.confirmBinding(id,b.requestedSessionId);
   }
 }

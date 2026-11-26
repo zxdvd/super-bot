@@ -13,16 +13,15 @@ const statuses: Record<string, string> = {
 };
 
 export function RecoveryPanel({ w, detail, recovery }: { w: WorkspaceState; detail: Detail; recovery: RecoveryDetail }) {
-  const [checked, setChecked] = useState(false);
-  const { task, binding, attentions } = detail;
+  const { attentions, lateJobRecovery: late } = detail;
   const { attentionId, worker, jobs, subtree } = recovery;
-  const busy = Boolean(worker?.status && worker.status !== 'idle' || worker?.inputs?.length ||
-    jobs?.some(job => ['running', 'stopping'].includes(job.status)) || subtree.state === 'active');
-  const disabled = w.locked || !checked || busy;
   const recoveryItem = attentions.find(item => item.id === attentionId);
-  const version = { id: task.id, expectedRowVersion: task.rowVersion, acknowledged: true };
+  const automatic = late?.state === 'waiting' || late?.state === 'ready';
+  const title = automatic && detail.task.controlMode === 'paused' ? '后台接续已暂停'
+    : late?.state === 'waiting' ? (late.terminalObserved ? '等待消费后台结果' : '等待后台结束')
+    : late?.state === 'ready' ? '准备接续原任务' : '恢复核对';
   return <section className="attention-box" aria-label="恢复核对">
-    <strong>恢复核对</strong>
+    <strong>{title}</strong>
     {recoveryItem && <WorkMarkdown text={recoveryItem.question}/>}
     <dl>
       <dt>Worker</dt><dd>{worker?.status ? statuses[worker.status] ?? worker.status
@@ -38,9 +37,26 @@ export function RecoveryPanel({ w, detail, recovery }: { w: WorkspaceState; deta
           <div key={child.sessionId}>{statuses[child.status] ?? child.status} · <code>{child.sessionId}</code></div>)
         : '仍有子树活动或清理'}</dd>
     </dl>
-    <div className="actions">{worker && <button onClick={() => w.api.openSession(worker.sessionId)}>打开原会话核对</button>}</div>
-    {attentionId && <>
-      <p>请在原会话处理待处理输入和作业结果，并检查文件与外部效果。宿主会在确认时再次核对当前活动。</p>
+    {worker && <div className="actions">
+      <button onClick={() => w.api.openSession(worker.sessionId)}>查看原 Worker 会话</button>
+    </div>}
+    {!automatic && attentionId && <ManualRecoveryActions w={w} detail={detail} recovery={recovery} attentionId={attentionId}/>}
+  </section>;
+}
+
+function ManualRecoveryActions({ w, detail, recovery, attentionId }: {
+  w: WorkspaceState; detail: Detail; recovery: RecoveryDetail; attentionId: string;
+}) {
+  const [checked, setChecked] = useState(false);
+  const { task, binding, lateJobRecovery: late } = detail;
+  const { worker, jobs, subtree } = recovery;
+  const busy = Boolean(worker?.status && worker.status !== 'idle' || worker?.inputs?.length ||
+    jobs?.some(job => ['running', 'stopping'].includes(job.status)) || subtree.state === 'active');
+  const disabled = w.locked || !checked || busy;
+  const version = { id: task.id, expectedRowVersion: task.rowVersion, acknowledged: true };
+  return <>
+      <p>{late?.state === 'blocked' ? '可在原聊天请 Bot 核对缺少的回执。已有可核实的事实时，也可用下方入口。'
+        : '请在原会话处理待处理输入和作业结果，并检查文件与外部效果。宿主会在确认时再次核对当前活动。'}</p>
       <label className="check">
         <input disabled={w.locked} type="checkbox" checked={checked} onChange={event => setChecked(event.target.checked)}/>
         我已检查，确认可以结束本次尝试
@@ -55,6 +71,5 @@ export function RecoveryPanel({ w, detail, recovery }: { w: WorkspaceState; deta
           ...version, requestId: `recover:${task.id}:${task.rowVersion}`,
         })}>{detail.closeRequest ? '确认核对并关闭任务' : '仅核对并保持暂停'}</button>
       </div>
-    </>}
-  </section>;
+  </>;
 }

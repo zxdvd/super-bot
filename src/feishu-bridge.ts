@@ -241,6 +241,11 @@ export class FeishuBridge {
           if (!this.current(route)) return;
           if (await this.managers.submitFeishu(input, receipt.message) && this.current(route)) {
             this.inboundErrors.delete(route.binding.botId);
+            // submitFeishu confirms the committed nativeSeq. The original inbound receipt already deduplicates
+            // both this dispatch and future redeliveries, including after restart.
+            void Promise.resolve().then(() => {
+              if (this.current(route)) return this.transport.reactReceived(message.messageId, () => this.current(route));
+            }).catch(() => { /* Receipt reactions are best effort and independent of chat delivery. */ });
           }
         } catch (error) {
           if (!this.current(route)) return;

@@ -254,7 +254,7 @@ export async function apply(ctx: Context, config: RuntimeOptions & {
       if (endpoint === 'task.dispatch') {
         const { id } = taskInScope(payload,true);
         return {ok:true,value:await execution.dispatch(requiredText(payload.requestId,'请求标识',200),id,
-          payload.expectedRowVersion as number,()=>{taskInScope(payload,true);})};
+          payload.expectedRowVersion as number,()=>{taskInScope(payload,true);managers.checkStageSources(id);})};
       }
       if (endpoint === 'task.stop') return {ok:true,value:await execution.stop(requiredText(payload.requestId,'请求标识',200),taskInScope(payload,true).id,payload.expectedRowVersion as number)};
       if (endpoint === 'task.close') return {ok:true,value:await execution.closeTask(

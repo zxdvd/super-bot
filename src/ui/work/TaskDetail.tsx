@@ -326,8 +326,9 @@ export function TaskDrawer({ w, compact, onReturn }: { w: WorkspaceState; compac
         <TaskDetailHeader w={w} detail={detail} close={close} onReturn={onReturn} recoveryPanel={!!detail.recovery?.worker}/>
         {detail.recovery && <RecoveryPanel w={w} detail={detail} recovery={detail.recovery}
           key={`${detail.task.id}:${detail.task.rowVersion}:${detail.recovery.attentionId}:${detail.binding?.generation}`}/>}
+        {detail.lateJobPriorEffects && <p className="notice">{detail.lateJobPriorEffects}</p>}
         {!detail.stage && <RecoveryFinding detail={detail}/>}
-        <TaskStages task={detail.task} current={detail.stage} history={detail.stages ?? []}/>
+        <TaskStages task={detail.task} current={detail.stage} history={detail.stages ?? []} release={detail.gitLabRelease}/>
         <Attentions w={w} detail={detail}/>
         <CurrentChildWaits detail={detail} api={w.api} online={w.online}/>
         {!resultBeforeProgress && <Progress detail={detail}/>}

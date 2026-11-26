@@ -122,6 +122,28 @@ const sender = { sender_type: 'user', sender_id: { open_id: config.ownerOpenId }
 const message = { chat_type: 'group', chat_id: 'oc_one', message_id: 'om_exact', message_type: 'text',
   create_time: '1795427300123', content: JSON.stringify({ text: '部署进度如何？' }) };
 
+test('received reaction uses the original message ID and fixed emoji and checks routing after token lookup', async t => {
+  const url = 'https://open.feishu.cn/open-apis/im/v1/messages/om_exact/reactions';
+  let allowed = true, revokeToken = false;
+  const f = fixture(request => {
+    assert.equal(request.method, 'post');
+    assert.equal(request.url, url);
+    assert.deepEqual(JSON.parse(request.data), { reaction_type: { emoji_type: 'THUMBSUP' } });
+    return { code: 0, data: { reaction_id: 'fixture' } };
+  }, undefined, () => { if (revokeToken) allowed = false; });
+  t.after(() => f.transport.stop());
+  f.transport.start(f.handlers);
+  f.sockets[0]!.options.onReady?.();
+  revokeToken = true;
+  await assert.rejects(f.transport.reactReceived('om_exact', () => allowed), /绑定或连接已变更/);
+  assert.equal(f.calls.filter(call => call.url === url).length, 0);
+  revokeToken = false;
+  allowed = true;
+  await f.transport.reactReceived('om_exact', () => allowed);
+  await assert.rejects(f.transport.reactReceived('om_bad/path', () => true), /未确认/);
+  assert.equal(f.calls.filter(call => call.url === url).length, 1);
+});
+
 test('official dispatcher preserves nested message time, filters senders and formats, and supports @ and topics', async t => {
   const f = fixture();
   t.after(() => f.transport.stop());

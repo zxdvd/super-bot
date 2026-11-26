@@ -64,7 +64,7 @@ type WorkerPromptPlan = {mode:'full'|'delta';carried:readonly WorkerPriorInput[]
 
 export function createWorkerRunMessage(
   run:Run,input:RunInput,standing:string,{mode,carried,inputOrder}:WorkerPromptPlan,
-  recovery?:{note:string|null},context?:RecoveryWorkContext,
+  recovery?:{note:string|null},context?:RecoveryWorkContext&{outputDirectory?:string},
 ):UserMessage {
   const sections = [runHeader(run.id)];
   if (mode === 'full') sections.push(standing);
@@ -79,7 +79,8 @@ export function createWorkerRunMessage(
     if(priorDirections)sections.push(...priorDirections.map(({text})=>`Retained owner direction:\n${text}`));
     else if(priorDirection)sections.push(`Retained owner direction:\n${priorDirection}`);
     sections.push('Continue the current assignment from all applicable owner directions in order and the verified state. Retain the substantive directions and limits when the latest message only confirms proceeding or selects this task. Treat the standing goal as background for this attempt. Read prior reports and receipts as evidence. Preserve observed effects and uncertainty. If a resource was created but is unready, report both facts. Use waiting for a specific decision or permission the owner must supply. Report a blocked external dependency with the responsible party or condition.');
-    sections.push(context.mode==='read-only'?
+    if(context.lateJobs)sections.push(`The old attempt ended before these background Job results were consumed. Use the saved progress, original native Job result messages and current files as evidence. Prior external effects remain unverified. Preserve the materials already collected. Continue only with reading existing regular files and writing the requested report under ${context.outputDirectory}. Do not repeat background work, modify existing inputs, perform an external action or claim an unverified external effect succeeded. If the task specifically needs an external action or unavailable evidence, report the remaining business requirement and the exact missing evidence.`);
+    else sections.push(context.mode==='read-only'?
       'Use only the read-only tools available for this continuation and report the actual observations.' :
       'Perform only the concrete next step the owner authorized within the standing scope. Check current facts first and stop before any action that could duplicate an observed effect.');
   }
