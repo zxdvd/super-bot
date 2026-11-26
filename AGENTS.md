@@ -1,14 +1,9 @@
 # Super Bot 工作约定
 
-- 产品名 Super Bot，仓库 `super-bot`；当前交付 DSH 插件，未来载体不预先限定。
-- 产品主线是“与 Bot 聊天 → Bot 自行安排执行 → 回到对话交付”；工作台是辅助入口。底层测试通过不能替代这一用户流程的验收，优先复用原生聊天与已有执行机制。
-- 开始工作先读 README、ROADMAP 和活动 change 的 README、tasks、evidence；只勾选实际验证完成的任务。
-- 领域与应用层不得 import DSH/Cordis/React；DSH 调用集中在适配层，Dashboard 通过应用命令/查询调用业务。
-- 单进程与一个 SQLite 起步，不提前引入微服务、多引擎调度、通用 DAG 或自研 Agent Loop。
-- 账本事务、幂等、版本、权限、资源占用是程序职责。Prompt 不能替代强制约束。
-- 区分模型报告、运行事实、业务验收。turn/end、取消 accepted、Agent idle 都不能单独证明 Task 完成或外部效果停止。
-- 不修改 DSH 安装包、上游源码或现有 `dsh-plugins`；兼容探针使用独立 profile/测试数据，不复用用户日常 Session。
-- 密钥与实际聊天正文不入仓库。数据库、日志、证据产物放运行数据目录；仓库仅保留合成夹具、脱敏结果和稳定引用。
-- 变更需有对应验收证据，尤其是重复投递、晚到事件、人工干预、停止与重启。实现阶段建立实际 build/typecheck/test 命令后同步 README。
-- Super Bot 默认直接交付到 `dev`。在工作分支完成改动后，先获取最新的 `origin/dev`，将提交 rebase 到它之上，再运行本地验证。验证通过后用 `git push origin HEAD:dev` 快进推送。
-- 本机 `http://127.0.0.1:3080/` 的 DSH Web 是测试环境。代码验证并推送后，直接升级该端插件、重启并验证实际页面。账本随版本迁移，跳过例行备份和二次确认。
+Super Bot 的主入口是原聊天。用户委托任务后，Bot 负责安排执行、跟进和交付。工作面板提供详细记录与同一组任务操作。
+
+- 开始改动前读 [README](README.md)、[ROADMAP](ROADMAP.md) 和相关 change 的设计、任务清单及验收记录。只勾选实际验证过的任务。
+- [开发与验证](docs/development.md) 说明如何找到代码、选择测试和核对线上行为。源码、界面和测试目录有各自的工作约定。
+- 使用单进程、单个 SQLite 账本和原生 DSH 会话。对宿主的适配留在本仓库。保持用户安装包、上游源码及相邻的 `dsh-plugins` 原样。
+- 获取最新 `origin/dev`，rebase 后验证，使用 `git push origin HEAD:dev` 快进推送。
+- 本机 `http://127.0.0.1:3080/` 是测试环境。推送后直接升级该插件并重启，允许随版本迁移账本，跳过例行备份和二次确认。核对实际加载的构建、Bot 对话及工作面板。

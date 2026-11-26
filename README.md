@@ -6,7 +6,7 @@
 
 当前为本地开发预览，通过 DSH Web 安装。与 Bot 聊天即可安排普通 Full Access Worker 执行，原对话接收交付并继续补充或返工。另一台机器试用只需一个 Web profile。macOS 同机只读镜像是可选功能。
 
-- **自动验证。** 既有基线使用 Node `24.22.1` 通过完整检查，含 104 项核心与 SDK 测试、310 项宿主适配测试、行数检查、类型检查及 Host/Client 构建。隔离 DSH 原生 Host 使用确定性模型验证聊天交付、版本附件与 Markdown 记忆等契约。飞书全局设置的验证范围见 [REQ-001 验收](specs/changes/2026-11-feishu-group-chat/tasks.md#req-001-全局设置验证--2026-11-24)。
+- **自动验证。** 从源码运行 `npm run check` 检查格式、代码、类型、测试和 Host/Client 构建。原生聊天、宿主重启和飞书收发另有隔离验收。[开发与验证](docs/development.md) · [飞书验收记录](specs/changes/2026-11-feishu-group-chat/tasks.md#req-001-全局设置验证--2026-11-24)
 - **真实使用记录。** 日常 Web 已实际从原聊天派发普通 Worker、交错回答两个任务的问题、收取并打开精确成果、返工和核对恢复。隔离浏览器曾由开发者点击接受新版，账本记录了该测试的人工接受。各项范围见 [实施路线](ROADMAP.md)。
 - **待用户验证。** 全新克隆后用自己的模型完成个人首版试用及最终接受，核对真实模型处理歧义与成果质量。日常 Web 和 macOS Desktop 的同机配对体验、精确费用归因也待核对。试用步骤见 [第一次真实模型试用](docs/first-trial.md)。
 
@@ -88,7 +88,7 @@ SUPER_BOT_PROFILE=super-bot-trial npm run dev:reload -- --wait 30
 
 在没有其他宿主使用该工作目录 `lib/` 的情况下，可运行 `npm ci`、`npm run dev`。`dev` 从仓库锁定的 DSH CLI 启动，使用 `.runtime/dsh-dev` 下的独立 home 和 `super-bot-dev` profile，默认监听 `127.0.0.1:3081`，可用 `SUPER_BOT_PORT` 改端口。自动构建监听 `src`，Host HMR 监听 `lib/index.js`，Client HMR 刷新 `lib/client.js`。进程使用自己的 DSH 存储，也会继承启动环境变量。用终端的登录链接进入，Ctrl-C 退出。再次运行保留任务数据，默认账本位于该 home 的 `super-bot/ledger.sqlite`。
 
-- `npm run check` 包含行数检查、类型检查、核心账本测试、DSH 适配层测试和 Host/Client 构建。`npm test` 单独运行账本测试。
+- `npm run check` 执行格式、lint、类型、核心与适配层测试和 Host/Client 构建。单跑账本和业务测试可用 `npm test`。
 - `npm run smoke:notifications`：自建全新隔离 home/profile/账本与确定性提供方，验证 Manager 未就绪、额度恢复、通知回执崩溃及重复重启；无真实模型费用、无生产连接。
 - `npm run smoke:chat`：在专用探针宿主上验证聊天接单、同对话交付、文件下载、提问回答、返工、Bot 直接 Shell 查询/noWait 拒绝与 Worker 原生 Shell 文件任务；仅确定性模型，不依赖外部服务。可传专用宿主日志：`npm run smoke:chat -- .runtime/permissions-host.log`。
 - `node scripts/smoke-manager-native-tools.mjs` 使用隔离 DSH Web、确定性模型和合成计数工具验证 Manager 的宿主工具执行边界。设置 `SUPER_BOT_TEST_PLAYWRIGHT` 和 `SUPER_BOT_TEST_BROWSER` 为本机 Playwright 模块与 Chromium 可执行文件的绝对路径。加 `--files` 验证 files 模式。
