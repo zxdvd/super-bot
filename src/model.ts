@@ -68,7 +68,7 @@ export interface Task {
   createdAt: number;
   updatedAt: number;
   status: 'unscheduled' | 'needs-input' | 'approval' | 'paused' | 'manual' | 'completed' | 'cancelled' | 'review' | 'queued' | 'running' | 'stopping' | 'recovery' | 'blocked';
-  /** Next actor from the local ledger, supplied by the inbox query. */
+  /** Next actor from the ledger, supplied by work view queries. */
   activity?: WorkActivity | null;
   activityQuestion?: string;
   managerReviewed?:boolean;

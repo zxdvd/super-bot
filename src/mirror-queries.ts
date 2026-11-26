@@ -6,9 +6,9 @@ import type { Store } from './store.ts';
 // Keep the wire projection explicit. The local queries can include Bot context, native session IDs and paths.
 function taskRecord(task: Task, detail: boolean): Task {
   const { id, botId, goal, scope, acceptance, reviewPolicy, lifecycle, controlMode, taskRevision, rowVersion,
-    createdAt, updatedAt, status, managerReviewed, blockingAttention, deliveredAt, botConfigRevision } = task;
+    createdAt, updatedAt, status, activity, stageState, managerReviewed, blockingAttention, deliveredAt, botConfigRevision } = task;
   return { id, botId, goal, scope: detail ? scope : '', acceptance: detail ? acceptance : '', reviewPolicy, lifecycle,
-    controlMode, taskRevision, rowVersion, sessionId: null, createdAt, updatedAt, status, managerReviewed, blockingAttention,
+    controlMode, taskRevision, rowVersion, sessionId: null, createdAt, updatedAt, status, activity, stageState, managerReviewed, blockingAttention,
     ...(task.waitingForPrerequisite && { waitingForPrerequisite: true }), deliveredAt, botConfigRevision };
 }
 

@@ -1,4 +1,4 @@
-import { inboxActivity } from './work-activity.ts';
+import { applyTaskActivity, inboxActivity, taskActivities } from './work-activity.ts';
 import { settledBlockerSql } from './settled-blocker.ts';
 import { readStageCondition, stageConditionText, stageReadyKey, STAGE_OBSERVE_MS, STAGE_WAIT_MS,
   type DueStage, type StageFollowUp, type StageObservation, type WorkStage } from './work-stage.ts';
@@ -10,6 +10,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { deliveryUncertainReason, readChatDeliveryIds, readChatDeliveryStatus, readDeliveryReceipt,
   readManagerProblem, readReportedDeliveryArtifacts, DELIVERY_RETRIES_EXHAUSTED, type ManagerProblem } from './store/delivery.ts';
 import { openLedger } from './store/schema.ts';
+import { currentLateJobSql } from './store/late-job.ts';
 import { readCommandReceipt, runCommand, writeTransaction } from './store/transactions.ts';
 import { AppError, requiredText, optionalText, taskStatus, type ChatSource, type Bot, type Task, type NewBot, type NewTask, type TaskPage, type TaskInboxPage, type ControlMode, type Attention, type Binding, type Run, type RunInput, type WorkReport, type Result,type ManagerBinding,type ManagerEvent,type ExistingSessionGrant,type ReferenceMaterial,type TaskBotContext,type DispatchWait,type WorkdirInfo,type RunTurn,botDraft } from './model.ts';
 import { RESULT_FRESH_MS, type ChatDeliveryStatus, type DeliveredResult, type DeliveryArtifacts, type DeliveryLinks, type RecoveryContinuation, type ReloadReceipt, type RunChildWait, type TaskCloseRequest,
@@ -752,7 +753,8 @@ export class Store {
     return readChatDeliveryStatus(this.db, task, result, historical);
   }
   taskDetail(id: string) {
-    const current=this.getTask(id),binding=this.activeBinding(id),run=this.latestRun(id);
+    const activity=taskActivities(this.db,[id]).get(id);
+    const current=applyTaskActivity(this.getTask(id),activity),binding=this.activeBinding(id),run=this.latestRun(id);
     const deliveredResult=this.deliveredResult(current);
     const result=run&&run.taskRevision===current.taskRevision&&run.bindingId===binding?.id?this.runResult(run.id):null;
     const task=result&&result.id===deliveredResult?.id&&['review','completed'].includes(current.lifecycle)
@@ -771,11 +773,12 @@ export class Store {
     const late=run?this.lateJobRecovery(run.id):null;
     const currentLate=run&&this.lateJobTarget(run.id,true);
     const invalidated=late&&['waiting','ready'].includes(late.state)&&!currentLate;
-    const lateState:LateJobRecovery|null=late&&invalidated?{...late,state:'blocked',reason:
-      '任务的指示、控制或 Worker 关联已更新。Bot 将按当前授权核对，旧的后台回执不再触发续跑。'}:late;
+    const lateBlocker=invalidated?'任务的指示、控制或 Worker 关联已更新。Bot 将按当前授权核对，旧的后台回执不再触发续跑。'
+      :activity?.lateJob==='expired'?'已到后台 Job 跟进期限。请核对原作业状态和原生结果回执。':undefined;
+    const lateState:LateJobRecovery|null=late&&lateBlocker?{...late,state:'blocked',reason:lateBlocker}:late;
     const lateNote=currentLate&&task.controlMode==='paused'
       ?'任务已按你的要求暂停。Bot 仍可核对后台结果，恢复管理后才会接续。'
-      :invalidated&&lateState?.state==='blocked'?lateState.reason:undefined;
+      :lateBlocker;
     if(lateNote) {
       const recovery=attentions.find(item=>item.id===`run:${run!.id}`&&item.state==='open');
       if(recovery)recovery.question=lateNote;
@@ -854,6 +857,11 @@ export class Store {
     });
   }
   listTasks(query: { botId: string; q?: string; lifecycle?: string; limit?: number; offset?: number }): TaskPage {
+    const page=this.taskPage(query);
+    const activity=taskActivities(this.db,page.items.map(task=>task.id));
+    return {...page,items:page.items.map(task=>applyTaskActivity(task,activity.get(task.id)))};
+  }
+  private taskPage(query: { botId: string; q?: string; lifecycle?: string; limit?: number; offset?: number }): TaskPage {
     this.getBot(query.botId);
     const limit = query.limit ?? 25, offset = query.offset ?? 0;
     if (!Number.isInteger(limit) || limit < 1 || limit > 100 || !Number.isInteger(offset) || offset < 0) throw new AppError('invalid-input', '分页参数无效。');
@@ -872,33 +880,34 @@ export class Store {
     return { items: rows.map(row=>this.withDelivery(this.decorateTask(row))), total, limit, offset, counts, snapshotVersion };
   }
   taskInbox(botId: string): TaskInboxPage {
-    const open=this.listTasks({botId,lifecycle:'open',limit:100});
-    const review=this.listTasks({botId,lifecycle:'review',limit:100});
-    const completed=this.listTasks({botId,lifecycle:'completed',limit:30});
-    const cancelled=this.listTasks({botId,lifecycle:'cancelled',limit:8});
+    const open=this.taskPage({botId,lifecycle:'open',limit:100});
+    const review=this.taskPage({botId,lifecycle:'review',limit:100});
+    const completed=this.taskPage({botId,lifecycle:'completed',limit:30});
+    const cancelled=this.taskPage({botId,lifecycle:'cancelled',limit:8});
     const visible=new Map([...open.items,...review.items,...completed.items,...cancelled.items].map(task=>[task.id,task]));
-    // Keep an active blocker or late delivery visible even when its task is outside the usual window.
+    // Keep active work and recent deliveries visible outside the usual window.
     const freshSince=Date.now()-RESULT_FRESH_MS;
-    const additional=this.db.prepare(`SELECT t.id FROM tasks t WHERE t.botId=? AND t.lifecycle IN ('open','review')
-      AND EXISTS(SELECT 1 FROM attentions WHERE taskId=t.id AND taskRevision=t.taskRevision AND ${BLOCKING_ATTENTIONS})
-      UNION SELECT t.id FROM events e JOIN tasks t ON t.id=e.taskId WHERE t.botId=? AND t.lifecycle IN ('review','completed')
+    const additional=this.db.prepare(`SELECT DISTINCT t.id FROM events e JOIN tasks t ON t.id=e.taskId
+      WHERE t.botId=? AND t.lifecycle IN ('review','completed')
       AND e.kind='manager.delivered' AND e.createdAt>? AND json_extract(e.data,'$.resultId') IS NOT NULL`)
-      .all(botId,botId,freshSince);
+      .all(botId,freshSince);
     for(const { id } of additional) {
       if(visible.has(String(id))) continue;
       const task=this.withDelivery(this.getTask(String(id)));
-      if(task.blockingAttention || (task.deliveredAt ?? 0)>freshSince) visible.set(task.id,task);
+      if((task.deliveredAt ?? 0)>freshSince) visible.set(task.id,task);
     }
     const { byTask: activity, reviewTotal } = inboxActivity(this.db, botId);
-    for (const [id, state] of activity) {
-      if ((state === 'working' || state === 'attention') && !visible.has(id)) visible.set(id, this.withDelivery(this.getTask(id)));
+    for (const [id, row] of activity) {
+      if ((row.activity === 'working' || row.activity === 'attention') && !visible.has(id)) visible.set(id, this.withDelivery(this.getTask(id)));
     }
     const question = this.db.prepare(`SELECT question FROM attentions WHERE taskId=? AND taskRevision=?
       AND kind='input' AND state='open' ORDER BY createdAt,id LIMIT 1`);
-    const items=[...visible.values()].map(task => ({
-      ...task, activity: activity.get(task.id) ?? null,
-      ...(task.blockingAttention === 'input' ? { activityQuestion: question.get(task.id, task.taskRevision)?.question as string } : {}),
-    }));
+    const items=[...visible.values()].map(rawTask => {
+      const task=applyTaskActivity(rawTask,activity.get(rawTask.id));
+      return {...task,
+        ...(task.blockingAttention === 'input' ? { activityQuestion: question.get(task.id, task.taskRevision)?.question as string } : {}),
+      };
+    });
     return {...open,items,limit:items.length,reviewTotal,truncated:open.total>open.items.length||review.total>review.items.length};
   }
   private toBinding(row:unknown):Binding {
@@ -1140,18 +1149,12 @@ export class Store {
     const run=this.getRun(runId),task=this.getTask(run.taskId);
     const binding=this.activeBinding(task.id),proof=this.runTurn(runId);
     const instruction=pending.instructionId?this.recoveryInstruction(task.id):null;
-    const controlled=task.controlMode==='auto'||includePaused&&task.controlMode==='paused';
-    if(task.rowVersion!==pending.rowVersion||
-      pending.instructionId&&(instruction?.id!==pending.instructionId||instruction.priorRunId!==runId||instruction.runId)||
-      task.lifecycle!=='open'||!controlled||this.isBotDeleted(task.botId)||this.taskClose(task.id)||
-      run.state!=='interrupted'||this.latestRun(task.id)?.id!==run.id||task.taskRevision!==run.taskRevision||
-      binding?.state!=='ready'||binding.id!==run.bindingId||binding.generation!==run.generation||
-      binding.sessionId!==run.sessionId||binding.taskRevision!==task.taskRevision||proof?.quiet!==0||proof.endSeq===null||
-      this.getRunInput(runId).state!=='entered'||!this.db.prepare('SELECT 1 FROM resources WHERE runId=?').get(runId)||
-      !this.db.prepare("SELECT 1 FROM attentions WHERE id=? AND state='open'").get(`run:${runId}`)||
-      this.db.prepare(`SELECT 1 FROM attentions WHERE taskId=? AND id!=? AND
-        (state IN ('open','responding') OR kind='approval' AND state='stale')`).get(task.id,`run:${runId}`)||
-      this.db.prepare("SELECT 1 FROM inputs WHERE taskId=? AND kind!='goal' AND state IN ('accepted','enqueued','unknown')").get(task.id)) return;
+    if(!binding||!proof||!this.db.prepare(`SELECT 1 FROM runs latest JOIN tasks t ON t.id=latest.taskId
+      JOIN bots b ON b.id=t.botId AND b.deletedAt IS NULL
+      JOIN metadata late ON late.key='late-job:' || latest.id
+      WHERE latest.id=? AND latest.id=(SELECT id FROM runs WHERE taskId=t.id ORDER BY createdAt DESC,rowid DESC LIMIT 1)
+        AND (t.controlMode='auto' OR ? AND t.controlMode='paused') AND ${currentLateJobSql}`)
+      .get(runId,Number(includePaused))) return;
     return {pending,run,task,binding,proof,instruction};
   }
   updateLateJob(runId:string,outcome:{reason:string}|{proof:LateJobProof}):void {

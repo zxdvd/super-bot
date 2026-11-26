@@ -92,6 +92,8 @@ export const groupTitles: Record<WorkGroup, string> = {
 export function workGroup(task: Task): WorkGroup {
   if (task.lifecycle === 'cancelled') return 'cancelled';
   if (task.lifecycle === 'review' || task.lifecycle === 'completed') return 'delivered';
+  if (task.activity === 'attention') return 'needs-you';
+  if (task.status === 'recovery' && task.blockingAttention === null) return 'doing';
   if (task.waitingForPrerequisite) return 'doing';
   return ['needs-input', 'approval', 'recovery', 'blocked', 'paused', 'manual'].includes(task.status) ? 'needs-you' : 'doing';
 }
@@ -132,17 +134,18 @@ export function stage(task: Task): Stage {
 /** The short status a row shows: the stage, refined by the concrete reason where that helps. */
 export function stageText(task: Task, readOnly = false): string {
   const s = stage(task);
-  if (task.status === 'blocked' && task.stageState === 'waiting') return '等待外部条件';
-  if (task.status === 'blocked' && task.stageState === 'awaiting-decision') return 'Bot 正在核对下一步';
-  if (task.activity === 'attention' && s !== 'needs-you') return '通知待核对';
-  if (task.activity === 'working' && s === 'done') return 'Bot 正在交付';
-  if (task.activity === 'working' && s === 'review') return task.managerReviewed ? 'Bot 正在交付' : 'Bot 跟进中';
-  if (task.activity === 'working' && s === 'waiting') return '等待自动跟进';
-  if (s === 'waiting' && task.waitingForPrerequisite) return '任务受阻';
   if (s === 'needs-you') {
     const status = blocker(task) ?? task.status;
     return status === 'needs-input' && readOnly ? '待补充' : labels[status];
   }
+  if (task.activity === 'attention') return task.stageState ? '后续待核对' : '通知待核对';
+  if (task.status === 'blocked' && task.stageState === 'waiting') return '等待外部条件';
+  if (task.activity === 'working' && task.stageState === 'awaiting-decision') return 'Bot 正在核对下一步';
+  if (task.activity === 'working' && s === 'done') return 'Bot 正在交付';
+  if (task.activity === 'working' && s === 'review') return task.managerReviewed ? 'Bot 正在交付' : 'Bot 跟进中';
+  if (task.activity === 'working' && s === 'waiting') return '等待自动跟进';
+  if (s === 'waiting' && task.controlMode === 'paused') return labels.paused;
+  if (s === 'waiting' && task.waitingForPrerequisite) return '任务受阻';
   if (s === 'running' || s === 'waiting' && (task.status === 'paused' || task.status === 'manual')) return labels[task.status];
   return stageLabels[s];
 }

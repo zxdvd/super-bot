@@ -2,8 +2,12 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { verifyLateJobs } from '../../src/dsh-late-job-proof.ts';
 import type { Run, RunInput, RunTurn, WorkerModelPlan } from '../../src/model.ts';
+import type { MirrorDetail } from '../../src/mirror.ts';
+import { readLocalMirror } from '../../src/mirror-queries.ts';
 import type { RunEvent } from '../../src/run-proof.ts';
 import { Store } from '../../src/store.ts';
+import { inboxGroups, stage, stageText, workGroup } from '../../src/ui/work/format.ts';
+import { botWorkSummaries } from '../../src/work-activity.ts';
 
 const run: Run = { id: 'old-run', taskId: 'task', bindingId: 'binding', sessionId: 'worker', taskRevision: 1,
   generation: 1, inputId: 'task-input', state: 'interrupted', createdAt: 0, finishedAt: 1, note: 'Job outstanding' };
@@ -86,17 +90,83 @@ function suspendedJob(store: Store) {
   store.runRecovery(old.id, 'Background work active');
   const getTask = () => store.getTask(task.id);
   const control = (mode: 'paused'|'auto') => store.controlTask(mode, task.id, getTask().rowVersion, mode);
-  assert.equal(control('paused').controlMode, 'paused');
-  return { old, binding, manager, getTask, control };
+  return { old, binding, bot, manager, getTask, control };
 }
 
 const plannedModel: WorkerModelPlan = { source: 'native-selection', provider: 'fixture', model: 'fixture', reasoningEffort: null };
 const laterProof = verify(terminal('a'), ...consumption('a', 2), terminal('b'), ...consumption('b', 3))!;
 
+test('late Job waiting, pause and a claimable receipt agree across work views without a Manager', t => {
+  t.mock.timers.enable({ apis: ['Date'] });
+  const store = new Store(':memory:');
+  t.after(() => store.close());
+  const { old, bot, manager, control } = suspendedJob(store);
+  const assertWorkView = (lateState: 'waiting' | 'ready', activity: 'working' | null) => {
+    const detail = store.taskDetail(old.taskId);
+    assert.equal(detail.lateJobRecovery?.state, lateState);
+    assert.equal(detail.task.status, 'recovery');
+    const inbox = store.taskInbox(bot.id);
+    const item = inbox.items.find(task => task.id === old.taskId)!;
+    const groups = inboxGroups(inbox.items, {}, Date.now());
+    const listed = store.listTasks({ botId: bot.id }).items.find(task => task.id === old.taskId)!;
+    const mirrored = readLocalMirror(store, { op: 'detail', id: old.taskId, botId: bot.id }) as MirrorDetail;
+    for (const task of [detail.task, item, listed, mirrored.task]) {
+      assert.equal(task.activity, activity);
+      assert.equal(stage(task), 'waiting');
+      assert.equal(stageText(task), activity === 'working' ? '等待自动跟进' : '已暂停');
+      assert.equal(workGroup(task), 'doing');
+    }
+    assert.equal(groups.attentionCount, 0);
+    assert.deepEqual(groups.active.map(task => task.id), activity === 'working' ? [old.taskId] : []);
+    const { working, attention } = botWorkSummaries(store.db)[0]!;
+    assert.deepEqual({ working, attention }, { working: Number(activity === 'working'), attention: 0 });
+  };
+  for (const event of store.managerNotifications(bot.id)) store.settleManagerEvent(event.id);
+  assertWorkView('waiting', 'working');
+  store.releaseManager('remove-manager', bot.id, manager.generation);
+  assertWorkView('waiting', 'working');
+  control('paused');
+  t.mock.timers.tick(store.lateJobRecovery(old.id)!.deadline - Date.now());
+  assertWorkView('waiting', null);
+  store.updateLateJob(old.id, { proof: laterProof });
+  assertWorkView('ready', null);
+  control('auto');
+  assert.equal(store.lateJobCanDispatch(old.id), true);
+  assertWorkView('ready', 'working');
+});
+
+test('late Job expiry, missing proof and separate owner blockers remain visible', t => {
+  t.mock.timers.enable({ apis: ['Date'] });
+  for (const cause of ['expiry', 'missing-proof', 'input', 'approval'] as const) {
+    const store = new Store(':memory:');
+    try {
+      const { old, bot, getTask } = suspendedJob(store);
+      if (cause === 'expiry') t.mock.timers.tick(store.lateJobRecovery(old.id)!.deadline - Date.now());
+      else if (cause === 'missing-proof') store.updateLateJob(old.id, { reason: 'No matching native receipt' });
+      else {
+        store.db.prepare('INSERT INTO attentions(id,taskId,kind,question,taskRevision,createdAt) VALUES (?,?,?,?,?,?)')
+          .run(`separate:${cause}`, old.taskId, cause, 'Owner decision needed', getTask().taskRevision, Date.now());
+        assert.equal(store.lateJobTarget(old.id), undefined);
+      }
+      const detail = store.taskDetail(old.taskId);
+      assert.equal(detail.lateJobRecovery?.state, 'blocked');
+      assert.equal(stage(detail.task), 'needs-you');
+      if (cause === 'input' || cause === 'approval') {
+        assert.ok(detail.attentions.some(item => item.kind === cause && item.state === 'open'));
+      }
+      const groups = inboxGroups(store.taskInbox(bot.id).items, {}, Date.now());
+      assert.deepEqual(groups.attention.map(task => task.id), [old.taskId]);
+      const { working, attention } = botWorkSummaries(store.db)[0]!;
+      assert.deepEqual({ working, attention }, { working: 0, attention: 1 });
+    } finally { store.close(); }
+  }
+});
+
 test('pause admits late settlement evidence and explicit resume transfers the original reservation once', () => {
   const store = new Store(':memory:');
   try {
     const { old, binding, getTask, control } = suspendedJob(store);
+    assert.equal(control('paused').controlMode, 'paused');
     store.updateLateJob(old.id, { proof: laterProof });
     assert.equal(store.lateJobRecovery(old.id)?.state, 'ready');
     assert.equal(store.lateJobRecovery(old.id)?.rowVersion, getTask().rowVersion);
@@ -116,7 +186,8 @@ test('owner takeover, closure and a new plan rule out carrying the old Job conti
   for (const interrupt of ['takeover','closure','new-plan']) {
     const store = new Store(':memory:');
     try {
-      const { old, manager, getTask, control } = suspendedJob(store);
+      const { old, bot, manager, getTask, control } = suspendedJob(store);
+      assert.equal(control('paused').controlMode, 'paused');
       store.updateLateJob(old.id, { proof: laterProof });
       if(interrupt==='takeover')store.nativeIntervention(old.sessionId, 'human-input');
       else if(interrupt==='closure')store.requestTaskClose('close', old.taskId, getTask().rowVersion);
@@ -127,6 +198,9 @@ test('owner takeover, closure and a new plan rule out carrying the old Job conti
       else control('auto');
       assert.equal(store.lateJobCanDispatch(old.id), false);
       assert.equal(store.latestRun(old.taskId)?.id, old.id);
+      assert.equal(store.taskDetail(old.taskId).lateJobRecovery?.state, 'blocked');
+      assert.equal(store.taskInbox(bot.id).items.find(task => task.id === old.taskId)?.activity, 'attention');
+      assert.equal(botWorkSummaries(store.db)[0]?.attention, 1);
     } finally { store.close(); }
   }
 });

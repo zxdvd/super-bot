@@ -6,6 +6,8 @@ import { join } from 'node:path';
 import type { Run } from '../src/model.ts';
 import { Store } from '../src/store.ts';
 import { observeGitLabStage, startStageObservation } from '../src/gitlab-observer.ts';
+import { botWorkSummaries } from '../src/work-activity.ts';
+import { stageText } from '../src/ui/work/format.ts';
 import { gitLabObservationOrigin, readStageCondition, STAGE_WAIT_MS, type StageCondition } from '../src/work-stage.ts';
 
 const origin = 'https://gitlab.example.invalid';
@@ -130,6 +132,10 @@ test('a GitLab wait frees the slot and survives restart, pause, old observations
     'Verify the exact deployment',pipeline,origin);
   assert.equal(decision.stage.state,'waiting');
   assert.equal(store.botCapacity(bot.id).botHeld,0);
+  for (const event of store.managerNotifications(bot.id)) store.settleManagerEvent(event.id);
+  assert.equal(stageText(store.taskDetail(task.id).task), '等待外部条件');
+  assert.equal(store.taskInbox(bot.id).items.find(item => item.id === task.id)?.activity, 'working');
+  assert.equal(botWorkSummaries(store.db).find(summary => summary.id === bot.id)?.working, 1);
   const other = createBound(store,'other',bot.id);
   const otherRun = enter(store,other.task.id,'other-work');
   const staleAddition = store.dueStages(1)[0]!;

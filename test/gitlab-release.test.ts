@@ -8,6 +8,7 @@ import { gitLabHttp } from '../src/gitlab-client.ts';
 import { discoverRelease, exactMergeReference, releaseReadback, type ReleaseTarget } from '../src/gitlab-release.ts';
 import type { Run } from '../src/model.ts';
 import { Store } from '../src/store.ts';
+import { botWorkSummaries } from '../src/work-activity.ts';
 
 const origin='https://gitlab.fixture.invalid';
 const mr=origin+'/fixture/release/-/merge_requests/11';
@@ -123,6 +124,30 @@ function release(store:Store,key:string,prep=arrange(store,key)) {
   const run=enter(store,task.id,key+'-formal');
   return {run,task,...store.beginGitLabRelease(run.id)};
 }
+
+test('an exact GitLab release receipt stays active after its notice until the observer reaches a blocker', t => {
+  const store = new Store(':memory:');
+  t.after(() => store.close());
+  const { run, task, stageRunId, url } = release(store, 'watch');
+  assert.equal(store.claimGitLabRelease(run.id), true);
+  const claimed = store.gitLabReleaseReceipt(stageRunId)!;
+  const tracking = releaseReadback(claimed, { code: 200, data: { ...job, status: 'running' } });
+  store.recordGitLabRelease(claimed, tracking, true);
+  store.workerReport(run.id, 'track', { kind: 'stage', stage: 'Release started', summary: 'Watching exact job',
+    evidenceRef: url, checks: 'Matched the claimed job' });
+  store.settleRun(run.id);
+  for (const event of store.managerNotifications(task.botId)) store.settleManagerEvent(event.id);
+  const assertActivity = (activity: 'working' | 'attention') => {
+    const detail = store.taskDetail(task.id);
+    assert.equal(detail.task.activity, activity);
+    assert.equal(store.taskInbox(task.botId).items.find(item => item.id === task.id)?.activity, activity);
+    assert.equal(botWorkSummaries(store.db)[0]?.[activity], 1);
+  };
+  assertActivity('working');
+  const expired = releaseReadback(tracking, { code: 503 }, false, tracking.deadlineAt);
+  store.recordGitLabRelease(tracking, expired);
+  assertActivity('attention');
+});
 
 test('schema 14 migrates and keeps globally single formal claim through lost receipt and reopen',t=>{
   const dir=mkdtempSync(join(tmpdir(),'super-bot-gitlab-'));

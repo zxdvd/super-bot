@@ -113,6 +113,12 @@ try {
   const old = await start('RESTART');
   await wait(async () => (await probe('inspect-session', chat)).assistantTexts
     .find(text => text.includes('仍在等待后台 Job 终态和原生结果消费')), 'original chat receives waiting status');
+  assert.equal((await detail(old.task.id)).task.activity, 'working');
+  const waitingInInbox = (await call('task.inbox', { botId: bot.id })).items.find(item => item.id === old.task.id);
+  assert.equal(waitingInInbox.activity, 'working');
+  assert.equal(waitingInInbox.blockingAttention, null);
+  const { working, attention } = (await call('bot.work')).find(summary => summary.id === bot.id);
+  assert.deepEqual({ working, attention }, { working: 1, attention: 0 });
   const supplement = `LATE_JOB_APPEND ${old.task.id} 请在报告附上部署限制，其他照旧。`;
   await probe('native-prompt', chat, { text: supplement });
   const appended = await detail(old.task.id);
@@ -172,6 +178,7 @@ try {
   assert.equal(ambiguous.run.id, duplicate.run.id);
   assert.equal(ambiguous.runHeld, true);
   assert.equal(ambiguous.result, null);
+  assert.equal(ambiguous.task.activity, 'attention');
 
   const takeover = await start('TAKEOVER');
   await releaseJob(takeover);
