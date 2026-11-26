@@ -18,7 +18,11 @@ const stageDeadline = `json_extract(stage.details,'$.deadlineAt')`;
 function activities(scope: '' | 'bot' | 'tasks') {
   return `SELECT t.id, t.botId, t.goal,
     CASE WHEN late.value IS NOT NULL THEN
-      CASE WHEN ${expiredLateJob} THEN 'expired' ELSE 'tracked' END END AS lateJob,
+      CASE WHEN ${expiredLateJob} THEN 'expired' ELSE 'tracked' END
+      WHEN latest.state='interrupted' AND EXISTS (
+        SELECT 1 FROM metadata WHERE key='late-job:' || latest.id
+      ) THEN 'blocked' END AS lateJob,
+    CASE WHEN stage.state='waiting' OR release.stageRunId IS NOT NULL THEN 1 ELSE 0 END AS observesExternalWork,
     CASE
     WHEN t.lifecycle='completed' AND res.humanAcceptedAt IS NULL THEN
       CASE WHEN delivery.state IN ('blocked','unknown') THEN 'attention'
@@ -82,7 +86,13 @@ export function botWorkSummaries(db: DatabaseSync): BotWorkSummary[] {
     .all({ $now: Date.now() }, TEST_TASK_PREFIX, TEST_TASK_PREFIX) as unknown as BotWorkSummary[];
 }
 
-type TaskActivity = { id: string; goal: string; activity: WorkActivity | null; lateJob: 'tracked' | 'expired' | null };
+type TaskActivity = {
+  id: string;
+  goal: string;
+  activity: WorkActivity | null;
+  lateJob: 'tracked' | 'expired' | 'blocked' | null;
+  observesExternalWork: 0 | 1;
+};
 
 export function taskActivities(db: DatabaseSync, taskIds: string[]) {
   const rows = db.prepare(`WITH managers_now AS (${managers}) ${activities('tasks')}`)
@@ -90,7 +100,8 @@ export function taskActivities(db: DatabaseSync, taskIds: string[]) {
   return new Map(rows.map(row => [row.id, row]));
 }
 
-export function applyTaskActivity(task: Task, row?: TaskActivity): Task {
+export function applyTaskActivity(task: Task, row?: TaskActivity, inbox = false): Task {
+  if (!inbox && !row?.lateJob && !row?.observesExternalWork) return task;
   return { ...task, activity: row?.activity ?? null,
     ...(row?.lateJob === 'tracked' && task.blockingAttention === 'recovery' ? { blockingAttention: null } : {}) };
 }

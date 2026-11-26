@@ -93,7 +93,8 @@ export function workGroup(task: Task): WorkGroup {
   if (task.lifecycle === 'cancelled') return 'cancelled';
   if (task.lifecycle === 'review' || task.lifecycle === 'completed') return 'delivered';
   if (task.activity === 'attention') return 'needs-you';
-  if (task.status === 'recovery' && task.blockingAttention === null) return 'doing';
+  if (task.status === 'recovery' && task.blockingAttention === null &&
+      (task.activity === 'working' || task.activity === null && task.controlMode === 'paused')) return 'doing';
   if (task.waitingForPrerequisite) return 'doing';
   return ['needs-input', 'approval', 'recovery', 'blocked', 'paused', 'manual'].includes(task.status) ? 'needs-you' : 'doing';
 }
@@ -140,7 +141,8 @@ export function stageText(task: Task, readOnly = false): string {
   }
   if (task.activity === 'attention') return task.stageState ? '后续待核对' : '通知待核对';
   if (task.status === 'blocked' && task.stageState === 'waiting') return '等待外部条件';
-  if (task.activity === 'working' && task.stageState === 'awaiting-decision') return 'Bot 正在核对下一步';
+  if (task.status === 'blocked' && task.stageState === 'awaiting-decision' &&
+      (task.activity === undefined || task.activity === 'working')) return 'Bot 正在核对下一步';
   if (task.activity === 'working' && s === 'done') return 'Bot 正在交付';
   if (task.activity === 'working' && s === 'review') return task.managerReviewed ? 'Bot 正在交付' : 'Bot 跟进中';
   if (task.activity === 'working' && s === 'waiting') return '等待自动跟进';

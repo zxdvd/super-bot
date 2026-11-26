@@ -903,7 +903,7 @@ export class Store {
     const question = this.db.prepare(`SELECT question FROM attentions WHERE taskId=? AND taskRevision=?
       AND kind='input' AND state='open' ORDER BY createdAt,id LIMIT 1`);
     const items=[...visible.values()].map(rawTask => {
-      const task=applyTaskActivity(rawTask,activity.get(rawTask.id));
+      const task=applyTaskActivity(rawTask,activity.get(rawTask.id),true);
       return {...task,
         ...(task.blockingAttention === 'input' ? { activityQuestion: question.get(task.id, task.taskRevision)?.question as string } : {}),
       };

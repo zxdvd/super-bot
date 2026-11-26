@@ -8,7 +8,8 @@ function taskRecord(task: Task, detail: boolean): Task {
   const { id, botId, goal, scope, acceptance, reviewPolicy, lifecycle, controlMode, taskRevision, rowVersion,
     createdAt, updatedAt, status, activity, stageState, managerReviewed, blockingAttention, deliveredAt, botConfigRevision } = task;
   return { id, botId, goal, scope: detail ? scope : '', acceptance: detail ? acceptance : '', reviewPolicy, lifecycle,
-    controlMode, taskRevision, rowVersion, sessionId: null, createdAt, updatedAt, status, activity, stageState, managerReviewed, blockingAttention,
+    controlMode, taskRevision, rowVersion, sessionId: null, createdAt, updatedAt, status, managerReviewed, blockingAttention,
+    ...(activity !== undefined ? { activity, ...(stageState ? { stageState } : {}) } : {}),
     ...(task.waitingForPrerequisite && { waitingForPrerequisite: true }), deliveredAt, botConfigRevision };
 }
 
