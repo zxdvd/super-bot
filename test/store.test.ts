@@ -45,6 +45,35 @@ test('commands are idempotent and conflicting reuse is rejected', () => {
   } finally { store.close(); }
 });
 
+test('GitLab task creation replays its committed receipt after the Manager is replaced', t => {
+  const dir = mkdtempSync(join(tmpdir(), 'super-bot-create-receipt-'));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const file = join(dir, 'ledger.sqlite');
+  let store = new Store(file);
+  try {
+    const bot = store.createBot('bot', { name: 'Release Bot', instructions: 'Track the fixture release' });
+    const manager = store.beginManager('manager', bot.id, dir);
+    store.confirmManager(manager.id, manager.requestedSessionId);
+    const reference = 'https://gitlab.fixture.invalid/team/project/-/merge_requests/11';
+    const source = { sessionId: manager.requestedSessionId, messageId: 'owner', seq: 4, text: `Publish ${reference}` };
+    const input = { botId: bot.id, goal: 'Publish the fixture', scope: 'One project', acceptance: 'Report the job', reviewPolicy: 'human' as const };
+    const task = store.createTask('create', input, source, undefined, { reference });
+    store.releaseManager('replace', bot.id, manager.generation);
+    const replacement = store.beginManager('replacement', bot.id, dir);
+    store.confirmManager(replacement.id, replacement.requestedSessionId);
+    store.close();
+    store = new Store(file);
+
+    const before = store.taskDetail(task.id);
+    assert.deepEqual(store.createTask('create', input, source, undefined, { reference }), task);
+    assert.throws(() => store.createTask('create', { ...input, goal: 'A different task' }, source, undefined, { reference }),
+      { code: 'idempotency-conflict' });
+    assert.throws(() => store.createTask('new-call', input, source, undefined, { reference }), { code: 'gitlab-release-scope' });
+    assert.equal(store.listTasks({ botId: bot.id }).total, 1);
+    assert.deepEqual(store.taskDetail(task.id), before);
+  } finally { store.close(); }
+});
+
 test('tasks can start paused without a scheduling race or changing legacy default request hashes',()=>{
   const store=new Store(':memory:');try {
     const bot=store.createBot('bot',{name:'Bot',instructions:'Files'});

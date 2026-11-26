@@ -5,11 +5,12 @@ import { readStageCondition, stageConditionText, stageReadyKey, STAGE_OBSERVE_MS
 import { exactMergeReference, mergeReferences, releaseKey, releaseUrl, RELEASE_CHECK_MS, RELEASE_WAIT_MS,
   type ReleaseAuthorization, type ReleasePlan, type ReleaseReceipt, type ReleaseTarget } from './gitlab-release.ts';
 import type { StageCondition } from './work-stage.ts';
-import { DatabaseSync } from 'node:sqlite';
-import { mkdirSync } from 'node:fs';
-import { dirname } from 'node:path';
+import type { DatabaseSync } from 'node:sqlite';
 import { createHash, randomUUID } from 'node:crypto';
-import schemaVersion from '../schema-version.json' with {type:'json'};
+import { deliveryUncertainReason, readChatDeliveryIds, readChatDeliveryStatus, readDeliveryReceipt,
+  readManagerProblem, readReportedDeliveryArtifacts, DELIVERY_RETRIES_EXHAUSTED, type ManagerProblem } from './store/delivery.ts';
+import { openLedger } from './store/schema.ts';
+import { readCommandReceipt, runCommand, writeTransaction } from './store/transactions.ts';
 import { AppError, requiredText, optionalText, taskStatus, type ChatSource, type Bot, type Task, type NewBot, type NewTask, type TaskPage, type TaskInboxPage, type ControlMode, type Attention, type Binding, type Run, type RunInput, type WorkReport, type Result,type ManagerBinding,type ManagerEvent,type ExistingSessionGrant,type ReferenceMaterial,type TaskBotContext,type DispatchWait,type WorkdirInfo,type RunTurn,botDraft } from './model.ts';
 import { RESULT_FRESH_MS, type ChatDeliveryStatus, type DeliveredResult, type DeliveryArtifacts, type DeliveryLinks, type RecoveryContinuation, type ReloadReceipt, type RunChildWait, type TaskCloseRequest,
   DEFAULT_BOT_RUNNING_TASKS, type BotCapacity, type TaskProgress, type UncertainDelivery,
@@ -26,10 +27,8 @@ const BLOCKING_ATTENTIONS="state='open' AND kind IN ('input','approval','recover
 const DELIVERY_ATTEMPT_LIMIT=3;
 const DELIVERY_RETRY_DELAY_MS=30000;
 const RESULT_DELIVERY_REASON='成果仍待在原对话交付。请在最终可见回复中附上当前版本的成果链接。';
-const DELIVERY_RETRIES_EXHAUSTED='成果补交付已达到 3 次上限，已停止自动唤醒。请在 Bot 对话或工作面板核对成果；未重新执行 Worker。';
 const BOT_CAPACITY_KEY = 'bot-capacity:';
 const JOB_RECOVERY_WAIT = '旧轮已结束，仍在等待后台 Job 终态和原生结果消费。Bot 会继续核对，原任务未交付。';
-type ManagerProblem = { message: string; at: number; eventId?: string };
 type RecoveryWorkPlan = { context: RecoveryWorkContext; authorizedProbes: {probe:ClusterProbe;auth:string}[] };
 type StoredRecoveryInstruction = RecoveryInstruction&{directionRefs?:Omit<RecoveryDirection,'source'>[]};
 export type BotDeletionReceipt = { botId: string; managerSessionId: string | null; feishuBindingId: string | null };
@@ -42,14 +41,6 @@ function capacityOverride(value: unknown): number | null {
   if (value === null) return null;
   if (typeof value === 'number' && Number.isSafeInteger(value) && value > 0) return value;
   throw new AppError('invalid-input', 'Bot 执行上限必须为正整数，留空可恢复默认。');
-}
-
-function deliveryUncertainReason(payload:{deliveryUncertainReason?:string;deliveryRetryExhausted?:boolean;
-  legacyDelivery?:{explicit?:boolean};reconcileNote?:string}, diagnostic?:string):string {
-  return payload.deliveryUncertainReason??diagnostic
-    ??(payload.deliveryRetryExhausted?DELIVERY_RETRIES_EXHAUSTED:undefined)
-    ??(payload.legacyDelivery?.explicit?'历史交付工具有回包，尚缺原聊天中的可核对回复。':undefined)
-    ??payload.reconcileNote??'账本未能确认这份成果已在原聊天交付。';
 }
 
 function workerReportPayload(runId:string,callId:string,report:WorkReport,evidence:NonNullable<WorkReport['evidence']>) {
@@ -68,144 +59,10 @@ function workerReportPayload(runId:string,callId:string,report:WorkReport,eviden
     evidence,...checkpoint,...(requestedFiles?{requestedFiles}:{}),...(links?{links}:{}),...(primaryLink?{primaryLink}:{})};
 }
 
-/** One local database. Business transactions will live here, not in the UI/adapter. */
 export class Store {
   readonly db: DatabaseSync;
   constructor(path: string, readonly memory?: BotMemory) {
-    if (path !== ':memory:') mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
-    this.db = new DatabaseSync(path);
-    try {
-      this.db.exec('PRAGMA busy_timeout=100; PRAGMA foreign_keys=ON; PRAGMA locking_mode=EXCLUSIVE;');
-      const version = this.db.prepare('PRAGMA user_version').get() as { user_version: number };
-      if (version.user_version > schemaVersion) throw new AppError('schema-newer', '数据库来自更新版本，请升级插件。');
-      this.db.exec('PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;');
-      this.db.exec(`BEGIN IMMEDIATE;
-        CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
-        CREATE TABLE IF NOT EXISTS bots (
-          id TEXT PRIMARY KEY, name TEXT NOT NULL, instructions TEXT NOT NULL,
-          configRevision INTEGER NOT NULL DEFAULT 1, managerSessionId TEXT, createdAt INTEGER NOT NULL
-        );
-        CREATE TABLE IF NOT EXISTS tasks (
-          id TEXT PRIMARY KEY, botId TEXT NOT NULL REFERENCES bots(id), goal TEXT NOT NULL,
-          scope TEXT NOT NULL, acceptance TEXT NOT NULL,
-          reviewPolicy TEXT NOT NULL CHECK(reviewPolicy IN ('human','bot')),
-          lifecycle TEXT NOT NULL DEFAULT 'open' CHECK(lifecycle IN ('open','review','completed','cancelled')),
-          controlMode TEXT NOT NULL DEFAULT 'auto' CHECK(controlMode IN ('auto','paused','manual')),
-          taskRevision INTEGER NOT NULL DEFAULT 1, rowVersion INTEGER NOT NULL DEFAULT 1,
-          sessionId TEXT, createdAt INTEGER NOT NULL, updatedAt INTEGER NOT NULL
-        );
-        CREATE INDEX IF NOT EXISTS tasks_bot ON tasks(botId, updatedAt DESC, id);
-        CREATE UNIQUE INDEX IF NOT EXISTS tasks_session ON tasks(sessionId) WHERE sessionId IS NOT NULL AND lifecycle IN ('open','review');
-        CREATE TABLE IF NOT EXISTS requests (id TEXT PRIMARY KEY, hash TEXT NOT NULL, result TEXT NOT NULL);
-        CREATE TABLE IF NOT EXISTS events (id INTEGER PRIMARY KEY AUTOINCREMENT, taskId TEXT, kind TEXT NOT NULL, data TEXT NOT NULL, createdAt INTEGER NOT NULL);
-        CREATE INDEX IF NOT EXISTS events_child_wait_task ON events(taskId,id) WHERE kind GLOB 'child-wait.*';
-        CREATE INDEX IF NOT EXISTS events_delivery_task ON events(taskId,id) WHERE kind='manager.delivered';
-        CREATE INDEX IF NOT EXISTS events_delivery_turn ON events(
-          json_extract(data,'$.sessionId'),json_extract(data,'$.turn'),json_extract(data,'$.endSeq')
-        ) WHERE kind='manager.delivered' AND json_type(data,'$.resultId')='text';
-        CREATE INDEX IF NOT EXISTS events_settled_task ON events(taskId) WHERE kind='run.settled';
-        CREATE TABLE IF NOT EXISTS inputs (id TEXT PRIMARY KEY, taskId TEXT NOT NULL REFERENCES tasks(id), kind TEXT NOT NULL, content TEXT NOT NULL, state TEXT NOT NULL DEFAULT 'accepted', createdAt INTEGER NOT NULL);
-        CREATE TABLE IF NOT EXISTS attentions (id TEXT PRIMARY KEY, taskId TEXT NOT NULL REFERENCES tasks(id), kind TEXT NOT NULL, question TEXT NOT NULL, taskRevision INTEGER NOT NULL, state TEXT NOT NULL DEFAULT 'open', createdAt INTEGER NOT NULL);
-        CREATE INDEX IF NOT EXISTS attentions_task_state ON attentions(taskId,state);
-        CREATE TABLE IF NOT EXISTS outbox (id TEXT PRIMARY KEY, kind TEXT NOT NULL, taskId TEXT REFERENCES tasks(id), payload TEXT NOT NULL, state TEXT NOT NULL DEFAULT 'pending', attempts INTEGER NOT NULL DEFAULT 0, createdAt INTEGER NOT NULL);
-        CREATE TABLE IF NOT EXISTS bindings (
-          id TEXT PRIMARY KEY, taskId TEXT NOT NULL REFERENCES tasks(id), generation INTEGER NOT NULL,
-          taskRevision INTEGER NOT NULL, requestedSessionId TEXT NOT NULL UNIQUE, sessionId TEXT,
-          cwd TEXT NOT NULL, state TEXT NOT NULL, createdAt INTEGER NOT NULL,
-          UNIQUE(taskId,generation)
-        );
-        CREATE UNIQUE INDEX IF NOT EXISTS bindings_active_task ON bindings(taskId) WHERE state!='released';
-        CREATE UNIQUE INDEX IF NOT EXISTS bindings_active_session ON bindings(sessionId) WHERE state!='released';
-        CREATE TABLE IF NOT EXISTS runs (
-          id TEXT PRIMARY KEY, taskId TEXT NOT NULL REFERENCES tasks(id), bindingId TEXT NOT NULL REFERENCES bindings(id),
-          sessionId TEXT NOT NULL, taskRevision INTEGER NOT NULL, generation INTEGER NOT NULL,
-          inputId TEXT NOT NULL REFERENCES inputs(id), state TEXT NOT NULL,
-          createdAt INTEGER NOT NULL, finishedAt INTEGER, note TEXT NOT NULL DEFAULT ''
-        );
-        CREATE TABLE IF NOT EXISTS run_turns (runId TEXT PRIMARY KEY REFERENCES runs(id),turn INTEGER,startSeq INTEGER,inputSeq INTEGER,endSeq INTEGER,endKind TEXT,quiet INTEGER NOT NULL DEFAULT 0,reportId TEXT);
-        CREATE UNIQUE INDEX IF NOT EXISTS runs_active_task ON runs(taskId) WHERE finishedAt IS NULL;
-        CREATE UNIQUE INDEX IF NOT EXISTS runs_active_session ON runs(sessionId) WHERE finishedAt IS NULL;
-        CREATE TABLE IF NOT EXISTS resources (runId TEXT PRIMARY KEY REFERENCES runs(id));
-        CREATE TABLE IF NOT EXISTS reports (id TEXT PRIMARY KEY,runId TEXT NOT NULL REFERENCES runs(id),kind TEXT NOT NULL,data TEXT NOT NULL,createdAt INTEGER NOT NULL);
-        CREATE INDEX IF NOT EXISTS reports_run ON reports(runId);
-        CREATE TABLE IF NOT EXISTS work_stages (
-          runId TEXT PRIMARY KEY REFERENCES runs(id), taskId TEXT NOT NULL REFERENCES tasks(id),
-          taskRevision INTEGER NOT NULL, state TEXT NOT NULL, details TEXT NOT NULL,
-          nextCheckAt INTEGER, failures INTEGER NOT NULL DEFAULT 0, observerOrigin TEXT
-        );
-        CREATE INDEX IF NOT EXISTS stages_task_revision ON work_stages(taskId,taskRevision);
-        CREATE INDEX IF NOT EXISTS stages_due ON work_stages(nextCheckAt) WHERE state='waiting';
-        CREATE TABLE IF NOT EXISTS gitlab_release_plans (
-          stageRunId TEXT PRIMARY KEY REFERENCES work_stages(runId),
-          authorization TEXT NOT NULL
-        );
-        CREATE TABLE IF NOT EXISTS gitlab_release_receipts (
-          stageRunId TEXT PRIMARY KEY REFERENCES work_stages(runId),
-          runId TEXT NOT NULL REFERENCES runs(id),
-          taskId TEXT NOT NULL REFERENCES tasks(id),
-          snapshot TEXT NOT NULL,
-          nextCheckAt INTEGER
-        );
-        CREATE INDEX IF NOT EXISTS gitlab_release_due ON gitlab_release_receipts(nextCheckAt) WHERE nextCheckAt IS NOT NULL;
-        CREATE TABLE IF NOT EXISTS gitlab_release_claims (
-          target TEXT PRIMARY KEY, runId TEXT NOT NULL REFERENCES runs(id), at INTEGER NOT NULL
-        );
-        CREATE TABLE IF NOT EXISTS results (id TEXT PRIMARY KEY,runId TEXT NOT NULL UNIQUE REFERENCES runs(id),taskId TEXT NOT NULL REFERENCES tasks(id),taskRevision INTEGER NOT NULL,summary TEXT NOT NULL,checks TEXT NOT NULL,evidence TEXT NOT NULL,createdAt INTEGER NOT NULL,humanAcceptedAt INTEGER);
-        CREATE TABLE IF NOT EXISTS result_attachments (
-          resultId TEXT NOT NULL REFERENCES results(id) ON DELETE CASCADE,
-          fileIndex INTEGER NOT NULL CHECK(fileIndex BETWEEN 0 AND 9),
-          data BLOB NOT NULL,
-          PRIMARY KEY(resultId,fileIndex)
-        ) STRICT;
-        CREATE TABLE IF NOT EXISTS reviews (id TEXT PRIMARY KEY,resultId TEXT NOT NULL REFERENCES results(id),actor TEXT NOT NULL,verdict TEXT NOT NULL,note TEXT NOT NULL,createdAt INTEGER NOT NULL);
-        CREATE TABLE IF NOT EXISTS managers (id TEXT PRIMARY KEY,botId TEXT NOT NULL REFERENCES bots(id),generation INTEGER NOT NULL,configRevision INTEGER NOT NULL,requestedSessionId TEXT NOT NULL UNIQUE,sessionId TEXT UNIQUE,cwd TEXT NOT NULL,state TEXT NOT NULL,createdAt INTEGER NOT NULL,UNIQUE(botId,generation));
-        CREATE UNIQUE INDEX IF NOT EXISTS managers_active ON managers(botId) WHERE state!='released';
-        CREATE TABLE IF NOT EXISTS waits (taskId TEXT PRIMARY KEY REFERENCES tasks(id),createdAt INTEGER NOT NULL,seq INTEGER NOT NULL);
-        CREATE TABLE IF NOT EXISTS feishu_group_bindings (
-          id TEXT NOT NULL UNIQUE, botId TEXT PRIMARY KEY REFERENCES bots(id),
-          appId TEXT NOT NULL, ownerOpenId TEXT NOT NULL,
-          chatId TEXT NOT NULL UNIQUE, name TEXT NOT NULL, boundAt INTEGER NOT NULL
-        );
-        CREATE TABLE IF NOT EXISTS feishu_group_creations (
-          id TEXT PRIMARY KEY, botId TEXT NOT NULL REFERENCES bots(id), appId TEXT NOT NULL,
-          ownerOpenId TEXT NOT NULL, name TEXT NOT NULL, startedAt INTEGER NOT NULL,
-          chatId TEXT, resolvedAt INTEGER
-        );
-        CREATE UNIQUE INDEX IF NOT EXISTS feishu_group_creation_pending
-          ON feishu_group_creations(botId,appId,ownerOpenId) WHERE resolvedAt IS NULL;
-        CREATE TABLE IF NOT EXISTS feishu_group_creation_requests (
-          requestId TEXT PRIMARY KEY, creationId TEXT NOT NULL REFERENCES feishu_group_creations(id)
-        );
-        CREATE TABLE IF NOT EXISTS feishu_inbound_receipts (
-          messageId TEXT PRIMARY KEY, nativeMessageId TEXT NOT NULL UNIQUE, bindingId TEXT NOT NULL,
-          botId TEXT NOT NULL, sessionId TEXT NOT NULL, senderOpenId TEXT NOT NULL, appId TEXT NOT NULL,
-          textDigest TEXT NOT NULL, acceptedAt INTEGER NOT NULL, nativeSeq INTEGER
-        );
-        `);
-      const inputColumns=this.db.prepare('PRAGMA table_info(inputs)').all().map(row=>row.name);
-      if(!inputColumns.includes('messageId'))this.db.exec('ALTER TABLE inputs ADD COLUMN messageId TEXT; ALTER TABLE inputs ADD COLUMN messageJson TEXT;');
-      if(!inputColumns.includes('attentionId'))this.db.exec('ALTER TABLE inputs ADD COLUMN attentionId TEXT REFERENCES attentions(id);');
-      const botColumns=this.db.prepare('PRAGMA table_info(bots)').all().map(row=>row.name);
-      if(!botColumns.includes('materials'))this.db.exec("ALTER TABLE bots ADD COLUMN materials TEXT NOT NULL DEFAULT '[]';");
-      if(!botColumns.includes('deletedAt'))this.db.exec('ALTER TABLE bots ADD COLUMN deletedAt INTEGER;');
-      const taskColumns=this.db.prepare('PRAGMA table_info(tasks)').all().map(row=>row.name);
-      if(!taskColumns.includes('botConfigRevision'))this.db.exec('ALTER TABLE tasks ADD COLUMN botConfigRevision INTEGER NOT NULL DEFAULT 1; UPDATE tasks SET botConfigRevision=(SELECT configRevision FROM bots WHERE bots.id=tasks.botId);');
-      if(!taskColumns.includes('botContext'))this.db.exec("ALTER TABLE tasks ADD COLUMN botContext TEXT NOT NULL DEFAULT '{}'; UPDATE tasks SET botContext=json_object('instructions',(SELECT instructions FROM bots WHERE bots.id=tasks.botId),'materials',json((SELECT materials FROM bots WHERE bots.id=tasks.botId)));");
-      if(!taskColumns.includes('workdirRequest'))this.db.exec('ALTER TABLE tasks ADD COLUMN workdirRequest TEXT;');
-      const bindingColumns=this.db.prepare('PRAGMA table_info(bindings)').all().map(row=>row.name);
-      if(!bindingColumns.includes('workdir'))this.db.exec('ALTER TABLE bindings ADD COLUMN workdir TEXT;');
-      if(version.user_version>0&&version.user_version<11)this.db.exec(`
-        CREATE TABLE resources_next (runId TEXT PRIMARY KEY REFERENCES runs(id));
-        INSERT INTO resources_next SELECT runId FROM resources;
-        DROP TABLE resources;
-        ALTER TABLE resources_next RENAME TO resources;
-      `);
-      this.db.exec(`PRAGMA user_version=${schemaVersion}; COMMIT;`);
-    } catch (error) {
-      this.db.close();
-      if ((error as { errcode?: number }).errcode === 5) throw new AppError('host-active', '另一宿主正在使用此工作台，请先关闭该宿主。');
-      throw error;
-    }
+    this.db = openLedger(path);
   }
   get(key: string): string | null {
     const row = this.db.prepare('SELECT value FROM metadata WHERE key=?').get(key) as { value: string } | undefined;
@@ -214,29 +71,11 @@ export class Store {
   set(key: string, value: string): void {
     this.db.prepare('INSERT INTO metadata VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value').run(key, value);
   }
-  commandReceipt<T>(requestId:string,action:string,payload:unknown):T|undefined {
-    const id=requiredText(requestId,'请求标识',200);
-    const prior=this.db.prepare('SELECT hash,result FROM requests WHERE id=?').get(id) as {hash:string;result:string}|undefined;
-    if(!prior)return;
-    const hash=createHash('sha256').update(JSON.stringify({action,payload})).digest('hex');
-    if(prior.hash!==hash)throw new AppError('idempotency-conflict','同一请求标识不能用于不同的内容。');
-    return JSON.parse(prior.result) as T;
+  commandReceipt<T>(requestId: string, action: string, payload: unknown): T | undefined {
+    return readCommandReceipt<T>(this.db, requestId, action, payload);
   }
   private command<T>(requestId: string, action: string, payload: unknown, operation: () => T): T {
-    const id = requiredText(requestId, '请求标识', 200);
-    // Payloads are explicit normalized records constructed by the command, never raw wire objects.
-    const hash = createHash('sha256').update(JSON.stringify({ action, payload })).digest('hex');
-    this.db.exec('BEGIN IMMEDIATE');
-    try {
-      const prior = this.db.prepare('SELECT hash,result FROM requests WHERE id=?').get(id) as { hash: string; result: string } | undefined;
-      if (prior) {
-        if (prior.hash !== hash) throw new AppError('idempotency-conflict', '同一请求标识不能用于不同的内容。');
-        this.db.exec('COMMIT'); return JSON.parse(prior.result) as T;
-      }
-      const result = operation();
-      this.db.prepare('INSERT INTO requests VALUES (?,?,?)').run(id, hash, JSON.stringify(result));
-      this.db.exec('COMMIT'); return result;
-    } catch (error) { this.db.exec('ROLLBACK'); throw error; }
+    return runCommand(this.db, requestId, action, payload, operation);
   }
   recordChildWait(taskId:string,edge:'started'|'updated'|'ended',wait:RunChildWait):void {
     this.event(`child-wait.${edge}`,taskId,wait);
@@ -524,7 +363,7 @@ export class Store {
       const row=this.db.prepare("SELECT state,payload,taskId,attempts FROM outbox WHERE id=? AND kind='manager.notify' AND json_extract(payload,'$.botId')=?").get(id,botId);
       if(!row)throw new AppError('not-found','通知不存在。');
       const payload=JSON.parse(String(row.payload));
-      const problem=JSON.parse(this.get(`managerProblem:${botId}`)??'null') as ManagerProblem|null;
+      const problem=readManagerProblem(this.db,botId);
       const diagnostic=problem?.eventId===id?problem.message:undefined;
       if(action==='retry-unsent') {
         if(row.state!=='blocked'||Number(row.attempts)!==0||payload.messageId!=null)throw new AppError('notification-uncertain','只有未入队且已停止重试的通知可以重试；未知投递须人工核对，不能重发。');
@@ -541,26 +380,27 @@ export class Store {
     });
   }
   claimManagerEvent(id:string,messageId:string,messageJson:string):boolean {
-    this.db.exec('BEGIN IMMEDIATE');
-    try {
+    return writeTransaction(this.db, () => {
       const row=this.db.prepare("SELECT payload,attempts FROM outbox WHERE id=? AND kind='manager.notify' AND state='pending'").get(id);
-      if(!row){this.db.exec('COMMIT');return false;}
+      if (!row) return false;
       const payload=JSON.parse(String(row.payload));
       if(payload.deliveryOnly&&Number(row.attempts)>=DELIVERY_ATTEMPT_LIMIT) {
-        this.stopManagerDeliveryRetries(id,payload.botId);this.db.exec('COMMIT');return false;
+        this.stopManagerDeliveryRetries(id,payload.botId);
+        return false;
       }
       if((Number(row.attempts)>0||payload.messageId!=null)&&!(payload.deliveryOnly&&typeof payload.messageId==='string'&&payload.messageId.length>0&&payload.deliveryAttemptEnd?.messageId===payload.messageId)) {
-        this.db.prepare("UPDATE outbox SET state='unknown' WHERE id=?").run(id);this.db.exec('COMMIT');return false;
+        this.db.prepare("UPDATE outbox SET state='unknown' WHERE id=?").run(id);
+        return false;
       }
-      if((payload.nextAttemptAt??0)>Date.now()){this.db.exec('COMMIT');return false;}
+      if ((payload.nextAttemptAt ?? 0) > Date.now()) return false;
       const claimed=this.db.prepare("UPDATE outbox SET state='sending',attempts=attempts+1,payload=json_set(payload,'$.messageId',?,'$.messageJson',?,'$.deliveredAt',?,'$.reconcileAttempts',0,'$.nextReconcileAt',0,'$.preflightFailures',0) WHERE id=? AND state='pending'").run(messageId,messageJson,Date.now(),id).changes===1;
       if(claimed) {
         const row=this.db.prepare('SELECT taskId,payload FROM outbox WHERE id=?').get(id)!;const botId=JSON.parse(String(row.payload)).botId as string;
         this.set('managerCursor',botId);
         this.event('manager.wake',row.taskId as string|null,{botId,eventId:id,messageId});
       }
-      this.db.exec('COMMIT');return claimed;
-    }catch(error){this.db.exec('ROLLBACK');throw error;}
+      return claimed;
+    });
   }
   managerEventEntered(id:string,messageId:string,durable=false):void {
     this.db.prepare("UPDATE outbox SET state='entered' WHERE id=? AND (state='sending' OR (?=1 AND state='unknown')) AND json_extract(payload,'$.messageId')=?").run(id,Number(durable),messageId);
@@ -583,8 +423,7 @@ export class Store {
     if(changed)this.managerProblem(botId,DELIVERY_RETRIES_EXHAUSTED,id);
   }
   managerDeliveryAttemptEnded(id:string,messageId:string,proof:{sessionId:string;turn:number;endSeq:number}):void {
-    this.db.exec('BEGIN IMMEDIATE');
-    try {
+    writeTransaction(this.db, () => {
       const row=this.db.prepare("SELECT payload,attempts FROM outbox WHERE id=? AND kind='manager.notify' AND state='entered' AND json_extract(payload,'$.deliveryOnly')=1 AND json_extract(payload,'$.messageId')=?").get(id,messageId);
       if(row) {
         const payload=JSON.parse(String(row.payload));
@@ -594,8 +433,7 @@ export class Store {
         if(Number(row.attempts)>=DELIVERY_ATTEMPT_LIMIT)this.stopManagerDeliveryRetries(id,payload.botId);
         else this.db.prepare("UPDATE outbox SET state='pending',payload=json_set(payload,'$.nextAttemptAt',?) WHERE id=?").run(Date.now()+DELIVERY_RETRY_DELAY_MS*2**Math.max(0,Number(row.attempts)-1),id);
       }
-      this.db.exec('COMMIT');
-    }catch(error){this.db.exec('ROLLBACK');throw error;}
+    });
   }
   managerWakeCount(botId:string,since:number):number {
     const current=Number(this.db.prepare("SELECT count(*) AS n FROM events WHERE kind='manager.wake' AND createdAt>=? AND json_extract(data,'$.botId')=?").get(since,botId)?.n);
@@ -662,7 +500,7 @@ export class Store {
     }else if(row.state!=='entered'&&row.state!=='unknown')return;
     this.command(`manager-delivered:${id}`,'manager.delivered',{id,sessionId,...proof},()=>{
       this.db.prepare("UPDATE outbox SET state='done',payload=json_set(payload,'$.chatDelivery',json(?)) WHERE id=?").run(JSON.stringify({sessionId,...proof}),id);
-      if(JSON.parse(this.get(`managerProblem:${payload.botId}`)??'null')?.eventId===id)this.managerProblem(payload.botId,'');
+      if(readManagerProblem(this.db,payload.botId)?.eventId===id)this.managerProblem(payload.botId,'');
       this.event('manager.delivered',row.taskId as string|null,{eventId:id,sessionId,...proof,...(payload.resultId?{resultId:payload.resultId}:{})});return {};
     });
   }
@@ -707,7 +545,7 @@ export class Store {
       const task=this.getTask(taskId),run=this.latestRun(taskId);
       if(task.botId!==botId)throw new AppError('manager-scope','只能管理自己负责的任务。');
       if(task.rowVersion!==expectedRowVersion)throw new AppError('version-conflict','任务已经更新，请重新读取交付版本。');
-      const receipt=this.deliveryReceipt(task,resultId);
+      const receipt=readDeliveryReceipt(this.db,task,resultId);
       if(!receipt||!['review','completed'].includes(task.lifecycle)||run?.id!==receipt.runId||
         run.taskRevision!==task.taskRevision||run.bindingId!==this.activeBinding(task.id)?.id) {
         throw new AppError('result-stale','只能更新当前已经在原聊天确认交付的成果。');
@@ -783,7 +621,7 @@ export class Store {
   }
   managerInfo(botId:string) {
     this.getBot(botId);
-    const problem=JSON.parse(this.get(`managerProblem:${botId}`)??'null') as ManagerProblem|null;
+    const problem=readManagerProblem(this.db,botId);
     return {binding:this.activeManager(botId),notifications:this.db.prepare(`SELECT id,state,attempts,json_extract(payload,'$.deferReason') deferReason,
         json_extract(payload,'$.nextAttemptAt') nextAttemptAt,json_extract(payload,'$.reconcileAttempts') reconcileAttempts,
         json_extract(payload,'$.reconcileNote') reconcileNote FROM outbox WHERE kind='manager.notify'
@@ -809,15 +647,15 @@ export class Store {
     if (!['human', 'bot'].includes(payload.reviewPolicy)) throw new AppError('invalid-input', '请选择有效的验收方式。');
     // Native provenance, not a model-provided call ID, identifies one human request.
     // Keep the normal call receipt too: reusing a call ID with changed content must still fail.
-    const reference=release&&exactMergeReference(release.reference);
-    if(release&&(!source||this.botForSession(source.sessionId)?.id!==input.botId||
-      !reference||!mergeReferences(source.text).some(item=>JSON.stringify(item)===JSON.stringify(reference)))) {
-      throw new AppError('gitlab-release-scope','创建任务时需要原聊天中的确切 GitLab MR 链接。');
-    }
     const intent = { ...payload, ...(conventionOverride===undefined?{}:{conventionOverride}), ...(release?{release}:{}) };
     const intentHash=source?createHash('sha256').update(JSON.stringify({action:'task.create-intent',payload:intent,source:{sessionId:source.sessionId,messages:(source.messages??[source]).map(({messageId,seq})=>({messageId,seq})).sort((a,b)=>a.seq-b.seq)}})).digest('hex'):undefined;
     const intentId=intentHash?`task-intent:${intentHash}`:undefined;
     return this.command(requestId, 'task.create', {...intent,...(source?{source}:{})}, () => {
+      const reference=release&&exactMergeReference(release.reference);
+      if(release&&(!source||this.botForSession(source.sessionId)?.id!==input.botId||
+        !reference||!mergeReferences(source.text).some(item=>JSON.stringify(item)===JSON.stringify(reference)))) {
+        throw new AppError('gitlab-release-scope','创建任务时需要原聊天中的确切 GitLab MR 链接。');
+      }
       const prior=intentId?this.db.prepare('SELECT result FROM requests WHERE id=?').get(intentId):undefined;
       if(prior)return JSON.parse(String(prior.result)) as Task;
       const bot=this.getBot(payload.botId),context=this.currentBotContext(payload.botId);
@@ -885,36 +723,14 @@ export class Store {
     if(task.lifecycle!=='review'&&task.lifecycle!=='completed') return task;
     const run=this.latestRun(task.id);
     if(!run || run.taskRevision!==task.taskRevision || run.bindingId!==this.activeBinding(task.id)?.id) return task;
-    const receipt=this.deliveryReceipt(task);
+    const receipt=readDeliveryReceipt(this.db,task);
     return receipt?.runId===run.id?{...task,deliveredAt:receipt.deliveredAt}:task;
   }
-  reportedDeliveryArtifacts(runId:string):DeliveryArtifacts {
-    const row=this.db.prepare("SELECT data FROM reports WHERE runId=? AND kind='ready'").get(runId);
-    const {links,primaryLink}=row?JSON.parse(String(row.data)) as WorkReport:{};
-    return {links:links??{},...(primaryLink?{primaryLink}:{})};
-  }
-  private deliveryReceipt(task:Task,resultId?:string) {
-    const receipt=this.db.prepare(`SELECT r.id AS resultId,r.runId,o.id AS eventId,e.createdAt AS deliveredAt,
-      json_extract(o.payload,'$.deliveryText') AS deliveryText,
-      coalesce(json_extract(o.payload,'$.links'),json_extract(p.data,'$.links')) AS links,
-      CASE WHEN json_type(o.payload,'$.links') IS NOT NULL OR json_type(o.payload,'$.primaryLink') IS NOT NULL
-        THEN json_extract(o.payload,'$.primaryLink') ELSE json_extract(p.data,'$.primaryLink') END AS primaryLink
-      FROM events e JOIN outbox o ON o.id=json_extract(e.data,'$.eventId') AND o.taskId=e.taskId
-      JOIN results r ON r.taskId=e.taskId AND r.id=json_extract(e.data,'$.resultId')
-      LEFT JOIN reports p ON p.runId=r.runId AND p.kind='ready'
-      WHERE e.taskId=? AND e.kind='manager.delivered' AND coalesce(json_extract(e.data,'$.explicit'),0)=0
-        AND o.id='manager-event:delivery:' || r.id AND o.kind='manager.notify' AND o.state='done'
-        AND json_extract(o.payload,'$.botId')=? AND json_extract(o.payload,'$.resultId')=r.id
-        AND json_extract(o.payload,'$.taskRevision')=r.taskRevision
-        AND json_extract(o.payload,'$.chatDelivery.messageId') IS NOT NULL AND (? IS NULL OR r.id=?)
-      ORDER BY e.id DESC LIMIT 1`).get(task.id,task.botId,resultId??null,resultId??null);
-    return receipt?{resultId:String(receipt.resultId),runId:String(receipt.runId),eventId:String(receipt.eventId),
-      deliveredAt:Number(receipt.deliveredAt),deliveryText:typeof receipt.deliveryText==='string'?receipt.deliveryText:undefined,
-      linksJson:typeof receipt.links==='string'?receipt.links:'{}',
-      primaryLink:typeof receipt.primaryLink==='string'?receipt.primaryLink:undefined}:null;
+  reportedDeliveryArtifacts(runId: string): DeliveryArtifacts {
+    return readReportedDeliveryArtifacts(this.db, runId);
   }
   deliveredResult(task:Task,exact?:Result):DeliveredResult|null {
-    const receipt=this.deliveryReceipt(task,exact?.id);
+    const receipt=readDeliveryReceipt(this.db,task,exact?.id);
     if(!receipt)return null;
     const result=exact??this.resultById(receipt.resultId);
     return result&&{...result,deliveredAt:receipt.deliveredAt,
@@ -925,34 +741,15 @@ export class Store {
   chatDeliveries(sessionId:string,turn:number,endSeq:number,messageId?:string):({taskId:string;resultId:string}&DeliveryArtifacts)[] {
     const bot=this.botForSession(sessionId);
     if(!bot)return [];
-    const rows=this.db.prepare(`SELECT e.taskId,json_extract(e.data,'$.resultId') AS resultId
-      FROM events e JOIN tasks t ON t.id=e.taskId
-      WHERE e.kind='manager.delivered' AND json_type(e.data,'$.resultId')='text'
-        AND json_extract(e.data,'$.sessionId')=? AND json_extract(e.data,'$.turn')=? AND json_extract(e.data,'$.endSeq')=?
-        AND coalesce(json_extract(e.data,'$.explicit'),0)=0 AND t.botId=?
-        AND (? IS NULL OR json_extract(e.data,'$.messageId')=?) ORDER BY e.id`)
-      .all(sessionId,turn,endSeq,bot.id,messageId??null,messageId??null);
-    return rows.flatMap(row=>{
-      const taskId=String(row.taskId), resultId=String(row.resultId), result=this.resultById(resultId);
+    const ids=readChatDeliveryIds(this.db,bot.id,sessionId,turn,endSeq,messageId);
+    return ids.flatMap(({taskId,resultId})=>{
+      const result=this.resultById(resultId);
       const delivery=result?.taskId===taskId?this.deliveredResult(this.getTask(taskId),result):null;
       return delivery?[{taskId,resultId,links:delivery.links,...(delivery.primaryLink?{primaryLink:delivery.primaryLink}:{})}]:[];
     });
   }
-  chatDeliveryStatus(task:Task,result:Result|null,historical=false):ChatDeliveryStatus|null {
-    if(!result||result.taskId!==task.id||(!historical&&!['review','completed'].includes(task.lifecycle)))return null;
-    const eventId=`manager-event:delivery:${result.id}`;
-    const row=this.db.prepare(`SELECT state,payload FROM outbox WHERE id=? AND kind='manager.notify' AND taskId=?
-      AND json_extract(payload,'$.botId')=? AND json_extract(payload,'$.taskRevision')=?`)
-      .get(eventId,task.id,task.botId,historical?result.taskRevision:task.taskRevision);
-    if(!row)return historical?null:{state:task.lifecycle==='review'&&!task.managerReviewed?'awaiting-review':'uncertain'};
-    const payload=JSON.parse(String(row.payload));
-    if(row.state==='done'&&payload.chatDelivery?.messageId)return {state:'delivered'};
-    const problem=JSON.parse(this.get(`managerProblem:${task.botId}`)??'null') as ManagerProblem|null;
-    const pending=['pending','sending','entered'].includes(String(row.state));
-    const diagnostic=problem?.eventId===eventId?problem.message:undefined;
-    const reason=row.state==='unknown'||row.state==='handled'?deliveryUncertainReason(payload,diagnostic)
-      :pending?(payload.deferReason??diagnostic):(diagnostic??payload.reconcileNote??payload.deferReason);
-    return {state:row.state==='handled'?'handled':pending?'pending':'uncertain',...(reason?{reason}:{})};
+  chatDeliveryStatus(task: Task, result: Result | null, historical = false): ChatDeliveryStatus | null {
+    return readChatDeliveryStatus(this.db, task, result, historical);
   }
   taskDetail(id: string) {
     const current=this.getTask(id),binding=this.activeBinding(id),run=this.latestRun(id);
@@ -1830,8 +1627,7 @@ export class Store {
     return this.gitLabReleaseReceipt(first.stageRunId)??first;
   }
   claimGitLabRelease(runId:string,now=Date.now()):boolean {
-    this.db.exec('BEGIN IMMEDIATE');
-    try {
+    return writeTransaction(this.db, () => {
       const {stage,target,task}=this.releaseRunTarget(runId);
       const receipt=this.gitLabReleaseReceipt(stage.runId);
       let granted=false;
@@ -1843,8 +1639,8 @@ export class Store {
         this.event('gitlab-release.claimed',task.id,{runId,target});
         granted=true;
       }
-      this.db.exec('COMMIT');return granted;
-    } catch(error) {this.db.exec('ROLLBACK');throw error;}
+      return granted;
+    });
   }
   private writeGitLabRelease(receipt:ReleaseReceipt):void {
     this.db.prepare('UPDATE gitlab_release_receipts SET snapshot=?,nextCheckAt=? WHERE stageRunId=?')
@@ -1880,8 +1676,7 @@ export class Store {
     return true;
   }
   recordGitLabRelease(previous:ReleaseReceipt,next:ReleaseReceipt,fromWorker=false,formalDenial=false):ReleaseReceipt {
-    this.db.exec('BEGIN IMMEDIATE');
-    try {
+    return writeTransaction(this.db, () => {
       const current=this.gitLabReleaseReceipt(previous.stageRunId);
       const task=this.getTask(previous.taskId);
       // The Worker can record a response to a request it already made. Background
@@ -1889,7 +1684,7 @@ export class Store {
       const fresh=this.getRun(previous.runId).taskRevision===task.taskRevision&&
         task.lifecycle==='open'&&task.controlMode==='auto'&&!this.isBotDeleted(task.botId);
       if(!current||JSON.stringify(current)!==JSON.stringify(previous)||!fromWorker&&!fresh) {
-        this.db.exec('COMMIT');return current??previous;
+        return current??previous;
       }
       if(!fromWorker&&current.state==='unsubmitted'&&next.state==='unsubmitted'&&next.nextCheckAt===null&&next.status==='manual') {
         const now=Date.now(), checkAt=Math.min(now+RELEASE_CHECK_MS,next.deadlineAt);
@@ -1908,8 +1703,8 @@ export class Store {
         if(fresh&&next.state!=='claim-pending') this.enqueueManager(task.botId,
           `gitlab-release:${next.stageRunId}:${next.state}:${next.status??'unconfirmed'}`,`${next.detail}\n${next.url}`,task.id,9);
       }
-      this.db.exec('COMMIT');return next;
-    } catch(error) {this.db.exec('ROLLBACK');throw error;}
+      return next;
+    });
   }
   private currentStage(task:Task,run:Run):WorkStage|null {
     if(run.taskRevision!==task.taskRevision||run.sessionId!==task.sessionId||run.finishedAt===null)return null;
@@ -2111,11 +1906,10 @@ export class Store {
       task.rowVersion!==due.rowVersion||task.controlMode!=='auto'||task.lifecycle!=='open'||this.isBotDeleted(task.botId)||
       binding?.state!=='ready'||binding.id!==run?.bindingId||this.stageOwnerFollowUp(task,run))return;
     // No asynchronous work between the fresh checks and commit in this single-owner ledger.
-    this.db.exec('BEGIN IMMEDIATE');
-    try {
+    writeTransaction(this.db, () => {
       if(stage.deadlineAt!==undefined&&now>=stage.deadlineAt) {
         this.expireStage(task,stage,now);
-        this.db.exec('COMMIT');return;
+        return;
       }
       const failures=observation.state==='transient'||observation.state==='unavailable'?Number(row.failures)+1:0;
       const outcome:StageObservation=observation.state==='transient'&&failures>=5?{state:'unavailable',detail:
@@ -2145,8 +1939,7 @@ export class Store {
         else this.enqueueManager(task.botId,`stage-blocked:${due.runId}:${due.rowVersion}`,
           `外部条件未满足或不可读：${stageConditionText(due.condition)}。请从任务详情说明当前事实。`,task.id,8);
       }
-      this.db.exec('COMMIT');
-    } catch(error) {this.db.exec('ROLLBACK');throw error;}
+    });
   }
   acceptResult(requestId:string,taskId:string,expectedRowVersion:number,resultId:string,source?:ChatSource):Task {
     return this.command(requestId,'result.accept',{taskId,expectedRowVersion,resultId,...(source?{source}:{})},()=>{
