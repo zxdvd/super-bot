@@ -350,7 +350,8 @@ export class Managers {
     if(option.rowVersion!==data.expectedRowVersion)throw new AppError('clarification-stale','所选任务版本已改变。');
     return combineChatSources(receipt.source,source);
   }
-  private checkWorkLinks(text:string,taskId:string,attentionId?:string,resultId?:string):void {
+  private checkWorkLinks(text:string,taskId:string,attentionId?:string,resultId?:string):boolean {
+    let exactResult=false;
     for(const url of chatUrls(text.replace(/[，。；、！？「」『』]/gu,' '))) {
       if(url.pathname!=='/'||!new URLSearchParams(url.hash.slice(1)).has('super-bot-task'))continue;
       const linked=parseWorkLink(url.hash);
@@ -361,7 +362,9 @@ export class Managers {
         throw new AppError('result-stale','请核对用户消息中引用的任务与成果版本。');
       }
       if(!linked||linked.taskId!==taskId)throw new AppError('control-task-link','请核对当前消息中引用的任务。');
+      if(linked.kind==='result'&&linked.resultId===resultId)exactResult=true;
     }
+    return exactResult;
   }
   private async inspectChatSession(manager:ManagerBinding,task:Task,source:ChatSource,data:Record<string,unknown>,
     turn:number,authorize:()=>void,signal:AbortSignal) {
@@ -413,7 +416,7 @@ export class Managers {
   }
 
   private async ownerWorkAction(action:OwnerWorkAction,manager:ManagerBinding,task:Task,source:ChatSource,
-    data:Record<string,unknown>,authorize:()=>void,signal:AbortSignal) {
+    data:Record<string,unknown>,authorize:()=>void,signal:AbortSignal,verifiedChoice:boolean) {
     const version=data.expectedRowVersion as number;
     const turn=this.nativeTurns.get(source.sessionId)!;
     const decision=data.decision;
@@ -426,8 +429,8 @@ export class Managers {
     }
     const targetId=action==='accept'?data.resultId:data.runId;
     const attentionId=action==='recover-and-continue'?data.attentionId:undefined;
-    const key=this.workConfirmationKey(manager),pending=decision===undefined?undefined:this.getWorkConfirmation(manager);
-    const confirmed=decision==='confirm'?pending:undefined;
+    const key=this.workConfirmationKey(manager);
+    const confirmed=decision==='confirm'?this.getWorkConfirmation(manager):undefined;
     if(decision==='confirm'&&(!confirmed?.shown||confirmed.selectionTurn!==turn||confirmed.action!==action||confirmed.taskId!==task.id||
       confirmed.rowVersion!==version||confirmed.targetId!==targetId||confirmed.attentionId!==attentionId||
       confirmed.source.sessionId!==source.sessionId||confirmed.source.seq>=source.seq)) {
@@ -442,6 +445,7 @@ export class Managers {
     };
     const ask=(action:WorkConfirmation['action'],question:string,exactId:string,exactAttention?:string,ownerFact?:string)=>{
       if(task.rowVersion!==version)throw new AppError('version-conflict','任务或候选版本已经改变，请重新核对。');
+      const pending=this.getWorkConfirmation(manager);
       if(pending?.turn===turn&&(pending.action!==action||pending.taskId!==task.id||pending.targetId!==exactId||pending.attentionId!==exactAttention)) {
         throw new AppError('clarification-required','本轮已有一个待确认目标，请在原聊天完成该项核对。');
       }
@@ -453,12 +457,16 @@ export class Managers {
     check();
     if(action==='accept') {
       const resultId=requiredText(data.resultId,'成果标识',200);
-      this.checkWorkLinks(fullSource.text,task.id,undefined,resultId);
+      const exactLink=this.checkWorkLinks(fullSource.text,task.id,undefined,resultId);
       const receipt=this.store.commandReceipt<Task>(requestId,'result.accept',{taskId:task.id,expectedRowVersion:version,resultId,source:fullSource});
       if(receipt)return {task:receipt,resultId};
       const detail=this.store.taskDetail(task.id);
       if(task.lifecycle!=='review'||detail.result?.id!==resultId)throw new AppError('result-stale','只能接受该任务当前待验收的成果。');
-      if(decision==='ask')return ask(action,`是否接受「${task.goal}」的这份成果？${deliveryResultLink(workUrl({kind:'result',taskId:task.id,resultId}),this.webOrigin())}`,resultId);
+      const newerUndelivered=detail.deliveredResult&&detail.deliveredResult.id!==resultId;
+      if(decision==='ask'||(newerUndelivered&&!exactLink&&!verifiedChoice&&!confirmed)) {
+        const versionNote=newerUndelivered?'上次交付后已有新成果。':'';
+        return ask(action,`${versionNote}是否接受「${task.goal}」的这份成果？${deliveryResultLink(workUrl({kind:'result',taskId:task.id,resultId}),this.webOrigin())}`,resultId);
+      }
       return {task:await this.execution.accept(requestId,task.id,version,resultId,check,fullSource),resultId};
     }
     if(task.rowVersion!==version)throw new AppError('version-conflict','任务或候选版本已经改变，请重新核对。');
@@ -664,14 +672,15 @@ export class Managers {
         throw new AppError('version-conflict','请使用当前任务的版本。');
       }
       const sessionChoice=data.action==='session-inspect'&&data.sessionQuery===undefined;
-      const source=data.choice!==undefined&&!sessionChoice?this.clarifiedSource(manager,task,data,owner):chatSource(owner);
+      const chosen=data.choice!==undefined&&!sessionChoice?this.clarifiedSource(manager,task,data,owner):undefined;
+      const source=chosen??chatSource(owner);
       const authorizeOwner=()=>{
         check();
         if(this.store.getTask(task.id).botId!==bot.id||!this.feishuInputs.hasCurrentSource(source,bot.id)) {
           throw new AppError('manager-scope','用户消息来源或任务权限已经改变。');
         }
       };
-      return this.ownerWorkAction(data.action,manager,task,source,data,authorizeOwner,exec.signal);
+      return this.ownerWorkAction(data.action,manager,task,source,data,authorizeOwner,exec.signal,chosen!==undefined);
     }
     if(data.action==='advance_stage'||data.action==='block_stage') {
       const runId=requiredText(data.runId,'阶段执行标识',200),version=data.expectedRowVersion as number;

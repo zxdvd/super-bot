@@ -33,7 +33,11 @@ async function fixture(t:TestContext,fullAccess?:boolean,extra:Record<string,unk
   const session:any={id:manager.requestedSessionId,header:{cwd:directory},meta:{}};
   const agent:any={id:session.id,session,status:'idle',model:{current:()=>({provider:'fake',model:'fake'}),select:()=>{}},inbox:{nextTurn:[],nextStep:[],remove:()=>{}},ctx:{tools:{restrict:(options:{allow:string[]})=>{allowed=options.allow;return ()=>{};},guard:(fn:Function)=>{guard=fn;return ()=>{};}},on:()=>()=>{},systemPrompt:{section:(section:{text:()=>string})=>{prompt=section.text;return ()=>{};}}},whenIdle:()=>idle,followup:(message:any)=>{followups++;agent.status='running';idle=new Promise<void>(resolve=>{resolveIdle=resolve;});agent.lastMessage=message;},cancel:()=>{cancels++;agent.status='idle';resolveIdle();}};
   const ctx={permissionPresets:{set:()=>{}},effect:(callback:()=>unknown)=>callback(),on:(name:string,callback:Function)=>{listeners.set(name,callback);return ()=>{};},agents:{list:()=>[agent]},tools:{register:(tool:any)=>{handler=tool.execute;return ()=>{};}},sessionController:{resolveAgent:async()=>({agent})},sessionProjections:{snapshot:()=>({values:{modelSelection:{next:{provider:'fake',model:'fake'}}}})},sessions:{flush:async()=>{if(flushMode==='blocked')await new Promise<void>(resolve=>{allowFlush=resolve;});if(flushMode==='throw')throw Error('Synthetic durability failure');if(flushMode==='false')return false;durable.splice(0,durable.length,...structuredClone(events));return true;}},sessionPersistence:{open:async()=>({read:async()=>({events:structuredClone(durable)}),close:async()=>{}})}} as unknown as Context;
-  const execution={dispatch:async()=>{dispatches++;throw Error('Worker must not run on delivery recovery');},verifyResult:async()=>{}} as unknown as DshExecution;
+  const accept:DshExecution['accept']=async(requestId,taskId,version,resultId,authorize,source)=>{
+    authorize?.();
+    return store.acceptResult(requestId,taskId,version,resultId,source);
+  };
+  const execution={dispatch:async()=>{dispatches++;throw Error('Worker must not run on delivery recovery');},verifyResult:async()=>{},accept} as unknown as DshExecution;
   const retired:Managers[]=[];
   let managers=new Managers(ctx,store,execution,directory,()=> 'https://example.test',{fullAccess,...extra});managers.install();
   const emit=async(type:string,data:any,surfaceOp?:string)=>{const event={type,data,seq:events.length,time:Date.now(),...(surfaceOp?{surfaceOp}:{})};events.push(event);await listeners.get('session/event')?.(session,event);return event;};
@@ -134,6 +138,104 @@ test('the original review turn can deliver without an extra wake, but never befo
     assert.deepEqual(f.store.chatDeliveries(f.agent.id,receipt.turn+1,receipt.endSeq),[]);
     assert.deepEqual(f.store.chatDeliveries('another-session',receipt.turn,receipt.endSeq),[]);
     await f.pulse();assert.equal(f.counts().followups,1);assert.equal(f.counts().dispatches,0);
+  }finally{await f.close();}
+});
+
+type DeliveryFixture=Awaited<ReturnType<typeof fixture>>;
+
+async function ownerMessage(f:DeliveryFixture,turn:number,text:string) {
+  await f.emit('turn/start',{turn});
+  await f.emit('user/message',{id:`owner-${turn}`,source:{kind:'user',rpcId:`owner-${turn}`},content:[{type:'text',text}]},'append');
+}
+
+async function completeResult(f:DeliveryFixture,taskId:string,summary:string) {
+  const run=f.store.reserveRun(`run:${summary}`,taskId,f.store.getTask(taskId).rowVersion);
+  const inputId=`input:${summary}`;
+  f.store.saveRunMessage(run.id,inputId,'{}');f.store.claimDispatch(run.id);f.store.inputEntered(run.id,inputId,1);
+  const cwd=f.agent.session.header.cwd,path=join(cwd,`${summary}.md`);
+  writeFileSync(path,summary);
+  const report=f.store.workerReport(run.id,'ready',{kind:'ready',summary,checks:'Read all facts',evidence:await collectEvidence(cwd,[path])});
+  f.store.settleRun(run.id);
+  return {taskId,resultId:report.resultId!,expectedRowVersion:f.store.getTask(taskId).rowVersion};
+}
+
+async function undeliveredUpdate(f:DeliveryFixture) {
+  await f.pulse();await f.enter(1);await f.review();await f.assistant(1);await f.end(1);
+  const taskId=f.task.id,oldResultId=f.report.resultId!;
+  assert.equal(f.state()?.state,'done');
+  assert.equal(f.store.taskDetail(taskId).deliveredResult?.id,oldResultId);
+  f.store.rejectResult('next-version',taskId,f.store.getTask(taskId).rowVersion,oldResultId,'Update the facts');
+  const target=await completeResult(f,taskId,'Updated facts');
+  const current=f.store.taskDetail(taskId);
+  assert.equal(current.result?.id,target.resultId);assert.notEqual(target.resultId,oldResultId);
+  assert.equal(current.deliveredResult?.id,oldResultId);
+  return {action:'accept',...target};
+}
+
+test('accepting the last handoff prompts for the exact newer undelivered result',async t=>{
+  const f=await fixture(t);try {
+    const args=await undeliveredUpdate(f),{taskId,resultId}=args;
+    const initial='Please accept the version you sent me.';
+    await ownerMessage(f,2,initial);
+    const pending=await f.call('last-handoff',{...args,userInstruction:initial});
+    assert.equal(f.store.resultById(resultId)?.humanAcceptedAt,null);
+    assert.equal(f.store.getTask(taskId).rowVersion,args.expectedRowVersion);
+    assert.equal(pending.status,'confirmation-required');
+    assert.match(pending.confirmationText,/上次交付.*新成果/);
+    assert.ok(pending.confirmationText.includes(`/#super-bot-task=${taskId}&resultId=${resultId}`));
+    await f.assistant(2,[{type:'text',text:pending.confirmationText}]);await f.end(2);
+    const decline='Keep it unaccepted for now.';
+    await ownerMessage(f,3,decline);
+    await f.call('declined-detail',{action:'detail',taskId});
+    assert.equal(f.store.resultById(resultId)?.humanAcceptedAt,null);
+    await f.end(3);
+    const reply='Yes, accept that exact new version.';
+    await ownerMessage(f,4,reply);
+    const confirm={...args,decision:'confirm',userInstruction:reply};
+    await assert.rejects(f.call('declined-previous-question',confirm),{code:'work-confirmation-stale'});
+    const question=await f.call('explicit-ask',{...args,decision:'ask',userInstruction:reply});
+    await f.assistant(4,[{type:'text',text:question.confirmationText}]);await f.end(4);
+    await ownerMessage(f,5,reply);
+    await assert.rejects(f.call('wrong-confirmation-version',{...confirm,expectedRowVersion:args.expectedRowVersion+1}),{code:'work-confirmation-stale'});
+    const accepted=await f.call('answer',confirm);
+    assert.equal(accepted.resultId,resultId);
+    assert.deepEqual(await f.call('answer-retry',confirm),accepted);
+    assert.equal(f.store.resultById(f.report.resultId!)?.humanAcceptedAt,null);
+    assert.equal(f.store.taskDetail(taskId).events.filter(event=>event.kind==='result.accepted').length,1);
+  }finally{await f.close();}
+});
+
+test('the exact linked update can be accepted directly in the owner message',async t=>{
+  const f=await fixture(t);try {
+    const args=await undeliveredUpdate(f);
+    const oldLink=`Accept ${f.resultLink()}`;
+    await ownerMessage(f,2,oldLink);
+    await assert.rejects(f.call('old-link',{...args,userInstruction:oldLink}),{code:'result-stale'});
+    await f.end(2);
+    const exactLink=`Accept https://example.test/#super-bot-task=${args.taskId}&resultId=${args.resultId}`;
+    await ownerMessage(f,3,exactLink);
+    assert.equal((await f.call('exact-link',{...args,userInstruction:exactLink})).resultId,args.resultId);
+  }finally{await f.close();}
+});
+
+test('an undelivered update can be selected only from its displayed numbered choices',async t=>{
+  const f=await fixture(t);try {
+    const args=await undeliveredUpdate(f);
+    const other=f.store.createTask('other',{botId:f.bot.id,goal:'Secondary facts',scope:'Own files',acceptance:'Read',reviewPolicy:'human'});
+    const binding=f.store.beginBinding('other-binding',other.id,other.rowVersion,f.agent.session.header.cwd);
+    f.store.confirmBinding(binding.id,binding.requestedSessionId);
+    const otherTarget=await completeResult(f,other.id,'Secondary report');
+    const reply='Choose the first report.';
+    await ownerMessage(f,2,reply);
+    const select={...args,userInstruction:reply,choice:1};
+    await assert.rejects(f.call('choice-without-question',select),{code:'clarification-stale'});
+    assert.equal(f.store.resultById(args.resultId)?.humanAcceptedAt,null);
+    const choices=await f.call('ask-which',{action:'clarify',followUp:'accept',resultIds:[args.resultId,otherTarget.resultId]});
+    assert.match(choices.numberedChoices[0].label,/Updated facts/);
+    await f.assistant(2,[{type:'text',text:choices.confirmationText}]);await f.end(2);
+    await ownerMessage(f,3,reply);
+    assert.equal((await f.call('shown-choice',select)).resultId,args.resultId);
+    assert.equal(f.store.resultById(otherTarget.resultId)?.humanAcceptedAt,null);
   }finally{await f.close();}
 });
 
@@ -265,8 +367,12 @@ for(const mode of [undefined,true,false])test(`Bot query tools and routing follo
       assert.match(f.prompt(),/read the target, make only the requested edit, and read it back/);
       assert.match(f.prompt(),/use a research subagent only if the host actually provides one/);
       assert.match(f.prompt(),/Delegate substantive modifications, multi-step work, long-running work and full verification as Worker Tasks/);
-      assert.match(f.prompt(),/Use respond for an open question and rework for an eligible result/);
-      assert.match(f.prompt(),/If the Worker is running and there is no current input route, tell the user/);
+      assert.match(f.prompt(),/\brespond\b[^.\n]*\bopen question\b/);
+      assert.match(f.prompt(),/\brework\b[^.\n]*\beligible result\b/);
+      assert.match(f.prompt(),/\bcontinue\b[^.\n]*\bsave\b[^.\n]*\brunning Worker\b/);
+      assert.match(f.prompt(),/\bdirectionStatus\b[^.\n]*\bentered\b/);
+      assert.match(f.prompt(),/\bstage\b[^.\n]*\bsettled Worker checkpoint\b/);
+      assert.match(f.prompt(),/\bblock_stage\b[^\n]*\bstage\.state\b[^.\n]*\bawaiting-decision\b/);
       assert.doesNotMatch(f.prompt(),/完整权限未开启/);
     }
   }finally{await f.close();}
