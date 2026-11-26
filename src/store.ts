@@ -3477,9 +3477,14 @@ export class Store {
           '请先在原聊天展示当前作业选项，再按用户的回答选择。',
         );
       }
-      const names = choices?.map((choice) => (typeof choice === 'string' ? choice : choice.name));
+      const names = choices?.flatMap((choice) => (typeof choice === 'string' ? [] : [choice.name]));
       if (jobName && !hasReleaseJobReference(source.text, jobName, names)) {
-        throw new AppError('gitlab-job-name', '请使用当前用户原文中的确切 GitLab 作业名称。');
+        throw new AppError(
+          'gitlab-job-name',
+          names?.length
+            ? '请在原聊天展示当前 GitLab 作业选项，并等待用户选择。'
+            : '请使用 clarify 核对 GitLab 作业，并在原聊天展示选项。',
+        );
       }
     }
     const subjects = [...source.text.matchAll(/!(\d+)\b/g)].map((match) => Number(match[1]));

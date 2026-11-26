@@ -165,6 +165,44 @@ test('discovery asks once for distinct selectable names but never swaps to a ret
   assert.equal((await discover([job, { ...job, id: 46 }])).releaseJob, undefined);
 });
 
+test('a longer live job name turns an ambiguous direct request into a displayed choice', async () => {
+  const preview = {
+    ...job,
+    id: 46,
+    name: job.name + ' preview',
+    web_url: origin + '/fixture/release/-/jobs/46',
+  };
+  const source = { sessionId: 'fixture', messageId: 'owner', seq: 9, text: 'Run ' + preview.name };
+  const observation = await discoverRelease(
+    condition,
+    { jobName: job.name, source },
+    async (path) => ({
+      code: 200,
+      data: path.includes('merge_requests')
+        ? {
+            iid: 11,
+            project_id: 21,
+            target_project_id: 21,
+            web_url: mr,
+            state: 'merged',
+            merge_commit_sha: sha,
+            target_branch: 'main',
+          }
+        : path.includes('/jobs?')
+          ? [job, preview]
+          : [pipeline],
+    }),
+    signal,
+  );
+  assert.equal(observation.state, 'unsatisfied');
+  assert.equal(observation.releaseJob, undefined);
+  assert.deepEqual(
+    observation.releaseChoices?.map((choice) => choice.name),
+    [job.name, preview.name],
+  );
+  assert.ok(observation.detail.includes('请在本对话选择作业'));
+});
+
 test('a Job name or deploy stage alone cannot prove a deployment and exact selection works after 100 jobs', async () => {
   const merger = {
     iid: 11,
@@ -515,7 +553,7 @@ test('structured release choices require a current observed object and preserve 
       acceptance: 'Result',
       reviewPolicy: 'human',
     },
-    { ...source, text: 'この件をお願いします ' + mr + ' · ' + job.name },
+    { ...source, text: 'Job:' + job.name + ' ' + mr },
     undefined,
     { reference: mr, jobName: job.name },
   );
@@ -604,7 +642,7 @@ test('structured release choices require a current observed object and preserve 
     code: 'gitlab-job-name',
   });
   assert.equal(store.gitLabReleaseReceipt(second.old.id), null);
-  const direct = publish('foreign-directed', '请执行「发布·预览」。', nonAscii.name);
+  const direct = publish('foreign-directed', '请运行发布·预览。', nonAscii.name);
   assert.equal(
     direct.stage.state,
     'waiting',

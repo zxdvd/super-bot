@@ -121,17 +121,20 @@ export function hasReleaseJobReference(
   name: string,
   otherNames: string[] = [],
 ): boolean {
+  if (!name) return false;
   const spans = (label: string) => {
     const matches: [number, number][] = [];
     const unicode = /[^\x00-\x7f]/u.test(label);
+    const known = otherNames.includes(label);
     for (let start = text.indexOf(label); start >= 0; start = text.indexOf(label, start + 1)) {
       const end = start + label.length,
         before = text.slice(0, start),
         after = text.slice(end);
       if (
-        /[\w/@%+#:-]$|\w\.$/u.test(before) ||
+        /[\w/@%+#-]$|\w\.$/u.test(before) ||
         /^[\w/@%+#:-]|^\.\w/u.test(after) ||
-        (unicode && (/[\p{L}\p{M}\p{N}]$/u.test(before) || /^[\p{L}\p{M}\p{N}]/u.test(after)))
+        (unicode &&
+          ((!known && /[\p{L}\p{M}\p{N}]$/u.test(before)) || /^[\p{L}\p{M}\p{N}]/u.test(after)))
       )
         continue;
       matches.push([start, end]);
@@ -324,20 +327,21 @@ export async function discoverRelease(
     jobs.push(...response.data.map(object));
     if (response.data.length < 100) break;
   }
-  if (
-    plan.jobName &&
-    plan.source &&
+  const { jobName, source } = plan;
+  const names = jobs
+    .map((job) => job.name)
+    .filter((name): name is string => typeof name === 'string' && jobNamePattern.test(name));
+  const needsConfirmation =
+    jobName &&
+    source &&
     !plan.requiresSelection &&
-    !hasReleaseJobReference(
-      plan.source.text,
-      plan.jobName,
-      jobs.map((job) => job.name).filter((name) => typeof name === 'string'),
-    )
-  ) {
-    return {
-      state: 'unsatisfied',
-      detail: '请在原聊天提供确切的 GitLab 作业名称，或选择当前已展示的作业。',
-    };
+    !hasReleaseJobReference(source.text, jobName, names);
+  const namedJobs = new Set(jobName ? [jobName] : []);
+  if (needsConfirmation) {
+    for (const name of names) {
+      if (name.includes(jobName) && hasReleaseJobReference(source.text, name, names))
+        namedJobs.add(name);
+    }
   }
   const deployments = plan.jobName
     ? new Map<string, string>()
@@ -349,9 +353,7 @@ export async function discoverRelease(
     (job) =>
       typeof job.name === 'string' &&
       jobNamePattern.test(job.name) &&
-      (plan.jobName
-        ? job.name === plan.jobName
-        : deployments.has(job.name) || job.status === 'manual'),
+      (jobName ? namedJobs.has(job.name) : deployments.has(job.name) || job.status === 'manual'),
   );
   const proven = plan.jobName
     ? possible
@@ -393,6 +395,7 @@ export async function discoverRelease(
   if (
     candidates.length !== 1 ||
     !proven.length ||
+    needsConfirmation ||
     plan.requiresSelection ||
     (plan.requiresJobName && !plan.jobName)
   ) {
@@ -426,7 +429,7 @@ function releaseChoiceObservation(
   return {
     state: 'unsatisfied',
     releaseChoices: targets,
-    detail: `流水线 #${pipelineId} 的作业选项 · ${labels.join('、')}。${more ? ' 也可以提供其他确切作业名称。' : ''}`,
+    detail: `流水线 #${pipelineId} 的作业选项 · ${labels.join('、')}。请在本对话选择作业。${more ? ' 也可以提供其他确切作业名称。' : ''}`,
   };
 }
 

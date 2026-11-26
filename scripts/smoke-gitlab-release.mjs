@@ -326,8 +326,7 @@ export async function smokeGitLabRelease({
         (result) =>
           result.message.isError &&
           result.message.content.some(
-            (block) =>
-              block.type === 'text' && block.text.includes('当前用户原文中的确切 GitLab 作业名称'),
+            (block) => block.type === 'text' && block.text.includes('展示当前 GitLab 作业选项'),
           ),
       ),
     );
