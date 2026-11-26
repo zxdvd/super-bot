@@ -39,7 +39,7 @@ test('request shape is validated before any path policy',()=>{
 });
 test('configuration drops HOME, filesystem root and relative roots with warnings; legacy workspace maps to allowedRoots',t=>{
   const {root,data}=sandbox(t);
-  const policy=workdirPolicy({allowedRoots:[homedir(),'/','relative',root]},data);
+  const policy=workdirPolicy({allowedRoots:[homedir(),'/','relative',root,'relative',root]},data);
   assert.deepEqual(policy.roots,[root]);assert.equal(policy.warnings.length,3);assert.equal(policy.defaultWorkdir,'isolated');
   const legacy=workdirPolicy({workspace:root},data);assert.deepEqual(legacy.roots,[root]);assert.equal(legacy.legacy,true);assert.match(legacy.warnings[0]!,/弃用/);
   assert.equal(workdirPolicy({},data).defaultWorkdir,'none');

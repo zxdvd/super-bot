@@ -130,7 +130,7 @@ export class DshExecution {
   private deletedRuns=new Map<string,AbortController>();
   private disposed=false;
   readonly policy:WorkdirPolicy;
-  constructor(private ctx:Context,private store:Store,private dataDir:string,private options:RuntimeOptions={},
+  constructor(private ctx:Context,private store:Store,dataDir:string,private options:RuntimeOptions={},
     private reloadAdmission=new ReloadAdmission()) {this.policy=workdirPolicy(options,dataDir);}
 
   reloadBlockers(): string[] {

@@ -1,5 +1,5 @@
 import { createHmac, randomUUID, timingSafeEqual } from 'node:crypto';
-import { closeSync, constants, fstatSync, linkSync, lstatSync, mkdirSync, openSync, readSync, realpathSync,
+import { closeSync, constants, fstatSync, linkSync, lstatSync, openSync, readSync, realpathSync,
   renameSync, unlinkSync, writeFileSync } from 'node:fs';
 import { createServer, request, type IncomingMessage, type ServerResponse } from 'node:http';
 import { isAbsolute, join, resolve } from 'node:path';

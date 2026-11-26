@@ -53,7 +53,7 @@ export function workdirPolicy(config:WorkdirConfig,dataDir:string):WorkdirPolicy
   const rawRoots=config.allowedRoots?.length?config.allowedRoots:config.workspace?[config.workspace]:[];
   if(!config.allowedRoots?.length&&config.workspace)warnings.push('workspace 已弃用，请改用 allowedRoots。');
   const roots:string[]=[];
-  for(const root of rawRoots) {
+  for(const root of new Set(rawRoots)) {
     const full=resolve(root);
     if(!isAbsolute(root)){warnings.push(`allowedRoots 必须是绝对路径，已忽略：${root}`);continue;}
     if(full===home||full===parse(full).root){warnings.push(`allowedRoots 不能是 HOME 或文件系统根目录，已忽略：${root}`);continue;}

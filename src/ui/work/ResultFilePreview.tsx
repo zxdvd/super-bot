@@ -16,7 +16,7 @@ export function ResultFilePreview({ href, showDownload = false }: { href: string
   return <>
     {showDownload && (result.status === 200 || result.status === 415) && <a href={href}>下载</a>}
     {result.status === 200
-      ? <pre aria-label="成果文件内容" style={{ maxHeight: '60vh', overflow: 'auto', whiteSpace: 'pre-wrap' }}>{result.text}</pre>
+      ? <pre role="region" aria-label="成果文件内容" style={{ maxHeight: '60vh', overflow: 'auto', whiteSpace: 'pre-wrap' }}>{result.text}</pre>
       : <p role="alert">{result.text}</p>}
   </>;
 }

@@ -22,7 +22,7 @@ export const inject = ['slots', 'uiWorkspace', 'connection', 'layout', 'sidebarR
 type ClientContext = Omit<Context, 'connection'> & { connection: ConnectionHandle };
 
 function Icon({ size = 20 }: { size?: number }) {
-  return <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.6">
+  return <svg aria-hidden="true" width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.6">
     <rect x="4" y="7" width="16" height="13" rx="4"/><path d="M12 3v4M8 12v2m8-2v2m-7 3h6"/>
   </svg>;
 }

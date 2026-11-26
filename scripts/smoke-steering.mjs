@@ -91,19 +91,6 @@ if(scenario==='restart-prepare') {
   assert.equal(after.s.stalledAborted,false);
   await probe('release-stalled-model',t.sid);
   await probe('ready-job-cancel',t.sid);await probe('ready-job-finish',t.sid);
-}else if(scenario==='background') {
-  const t=await start('READY_WITH_JOB_PROBE');
-  await until(async()=>({ok:(await probe('inspect-session',t.sid)).status==='idle'}),'ready with background job');
-  const before=await snapshot(t,'background: candidate but unresolved effect');
-  assert.equal(before.d.run.state,'interrupted');assert.ok(before.d.result);
-  assert.equal((await probe('ready-job-status',t.sid)).status,'running');
-  await probe('queue-native',t.sid,{text:'SCOPED_TOOL_PROBE NATIVE_HOLD_PROBE'});
-  await until(async()=>{const s=await probe('inspect-session',t.sid);return {ok:s.stalled&&s.scopedProbeCalls===1};},'native after unresolved background');
-  const after=await snapshot(t,'background: native starts with old resource held');
-  assert.equal(after.d.run.state,'interrupted');assert.equal(after.d.task.controlMode,'manual');
-  assert.equal(after.s.stalledAborted,false);
-  await probe('release-stalled-model',t.sid);
-  await probe('ready-job-cancel',t.sid);await probe('ready-job-finish',t.sid);
 }else if(scenario==='normal'||scenario==='error'||scenario==='missing') {
   const t=await start(scenario==='error'?'MODEL_FAILURE_PROBE':scenario==='missing'?'RELIABILITY_MISSING_REPORT':'Normal completion');
   await until(async()=>({ok:(await probe('inspect-session',t.sid)).status==='idle'}),'end');

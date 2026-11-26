@@ -1,7 +1,6 @@
 /** Isolated-only notification harness: real Manager adapter, native Agent, events and persistence. */
 import type {Context} from '@deepseek-ai/cordis';
 import {LlmAdapter,createUserMessage,type GenerateOptions,type StreamChunk} from '@deepseek-ai/dsh-llm';
-import type {Agent} from '@deepseek-ai/dsh-agent';
 import {SessionId,type SessionStore} from '@deepseek-ai/dsh-session';
 import type {} from '@deepseek-ai/dsh-api-session-controller';
 import assert from 'node:assert/strict';
