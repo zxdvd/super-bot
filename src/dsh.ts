@@ -16,8 +16,7 @@ import { randomUUID } from 'node:crypto';
 import { parseClusterProbe,prepareClusterProbe } from './kubernetes-preflight.ts';
 import {GIT_STATUS_QUERY,WORKER_QUERY_TOOL,gitWorkingTreeStatus,parseGitStatusQuery} from './git-status-query.ts';
 import { freezeMessage,ToolCallId,type UserMessage } from '@deepseek-ai/dsh-llm';
-import type {Session,SessionStore} from '@deepseek-ai/dsh-session';
-import type {} from '@deepseek-ai/dsh-session-persistence';
+import type {Session} from '@deepseek-ai/dsh-session';
 import {verifyRunTurn} from './run-proof.ts';
 import {verifyLateJobs,verifyLateJobScope} from './dsh-late-job-proof.ts';
 import { SessionId } from '@deepseek-ai/dsh-session/types';
@@ -36,8 +35,9 @@ import { captureEvidence,containedPath,verifyEvidence,evidencePaths,type Capture
 import {configureRole,fullAccessEnabled,type RuntimeOptions} from './runtime.ts';
 import { createWorkerRunMessage,registerWorkerContext,workerPromptPlan,workerStandingPrompt } from './worker-prompt.ts';
 import { ReloadAdmission } from './reload-admission.ts';
-import { gitLabReader, glabGitLab } from './gitlab-client.ts';
-import { exactJobStatus, GITLAB_PLAY_TOOL, releaseJobPath, releaseReadback, type ReleaseTarget } from './gitlab-release.ts';
+import { GITLAB_PLAY_TOOL } from './gitlab-release.ts';
+import { registerGitLabReleaseTool, type GitLabReleaseScope } from './dsh/gitlab-release-tool.ts';
+import { readRunEvents } from './dsh/run-events.ts';
 
 /** Host defaults are not a model selection made for this conversation. */
 export function selectedModel(ctx:Context,agent:Agent) {
@@ -281,57 +281,8 @@ export class DshExecution {
       },
     },{when:({agent})=>this.store.heldRuns().some(run=>run.sessionId===agent.id&&run.finishedAt===null&&
       !this.store.isBotDeleted(this.store.getTask(run.taskId).botId))}));
-    if(fullAccessEnabled(this.options))this.ctx.effect(()=>this.ctx.tools.register({
-      name:GITLAB_PLAY_TOOL,
-      description:'Execute the one already authorized GitLab manual job for this run, or follow the same job by readback. Host verifies the saved target and reports the actual outcome. No arguments.',
-      parameters:{type:'object',properties:{},additionalProperties:false},
-      output:{schema:{type:'object',additionalProperties:true},render:(_args,value)=>[{type:'text',text:JSON.stringify(value)}]},
-      execute:async(args,exec)=>{
-        const agent=exec.agent,run=agent&&this.store.heldRuns().find(item=>item.sessionId===agent.id&&item.state==='running');
-        if(!agent||!run||!args||typeof args!=='object'||Array.isArray(args)||Object.keys(args).length||
-          !this.autoTurns.has(run.id)||this.store.runTurn(run.id)?.inputSeq==null) {
-          throw new AppError('gitlab-release-scope','没有与本轮 Worker 绑定的正式 GitLab 作业授权。');
-        }
-        const binding=this.store.getBinding(run.bindingId);
-        let confirmedPreset:string|undefined;
-        const authorize=()=>{
-          exec.signal.throwIfAborted();
-          const current=this.store.getRun(run.id),task=this.store.getTask(run.taskId);
-          if(this.disposed||!this.autoTurns.has(run.id)||current.state!=='running'||task.controlMode!=='auto'||
-            this.store.activeBinding(task.id)?.id!==binding.id||this.store.finalReport(run.id)||
-            agent.inbox.nextStep.length||agent.inbox.nextTurn.length||!this.store.gitLabReleaseForRun(run)||
-            (confirmedPreset&&this.ctx.permissionPresets.current(agent.session)!==confirmedPreset)) {
-            throw new AppError('gitlab-release-stale','Worker 轮次或原任务授权已改变。');
-          }
-          this.assertDirectory(agent,binding.cwd);
-          this.assertExternalQuiet(agent);
-        };
-        authorize();
-        const receipt=await this.runGitLabRelease(agent,run,exec.signal,authorize,async target=>{
-          const preset=this.ctx.permissionPresets.current(agent.session);
-          if(preset==='custom')return false;
-          const permission=this.ctx.permissionPresets.resolve(preset);
-          if(permission.approval!=='ask') {
-            if(permission.sandbox!=='danger-full-access'||preset==='auto')return false;
-            confirmedPreset=preset;return true;
-          }
-          const approval=this.ctx.get?.('approval');
-          const outcome=await approval?.request({agent,signal:exec.signal,callId:exec.callId,toolName:GITLAB_PLAY_TOOL,
-            reason:`允许当前 Worker 启动 ${target.project} 流水线 #${target.pipelineId} 的作业 #${target.jobId}？`});
-          if(outcome!=='allowed-once')return false;
-          confirmedPreset=preset;return true;
-        });
-        authorize();
-        const treeCheck=this.treeChecks.get(run.id);
-        this.assertObservedTreeQuiet(treeCheck);
-        if(hasPendingChildResult(agent))throw new AppError('gitlab-release-stale','原生子任务结果等待处理，已保留发布作业的实际回执。');
-        this.store.workerReport(run.id,exec.callId,{ kind:'stage',stage:'GitLab 正式作业',
-          summary:receipt.detail,evidenceRef:receipt.url,checks:`GitLab 流水线 #${receipt.target.pipelineId}，作业 #${receipt.target.jobId}，${receipt.state}` });
-        if(treeCheck)treeCheck.reportRevision=treeCheck.revision;
-        exec.concludeTurn();
-        return receipt;
-      },
-    },{when:({agent})=>this.store.heldRuns().some(run=>run.sessionId===agent.id&&!!this.store.gitLabReleaseForRun(run))}));
+    if(fullAccessEnabled(this.options))registerGitLabReleaseTool(this.ctx,this.store,this.options,
+      (agent,signal)=>this.gitLabReleaseScope(agent,signal));
     if(fullAccessEnabled(this.options))this.ctx.effect(()=>this.ctx.tools.register({
       name:WORKER_QUERY_TOOL,
       description:'Read-only Git working tree status in the bound task directory. Reports available HEAD and staged, unstaged and untracked paths. Use for the opening Git baseline and working tree checks. No shell, path or flags.',
@@ -449,6 +400,34 @@ export class DshExecution {
     }
     this.stopDeletedBot();
   }
+  private gitLabReleaseScope(agent:Agent,signal:AbortSignal):GitLabReleaseScope|undefined {
+    const run=this.store.heldRuns().find(item=>item.sessionId===agent.id&&item.state==='running');
+    if(!run||!this.autoTurns.has(run.id)||this.store.runTurn(run.id)?.inputSeq==null)return;
+    const binding=this.store.getBinding(run.bindingId);
+    return {
+      run,
+      assertCurrent:confirmedPreset=>{
+        signal.throwIfAborted();
+        const current=this.store.getRun(run.id),task=this.store.getTask(run.taskId);
+        if(this.disposed||!this.autoTurns.has(run.id)||current.state!=='running'||task.controlMode!=='auto'||
+          this.store.activeBinding(task.id)?.id!==binding.id||this.store.finalReport(run.id)||
+          agent.inbox.nextStep.length||agent.inbox.nextTurn.length||!this.store.gitLabReleaseForRun(run)||
+          (confirmedPreset&&this.ctx.permissionPresets.current(agent.session)!==confirmedPreset)) {
+          throw new AppError('gitlab-release-stale','Worker 轮次或原任务授权已改变。');
+        }
+        this.assertDirectory(agent,binding.cwd);
+        this.assertExternalQuiet(agent);
+      },
+      recordStage:(callId,report)=>{
+        const treeCheck=this.treeChecks.get(run.id);
+        this.assertObservedTreeQuiet(treeCheck);
+        if(hasPendingChildResult(agent))throw new AppError('gitlab-release-stale','原生子任务结果等待处理，已保留发布作业的实际回执。');
+        this.store.workerReport(run.id,callId,report);
+        if(treeCheck)treeCheck.reportRevision=treeCheck.revision;
+      },
+    };
+  }
+
   /** Useful to callers/tests before inspecting startup reconciliation; never executes model work. */
   async whenReconciled():Promise<void> {await Promise.all([...this.finishing.values(),...this.closing.values()]);}
   private scheduleReconciliation(runId:string,session?:Session):void {
@@ -465,7 +444,7 @@ export class DshExecution {
   private async reconcileRun(runId:string,session?:Session):Promise<void> {
     const run=this.store.getRun(runId);if(run.finishedAt!==null||this.disposed)return;
     const proof=this.store.runTurn(runId);if(!proof)throw new AppError('run-proof','旧版执行没有可归属的持久证据。');
-    const followups=verifyRunTurn(run,this.store.getRunInput(runId),proof,await this.readRunEvents(run,session));
+    const followups=verifyRunTurn(run,this.store.getRunInput(runId),proof,await readRunEvents(this.ctx,run,session));
     const current=this.store.getRun(runId);
     if(this.disposed||current.finishedAt!==null||this.store.isBotDeleted(this.store.getTask(run.taskId).botId))return;
     if(current.state!=='cancelling'&&(!proof.reportId||this.store.finalReport(runId)?.id!==proof.reportId))throw new AppError('run-proof','没有绑定到结束边界的最终报告；不会推断完成。');
@@ -475,14 +454,6 @@ export class DshExecution {
     // become an automatic scheduling/review opportunity in between these writes.
     if(current.state==='cancelling')this.store.settleCancelled(runId,!!session);else this.store.settleRun(runId,!!session);
     for(const id of followups)this.store.nativeIntervention(run.sessionId,id);
-  }
-  private async readRunEvents(run:Run,session?:Session) {
-    if(session&&!await (this.ctx.sessions as unknown as SessionStore).flush(session))throw new AppError('run-proof','宿主未确认轮次持久保存，保留占用。');
-    const handle=await this.ctx.sessionPersistence.open(SessionId(run.sessionId),'read');
-    try {
-      if(handle.header.id!==run.sessionId)throw new AppError('run-proof','持久会话身份不符。');
-      return (await handle.read()).events;
-    }finally{await handle.close();}
   }
   private scheduleLateJobForSession(sessionId:string):void {
     if(this.disposed)return;
@@ -510,7 +481,7 @@ export class DshExecution {
     const agent=this.ctx.agents.get(SessionId(run.sessionId));
     let reason:string;
     try {
-      const events=await this.readRunEvents(run,agent?.session);
+      const events=await readRunEvents(this.ctx,run,agent?.session);
       if(this.disposed||!this.store.lateJobTarget(runId,true))return;
       const late=verifyLateJobs(run,this.store.getRunInput(run.id),proof,pending.ids,events);
       verifyLateJobScope(events,proof);
@@ -549,7 +520,7 @@ export class DshExecution {
         const agent=resolved.agent,tree=originalService(this.nativeSubagents());
         this.assertRecoveryQuiet(agent,run.id);this.assertDirectory(agent,binding.cwd);
         await this.confirmRecoveryTree(agent);
-        const events=await this.readRunEvents(run,agent.session);
+        const events=await readRunEvents(this.ctx,run,agent.session);
         validate();
         this.assertRecoveryQuiet(agent,run.id);this.assertDirectory(agent,binding.cwd);
         if(tree!==originalService(this.nativeSubagents()))throw new AppError('child-unknown','子树服务已变更。');
@@ -577,86 +548,6 @@ export class DshExecution {
         }
       }
     });
-  }
-  private async priorGitLabTools(agent:Agent,run:Run):Promise<boolean> {
-    const release=this.store.gitLabReleaseForRun(run);
-    if(!release)return false;
-    try {
-      const events=await this.readRunEvents(run,agent.session);
-      const here=this.store.runTurn(run.id);
-      if(here?.startSeq==null)return false;
-      const history=this.store.taskRuns(run.taskId).filter(item=>item.id!==run.id&&item.taskRevision===run.taskRevision);
-      for(const previous of history) {
-        if(previous.sessionId!==run.sessionId||previous.bindingId!==run.bindingId)return false;
-        const proof=this.store.runTurn(previous.id);
-        if(!proof||proof.startSeq==null||proof.endSeq==null||proof.endSeq>=here.startSeq)return false;
-        if(verifyRunTurn(previous,this.store.getRunInput(previous.id),proof,events.slice(0,here.startSeq),true).length)return false;
-        if(release.target.newAfterMerge&&release.stage.releaseOpenedAt!==undefined&&
-          previous.finishedAt!==null&&previous.finishedAt<=release.stage.releaseOpenedAt)continue;
-        const segment=events.slice(proof.startSeq+1,proof.endSeq);
-        if(segment.some(event=>event.type==='job/registered'||event.type==='working-directory/change'||
-          event.type==='user/message'&&event.seq!==proof.inputSeq&&
-          !['runtime-context','time-context','skill-catalog'].includes(event.data.source?.kind)))return false;
-        const calls=segment.filter(event=>event.type==='tool/call');
-        const results=segment.filter(event=>event.type==='tool/result');
-        if(calls.length!==results.length)return false;
-        for(const call of calls) {
-          const matches=results.filter(result=>result.seq>call.seq&&result.data.step===call.data.step&&
-            result.data.message?.toolCallId===call.data.callId);
-          if(matches.length!==1)return false;
-          const {name}=call.data;
-          if(['super_bot_report','read','write','edit',WORKER_QUERY_TOOL].includes(name))continue;
-          const formal=name===GITLAB_PLAY_TOOL&&release.plan.retryTarget&&this.store.gitLabReleaseForRun(previous);
-          const receipt=formal&&this.store.gitLabReleaseReceipt(formal.stage.runId);
-          if(receipt&&['unsubmitted','needs-permission'].includes(receipt.state))continue;
-          return false;
-        }
-      }
-      return history.some(item=>item.id===release.stage.runId);
-    } catch {return false;}
-  }
-  private async runGitLabRelease(agent:Agent,run:Run,signal:AbortSignal,authorize:()=>void,
-    permitted:(target:ReleaseTarget)=>Promise<boolean>) {
-    let receipt=this.store.beginGitLabRelease(run.id);
-    const path=releaseJobPath(receipt.target);
-    const reader=await gitLabReader(receipt.target.origin,this.options.gitLabObserverOrigin,signal);
-    const response=await reader(path,signal);
-    authorize();
-    let outcome=releaseReadback(receipt,response);
-    if(outcome.state!=='unsubmitted'||outcome.nextCheckAt!==null)return this.store.recordGitLabRelease(receipt,outcome,true);
-    if(!await this.priorGitLabTools(agent,run)) {
-      authorize();
-      outcome=releaseReadback({...receipt,state:'unknown'},response);
-      return this.store.recordGitLabRelease(receipt,{...outcome,
-        detail:`无法排除旧轮中可能影响 ${receipt.target.project} 发布作业 #${receipt.target.jobId} 的外部操作。将只读跟踪原作业。`},true);
-    }
-    authorize();
-    const writer=await glabGitLab(receipt.target.origin,signal);
-    const missing=(detail:string)=>this.store.recordGitLabRelease(receipt,{...receipt,state:'needs-permission',detail},true);
-    if(!writer)return missing(`当前 Worker 缺少 ${receipt.target.origin} 的同实例 glab 登录，无法运行作业 #${receipt.target.jobId}。请由有权运行该作业的人恢复本机 Worker 登录。`);
-    if(!await permitted(receipt.target)) {
-      return missing(`当前 Worker 的原生权限或审批未允许启动作业 #${receipt.target.jobId}。请在原生审批入口处理这个作业。`);
-    }
-    const lastRead=await writer(path,signal);
-    authorize();
-    if([401,403,404].includes(lastRead.code))return missing(`GitLab 无法以 Worker 身份访问作业 #${receipt.target.jobId}（HTTP ${lastRead.code}）。请由项目负责人核对访问权限。`);
-    if(exactJobStatus(lastRead.data,receipt.target)!=='manual') {
-      return this.store.recordGitLabRelease(receipt,releaseReadback(receipt,lastRead),true);
-    }
-    if(!this.store.claimGitLabRelease(run.id)) {
-      receipt=this.store.gitLabReleaseReceipt(receipt.stageRunId)??receipt;
-      return this.store.recordGitLabRelease(receipt,releaseReadback({...receipt,state:'unknown'},lastRead),true);
-    }
-    receipt=this.store.gitLabReleaseReceipt(receipt.stageRunId)!;
-    const submitted=await writer(path+'/play',signal,'POST');
-    const result=releaseReadback(receipt,submitted,true);
-    if(result.state==='unknown'&&submitted.code>=200&&submitted.code<300&&!signal.aborted) {
-      // The play endpoint may omit the pipeline coordinates. Use its exact
-      // job GET representation rather than inferring status from the write.
-      const readback=await reader(path,signal);
-      return this.store.recordGitLabRelease(receipt,releaseReadback(receipt,readback),true);
-    }
-    return this.store.recordGitLabRelease(receipt,result,true,true);
   }
   private nativeSubagents():NativeSubagents|undefined {
     return this.ctx.get?.('subagents') as NativeSubagents|undefined;
@@ -1208,7 +1099,7 @@ export class DshExecution {
     let durableQuiet=false;
     if(!ownAtDeletion&&proof?.inputSeq!=null) {
       try {
-        const events=await this.readRunEvents(run,agent?.session);
+        const events=await readRunEvents(this.ctx,run,agent?.session);
         signal.throwIfAborted();
         const entered=events[proof.inputSeq],source=entered?.type==='user/message'?entered.data.source:undefined;
         if(entered?.type==='user/message'&&entered.data.id===input.messageId&&source?.kind==='super-bot'&&
@@ -1350,7 +1241,7 @@ export class DshExecution {
     if(outcome!=='quiet')throw new AppError('child-unknown','原生子树仍在活动或无法确认，请核对后再试。');
   }
   private async readRecoveryTools(run:Run,cwd:string,proof:RunTurn,agent?:Agent,closing=false) {
-    const events=await this.readRunEvents(run,agent?.session);
+    const events=await readRunEvents(this.ctx,run,agent?.session);
     const later=verifyRunTurn(run,this.store.getRunInput(run.id),proof,events,true);
     if(later.length||events.some(event=>event.seq>proof.endSeq!&&
       ['turn/start','turn/end','user/message','tool/call','tool/result','approval/asked','working-directory/change'].includes(event.type))) {
