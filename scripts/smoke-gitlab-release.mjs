@@ -4,10 +4,11 @@ import { once } from 'node:events';
 import { chmod, mkdir, readFile, writeFile } from 'node:fs/promises';
 import { createServer } from 'node:https';
 import { delimiter, join } from 'node:path';
-import { approveFixtureDeployment, approveRelease, confirmReleaseChoice, prepareRelease, releaseFixtureGoal,
+import { DatabaseSync } from 'node:sqlite';
+import { approveFixtureDeployment, approveRelease, confirmReleaseChoice, prepareRelease, publishOrdinal, releaseFixtureGoal,
   releaseProject, releaseSha, releaseStatusQuestion, restoreReleasePermission, showReleaseChoices } from '../test/gitlab-release-fixture.ts';
 
-export async function smokeGitLabRelease({ base, configure, launch, stop, call, makeBot, probe, wait }) {
+export async function smokeGitLabRelease({ base, configure, launch, stop, call, makeBot, probe, wait, ledgerPath }) {
   const cert = join(base, 'gitlab-ca.pem'), key = join(base, 'gitlab-ca.key'), conf = join(base, 'gitlab-ca.conf');
   await writeFile(conf, '[req]\ndistinguished_name=dn\nx509_extensions=ext\n[dn]\n[ext]\nsubjectAltName=IP:127.0.0.1\nbasicConstraints=critical,CA:TRUE\n');
   execFileSync('openssl', ['req', '-x509', '-newkey', 'rsa:2048', '-nodes', '-days', '1',
@@ -21,6 +22,7 @@ export async function smokeGitLabRelease({ base, configure, launch, stop, call, 
     [16, { mr: 'merged', job: 'manual', outcome: 'success' }],
     [17, { mr: 'merged', job: 'manual', outcome: 'success', readFailures: 1 }],
     [18, { mr: 'merged', job: 'manual', outcome: 'success' }],
+    [19, { mr: 'merged', job: 'manual', outcome: 'success' }],
   ]);
   const seen = [], token = 'glpat-isolated-fixture-token';
   let origin;
@@ -37,8 +39,9 @@ export async function smokeGitLabRelease({ base, configure, launch, stop, call, 
       merged_at: '2026-11-25T09:00:00.000Z' };
     const pipeline = { id: 100 + id, project_id: 900 + id, source: 'push', sha: releaseSha, ref: 'main',
       web_url: `${origin}/${releaseProject}/-/pipelines/${100 + id}`, created_at: '2026-11-25T09:00:01.000Z' };
-    const job = () => ({ id: 200 + id, name: 'publish-release', stage: 'deploy', status: fixture.job,
-      pipeline, web_url: `${origin}/${releaseProject}/-/jobs/${200 + id}`, created_at: '2026-11-25T09:00:02.000Z' });
+    const jobId = fixture.jobId ?? 200 + id;
+    const job = () => ({ id: jobId, name: 'publish-release', stage: 'deploy', status: fixture.job,
+      pipeline, web_url: `${origin}/${releaseProject}/-/jobs/${jobId}`, created_at: '2026-11-25T09:00:02.000Z' });
     if (req.method === 'GET' && url.pathname === `/api/v4/projects/fixture%2Frelease/merge_requests/${id}`) return json(200, mr);
     if (req.method === 'GET' && url.pathname === `/api/v4/projects/${900 + id}/pipelines`) return json(200, [pipeline]);
     if (req.method === 'GET' && url.pathname === `/api/v4/projects/${900 + id}/ci/lint`) {
@@ -46,14 +49,14 @@ export async function smokeGitLabRelease({ base, configure, launch, stop, call, 
       return json(200, { valid: true, includes: [], merged_yaml: 'publish-release:\n  environment:\n    name: fixture\n    action: start\n' });
     }
     if (req.method === 'GET' && url.pathname === `/api/v4/projects/${900 + id}/pipelines/${100 + id}/jobs`) return json(200, [job()]);
-    if (req.method === 'GET' && url.pathname === `/api/v4/projects/${900 + id}/jobs/${200 + id}`) {
+    if (req.method === 'GET' && url.pathname === `/api/v4/projects/${900 + id}/jobs/${jobId}`) {
       if(fixture.readFailures>0) {
         fixture.readFailures--;
         return json(503, {});
       }
       return json(200, job());
     }
-    if (req.method === 'POST' && url.pathname === `/api/v4/projects/${900 + id}/jobs/${200 + id}/play`) {
+    if (req.method === 'POST' && url.pathname === `/api/v4/projects/${900 + id}/jobs/${jobId}/play`) {
       if (fixture.outcome === 'ambiguous-response') return json(503, {});
       if (fixture.outcome === 'deny') return json(403, {});
       if (fixture.outcome !== 'success') return json(500, {});
@@ -94,7 +97,7 @@ export async function smokeGitLabRelease({ base, configure, launch, stop, call, 
       assert.equal((await taskDetail(task)).stage.state, 'awaiting-decision');
       assert.equal(posts(id).length, 0, 'a status question and explicit read-only direction did not authorize release');
     }
-    await probe(host, 'native-prompt', bot.managerId, [16,18].includes(id) ? approveFixtureDeployment : approveRelease);
+    await probe(host, 'native-prompt', bot.managerId, [16,18,19].includes(id) ? approveFixtureDeployment : approveRelease);
     return { task, bot, inspect };
   }
   async function reported(test, state, attempts = 400) {
@@ -164,6 +167,11 @@ export async function smokeGitLabRelease({ base, configure, launch, stop, call, 
       const chat=await hiddenChoice.inspect();
       return chat.status==='idle'&&chat.assistantTexts.includes('已核对该流水线。');
     },'provider option is recorded but has not appeared to the owner');
+    await probe(host, 'native-prompt', hiddenChoice.bot.managerId, publishOrdinal);
+    const misdirected = await hiddenChoice.inspect();
+    assert.ok(misdirected.toolResults.some(result => result.message.isError &&
+      result.message.content.some(block => block.type === 'text' && block.text.includes('当前用户原文中的确切 GitLab 作业名称'))));
+    assert.equal((await taskDetail(hiddenChoice.task)).gitLabRelease, null);
     await probe(host,'native-prompt',hiddenChoice.bot.managerId,confirmReleaseChoice);
     const rejected=await hiddenChoice.inspect();
     assert.ok(rejected.toolResults.some(result=>result.message.isError&&
@@ -175,8 +183,36 @@ export async function smokeGitLabRelease({ base, configure, launch, stop, call, 
     await probe(host,'native-prompt',hiddenChoice.bot.managerId,confirmReleaseChoice);
     await reported(hiddenChoice,'success');
     assert.equal(posts(18).length,1);
+
+    const legacy = await fresh(19);
+    const oldStage = await wait(async () => {
+      const { stage } = await taskDetail(legacy.task);
+      return stage?.state === 'blocked' && stage;
+    }, 'release approval awaits a choice');
+    await stop('web');
+    const db = new DatabaseSync(ledgerPath);
+    db.prepare("UPDATE work_stages SET details=json_set(details,'$.observation.releaseChoices',json(?),'$.observation.detail',?) WHERE runId=?")
+      .run(JSON.stringify(['former-blue', 'former-green']), 'Former choices: former-blue, former-green.', oldStage.runId);
+    db.close();
+    fixtures.get(19).jobId = 319;
+    host = await launch('web', 'gitlab-legacy-choices-reopened', options);
+    await wait(async () => {
+      const { stage } = await taskDetail(legacy.task);
+      return stage?.state === 'blocked' && stage.observation?.releaseChoices?.[0]?.jobId === 319;
+    }, 'reopened old choices trigger trusted read-only discovery of the replacement job');
+    await probe(host, 'native-prompt', legacy.bot.managerId, confirmReleaseChoice);
+    assert.equal((await taskDetail(legacy.task)).gitLabRelease, null);
+    assert.equal(posts(19).length, 0, 'an ordinal reply cannot choose the undisplayed replacement');
+    await probe(host, 'native-prompt', legacy.bot.managerId, showReleaseChoices);
+    await wait(async () => (await legacy.inspect()).assistantTexts.some(text => text.includes('作业选项 · publish-release')),
+      'actual replacement option appears in the restored chat');
+    await probe(host, 'native-prompt', legacy.bot.managerId, confirmReleaseChoice);
+    const replacement = await reported(legacy, 'success');
+    assert.equal(replacement.gitLabRelease.target.jobId, 319);
+    assert.deepEqual(posts(19).map(item => item.path), ['/api/v4/projects/919/jobs/319/play']);
+
     assert.ok(seen.every(item => item.token === token));
-    console.log('PASS original DSH chat, same login observation, counted formal job, restart readback, prior effects, and permission recovery');
+    console.log('PASS original DSH chat, hidden and reopened choices, counted formal jobs, restart readback, prior effects, and permission recovery');
   } finally {
     server.close();
     server.closeAllConnections();

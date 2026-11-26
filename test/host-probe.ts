@@ -23,7 +23,7 @@ import { SessionId } from '@deepseek-ai/dsh-session/types';
 import type {SessionStore} from '@deepseek-ai/dsh-session';
 import { closeTask, ownerAcceptance, ownerAcceptanceConfirm, ownerConfirm, ownerDetach, ownerInspect, ownerNewGoal, ownerOldGoal, ownerPrepare,
   ownerRevise, ownerSessionTitle, stageArtifacts, stageGoal, stageRevoke, stageSupplement, stoppableGoal } from './stage-host-fixture.ts';
-import { approveFixtureDeployment, approveRelease, confirmReleaseChoice, prepareRelease, releaseFixtureGoal,
+import { approveFixtureDeployment, approveRelease, confirmReleaseChoice, prepareRelease, publishOrdinal, releaseFixtureGoal,
   releaseStatusQuestion, restoreReleasePermission, showReleaseChoices } from './gitlab-release-fixture.ts';
 import { artifactDeliveryText, artifactEditReply, artifactGoal, artifactLinks, artifactPrimary, artifactPortProbeGoal, artifactPortProbeText, artifactReference,
   artifactRevision, replacementMr, supplementalDoc } from './delivery-link-fixture.ts';
@@ -174,7 +174,7 @@ class ProbeAdapter extends LlmAdapter {
       }
       let plan:Record<string,unknown>|null=null;
       const releaseFollowup=trigger?.source?.kind==='user'&&
-        [approveRelease,approveFixtureDeployment,confirmReleaseChoice,releaseStatusQuestion,restoreReleasePermission,showReleaseChoices].includes(text);
+        [approveRelease,approveFixtureDeployment,confirmReleaseChoice,publishOrdinal,releaseStatusQuestion,restoreReleasePermission,showReleaseChoices].includes(text);
       if(releaseFollowup) {
         if(!prior){yield* probeTool('super_bot_manage',{action:'list'});return;}
         if(prior.action==='list') {
@@ -196,7 +196,7 @@ class ProbeAdapter extends LlmAdapter {
           }
           const retry=text===restoreReleasePermission;
           const select=text===confirmReleaseChoice;
-          if(select)assert.equal(value.stage.observation.releaseChoices,undefined,'choice identity stays in the application ledger');
+          if(select)assert.equal(value.stage.observation?.releaseChoices,undefined,'choice identity stays in the application ledger');
           const evidence=retry?value.gitLabRelease?.condition:undefined;
           const url=retry?null:new URL(value.stage.evidenceRef);
           const condition=evidence??{kind:'gitlab-merge',sourceOrigin:url!.origin,
@@ -205,6 +205,7 @@ class ProbeAdapter extends LlmAdapter {
             expectedRowVersion:value.task.rowVersion,nextStep:'运行已授权的正式发布作业',condition,userInstruction:text,
             gitLabRelease:{intent:retry?'retry':select?'select':'publish',
               ...(select?{jobName:value.gitLabReleaseChoices[0]}:{}),
+              ...(text===publishOrdinal?{jobName:'publish-release'}:{}),
               ...(text===approveFixtureDeployment?{requiresJobName:true}:{})}});
           return;
         }
@@ -369,7 +370,7 @@ class ProbeAdapter extends LlmAdapter {
       let reply='已核对当前状态。';
       if(value?.gitLabRelease)reply=value.gitLabRelease.detail+'\n'+value.gitLabRelease.url;
       else if(value?.task?.goal?.startsWith(releaseFixtureGoal)&&value.gitLabReleaseQuestion) {
-        reply=value.task.goal.endsWith('/18')?'已核对该流水线。':value.gitLabReleaseQuestion;
+        reply=value.task.goal.endsWith('/18')||value.task.goal.endsWith('/19')?'已核对该流水线。':value.gitLabReleaseQuestion;
       }
       else if(ownerAction&&prior?.action==='session-inspect'&&typeof value?.confirmationText==='string')reply=value.confirmationText;
       else if(ownerAction&&prior?.action===ownerAction&&typeof value?.confirmationText==='string')reply=value.confirmationText;

@@ -12,7 +12,9 @@ export interface ReleaseAuthorization {
   source: ChatSource; intent: 'publish' | 'select' | 'retry' | 'clarify'; jobName?: string; requiresJobName?: boolean;
   selection?: { observedAt: number; target: ReleaseTarget };
 }
-export type ReleasePlan = Pick<ReleaseAuthorization, 'jobName'> & { requiresJobName?: boolean; retryTarget?: ReleaseTarget };
+export type ReleasePlan = Pick<ReleaseAuthorization, 'jobName'> & {
+  source?: ChatSource; requiresJobName?: boolean; requiresSelection?: boolean; retryTarget?: ReleaseTarget;
+};
 export interface ReleaseTarget {
   origin: string; project: string; projectId: number; pipelineId: number; jobId: number; name: string; sha: string; ref: string;
   newAfterMerge?: true;
@@ -51,6 +53,24 @@ export function releaseJobName(value: unknown): string | undefined {
     throw new AppError('gitlab-job-name', '请选择原聊天已授权的确切 GitLab 作业名称。');
   }
   return value;
+}
+
+export function hasReleaseJobReference(text: string, name: string, otherNames: string[] = []): boolean {
+  const spans = (label: string) => {
+    const matches: [number, number][] = [];
+    const unicode = /[^\x00-\x7f]/u.test(label);
+    for (let start = text.indexOf(label); start >= 0; start = text.indexOf(label, start + 1)) {
+      const end = start + label.length, before = text.slice(0, start), after = text.slice(end);
+      if (/[\w/@%+#:-]$|\w\.$/u.test(before) || /^[\w/@%+#:-]|^\.\w/u.test(after) ||
+        unicode && (/[\p{L}\p{M}\p{N}]$/u.test(before) || /^[\p{L}\p{M}\p{N}]/u.test(after))) continue;
+      matches.push([start, end]);
+    }
+    return matches;
+  };
+  const references = spans(name);
+  if (!references.length) return false;
+  const longer = otherNames.filter(other => other.length > name.length && other.includes(name)).flatMap(spans);
+  return references.some(([start, end]) => !longer.some(([left, right]) => left <= start && end <= right));
 }
 
 export function mergeReferences(prose:string):StageCondition[] {
@@ -122,6 +142,7 @@ export async function discoverRelease(
     if (!good(checked)) return missing(checked, `先前的发布作业 #${target.jobId}`);
     const status = exactJobStatus(checked.data, target);
     if (!status) return unavailable(`无法重新核对流水线 #${target.pipelineId} 中原发布作业 #${target.jobId} 的确切身份。`);
+    if (plan.requiresSelection) return releaseChoiceObservation(target.pipelineId, [target], new Map(), false);
     return { state: 'satisfied', stateLabel: status, detail: `已核对原发布作业 #${target.jobId}（${status}）。`,
       url: releaseUrl(target), releaseJob: target };
   }
@@ -154,6 +175,10 @@ export async function discoverRelease(
     jobs.push(...response.data.map(object));
     if(response.data.length<100)break;
   }
+  if (plan.jobName && plan.source && !plan.requiresSelection &&
+    !hasReleaseJobReference(plan.source.text, plan.jobName, jobs.map(job => job.name).filter(name => typeof name === 'string'))) {
+    return { state: 'unsatisfied', detail: '请在原聊天提供确切的 GitLab 作业名称，或选择当前已展示的作业。' };
+  }
   const deployments=plan.jobName?new Map<string,string>():declaredEnvironments(
     await read(`${base}/ci/lint?content_ref=${sha}`,signal));
   const mergedAt=typeof mr.merged_at==='string'?Date.parse(mr.merged_at):NaN;
@@ -179,16 +204,19 @@ export async function discoverRelease(
     if(!status)return unavailable(`GitLab 未返回流水线 #${pipelineId} 中作业 #${job.id} 的匹配身份。`);
     verified.push({target,status});
   }
-  if(candidates.length!==1||!proven.length||plan.requiresJobName&&!plan.jobName) {
-    const labels=verified.map(({target})=>deployments.has(target.name)?`${target.name}（${deployments.get(target.name)}）`:target.name);
-    const more=candidates.length>verified.length?' 也可以提供其他确切作业名称。':'';
-    return {state:'unsatisfied',detail:`流水线 #${pipelineId} 的作业选项 · ${labels.join('、')}。${more}`,
-      releaseChoices:verified.map(item=>item.target)};
+  if(candidates.length!==1||!proven.length||plan.requiresSelection||plan.requiresJobName&&!plan.jobName) {
+    return releaseChoiceObservation(pipelineId, verified.map(item => item.target), deployments, candidates.length > verified.length);
   }
   const {target,status}=verified[0]!;
   if(status==='created')return pending(`等待发布作业 #${target.jobId} 进入可确认状态。`);
   return { state: 'satisfied', stateLabel: status, detail: `已核对 ${project} !${iid} 的发布作业 #${target.jobId}（${status}）。`,
     url: releaseUrl(target), releaseJob: target };
+}
+
+function releaseChoiceObservation(pipelineId: number, targets: ReleaseTarget[], deployments: ReadonlyMap<string, string>, more: boolean): StageObservation {
+  const labels = targets.map(({name}) => deployments.has(name) ? `${name}（${deployments.get(name)}）` : name);
+  return { state: 'unsatisfied', releaseChoices: targets,
+    detail: `流水线 #${pipelineId} 的作业选项 · ${labels.join('、')}。${more ? ' 也可以提供其他确切作业名称。' : ''}` };
 }
 
 export function exactJobStatus(data: unknown, target: ReleaseTarget): string | undefined {

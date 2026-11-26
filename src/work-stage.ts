@@ -29,7 +29,7 @@ export interface WorkStage {
   nextStep?: string;
   dispatchedRunId?: string;
   condition?: StageCondition;
-  observation?: StageObservation & { at: number };
+  observation?: Omit<StageObservation, 'releaseChoices'> & { at: number; releaseChoices?: ReleaseTarget[] | string[] };
   reason?: string;
   deadlineAt?: number;
   expired?: boolean;

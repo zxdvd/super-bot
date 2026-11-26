@@ -2,8 +2,8 @@ import { applyTaskActivity, inboxActivity, taskActivities } from './work-activit
 import { settledBlockerSql } from './settled-blocker.ts';
 import { readStageCondition, stageConditionText, stageReadyKey, STAGE_OBSERVE_MS, STAGE_WAIT_MS,
   type DueStage, type StageFollowUp, type StageObservation, type WorkStage } from './work-stage.ts';
-import { exactMergeReference, mergeReferences, releaseKey, releaseUrl, RELEASE_CHECK_MS, RELEASE_WAIT_MS,
-  type ReleaseAuthorization, type ReleasePlan, type ReleaseReceipt, type ReleaseTarget } from './gitlab-release.ts';
+import { exactMergeReference, hasReleaseJobReference, mergeReferences, releaseKey, releaseUrl, RELEASE_CHECK_MS, RELEASE_WAIT_MS,
+  type ReleaseAuthorization, type ReleasePlan, type ReleaseReceipt } from './gitlab-release.ts';
 import type { StageCondition } from './work-stage.ts';
 import type { DatabaseSync } from 'node:sqlite';
 import { createHash, randomUUID } from 'node:crypto';
@@ -656,6 +656,9 @@ export class Store {
       if(release&&(!source||this.botForSession(source.sessionId)?.id!==input.botId||
         !reference||!mergeReferences(source.text).some(item=>JSON.stringify(item)===JSON.stringify(reference)))) {
         throw new AppError('gitlab-release-scope','创建任务时需要原聊天中的确切 GitLab MR 链接。');
+      }
+      if(release?.jobName&&source&&!hasReleaseJobReference(source.text,release.jobName)) {
+        throw new AppError('gitlab-job-name','请使用当前用户原文中的确切 GitLab 作业名称。');
       }
       const prior=intentId?this.db.prepare('SELECT result FROM requests WHERE id=?').get(intentId):undefined;
       if(prior)return JSON.parse(String(prior.result)) as Task;
@@ -1550,6 +1553,17 @@ export class Store {
       !(intent==='publish'||intent==='clarify'&&!jobName||chosen||earlierAuthorization)) {
       throw new AppError('gitlab-release-scope','需要当前任务的可信 GitLab MR 引用和原聊天中明确的发布授权。若意图不清楚，请在原聊天点明该合并请求并询问是否执行发布。');
     }
+    if(intent==='publish') {
+      const choices=stage.observation?.releaseChoices;
+      if((choices?.length||previous?.requiresSelection)&&
+        (!jobName||previous?.source.sessionId===source.sessionId&&previous.source.seq>=source.seq)) {
+        throw new AppError('gitlab-choice-stale','请先在原聊天展示当前作业选项，再按用户的回答选择。');
+      }
+      const names=choices?.map(choice=>typeof choice==='string'?choice:choice.name);
+      if(jobName&&!hasReleaseJobReference(source.text,jobName,names)) {
+        throw new AppError('gitlab-job-name','请使用当前用户原文中的确切 GitLab 作业名称。');
+      }
+    }
     const subjects=[...source.text.matchAll(/!(\d+)\b/g)].map(match=>Number(match[1]));
     const urls=mergeReferences(source.text);
     if((subjects.length>0&&!subjects.includes(condition.number))||
@@ -1562,8 +1576,10 @@ export class Store {
     const requiresJobName=intent==='clarify'||authorization.requiresJobName===true||previous?.requiresJobName===true;
     if(prior&&(JSON.stringify(prior.condition??this.gitLabReleaseForStage(prior.stageRunId)?.condition)!==JSON.stringify(condition)||
       jobName&&jobName!==prior.target.name)) throw new AppError('gitlab-release-tracked','请继续核对已登记的同一作业。');
-    const boundTarget=chosen??(intent==='clarify'?undefined:prior?.target);
-    const plan={source,jobName,requiresJobName,condition,
+    const requiresSelection=intent==='clarify'&&previous?.requiresSelection===true;
+    const boundTarget=chosen??(requiresSelection?previous.retryTarget:intent==='clarify'?undefined:prior?.target);
+    const plan={source,jobName:requiresSelection?previous.jobName:jobName,requiresJobName,condition,
+      ...(requiresSelection?{requiresSelection}:{}),
       ...(boundTarget?{retryTarget:boundTarget}:{})};
     this.db.prepare(`INSERT INTO gitlab_release_plans VALUES (?,?)
       ON CONFLICT(stageRunId) DO UPDATE SET authorization=excluded.authorization`).run(stage.runId,JSON.stringify(plan));
@@ -1572,7 +1588,7 @@ export class Store {
     this.db.prepare('DELETE FROM gitlab_release_plans WHERE stageRunId=? AND NOT EXISTS (SELECT 1 FROM gitlab_release_receipts WHERE stageRunId=?)')
       .run(stageRunId,stageRunId);
   }
-  gitLabReleaseForStage(stageRunId:string):(ReleasePlan&{ source:ChatSource; condition:StageCondition; retryTarget?:ReleaseTarget })|null {
+  gitLabReleaseForStage(stageRunId:string):(ReleasePlan&{ source:ChatSource; condition:StageCondition })|null {
     const row=this.db.prepare('SELECT authorization FROM gitlab_release_plans WHERE stageRunId=?').get(stageRunId);
     return row?JSON.parse(String(row.authorization)):null;
   }
@@ -1776,7 +1792,10 @@ export class Store {
         stage.nextStep===nextStep&&JSON.stringify(stage.condition)===JSON.stringify(condition);
       const releaseSelection=stage.state==='blocked'&&options?.release?.intent==='select'&&!!stage.observation?.releaseChoices?.length;
       const releaseDirected=stage.state==='blocked'&&options?.release?.intent==='publish'&&!!options.release.jobName;
-      if(stage.state!=='awaiting-decision'&&!retry&&!source&&!releaseSelection&&!releaseDirected) {
+      const releaseClarification=stage.state==='blocked'&&options?.release?.intent==='clarify'&&
+        !stage.observation?.releaseChoices?.length&&this.gitLabReleaseForStage(runId)?.requiresSelection===true&&
+        stage.nextStep===nextStep&&JSON.stringify(stage.condition)===JSON.stringify(condition);
+      if(stage.state!=='awaiting-decision'&&!retry&&!source&&!releaseSelection&&!releaseDirected&&!releaseClarification) {
         throw new AppError('stage-decided','此阶段已有处理决定。请读取当前任务。');
       }
       if(source&&['awaiting-decision','dispatched'].includes(stage.state)) {
@@ -1799,7 +1818,7 @@ export class Store {
       const details:WorkStage={...stage,nextStep,condition,observation:undefined,reason:undefined,expired:undefined,
         releaseOpenedAt:JSON.stringify(stage.condition)===JSON.stringify(condition)?stage.releaseOpenedAt:undefined,
         deadlineAt:repeated?undefined:now+STAGE_WAIT_MS,
-        ...(source||retry||releaseSelection||releaseDirected?{planVersion:task.rowVersion+1}:{}),...(source?{planSource:source}:{})};
+        ...(source||retry||releaseSelection||releaseDirected||releaseClarification?{planVersion:task.rowVersion+1}:{}),...(source?{planSource:source}:{})};
       const decision:WorkStage['state']=repeated?'blocked':condition?'waiting':'ready';
       if(repeated)details.reason='已经核对过同一外部条件。请确认下一阶段需要的具体前提。';
       else if(condition&&condition.sourceOrigin!==origin) {
@@ -1845,12 +1864,18 @@ export class Store {
       WHERE r.id=(SELECT id FROM runs WHERE taskId=t.id ORDER BY createdAt DESC,rowid DESC LIMIT 1) AND
         (s.state IN ('waiting','ready') AND coalesce(json_extract(s.details,'$.deadlineAt'),0)<=? OR
          s.state='blocked' AND json_extract(s.details,'$.observation.state')='unavailable'
-          AND json_extract(s.details,'$.deadlineAt') IS NULL)
+          AND json_extract(s.details,'$.deadlineAt') IS NULL OR
+         s.state='blocked' AND json_type(s.details,'$.observation.releaseChoices[0]')='text'
+          AND EXISTS (SELECT 1 FROM gitlab_release_plans p WHERE p.stageRunId=s.runId))
       ORDER BY coalesce(json_extract(s.details,'$.deadlineAt'),0),s.runId LIMIT 16`).all(now);
     for(const row of candidates) {
       const task=this.getTask(String(row.taskId)),run=this.latestRun(task.id)!;
       const stage=this.currentStage(task,run);
       if(!stage)continue;
+      if(stage.state==='blocked'&&typeof stage.observation?.releaseChoices?.[0]==='string') {
+        this.refreshLegacyGitLabChoices(task,run,stage,now);
+        continue;
+      }
       const deadlineAt=stage.deadlineAt??(stage.observation?.at??stage.at)+STAGE_WAIT_MS;
       this.command(`stage-supervise:${run.id}:${stage.planVersion??0}:${deadlineAt}:${stage.deadlineAt===undefined?'legacy':'expire'}`,
         'stage.supervise',{taskId:task.id,runId:run.id,deadlineAt},()=>{
@@ -1867,6 +1892,20 @@ export class Store {
           return {};
         });
     }
+  }
+  private refreshLegacyGitLabChoices(task:Task,run:Run,stage:WorkStage,now:number):void {
+    const plan=this.gitLabReleaseForStage(stage.runId),condition=stage.condition;
+    if(!condition||condition.kind!=='gitlab-merge'||!plan||
+      JSON.stringify(plan.condition)!==JSON.stringify(condition)||this.stageOwnerFollowUp(task,run))return;
+    const details:WorkStage={...stage,state:'waiting',observation:undefined,reason:undefined,expired:undefined,
+      deadlineAt:now+STAGE_WAIT_MS,planVersion:task.rowVersion+1};
+    writeTransaction(this.db,()=>{
+      this.db.prepare('UPDATE gitlab_release_plans SET authorization=? WHERE stageRunId=?')
+        .run(JSON.stringify({...plan,requiresSelection:true}),stage.runId);
+      this.db.prepare("UPDATE work_stages SET state='waiting',details=?,nextCheckAt=?,failures=0,observerOrigin=? WHERE runId=?")
+        .run(JSON.stringify({...details,state:undefined}),now,condition.sourceOrigin,stage.runId);
+      this.db.prepare('UPDATE tasks SET rowVersion=rowVersion+1,updatedAt=? WHERE id=?').run(now,task.id);
+    });
   }
   private expireStage(task:Task,stage:WorkStage,now:number):void {
     const last=stage.observation?.detail?`最近一次核对：${stage.observation.detail}`:'';

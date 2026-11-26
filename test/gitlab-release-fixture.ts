@@ -3,6 +3,7 @@ export const prepareRelease = '请准备合成合并请求 ';
 export const approveRelease = '之前提到的 MR 已合并了，帮我把这次发布走完吧。';
 export const approveFixtureDeployment = '这个 MR 已经合并了，请按合成环境的正式流程完成发布。';
 export const confirmReleaseChoice = 'Dann bitte diese Variante.';
+export const publishOrdinal = 'Use the second one.';
 export const showReleaseChoices = '这个阶段可以选哪几个？';
 export const releaseStatusQuestion = '发布完了吗？如果还没有，先只查状态。';
 export const restoreReleasePermission = 'Die Berechtigung ist jetzt eingerichtet. Nimm bitte denselben Auftrag wieder auf.';

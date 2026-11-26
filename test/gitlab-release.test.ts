@@ -216,7 +216,7 @@ test('structured release choices require a current observed object and preserve 
   assert.throws(()=>store.createTask('bad-grant',{botId:bot.id,goal:'Publish',scope:'Fixture',acceptance:'Result',reviewPolicy:'human'},
     {...source,text:'The exact link is '+mr+'1'},undefined,{reference:mr}),{code:'gitlab-release-scope'});
   const created=store.createTask('exact-grant',{botId:bot.id,goal:'Publish',scope:'Fixture',acceptance:'Result',reviewPolicy:'human'},
-    {...source,text:'この件をお願いします '+mr},undefined,{reference:mr,jobName:job.name});
+    {...source,text:'この件をお願いします '+mr+' · '+job.name},undefined,{reference:mr,jobName:job.name});
   assert.equal(store.gitLabTaskAuthorization(created.id,mr)?.jobName,job.name);
   store.advanceStage('discover',bot.id,task.id,store.getTask(task.id).rowVersion,old.id,'Publish',condition,origin,false,
     {release:{source,intent:'clarify'}});
@@ -234,10 +234,81 @@ test('structured release choices require a current observed object and preserve 
   store.advanceStage('foreign-discover',second.bot.id,second.task.id,store.getTask(second.task.id).rowVersion,second.old.id,
     'Publish',condition,origin,false,{release:{source:second.source,intent:'clarify'}});
   const secondDue=store.dueStages(4).find(item=>item.runId===second.old.id)!;
-  store.recordStageObservation(secondDue,{state:'unsatisfied',detail:'Please select',releaseChoices:[target]},secondDue.checkAt);
-  const direct=store.advanceStage('foreign-directed',second.bot.id,second.task.id,store.getTask(second.task.id).rowVersion,
-    second.old.id,'Publish',condition,origin,false,{release:{source:{...second.source,seq:30,text:'Run the artifact entry I named.'},
-      intent:'publish',jobName:job.name}});
+  const nonAscii={...target,jobId:45,name:'发布·预览'};
+  const compound={...target,jobId:46,name:target.name+' preview'};
+  store.recordStageObservation(secondDue,{state:'unsatisfied',detail:'Please select',releaseChoices:[target,nonAscii,compound]},secondDue.checkAt);
+  const publish=(key:string,text:string,jobName?:string,replace=false)=>{
+    const source={...second.source,messageId:key,seq:30,text};
+    return store.advanceStage(key,second.bot.id,second.task.id,store.getTask(second.task.id).rowVersion,
+      second.old.id,'Publish',condition,origin,false,{...(replace?{source}:{}),release:{source,intent:'publish',jobName}});
+  };
+  assert.throws(()=>publish('hidden-directed','Use the second one.',job.name),{code:'gitlab-job-name'});
+  assert.throws(()=>publish('no-name-replace','Use the second one.',undefined,true),{code:'gitlab-choice-stale'});
+  assert.throws(()=>publish('hidden-prefix',`Run ${job.name}-preview.`,job.name),{code:'gitlab-job-name'});
+  assert.throws(()=>publish('hidden-compound',`Run ${compound.name}.`,job.name),{code:'gitlab-job-name'});
+  assert.throws(()=>publish('hidden-unicode-prefix','请执行「发布·预览版」。',nonAscii.name),{code:'gitlab-job-name'});
+  assert.equal(store.gitLabReleaseReceipt(second.old.id),null);
+  const direct=publish('foreign-directed','请执行「发布·预览」。',nonAscii.name);
   assert.equal(direct.stage.state,'waiting','a new explicit request for an exact job needs no displayed option');
-  assert.equal(store.gitLabReleaseForStage(second.old.id)?.jobName,job.name);
+  assert.equal(store.gitLabReleaseForStage(second.old.id)?.jobName,nonAscii.name);
+
+  const inline=arrange(store,'inline');
+  const inlineSource={...inline.source,text:`请发布${job.name}。`};
+  assert.equal(store.advanceStage('inline-direct',inline.bot.id,inline.task.id,store.getTask(inline.task.id).rowVersion,
+    inline.old.id,'Publish',condition,origin,false,{release:{source:inlineSource,intent:'publish',jobName:job.name}}).stage.state,'waiting');
+});
+
+test('reopening legacy string choices reads the saved MR and requires selection of a freshly verified job',async t=>{
+  const dir=mkdtempSync(join(tmpdir(),'super-bot-legacy-release-'));
+  const path=join(dir,'ledger.sqlite');
+  t.after(()=>rmSync(dir,{force:true,recursive:true}));
+  const oldStore=new Store(path);
+  const {bot,task,old,source}=arrange(oldStore,'legacy');
+  source.text='Run '+target.name;
+  oldStore.advanceStage('discover-legacy',bot.id,task.id,oldStore.getTask(task.id).rowVersion,old.id,'Publish',condition,origin,false,
+    {release:{source,intent:'publish',jobName:target.name}});
+  const previous=oldStore.dueStages(4)[0]!;
+  oldStore.recordStageObservation(previous,{state:'unsatisfied',detail:'Old choices',releaseChoices:[target]},previous.checkAt);
+  oldStore.close();
+  const legacy=new DatabaseSync(path);
+  legacy.prepare("UPDATE work_stages SET details=json_set(details,'$.observation.releaseChoices',json(?)) WHERE runId=?")
+    .run(JSON.stringify([target.name,'other']),old.id);
+  legacy.close();
+
+  const store=new Store(path);
+  t.after(()=>store.close());
+  const replaced={...job,id:54,web_url:origin+'/fixture/release/-/jobs/54'};
+  const other={...job,id:55,name:'other',web_url:origin+'/fixture/release/-/jobs/55'};
+  const read=(jobs:unknown[])=>async(path:string)=>({code:200,data:path.includes('merge_requests')?
+    {iid:11,project_id:21,target_project_id:21,web_url:mr,state:'merged',merge_commit_sha:sha,target_branch:'main'}:
+    path.includes('/jobs?')?jobs:path.includes('/ci/lint')?lint:[pipeline]});
+  store.superviseStages();
+  const due=store.dueStages(4)[0]!;
+  assert.deepEqual(due.condition,condition);
+  assert.equal(due.origin,origin);
+  assert.equal(store.taskDetail(task.id).stage?.observation,undefined);
+  assert.equal(store.gitLabReleaseReceipt(old.id),null);
+  const plan=store.gitLabReleaseForStage(old.id)!;
+  assert.deepEqual(plan.source,source);
+  assert.equal(plan.jobName,target.name);
+  const missing=await discoverRelease(due.condition,plan,read([other]),signal);
+  assert.equal(missing.releaseChoices,undefined);
+  assert.equal(missing.releaseJob,undefined);
+  store.recordStageObservation(due,{state:'unavailable',detail:'Cannot read fixture'},due.checkAt);
+  assert.equal(store.dueStages(4,due.checkAt+1).length,0);
+  const retried=store.dueStages(4,due.checkAt+5*60_000)[0]!;
+  const refreshed=await discoverRelease(retried.condition,plan,read([replaced,other]),signal);
+  const replacement={...target,jobId:54};
+  assert.deepEqual(refreshed.releaseChoices,[replacement]);
+  assert.equal(refreshed.releaseJob,undefined);
+  store.recordStageObservation(retried,refreshed,retried.checkAt);
+  assert.equal(store.taskDetail(task.id).stage?.state,'blocked');
+  assert.throws(()=>store.reserveRun('premature',task.id,store.getTask(task.id).rowVersion),{code:'work-blocked'});
+  assert.equal(store.gitLabReleaseReceipt(old.id),null);
+  const select=(key:string,job:ReleaseTarget)=>store.advanceStage(key,bot.id,task.id,store.getTask(task.id).rowVersion,
+    old.id,'Publish',condition,origin,false,{release:{source:{...source,messageId:key,seq:20,text:'Use that one.'},
+      intent:'select',jobName:job.name,selection:{observedAt:retried.checkAt,target:job}}});
+  assert.throws(()=>select('old-target',target),{code:'gitlab-release-scope'});
+  assert.equal(select('shown-target',replacement).stage.state,'waiting');
+  assert.deepEqual(store.gitLabReleaseForStage(old.id)?.retryTarget,replacement);
 });

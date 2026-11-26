@@ -277,26 +277,27 @@ export class Managers {
     const saved=this.store.get(this.gitLabQuestionKey(manager));
     if(saved)return JSON.parse(saved) as GitLabQuestion;
   }
-  private offerGitLabChoices(manager:ManagerBinding,task:Task,stage:WorkStage|null):string|undefined {
+  private offerGitLabChoices(manager:ManagerBinding,task:Task,stage:WorkStage|null) {
     const observation=stage?.state==='blocked'?stage.observation:undefined;
-    const choices=observation?.releaseChoices?.filter(choice=>!!choice.jobId);
+    const choices=observation?.releaseChoices?.filter((choice):choice is ReleaseTarget=>typeof choice!=='string'&&!!choice.jobId);
     if(!stage||!observation||!choices?.length||!manager.sessionId)return;
     const sessionId=manager.sessionId,question=observation.detail;
+    const offered={gitLabReleaseQuestion:question,gitLabReleaseChoices:choices.map(choice=>choice.name)};
     const previous=this.getGitLabQuestion(manager);
     const same=previous?.taskId===task.id&&previous.rowVersion===task.rowVersion&&previous.stageRunId===stage.runId&&
       previous.observedAt===observation.at;
-    if(same&&previous.shown)return question;
+    if(same&&previous.shown)return offered;
     const turn=this.nativeTurns.get(sessionId);
     const notice=this.notificationTurns.get(sessionId),owner=this.currentOwner(sessionId);
     const exactNotice=notice&&notice.turn===turn&&notice.eventId.startsWith(`manager-event:stage-blocked:${stage.runId}:`)&&
       this.store.managerEventTargets(notice.eventId,notice.messageId,manager.botId,task.id)?notice:undefined;
     const source=owner?chatSource(owner):exactNotice?this.store.gitLabReleaseForStage(stage.runId)?.source:undefined;
-    if(turn===undefined||!source||source.sessionId!==sessionId||!owner&&previous?.shown)return;
+    if(turn===undefined||!source||source.sessionId!==sessionId||!owner&&previous?.shown&&previous.taskId!==task.id)return;
     this.store.set(this.gitLabQuestionKey(manager),JSON.stringify({
       turn,source,question,taskId:task.id,rowVersion:task.rowVersion,stageRunId:stage.runId,observedAt:observation.at,choices,
       ...(exactNotice?{noticeMessageId:exactNotice.messageId}:{}),
     } satisfies GitLabQuestion));
-    return question;
+    return offered;
   }
   private shownGitLabChoice(manager:ManagerBinding,task:Task,stage:WorkStage,jobName:string|undefined,owner:OwnerSource) {
     const shown=this.getGitLabQuestion(manager),target=shown?.choices.find(choice=>choice.name===jobName);
@@ -962,7 +963,7 @@ export class Managers {
             retryable:item.state==='blocked'&&Number(preflightFailures)===5&&messageId==null};
         });
       return {...snapshot,stage:visibleStage,stageObserver:{provider:'gitlab',origin:gitLabObservationOrigin(this.options.gitLabObserverOrigin)},
-        ...(gitLabReleaseQuestion?{gitLabReleaseQuestion,gitLabReleaseChoices:releaseChoices!.map(choice=>choice.name)}:{}),
+        ...gitLabReleaseQuestion,
         ...(gitLabCurrentStatus?{gitLabCurrentStatus}:{}),
         notifications,
         pendingQuestions:pendingQuestions.map(question=>questionLink(question,origin)),
