@@ -12,9 +12,10 @@ type ClarificationOption = {
 };
 
 const OPEN_TASK_ACTIONS: readonly ClarificationAction[] = [
-  'continue', 'respond', 'pause', 'resume', 'stop', 'revise',
-  'session-prepare', 'session-inspect', 'session-detach', 'session-reconcile',
+  'continue', 'respond', 'revise', 'recover-and-continue',
+  'session-prepare', 'session-inspect', 'session-detach',
 ];
+const UNFINISHED_TASK_ACTIONS: readonly ClarificationAction[] = ['pause', 'resume', 'close', 'cancel', 'recover'];
 
 export function clarificationOptions(store: Store, botId: string, action: ClarificationAction,
   { taskIds, resultIds }: Record<string, unknown>): ClarificationOption[] {
@@ -30,9 +31,13 @@ export function clarificationOptions(store: Store, botId: string, action: Clarif
     const requestedResult = exactResults ? store.resultById(requiredText(id, '候选成果标识', 200)) : null;
     if (exactResults && !requestedResult) throw new AppError('result-stale', '该候选成果已经无法核对。');
     const task = store.getTask(requestedResult?.taskId ?? requiredText(id, '候选任务标识', 200));
-    if (task.botId !== botId || (selectsResult && task.lifecycle !== 'review') ||
-      (OPEN_TASK_ACTIONS.includes(action) && task.lifecycle !== 'open') ||
-      ((action === 'close' || action === 'cancel') && task.lifecycle !== 'open' && task.lifecycle !== 'review')) {
+    const open = task.lifecycle === 'open';
+    const review = task.lifecycle === 'review';
+    if (task.botId !== botId || (selectsResult && !review) ||
+      (OPEN_TASK_ACTIONS.includes(action) && !open) ||
+      (UNFINISHED_TASK_ACTIONS.includes(action) && !open && !review) ||
+      (action === 'stop' && store.latestRun(task.id)?.finishedAt !== null) ||
+      (action === 'session-reconcile' && !store.activeBinding(task.id))) {
       throw new AppError('manager-scope', '只能澄清当前 Bot 的有效业务目标。');
     }
 

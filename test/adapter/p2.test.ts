@@ -319,6 +319,56 @@ test('chat can select which task to close while both have pending results',async
   }finally{await f.close();}
 });
 
+for(const action of ['pause','resume','session-reconcile'] as const) {
+  test(`chat can select a task for ${action} while both have pending results`,async t=>{
+    const f=fixture(t);try {
+      const first=await ownerReviewFixture(f,'first-for-choice'),second=await ownerReviewFixture(f,'second-for-choice');
+      if(action==='resume') {
+        f.store.controlTask('pause-first',first.taskId,first.expectedRowVersion,'paused');
+        f.store.controlTask('pause-second',second.taskId,second.expectedRowVersion,'paused');
+      }
+      const request={pause:'Pause automatic work on one of the reports.',resume:'Resume automatic work on one of the reports.',
+        'session-reconcile':'Check the existing Worker session for one of the reports.'}[action];
+      await askOnOwnerTurn(f,1,10,request);
+      const options=await f.nativeCall('clarify-action',{action:'clarify',followUp:action,taskIds:[first.taskId,second.taskId]});
+      await showOwnerQuestion(f,1,12,options.confirmationText);await endOwnerTurn(f,13);
+      const reply='The second one.';
+      await askOnOwnerTurn(f,2,20,reply);
+      const selected=await f.nativeCall('selected-action',{action,taskId:second.taskId,choice:2,
+        expectedRowVersion:f.store.getTask(second.taskId).rowVersion,userInstruction:reply});
+      if(action==='session-reconcile') {
+        assert.equal(selected.binding.taskId,second.taskId);
+        assert.equal(selected.binding.state,'ready');
+      }else {
+        assert.equal(selected.task.controlMode,action==='pause'?'paused':'auto');
+        assert.equal(f.store.getTask(first.taskId).controlMode,action==='pause'?'auto':'paused');
+      }
+      assert.equal(f.store.getTask(second.taskId).lifecycle,'review');
+      assert.equal(f.store.taskDetail(second.taskId).result?.id,second.resultId);
+    }finally{await f.close();}
+  });
+}
+
+test('clarification excludes unavailable detach, stop, and pause targets',async t=>{
+  const f=fixture(t);try {
+    const first=await ownerReviewFixture(f,'first-to-check'),second=await ownerReviewFixture(f,'second-to-check');
+    const taskIds=[first.taskId,second.taskId];
+    await askOnOwnerTurn(f,1,10,'Could you detach one of the Worker sessions?');
+    const detach=await f.nativeResult('clarify-detach',{action:'clarify',followUp:'session-detach',taskIds});
+    assert.equal(detach.isError,true);
+    assert.equal(f.store.activeBinding(first.taskId)?.state,'ready');
+    await f.native('owner-stop',12,'Stop the current attempt of one of the reports instead.');
+    const stop=await f.nativeResult('clarify-stop',{action:'clarify',followUp:'stop',taskIds});
+    assert.equal(stop.isError,true);
+    await endOwnerTurn(f,13);
+    f.store.cancelTask('end-first',first.taskId,first.expectedRowVersion);
+    await askOnOwnerTurn(f,2,20,'Pause one of the reports.');
+    const pause=await f.nativeResult('clarify-pause-ended',{action:'clarify',followUp:'pause',taskIds});
+    assert.equal(pause.isError,true);
+    assert.equal(f.store.getTask(second.taskId).controlMode,'auto');
+  }finally{await f.close();}
+});
+
 test('dispatch preparation reports when the binding was released before the Manager replied',async t=>{
   const f=fixture(t);try {
     const task=f.store.createTask('prepare-race',{botId:f.bot.id,goal:'Facts',scope:'Own folder',acceptance:'Read back',reviewPolicy:'human'});
