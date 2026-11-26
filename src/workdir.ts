@@ -270,11 +270,11 @@ export function workdirGuidance(policy:WorkdirPolicy):string {
   return [
     'Working directory: every task runs in one directory you may choose with the optional `workdir` object on create (or on the first dispatch before a session exists).',
     `Allowed roots: ${roots}. Default when you omit workdir: ${policy.defaultWorkdir==='none'?'a private directory under the Super Bot data dir':policy.defaultWorkdir}.`,
-    'Modes: existing {path} = work directly in a directory the user named (exclusive: tasks on the same or nested directory queue FIFO);',
-    'worktree {repo, name?, base?, branch?} = a git worktree of that repository on a new branch (default sb/<name>-<id>), safe for parallel work;',
+    'Modes: existing {path} = work directly in the named directory. Independent tasks can run in the same or nested directories, subject to this Bot’s Worker capacity;',
+    'worktree {repo, name?, base?, branch?} = a separate checkout on a new branch (default sb/<name>-<id>) when edits need isolation;',
     'isolated {name?, under?} = a fresh empty directory for research, documents or scratch work;',
     policy.hook?`hook {name?, args?} = run the user's provisioning hook. Hook purpose: ${policy.hook.description??'(no description)'}. Allowed args: ${(policy.hook.argNames??[]).join(', ')||'none'}.`:'hook = not configured.',
-    'Pick from the request and context: if the user named a repo or folder and wants it changed in place use existing; if they want changes to a repo without touching their checkout, or another task already uses it, use worktree; otherwise isolated.',
+    'Use existing for work in a named checkout or directory. Use worktree when the user requests a separate checkout or when concurrent edits would interfere. Use isolated for standalone work that needs its own empty directory.',
     'Give name as a short English kebab-case phrase. If the repository is unclear, check with read-only shell commands or ask; do not guess a root and leave the Worker to search.',
     'workdir-rejected means the plugin refused the path; choose another mode or ask the user, never work around it. Mention the working directory when delivering.',
   ].join('\n');

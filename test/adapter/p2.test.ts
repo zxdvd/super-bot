@@ -270,6 +270,72 @@ test('a displayed numbered selection applies only to its exact result and record
   }finally{await f.close();}
 });
 
+test('acceptance clarification rejects historical result candidates',async t=>{
+  const f=fixture(t);try {
+    const historical=await ownerReviewFixture(f,'previous');
+    const rework=f.store.rejectResult('make-new-version',historical.taskId,historical.expectedRowVersion,historical.resultId,'Update the document.');
+    const binding=f.store.activeBinding(rework.id)!;
+    const path=join(binding.cwd,'result.md');writeFileSync(path,'Current document');
+    await f.execution.dispatch('next-version',rework.id,rework.rowVersion);
+    await f.finish(rework.id,[path]);
+    const current=f.store.taskDetail(rework.id).result!;
+    const another=await ownerReviewFixture(f,'another');
+    await askOnOwnerTurn(f,1,10,'I want to accept one of the reports.');
+    const clarify={action:'clarify',followUp:'accept'};
+    await assert.rejects(f.call('historic-option',{...clarify,resultIds:[historical.resultId,another.resultId]}),{code:'result-stale'});
+    const choices=await f.nativeCall('current-options',{...clarify,resultIds:[current.id,another.resultId]});
+    assert.equal(choices.numberedChoices.length,2);
+  }finally{await f.close();}
+});
+
+test('numbered rework applies only to the selected current result',async t=>{
+  const f=fixture(t);try {
+    const first=await ownerReviewFixture(f,'research'),second=await ownerReviewFixture(f,'draft');
+    const request='Please add a short conclusion to the report.',reply='The draft, number two.';
+    await askOnOwnerTurn(f,1,10,request);
+    const choices=await f.nativeCall('clarify-rework',{action:'clarify',followUp:'rework',taskIds:[first.taskId,second.taskId]});
+    await showOwnerQuestion(f,1,12,choices.confirmationText);await endOwnerTurn(f,13);
+    await askOnOwnerTurn(f,2,20,reply);
+    await assert.rejects(f.call('wrong-result',{action:'rework',...second,resultId:first.resultId,choice:2}),{code:'clarification-selection'});
+    await f.nativeCall('rework-selected',{action:'rework',...second,choice:2});
+    assert.equal(f.store.pendingInput(first.taskId),null);
+    assert.equal(f.store.pendingInput(second.taskId)?.content,`${request}\n\n${reply}`);
+    assert.equal(f.store.resultById(second.resultId)?.humanAcceptedAt,null);
+  }finally{await f.close();}
+});
+
+test('chat can select which task to close while both have pending results',async t=>{
+  const f=fixture(t);try {
+    const first=await ownerReviewFixture(f,'first-to-close'),second=await ownerReviewFixture(f,'second-to-close');
+    await askOnOwnerTurn(f,1,10,'Close one of the report tasks.');
+    const options=await f.nativeCall('clarify-close',{action:'clarify',followUp:'close',taskIds:[first.taskId,second.taskId]});
+    await showOwnerQuestion(f,1,12,options.confirmationText);await endOwnerTurn(f,13);
+    const reply='The second one.';
+    await askOnOwnerTurn(f,2,20,reply);
+    const closed=await f.nativeCall('close-selected',{action:'close',taskId:second.taskId,choice:2,
+      expectedRowVersion:second.expectedRowVersion,userInstruction:reply});
+    assert.equal(closed.task.lifecycle,'cancelled');
+    assert.equal(f.store.getTask(first.taskId).lifecycle,'review');
+  }finally{await f.close();}
+});
+
+test('dispatch preparation reports when the binding was released before the Manager replied',async t=>{
+  const f=fixture(t);try {
+    const task=f.store.createTask('prepare-race',{botId:f.bot.id,goal:'Facts',scope:'Own folder',acceptance:'Read back',reviewPolicy:'human'});
+    const prepare=f.execution.prepareSession.bind(f.execution);
+    t.mock.method(f.execution,'prepareSession',async (...args:Parameters<typeof prepare>)=>{
+      const binding=await prepare(...args);
+      f.store.detachSession('panel-detach',task.id,f.store.getTask(task.id).rowVersion);
+      return binding;
+    });
+    const args={action:'dispatch',taskId:task.id,expectedRowVersion:task.rowVersion};
+    const prepared=await f.nativeCall('dispatch-prepare-race',args);
+    assert.equal(prepared.prepared,false);assert.equal(prepared.task.sessionId,null);
+    assert.equal(f.store.latestRun(task.id),null);
+    assert.deepEqual(await f.nativeCall('dispatch-prepare-race',args),prepared);
+  }finally{await f.close();}
+});
+
 test('selection fails for an unshown question or a newer task version',async t=>{
   const f=fixture(t);try {
     const first=await ownerReviewFixture(f,'first'),second=await ownerReviewFixture(f,'second');
