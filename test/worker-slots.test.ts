@@ -14,9 +14,18 @@ function makeBot(store: Store, name: string): Bot {
 
 function readyTask(store: Store, bot: Bot, name: string) {
   const task = store.createTask(`task-${name}`, {
-    botId: bot.id, goal: name, scope: 'Own synthetic files', acceptance: 'Read them back', reviewPolicy: 'human',
+    botId: bot.id,
+    goal: name,
+    scope: 'Own synthetic files',
+    acceptance: 'Read them back',
+    reviewPolicy: 'human',
   });
-  const intent = store.beginBinding(`binding-${name}`, task.id, task.rowVersion, '/synthetic/worker');
+  const intent = store.beginBinding(
+    `binding-${name}`,
+    task.id,
+    task.rowVersion,
+    '/synthetic/worker',
+  );
   const binding = store.confirmBinding(intent.id, intent.requestedSessionId);
   return { id: task.id, binding };
 }
@@ -41,7 +50,12 @@ function wait(store: Store, taskId: string) {
   assert.throws(() => reserve(store, taskId), { code: 'capacity' });
   assert.equal(store.latestRun(taskId), null);
   store.recordWait(taskId);
-  store.enqueueManager(task.botId, `capacity:${taskId}:${task.rowVersion}`, 'Synthetic queue', taskId);
+  store.enqueueManager(
+    task.botId,
+    `capacity:${taskId}:${task.rowVersion}`,
+    'Synthetic queue',
+    taskId,
+  );
 }
 
 function finish(store: Store, run: Run) {
@@ -50,18 +64,24 @@ function finish(store: Store, run: Run) {
   store.settleCancelled(run.id);
 }
 
-test('two Bots run five Workers each and release capacity for their own sixth task', t => {
+test('two Bots run five Workers each and release capacity for their own sixth task', (t) => {
   const store = new Store(':memory:');
   t.after(() => store.close());
-  const a = makeBot(store, 'A'), b = makeBot(store, 'B');
+  const a = makeBot(store, 'A'),
+    b = makeBot(store, 'B');
   assert.deepEqual(store.botCapacity(a.id), { maxRunningTasks: null, botLimit: 5, botHeld: 0 });
-  const fill = (bot: Bot) => Array.from({ length: 5 }, (_, i) => start(store, readyTask(store, bot, `${bot.name}${i + 1}`).id));
-  const [a1] = fill(a), moreA = readyTask(store, a, 'A6');
+  const fill = (bot: Bot) =>
+    Array.from({ length: 5 }, (_, i) =>
+      start(store, readyTask(store, bot, `${bot.name}${i + 1}`).id),
+    );
+  const [a1] = fill(a),
+    moreA = readyTask(store, a, 'A6');
   wait(store, moreA.id);
   assert.deepEqual(store.botCapacity(b.id), { maxRunningTasks: null, botLimit: 5, botHeld: 0 });
-  const [b1] = fill(b), moreB = readyTask(store, b, 'B6');
+  const [b1] = fill(b),
+    moreB = readyTask(store, b, 'B6');
   wait(store, moreB.id);
-  assert.equal(store.heldRuns().filter(run => run.state === 'running').length, 10);
+  assert.equal(store.heldRuns().filter((run) => run.state === 'running').length, 10);
   assert.deepEqual(store.botCapacity(a.id), { maxRunningTasks: null, botLimit: 5, botHeld: 5 });
   assert.deepEqual(store.botCapacity(b.id), { maxRunningTasks: null, botLimit: 5, botHeld: 5 });
 
@@ -75,24 +95,34 @@ test('two Bots run five Workers each and release capacity for their own sixth ta
   assert.equal(store.heldRuns().length, 10);
 });
 
-test('Bot Worker slot changes apply immediately and persist through reset and reopen', t => {
+test('Bot Worker slot changes apply immediately and persist through reset and reopen', (t) => {
   const runtime = join(process.cwd(), '.runtime');
   mkdirSync(runtime, { recursive: true });
   const dir = mkdtempSync(join(runtime, 'worker-slots-'));
   const file = join(dir, 'ledger.sqlite');
   let store = new Store(file);
-  t.after(() => { store.close(); rmSync(dir, { recursive: true }); });
-  const a = makeBot(store, 'A'), b = makeBot(store, 'B');
-  const first = readyTask(store, a, 'A1'), next = readyTask(store, a, 'A2'), third = readyTask(store, a, 'A3');
+  t.after(() => {
+    store.close();
+    rmSync(dir, { recursive: true });
+  });
+  const a = makeBot(store, 'A'),
+    b = makeBot(store, 'B');
+  const first = readyTask(store, a, 'A1'),
+    next = readyTask(store, a, 'A2'),
+    third = readyTask(store, a, 'A3');
   assert.equal(store.setBotCapacity('limit-1', a.id, null, 1).botLimit, 1);
   reserve(store, first.id);
   assert.equal(store.dispatchWait(next.id)?.scope, 'bot');
   const raised = store.setBotCapacity('limit-2', a.id, 1, 2);
   assert.equal(raised.botLimit, 2);
   assert.deepEqual(store.setBotCapacity('limit-2', a.id, 1, 2), raised);
-  assert.throws(() => store.setBotCapacity('stale-limit', a.id, 1, 3), { code: 'version-conflict' });
+  assert.throws(() => store.setBotCapacity('stale-limit', a.id, 1, 3), {
+    code: 'version-conflict',
+  });
   for (const invalid of [0, -1, 1.5]) {
-    assert.throws(() => store.setBotCapacity(`invalid-${invalid}`, a.id, 2, invalid), { code: 'invalid-input' });
+    assert.throws(() => store.setBotCapacity(`invalid-${invalid}`, a.id, 2, invalid), {
+      code: 'invalid-input',
+    });
   }
   assert.equal(store.dispatchWait(next.id), null);
   assert.equal(reserve(store, next.id).state, 'queued');
@@ -111,14 +141,23 @@ test('Bot Worker slot changes apply immediately and persist through reset and re
   assert.deepEqual(store.botCapacity(a.id), reset);
 });
 
-test('lowering A to three keeps its running Workers and leaves B at five', t => {
+test('lowering A to three keeps its running Workers and leaves B at five', (t) => {
   const store = new Store(':memory:');
   t.after(() => store.close());
-  const a = makeBot(store, 'A'), b = makeBot(store, 'B');
-  const running = Array.from({ length: 4 }, (_, i) => start(store, readyTask(store, a, `A${i + 1}`).id));
+  const a = makeBot(store, 'A'),
+    b = makeBot(store, 'B');
+  const running = Array.from({ length: 4 }, (_, i) =>
+    start(store, readyTask(store, a, `A${i + 1}`).id),
+  );
   const next = readyTask(store, a, 'A5');
-  const [b1] = Array.from({ length: 4 }, (_, i) => start(store, readyTask(store, b, `B${i + 1}`).id));
-  assert.deepEqual(store.setBotCapacity('lower', a.id, null, 3), { maxRunningTasks: 3, botLimit: 3, botHeld: 4 });
+  const [b1] = Array.from({ length: 4 }, (_, i) =>
+    start(store, readyTask(store, b, `B${i + 1}`).id),
+  );
+  assert.deepEqual(store.setBotCapacity('lower', a.id, null, 3), {
+    maxRunningTasks: 3,
+    botLimit: 3,
+    botHeld: 4,
+  });
   for (const run of running) assert.deepEqual(store.getRun(run.id), run);
   wait(store, next.id);
   assert.equal(start(store, readyTask(store, b, 'B5').id).state, 'running');
@@ -136,14 +175,17 @@ test('lowering A to three keeps its running Workers and leaves B at five', t => 
   assert.equal(store.botCapacity(a.id).botHeld, 3);
 });
 
-test('older A waiters keep their order while B dispatches independently', t => {
+test('older A waiters keep their order while B dispatches independently', (t) => {
   const store = new Store(':memory:');
   t.after(() => store.close());
-  const a = makeBot(store, 'A'), b = makeBot(store, 'B');
+  const a = makeBot(store, 'A'),
+    b = makeBot(store, 'B');
   store.setBotCapacity('limit-a', a.id, null, 1);
   const a1 = reserve(store, readyTask(store, a, 'A1').id);
   reserve(store, readyTask(store, b, 'B1').id);
-  const a2 = readyTask(store, a, 'A2'), a3 = readyTask(store, a, 'A3'), b2 = readyTask(store, b, 'B2');
+  const a2 = readyTask(store, a, 'A2'),
+    a3 = readyTask(store, a, 'A3'),
+    b2 = readyTask(store, b, 'B2');
   wait(store, a2.id);
   wait(store, a3.id);
   assert.equal(store.dispatchWait(b2.id), null);
@@ -156,20 +198,32 @@ test('older A waiters keep their order while B dispatches independently', t => {
   assert.equal(reserve(store, a2.id).state, 'queued');
 });
 
-test('recovery continuation atomically replaces its own Bot slot and only-check releases it', t => {
+test('recovery continuation atomically replaces its own Bot slot and only-check releases it', (t) => {
   const store = new Store(':memory:');
   t.after(() => store.close());
-  const a = makeBot(store, 'A'), b = makeBot(store, 'B');
-  const work = readyTask(store, a, 'interrupted'), waiting = readyTask(store, a, 'waiting');
-  const prior = reserve(store, work.id), other = reserve(store, readyTask(store, a, 'occupied-a').id);
+  const a = makeBot(store, 'A'),
+    b = makeBot(store, 'B');
+  const work = readyTask(store, a, 'interrupted'),
+    waiting = readyTask(store, a, 'waiting');
+  const prior = reserve(store, work.id),
+    other = reserve(store, readyTask(store, a, 'occupied-a').id);
   const bRun = reserve(store, readyTask(store, b, 'occupied-b').id);
   store.runRecovery(prior.id, 'Synthetic interrupted delivery');
   const current = store.getTask(work.id);
-  const args = { attentionId: `run:${prior.id}`, bindingId: work.binding.id, expectedBindingGeneration: work.binding.generation };
+  const args = {
+    attentionId: `run:${prior.id}`,
+    bindingId: work.binding.id,
+    expectedBindingGeneration: work.binding.generation,
+  };
   store.setBotCapacity('limit-a', a.id, null, 1);
-  assert.throws(() => store.continueRunRecovery('continue', work.id, current.rowVersion, args), { code: 'capacity' });
+  assert.throws(() => store.continueRunRecovery('continue', work.id, current.rowVersion, args), {
+    code: 'capacity',
+  });
   assert.deepEqual(store.getTask(work.id), current);
-  assert.deepEqual(new Set(store.heldRuns().map(run => run.id)), new Set([prior.id, other.id, bRun.id]));
+  assert.deepEqual(
+    new Set(store.heldRuns().map((run) => run.id)),
+    new Set([prior.id, other.id, bRun.id]),
+  );
   assert.equal(store.recoveryTarget(work.id, current.rowVersion, args).run?.id, prior.id);
   assert.equal(store.dispatchWait(readyTask(store, b, 'B2').id), null);
 
@@ -178,8 +232,14 @@ test('recovery continuation atomically replaces its own Bot slot and only-check 
   assert.notEqual(next.id, prior.id);
   assert.notEqual(next.inputId, prior.inputId);
   assert.equal(next.bindingId, work.binding.id);
-  assert.equal(store.continueRunRecovery('continue', work.id, current.rowVersion, args).id, next.id);
-  assert.deepEqual(new Set(store.heldRuns().map(run => run.id)), new Set([next.id, other.id, bRun.id]));
+  assert.equal(
+    store.continueRunRecovery('continue', work.id, current.rowVersion, args).id,
+    next.id,
+  );
+  assert.deepEqual(
+    new Set(store.heldRuns().map((run) => run.id)),
+    new Set([next.id, other.id, bRun.id]),
+  );
   assert.equal(store.dispatchWait(waiting.id)?.scope, 'bot');
 
   store.runRecovery(next.id, 'Synthetic lost confirmation');
@@ -187,6 +247,6 @@ test('recovery continuation atomically replaces its own Bot slot and only-check 
   const paused = store.resolveRunRecovery('only-check', work.id, problem.rowVersion);
   assert.equal(paused.controlMode, 'paused');
   assert.equal(store.latestRun(work.id)?.id, next.id);
-  assert.deepEqual(new Set(store.heldRuns().map(run => run.id)), new Set([other.id, bRun.id]));
+  assert.deepEqual(new Set(store.heldRuns().map((run) => run.id)), new Set([other.id, bRun.id]));
   assert.equal(store.dispatchWait(waiting.id), null);
 });

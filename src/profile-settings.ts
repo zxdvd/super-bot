@@ -1,13 +1,24 @@
 import { isUtf8 } from 'node:buffer';
 import { randomUUID } from 'node:crypto';
-import { closeSync, constants, fchmodSync, fstatSync, openSync, readSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
+import {
+  closeSync,
+  constants,
+  fchmodSync,
+  fstatSync,
+  openSync,
+  readSync,
+  renameSync,
+  unlinkSync,
+  writeFileSync,
+} from 'node:fs';
 import { join } from 'node:path';
 import { AppError } from './model.ts';
 
 export const FILE = 'super-bot.json';
 const SETTINGS_LIMIT = 64 * 1024;
 const LEGACY_LIMIT = 4096;
-export const STORAGE_ERROR = '无法读取或保存当前 profile 的 Super Bot 设置。请核对本机设置文件及权限。';
+export const STORAGE_ERROR =
+  '无法读取或保存当前 profile 的 Super Bot 设置。请核对本机设置文件及权限。';
 
 export type Document = Record<string, unknown>;
 
@@ -31,8 +42,14 @@ export function readDocument(path: string, legacy = false): Document | undefined
   try {
     const stat = fstatSync(fd);
     const unsafeMode = legacy ? Boolean(stat.mode & 0o077) : (stat.mode & 0o7777) !== 0o600;
-    if (!stat.isFile() || stat.size > limit || (process.getuid && stat.uid !== process.getuid())
-      || stat.nlink !== 1 || unsafeMode) throw storageError();
+    if (
+      !stat.isFile() ||
+      stat.size > limit ||
+      (process.getuid && stat.uid !== process.getuid()) ||
+      stat.nlink !== 1 ||
+      unsafeMode
+    )
+      throw storageError();
     const buffer = Buffer.alloc(limit + 1);
     let bytes = 0;
     while (bytes < buffer.length) {
@@ -64,7 +81,11 @@ export function publish(profileDir: string, document: Document): void {
     }
     renameSync(tempPath, join(profileDir, FILE));
   } catch (error) {
-    try { unlinkSync(tempPath); } catch { /* Keep the publication error. */ }
+    try {
+      unlinkSync(tempPath);
+    } catch {
+      /* Keep the publication error. */
+    }
     throw error;
   }
 }

@@ -29,7 +29,10 @@ export interface WorkStage {
   nextStep?: string;
   dispatchedRunId?: string;
   condition?: StageCondition;
-  observation?: Omit<StageObservation, 'releaseChoices'> & { at: number; releaseChoices?: ReleaseTarget[] | string[] };
+  observation?: Omit<StageObservation, 'releaseChoices'> & {
+    at: number;
+    releaseChoices?: ReleaseTarget[] | string[];
+  };
   reason?: string;
   deadlineAt?: number;
   expired?: boolean;
@@ -61,8 +64,15 @@ export const STAGE_CONDITION_SCHEMA = {
   type: 'object',
   properties: {
     kind: { type: 'string', enum: ['gitlab-merge', 'gitlab-pipeline'] },
-    sourceOrigin: { type: 'string', description: 'Exact HTTPS origin of the known GitLab source, compared with the host configuration.' },
-    project: { type: 'string', description: 'Exact GitLab namespace/project or numeric Project ID.' },
+    sourceOrigin: {
+      type: 'string',
+      description:
+        'Exact HTTPS origin of the known GitLab source, compared with the host configuration.',
+    },
+    project: {
+      type: 'string',
+      description: 'Exact GitLab namespace/project or numeric Project ID.',
+    },
     number: { type: 'integer', minimum: 1, description: 'Merge request IID or exact pipeline ID.' },
   },
   required: ['kind', 'sourceOrigin', 'project', 'number'],
@@ -72,26 +82,42 @@ export const STAGE_CONDITION_SCHEMA = {
 export function readStageCondition(value: unknown): StageCondition | undefined {
   if (value === undefined) return undefined;
   const raw = value as Partial<StageCondition> | null;
-  if (typeof value !== 'object' || !raw || Array.isArray(raw) ||
-    Object.keys(raw).some(key => !['kind', 'sourceOrigin', 'project', 'number'].includes(key)) ||
+  if (
+    typeof value !== 'object' ||
+    !raw ||
+    Array.isArray(raw) ||
+    Object.keys(raw).some((key) => !['kind', 'sourceOrigin', 'project', 'number'].includes(key)) ||
     (raw.kind !== 'gitlab-merge' && raw.kind !== 'gitlab-pipeline') ||
-    typeof raw.number !== 'number' || !Number.isSafeInteger(raw.number) || raw.number < 1) {
+    typeof raw.number !== 'number' ||
+    !Number.isSafeInteger(raw.number) ||
+    raw.number < 1
+  ) {
     throw new AppError('stage-condition', '请指定 GitLab 项目和确切的合并请求 IID 或流水线 ID。');
   }
   const project = requiredText(raw.project, 'GitLab 项目', 256);
   if (!/^(?:[1-9]\d*|(?:[\w-][\w.-]*\/)+[\w-][\w.-]*)$/u.test(project)) {
     throw new AppError('stage-condition', '请填写 GitLab 项目路径或项目数字 ID。');
   }
-  const sourceOrigin = gitLabObservationOrigin(typeof raw.sourceOrigin === 'string' ? raw.sourceOrigin : undefined);
-  if (!sourceOrigin) throw new AppError('stage-condition', '请填写对象所在 GitLab 实例的明确 HTTPS 来源。');
+  const sourceOrigin = gitLabObservationOrigin(
+    typeof raw.sourceOrigin === 'string' ? raw.sourceOrigin : undefined,
+  );
+  if (!sourceOrigin)
+    throw new AppError('stage-condition', '请填写对象所在 GitLab 实例的明确 HTTPS 来源。');
   return { kind: raw.kind, sourceOrigin, project, number: raw.number };
 }
 
 export function gitLabObservationOrigin(value?: string): string | null {
   try {
     const url = new URL(value ?? '');
-    if (url.protocol === 'https:' && !url.username && !url.password &&
-      url.pathname === '/' && !url.search && !url.hash) return url.origin;
+    if (
+      url.protocol === 'https:' &&
+      !url.username &&
+      !url.password &&
+      url.pathname === '/' &&
+      !url.search &&
+      !url.hash
+    )
+      return url.origin;
   } catch {
     // Treat an invalid host configuration as unavailable.
   }

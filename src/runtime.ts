@@ -1,33 +1,52 @@
 /** DSH role configuration; native full access is the default; files isolation is explicit opt-in. */
-import type {Context} from '@deepseek-ai/cordis';
-import type {Agent,ModelSelection} from '@deepseek-ai/dsh-agent';
+import type { Context } from '@deepseek-ai/cordis';
+import type { Agent, ModelSelection } from '@deepseek-ai/dsh-agent';
 import type {} from '@deepseek-ai/dsh-permission-presets';
 import type {} from '@deepseek-ai/dsh-session-projection';
-import type {WorkdirConfig} from './workdir.ts';
+import type { WorkdirConfig } from './workdir.ts';
 
 export interface RuntimeOptions extends WorkdirConfig {
-  fullAccess?:boolean;
-  managerModel?:ModelSelection;
-  workerModel?:ModelSelection;
-  gitLabObserverOrigin?:string;
+  fullAccess?: boolean;
+  managerModel?: ModelSelection;
+  workerModel?: ModelSelection;
+  gitLabObserverOrigin?: string;
   /** Automatic Bot wakes per Bot per rolling hour (default 20). */
-  managerWakesPerHour?:number;
+  managerWakesPerHour?: number;
   /** Bots woken at the same time (default 2). */
-  managerConcurrentWakes?:number;
+  managerConcurrentWakes?: number;
   /** Hard limit for one automatic Bot turn, in minutes (default 5). */
-  managerTurnMinutes?:number;
+  managerTurnMinutes?: number;
 }
-const positive=(value:unknown,fallback:number)=>typeof value==='number'&&Number.isInteger(value)&&value>0?value:fallback;
-export function runtimeLimits(options:RuntimeOptions) {
-  return {managerWakesPerHour:positive(options.managerWakesPerHour,20),managerConcurrentWakes:positive(options.managerConcurrentWakes,2),managerTurnMinutes:positive(options.managerTurnMinutes,5)};
+const positive = (value: unknown, fallback: number) =>
+  typeof value === 'number' && Number.isInteger(value) && value > 0 ? value : fallback;
+export function runtimeLimits(options: RuntimeOptions) {
+  return {
+    managerWakesPerHour: positive(options.managerWakesPerHour, 20),
+    managerConcurrentWakes: positive(options.managerConcurrentWakes, 2),
+    managerTurnMinutes: positive(options.managerTurnMinutes, 5),
+  };
 }
-export function fullAccessEnabled(options:RuntimeOptions):boolean { return options.fullAccess!==false; }
+export function fullAccessEnabled(options: RuntimeOptions): boolean {
+  return options.fullAccess !== false;
+}
 
-export function configureRole(ctx:Context,agent:Agent,role:'manager'|'worker',options:RuntimeOptions,keepPermissions=false):void {
-  const model=role==='manager'?options.managerModel:options.workerModel;
+export function configureRole(
+  ctx: Context,
+  agent: Agent,
+  role: 'manager' | 'worker',
+  options: RuntimeOptions,
+  keepPermissions = false,
+): void {
+  const model = role === 'manager' ? options.managerModel : options.workerModel;
   // A missing projection cannot establish that the session has no recorded selection.
-  if(model&&(role==='worker'||ctx.sessionProjections.snapshot(agent.session,['modelSelection']).values.modelSelection?.next===null)) {
+  if (
+    model &&
+    (role === 'worker' ||
+      ctx.sessionProjections.snapshot(agent.session, ['modelSelection']).values.modelSelection
+        ?.next === null)
+  ) {
     agent.model.select(model);
   }
-  if(fullAccessEnabled(options)&&!keepPermissions)ctx.permissionPresets.set(agent.session,'danger-full-access');
+  if (fullAccessEnabled(options) && !keepPermissions)
+    ctx.permissionPresets.set(agent.session, 'danger-full-access');
 }

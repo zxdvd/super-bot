@@ -3,7 +3,13 @@ import type { ISidebarRight } from '@deepseek-ai/dsh-client-ui-sidebar-right/cli
 import type { Bot, ManagerBinding, Task } from '../model.ts';
 import { managedSessionId, type SessionOrigin } from '../mirror.ts';
 import type { WorkspaceApi } from './Workspace.tsx';
-import { parseResultFileLink, parseWorkLink, RESULT_FILE_PATH, workUrl, type WorkLink } from '../work-links.ts';
+import {
+  parseResultFileLink,
+  parseWorkLink,
+  RESULT_FILE_PATH,
+  workUrl,
+  type WorkLink,
+} from '../work-links.ts';
 import type { Detail } from './work/types.ts';
 
 export const WORK_TAB = 'super-bot-work';
@@ -20,27 +26,38 @@ function isDesktopDocument(url: URL): boolean {
 }
 
 export function sameWorkHost(url: URL, current: URL): boolean {
-  return isDesktopDocument(current) ? isDesktopDocument(url)
-    : (current.protocol === 'http:' || current.protocol === 'https:') && url.origin === current.origin;
+  return isDesktopDocument(current)
+    ? isDesktopDocument(url)
+    : (current.protocol === 'http:' || current.protocol === 'https:') &&
+        url.origin === current.origin;
 }
 
 export function workLinkForUrl(url: URL, current: URL): WorkLink | undefined {
-  if (sameWorkHost(url, current) && url.pathname === '/' && !url.searchParams.has('resultId') && !url.searchParams.has('attentionId')) {
+  if (
+    sameWorkHost(url, current) &&
+    url.pathname === '/' &&
+    !url.searchParams.has('resultId') &&
+    !url.searchParams.has('attentionId')
+  ) {
     return parseWorkLink(url.hash);
   }
 }
 
-type ChatDeliveryLink = Extract<WorkLink, { kind: 'result' }>
+type ChatDeliveryLink =
+  | Extract<WorkLink, { kind: 'result' }>
   | ({ kind: 'file' } & NonNullable<ReturnType<typeof parseResultFileLink>>);
 
 /** Only the exact delivery namespace is reserved in native chat. Arbitrary HTTP links keep DSH's handler. */
 export function chatDeliveryLink(url: URL, current: URL): ChatDeliveryLink | 'blocked' | undefined {
   const isFile = url.pathname === RESULT_FILE_PATH;
   const hash = new URLSearchParams(url.hash.slice(1));
-  if (!isFile && !(url.pathname === '/' && hash.has('super-bot-task') && hash.has('resultId'))) return;
-  const loopback = (value: URL) => value.protocol === 'http:' && value.hostname === '127.0.0.1' && !!value.port;
+  if (!isFile && !(url.pathname === '/' && hash.has('super-bot-task') && hash.has('resultId')))
+    return;
+  const loopback = (value: URL) =>
+    value.protocol === 'http:' && value.hostname === '127.0.0.1' && !!value.port;
   const localCarrier = loopback(url) && (isDesktopDocument(current) || loopback(current));
-  if (url.username || url.password || (!sameWorkHost(url, current) && !localCarrier)) return 'blocked';
+  if (url.username || url.password || (!sameWorkHost(url, current) && !localCarrier))
+    return 'blocked';
   if (isFile) {
     const file = parseResultFileLink(url);
     return file ? { kind: 'file', ...file } : 'blocked';
@@ -50,14 +67,18 @@ export function chatDeliveryLink(url: URL, current: URL): ChatDeliveryLink | 'bl
 }
 
 export async function openWorkLink(
-  api: WorkspaceApi, sidebar: Pick<Context['sidebarRight'], 'mounted' | 'active' | 'openTab' | 'tabsIn'>, link: WorkLink,
-  signal: AbortSignal, chatOnly = false,
+  api: WorkspaceApi,
+  sidebar: Pick<Context['sidebarRight'], 'mounted' | 'active' | 'openTab' | 'tabsIn'>,
+  link: WorkLink,
+  signal: AbortSignal,
+  chatOnly = false,
 ): Promise<'sidebar' | 'work' | undefined> {
   if (signal.aborted) return;
   const fallback = chatOnly ? undefined : 'work';
   const sessionId = sidebar.mounted.getSnapshot();
   if (!sessionId || link.kind === 'task') return fallback;
-  const navigation = api.beginNavigation(), request = new AbortController();
+  const navigation = api.beginNavigation(),
+    request = new AbortController();
   const unsubscribe = sidebar.mounted.subscribe(() => request.abort());
   const current = AbortSignal.any([signal, navigation, request.signal]);
   try {
@@ -65,12 +86,25 @@ export async function openWorkLink(
     if (current.aborted || bot === undefined) return;
     if (!bot) return fallback;
     if (chatOnly && link.kind === 'result') {
-      const detail = await api.call<Detail>('task.detail', { id: link.taskId, resultId: link.resultId, sessionId }, current);
-      if (current.aborted || detail.task.id !== link.taskId || detail.task.botId !== bot.id
-        || detail.linkedResult?.id !== link.resultId || detail.linkedResult.taskId !== link.taskId) return;
+      const detail = await api.call<Detail>(
+        'task.detail',
+        { id: link.taskId, resultId: link.resultId, sessionId },
+        current,
+      );
+      if (
+        current.aborted ||
+        detail.task.id !== link.taskId ||
+        detail.task.botId !== bot.id ||
+        detail.linkedResult?.id !== link.resultId ||
+        detail.linkedResult.taskId !== link.taskId
+      )
+        return;
     }
     const active = sidebar.active();
-    const existing = active?.kind === WORK_TAB ? active : sidebar.tabsIn(sessionId).find(tab => tab.kind === WORK_TAB);
+    const existing =
+      active?.kind === WORK_TAB
+        ? active
+        : sidebar.tabsIn(sessionId).find((tab) => tab.kind === WORK_TAB);
     sidebar.openTab(WORK_TAB, {
       params: { sessionId, botId: bot.id, href: workUrl(link) },
       ...(existing ? { replaceTab: existing.id } : {}),
@@ -78,12 +112,17 @@ export async function openWorkLink(
     return 'sidebar';
   } catch {
     if (!current.aborted && sidebar.mounted.getSnapshot() === sessionId) return fallback;
-  } finally { unsubscribe(); }
+  } finally {
+    unsubscribe();
+  }
 }
 
 /** No remembered Bot participates in this lookup. Undefined means a superseded read. */
 export async function readSessionBot(
-  api: WorkspaceApi, sessionId: string, signal: AbortSignal, currentSession: () => string | undefined,
+  api: WorkspaceApi,
+  sessionId: string,
+  signal: AbortSignal,
+  currentSession: () => string | undefined,
 ): Promise<Bot | null | undefined> {
   try {
     const bot = await api.call<Bot | null>('bot.for-session', { sessionId }, signal);
@@ -102,7 +141,10 @@ export interface SessionSource {
 export type SessionBotState = { bot: Bot | null; error?: string };
 
 export function watchSessionOrigin(
-  api: WorkspaceApi, sessionId: string, source: SessionSource, receive: (origin: SessionOrigin | undefined) => void,
+  api: WorkspaceApi,
+  sessionId: string,
+  source: SessionSource,
+  receive: (origin: SessionOrigin | undefined) => void,
 ): () => void {
   let controller: AbortController | undefined;
   const changed = () => {
@@ -111,19 +153,36 @@ export function watchSessionOrigin(
     if (source.getSnapshot() !== sessionId || !managedSessionId.test(sessionId)) return;
     controller = new AbortController();
     const { signal } = controller;
-    void api.call<SessionOrigin | null>('session.origin', { sessionId }, signal).then(origin => {
-      if (!signal.aborted && source.getSnapshot() === sessionId && origin
-        && (origin.owner === 'web' || origin.owner === 'desktop') && typeof origin.local === 'boolean') receive(origin);
-    }).catch(() => { /* No hint until the origin is known. */ });
+    void api
+      .call<SessionOrigin | null>('session.origin', { sessionId }, signal)
+      .then((origin) => {
+        if (
+          !signal.aborted &&
+          source.getSnapshot() === sessionId &&
+          origin &&
+          (origin.owner === 'web' || origin.owner === 'desktop') &&
+          typeof origin.local === 'boolean'
+        )
+          receive(origin);
+      })
+      .catch(() => {
+        /* No hint until the origin is known. */
+      });
   };
   const unsubscribe = source.subscribe(changed);
   changed();
-  return () => { controller?.abort(); unsubscribe(); };
+  return () => {
+    controller?.abort();
+    unsubscribe();
+  };
 }
 
 /** UI-only refresh; native selection changes invalidate reads synchronously, including A → B → A. */
 export function watchSessionBot(
-  api: WorkspaceApi, sessionId: string, source: SessionSource, receive: (state: SessionBotState | undefined) => void,
+  api: WorkspaceApi,
+  sessionId: string,
+  source: SessionSource,
+  receive: (state: SessionBotState | undefined) => void,
 ): () => void {
   let controller = new AbortController();
   let timer: ReturnType<typeof setTimeout>;
@@ -132,33 +191,59 @@ export function watchSessionBot(
       const bot = await readSessionBot(api, sessionId, signal, () => source.getSnapshot());
       if (!signal.aborted && bot !== undefined) receive({ bot });
     } catch (error) {
-      if (!signal.aborted) receive({ bot: null, error: error instanceof Error ? error.message : '暂时无法读取会话归属。' });
+      if (!signal.aborted)
+        receive({
+          bot: null,
+          error: error instanceof Error ? error.message : '暂时无法读取会话归属。',
+        });
     }
     if (!signal.aborted) timer = setTimeout(() => void pull(signal), 5000);
   }
   const changed = () => {
-    controller.abort(); clearTimeout(timer); controller = new AbortController(); receive(undefined);
+    controller.abort();
+    clearTimeout(timer);
+    controller = new AbortController();
+    receive(undefined);
     if (source.getSnapshot() === sessionId) void pull(controller.signal);
   };
   const unsubscribe = source.subscribe(changed);
   changed();
-  return () => { unsubscribe(); controller.abort(); clearTimeout(timer); };
+  return () => {
+    unsubscribe();
+    controller.abort();
+    clearTimeout(timer);
+  };
 }
 
 /** Preparing a conversation may commit after navigation; opening it must not. */
-export async function openBotConversation(api: WorkspaceApi, botId: string, navigation: AbortSignal): Promise<void> {
+export async function openBotConversation(
+  api: WorkspaceApi,
+  botId: string,
+  navigation: AbortSignal,
+): Promise<void> {
   if (navigation.aborted) return;
   let binding: ManagerBinding;
-  try { binding = await api.call<ManagerBinding>('manager.prepare', { botId, requestId: crypto.randomUUID() }); }
-  catch (error) { if (navigation.aborted) return; throw error; }
+  try {
+    binding = await api.call<ManagerBinding>('manager.prepare', {
+      botId,
+      requestId: crypto.randomUUID(),
+    });
+  } catch (error) {
+    if (navigation.aborted) return;
+    throw error;
+  }
   if (navigation.aborted) return;
-  if (binding.botId !== botId || binding.state !== 'ready' || !binding.sessionId) throw new Error('对话尚未准备好，请在“工作”的设置（⋯）中查看状态。');
+  if (binding.botId !== botId || binding.state !== 'ready' || !binding.sessionId)
+    throw new Error('对话尚未准备好，请在“工作”的设置（⋯）中查看状态。');
   api.openSession(binding.sessionId);
 }
 
 /** A delivery link resolves its real task owner, but cannot outlive navigation away. */
 export async function readTaskLink(
-  api: WorkspaceApi, taskId: string, signal: AbortSignal, navigation: AbortSignal,
+  api: WorkspaceApi,
+  taskId: string,
+  signal: AbortSignal,
+  navigation: AbortSignal,
 ): Promise<Task | undefined> {
   try {
     const { task } = await api.call<{ task: Task }>('task.detail', { id: taskId }, signal);
@@ -171,7 +256,10 @@ export async function readTaskLink(
 }
 
 /** The native controller targets its on-screen Session, not the caller's old closure. */
-export function toggleSessionWork(sessionId: string, sidebar: Pick<ISidebarRight,'mounted'|'active'|'isExpanded'|'hide'|'openTab'>): void {
+export function toggleSessionWork(
+  sessionId: string,
+  sidebar: Pick<ISidebarRight, 'mounted' | 'active' | 'isExpanded' | 'hide' | 'openTab'>,
+): void {
   if (sidebar.mounted.getSnapshot() !== sessionId) return;
   const active = sidebar.active();
   if (active?.kind === WORK_TAB && sidebar.isExpanded()) sidebar.hide(active.id);

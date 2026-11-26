@@ -1,16 +1,29 @@
 import { AppError, type DeliveryLinks } from './model.ts';
 
 export function deliveryArtifactUrl(value: unknown): string | undefined {
-  if (typeof value !== 'string' || !/^https?:\/\/[^/?#@]+(?:[/?#]|$)/i.test(value) || /[\s\\\u0000-\u001f\u007f]/u.test(value)) return;
+  if (
+    typeof value !== 'string' ||
+    !/^https?:\/\/[^/?#@]+(?:[/?#]|$)/i.test(value) ||
+    /[\s\\\u0000-\u001f\u007f]/u.test(value)
+  )
+    return;
   try {
     const url = new URL(value);
     if (url.hostname && !url.username && !url.password) return value;
-  } catch { /* A malformed address has no external action. */ }
+  } catch {
+    /* A malformed address has no external action. */
+  }
 }
 
 export function readDeliveryLinks(value: unknown, allowDeletion: false): DeliveryLinks;
-export function readDeliveryLinks(value: unknown, allowDeletion: true): Record<string, string | null>;
-export function readDeliveryLinks(value: unknown, allowDeletion: boolean): Record<string, string | null> {
+export function readDeliveryLinks(
+  value: unknown,
+  allowDeletion: true,
+): Record<string, string | null>;
+export function readDeliveryLinks(
+  value: unknown,
+  allowDeletion: boolean,
+): Record<string, string | null> {
   if (!value || typeof value !== 'object' || Array.isArray(value)) {
     throw new AppError('invalid-delivery-links', '交付物需要提供显示名与链接的映射。');
   }
@@ -20,7 +33,10 @@ export function readDeliveryLinks(value: unknown, allowDeletion: boolean): Recor
     if (!name.trim()) throw new AppError('invalid-delivery-links', '交付物显示名不能为空。');
     const url = allowDeletion && map[name] === null ? null : deliveryArtifactUrl(map[name]);
     if (url === undefined) {
-      throw new AppError('invalid-delivery-links', '交付物链接需要使用不含凭据的完整 HTTP(S) 地址。');
+      throw new AppError(
+        'invalid-delivery-links',
+        '交付物链接需要使用不含凭据的完整 HTTP(S) 地址。',
+      );
     }
     entries.set(name, url);
   }
@@ -28,13 +44,20 @@ export function readDeliveryLinks(value: unknown, allowDeletion: boolean): Recor
 }
 
 export function readPrimaryDeliveryLink(links: DeliveryLinks, name: unknown): string {
-  if (typeof name !== 'string' || !Object.hasOwn(links, name) || !deliveryArtifactUrl(links[name])) {
+  if (
+    typeof name !== 'string' ||
+    !Object.hasOwn(links, name) ||
+    !deliveryArtifactUrl(links[name])
+  ) {
     throw new AppError('invalid-primary-link', '首要入口必须选择已登记的交付物显示名。');
   }
   return name;
 }
 
-export function orderedDeliveryLinks(links: DeliveryLinks, primaryLink?: string): [string, string][] {
+export function orderedDeliveryLinks(
+  links: DeliveryLinks,
+  primaryLink?: string,
+): [string, string][] {
   const entries = Object.entries(links);
   if (primaryLink === undefined || !Object.hasOwn(links, primaryLink)) return entries;
   return [[primaryLink, links[primaryLink]!], ...entries.filter(([name]) => name !== primaryLink)];

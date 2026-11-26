@@ -50,8 +50,10 @@
     "build": "node scripts/build.mjs",
     "typecheck": "tsc --noEmit",
     "test": "node --import tsx --test test/*.test.ts",
-    "lint:lines": "node scripts/lint-lines.mjs",
-    "check": "npm run lint:lines && npm run typecheck && npm test && npm run test:adapter && npm run build",
+    "format": "biome format --write src test scripts",
+    "format:check": "biome format src test scripts",
+    "lint": "biome lint --error-on-warnings src test scripts && node scripts/lint-boundaries.mjs",
+    "check": "npm run format:check && npm run lint && npm run typecheck && npm test && npm run test:adapter && npm run build",
     "probe:build": "node scripts/build-probe.mjs",
     "probe:run": "node scripts/probe.mjs",
     "smoke:execution": "node scripts/smoke-execution.mjs",
@@ -73,6 +75,7 @@
     "yaml": "2.9.1"
   },
   "devDependencies": {
+    "@biomejs/biome": "2.6.9",
     "@deepseek-ai/cordis": "4.1.0",
     "@deepseek-ai/dsh": "0.2.2-rc.1",
     "@deepseek-ai/dsh-agent": "0.2.2-rc.1",

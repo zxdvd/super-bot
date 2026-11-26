@@ -6,15 +6,24 @@ import { pathToFileURL } from 'node:url';
 import { hostClient } from './host-client.mjs';
 
 const log = process.argv[2];
-const { SUPER_BOT_TEST_PLAYWRIGHT: playwright, SUPER_BOT_TEST_BROWSER: executablePath } = process.env;
-assert.ok(log && playwright && executablePath, 'Pass a fresh isolated host log and the Playwright/browser paths.');
+const { SUPER_BOT_TEST_PLAYWRIGHT: playwright, SUPER_BOT_TEST_BROWSER: executablePath } =
+  process.env;
+assert.ok(
+  log && playwright && executablePath,
+  'Pass a fresh isolated host log and the Playwright/browser paths.',
+);
 const host = await hostClient(log);
-const url = (await readFile(log, 'utf8')).match(/dsh web: (http:\/\/127\.0\.0\.1:\d+\/\?token=\S+)/)?.[1];
+const url = (await readFile(log, 'utf8')).match(
+  /dsh web: (http:\/\/127\.0\.0\.1:\d+\/\?token=\S+)/,
+)?.[1];
 assert.ok(url && new URL(url).origin === host.base, 'Use the isolated host launch link.');
 
 async function call(action, payload = {}) {
   const response = await host.post('/api/super-bot', {
-    type: 'client-request', rpcId: randomUUID(), method: 'super-bot', payload: { action, ...payload },
+    type: 'client-request',
+    rpcId: randomUUID(),
+    method: 'super-bot',
+    payload: { action, ...payload },
   });
   assert.equal(response.status, 200, action);
   const { result } = await response.json();
@@ -24,15 +33,21 @@ async function call(action, payload = {}) {
 assert.deepEqual(await call('bot.list'), [], 'Start with a fresh isolated ledger.');
 
 const { chromium } = await import(pathToFileURL(playwright).href);
-const browser = await chromium.launch({ executablePath, args: ['--disable-background-networking'] });
+const browser = await chromium.launch({
+  executablePath,
+  args: ['--disable-background-networking'],
+});
 try {
   const context = await browser.newContext({ viewport: { width: 1280, height: 900 } });
-  await context.route('**/*', route => new URL(route.request().url()).origin === host.base ? route.continue() : route.abort());
+  await context.route('**/*', (route) =>
+    new URL(route.request().url()).origin === host.base ? route.continue() : route.abort(),
+  );
   const page = await context.newPage();
   page.setDefaultTimeout(15000);
-  const button = name => page.getByRole('button', { name, exact: true });
-  const heading = name => page.getByRole('heading', { name, exact: true });
-  const botRow = name => page.locator('.bot-row').filter({ has: page.getByText(name, { exact: true }) });
+  const button = (name) => page.getByRole('button', { name, exact: true });
+  const heading = (name) => page.getByRole('heading', { name, exact: true });
+  const botRow = (name) =>
+    page.locator('.bot-row').filter({ has: page.getByText(name, { exact: true }) });
   const home = async () => {
     await button('Super Bot').click();
     await heading('你想一起做点什么？').waitFor();
@@ -47,11 +62,14 @@ try {
   };
 
   await page.goto(url, { waitUntil: 'domcontentloaded' });
-  await button('Continue').click({ timeout: 1500 }).catch(() => {});
+  await button('Continue')
+    .click({ timeout: 1500 })
+    .catch(() => {});
   await home();
   await heading('创建你的第一个 Bot').waitFor();
   assert.equal(await button('删除 Bot').count(), 0);
-  const name = '合成删除样例', otherName = '合成保留样例';
+  const name = '合成删除样例',
+    otherName = '合成保留样例';
   await page.getByLabel('给它起个名字').fill(name);
   await button('创建并聊天').click();
   await chatSettings();
@@ -68,7 +86,11 @@ try {
   assert.equal((await call('bot.for-session', { sessionId: bot.managerSessionId })).id, bot.id);
   await button('← 返回聊天').click();
 
-  const other = await call('bot.create', { requestId: randomUUID(), name: otherName, instructions: '仅用于隔离测试' });
+  const other = await call('bot.create', {
+    requestId: randomUUID(),
+    name: otherName,
+    instructions: '仅用于隔离测试',
+  });
   await home();
   await botRow(name).getByRole('button', { name: '工作', exact: true }).click();
   await settings();
@@ -83,7 +105,12 @@ try {
   await chatSettings();
   await button('删除 Bot').click();
   const task = await call('task.create', {
-    requestId: randomUUID(), botId: bot.id, goal: '合成未结束任务', scope: '仅测试', acceptance: '手动确认', startPaused: true,
+    requestId: randomUUID(),
+    botId: bot.id,
+    goal: '合成未结束任务',
+    scope: '仅测试',
+    acceptance: '手动确认',
+    startPaused: true,
     reviewPolicy: 'human',
   });
   await button('确认删除 Bot').click();
@@ -96,7 +123,10 @@ try {
   await button('确认强制删除 Bot').click();
   await heading('你想一起做点什么？').waitFor();
   await botRow(otherName).waitFor();
-  assert.deepEqual((await call('bot.list')).map(bot => bot.id), [other.id]);
+  assert.deepEqual(
+    (await call('bot.list')).map((bot) => bot.id),
+    [other.id],
+  );
   assert.equal(await call('bot.for-session', { sessionId: bot.managerSessionId }), null);
   assert.equal((await call('task.detail', { id: task.id })).task.lifecycle, 'cancelled');
 
@@ -106,7 +136,9 @@ try {
   await button('确认删除 Bot').click();
   await heading('创建你的第一个 Bot').waitFor();
   assert.deepEqual(await call('bot.list'), []);
-  console.log('PASS DSH Web delete confirmation, cancel, polling, Bot switch, late blocker, force, surviving Bot, and empty home');
+  console.log(
+    'PASS DSH Web delete confirmation, cancel, polling, Bot switch, late blocker, force, surviving Bot, and empty home',
+  );
 } finally {
   await browser.close();
 }

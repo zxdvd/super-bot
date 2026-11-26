@@ -2,29 +2,52 @@
 import { readFile } from 'node:fs/promises';
 import assert from 'node:assert/strict';
 import { setTimeout as delay } from 'node:timers/promises';
-export async function hostClient(logPath='.runtime/host.log') {
+export async function hostClient(logPath = '.runtime/host.log') {
   let match;
-  for(let n=0;n<100;n++) {
-    let log='';try{log=await readFile(logPath,'utf8');}catch(error){if(error.code!=='ENOENT')throw error;}
-    match=log.match(/dsh web: (http:\/\/127\.0\.0\.1:\d+\/\?token=\S+)/);if(match)break;await delay(100);
+  for (let n = 0; n < 100; n++) {
+    let log = '';
+    try {
+      log = await readFile(logPath, 'utf8');
+    } catch (error) {
+      if (error.code !== 'ENOENT') throw error;
+    }
+    match = log.match(/dsh web: (http:\/\/127\.0\.0\.1:\d+\/\?token=\S+)/);
+    if (match) break;
+    await delay(100);
   }
-  assert.ok(match,'dedicated host has not announced a URL');
+  assert.ok(match, 'dedicated host has not announced a URL');
   return authenticateHost(match[1]);
 }
 
 export async function authenticateHost(launchUrl) {
-  const base=new URL(launchUrl).origin;const cookies=new Map();let url=launchUrl;
-  for(let n=0;n<5;n++) {
-    const response=await fetch(url,{redirect:'manual',headers:{cookie:[...cookies].map(([k,v])=>`${k}=${v}`).join('; ')}});
-    for(const cookie of response.headers.getSetCookie()) {const [pair]=cookie.split(';');const i=pair.indexOf('=');cookies.set(pair.slice(0,i),pair.slice(i+1));}
-    const location=response.headers.get('location');if(!location)break;url=new URL(location,url).href;
-    assert.equal(new URL(url).origin,base,'authentication stays on dedicated host');
+  const base = new URL(launchUrl).origin;
+  const cookies = new Map();
+  let url = launchUrl;
+  for (let n = 0; n < 5; n++) {
+    const response = await fetch(url, {
+      redirect: 'manual',
+      headers: { cookie: [...cookies].map(([k, v]) => `${k}=${v}`).join('; ') },
+    });
+    for (const cookie of response.headers.getSetCookie()) {
+      const [pair] = cookie.split(';');
+      const i = pair.indexOf('=');
+      cookies.set(pair.slice(0, i), pair.slice(i + 1));
+    }
+    const location = response.headers.get('location');
+    if (!location) break;
+    url = new URL(location, url).href;
+    assert.equal(new URL(url).origin, base, 'authentication stays on dedicated host');
   }
   const cookie = [...cookies].map(([key, value]) => `${key}=${value}`).join('; ');
-  return { base, get: path => fetch(base + path, { redirect: 'manual', headers: { cookie } }),
-    post: (path, body = {}, headers = {}) => fetch(base + path, {
-      method: 'POST', redirect: 'manual', headers: { cookie, origin: base, 'content-type': 'application/json', ...headers },
-      body: JSON.stringify(body),
-    }),
+  return {
+    base,
+    get: (path) => fetch(base + path, { redirect: 'manual', headers: { cookie } }),
+    post: (path, body = {}, headers = {}) =>
+      fetch(base + path, {
+        method: 'POST',
+        redirect: 'manual',
+        headers: { cookie, origin: base, 'content-type': 'application/json', ...headers },
+        body: JSON.stringify(body),
+      }),
   };
 }

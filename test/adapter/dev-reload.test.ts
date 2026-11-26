@@ -2,13 +2,28 @@ import assert from 'node:assert/strict';
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { spawn } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
-import { existsSync, copyFileSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, watch, writeFileSync } from 'node:fs';
+import {
+  existsSync,
+  copyFileSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  realpathSync,
+  rmSync,
+  symlinkSync,
+  watch,
+  writeFileSync,
+} from 'node:fs';
 import { join } from 'node:path';
 import { test, type TestContext } from 'node:test';
 import { setTimeout as delay } from 'node:timers/promises';
 import type { Context } from '@deepseek-ai/cordis';
 import { startReloadHost, type ReloadHmr } from '../../src/dev-reload-host.ts';
-import { reloadArtifacts, reloadDirectory, type ReloadEndpoint } from '../../src/dev-reload-paths.ts';
+import {
+  reloadArtifacts,
+  reloadDirectory,
+  type ReloadEndpoint,
+} from '../../src/dev-reload-paths.ts';
 import { ReloadAdmission } from '../../src/reload-admission.ts';
 import { DshExecution } from '../../src/dsh.ts';
 import { Managers } from '../../src/manager.ts';
@@ -43,7 +58,9 @@ function fixture(t: TestContext) {
   for (const file of reloadArtifacts) writeFileSync(join(lib, file), 'outgoing build');
   const hold = join(root, 'hold');
   const releaseBuild = join(root, 'release-build');
-  writeFileSync(join(root, 'scripts/build.mjs'), `
+  writeFileSync(
+    join(root, 'scripts/build.mjs'),
+    `
     import { existsSync, writeFileSync } from 'node:fs';
     import { setTimeout } from 'node:timers/promises';
     import { join } from 'node:path';
@@ -54,7 +71,8 @@ function fixture(t: TestContext) {
       const data = file.endsWith('.map') ? JSON.stringify({ sources: ['../src/change.ts'], sourcesContent: ['verified source'] }) : id;
       writeFileSync(join(process.env.SUPER_BOT_BUILD_OUTDIR, file), data);
     }
-  `);
+  `,
+  );
   const hosts: NonNullable<ReturnType<typeof startReloadHost>>[] = [];
   t.after(() => {
     for (const host of hosts) host.close();
@@ -64,22 +82,46 @@ function fixture(t: TestContext) {
   });
   function start(args: string[] = [], selectedProfile = name) {
     const child = spawn(process.execPath, [join(root, 'scripts/dev-reload.mjs'), ...args], {
-      cwd: root, env: { ...process.env, DSH_HOME: home, SUPER_BOT_PROFILE: selectedProfile },
-      stdio: ['ignore', 'pipe', 'pipe'], timeout: 15_000,
+      cwd: root,
+      env: { ...process.env, DSH_HOME: home, SUPER_BOT_PROFILE: selectedProfile },
+      stdio: ['ignore', 'pipe', 'pipe'],
+      timeout: 15_000,
     });
-    let stdout = '', stderr = '';
-    child.stdout.on('data', chunk => { stdout += chunk; });
-    child.stderr.on('data', chunk => { stderr += chunk; });
-    const result = new Promise<{ code: number|null; stdout: string; stderr: string }>((done, fail) => {
-      child.once('error', fail);
-      child.once('close', code => done({ code, stdout, stderr }));
+    let stdout = '',
+      stderr = '';
+    child.stdout.on('data', (chunk) => {
+      stdout += chunk;
     });
+    child.stderr.on('data', (chunk) => {
+      stderr += chunk;
+    });
+    const result = new Promise<{ code: number | null; stdout: string; stderr: string }>(
+      (done, fail) => {
+        child.once('error', fail);
+        child.once('close', (code) => done({ code, stdout, stderr }));
+      },
+    );
     return { result, child, stdout: () => stdout };
   }
-  function mount(hmr: ReloadHmr, admission = new ReloadAdmission(), blockers = () => [] as string[], build = '', leaseMs?: number,
-    reloadResult?: Parameters<typeof startReloadHost>[0]['reloadResult']) {
-    const host = startReloadHost({ profile: { home, name, dir, patchPath }, root, build, admission, blockers, hmr, leaseMs, reloadResult,
-      log: message => t.diagnostic(message) });
+  function mount(
+    hmr: ReloadHmr,
+    admission = new ReloadAdmission(),
+    blockers = () => [] as string[],
+    build = '',
+    leaseMs?: number,
+    reloadResult?: Parameters<typeof startReloadHost>[0]['reloadResult'],
+  ) {
+    const host = startReloadHost({
+      profile: { home, name, dir, patchPath },
+      root,
+      build,
+      admission,
+      blockers,
+      hmr,
+      leaseMs,
+      reloadResult,
+      log: (message) => t.diagnostic(message),
+    });
     assert.ok(host);
     hosts.push(host);
     return host;
@@ -90,37 +132,63 @@ function fixture(t: TestContext) {
     assert.equal(readFileSync(patchPath, 'utf8'), originalPatch);
     assert.equal(published(), 'outgoing build');
   };
-  return { root, home, name, dir, patchPath, built, hold, releaseBuild, manifest, linkManifest, mount, start, published, unmodified,
-    run: (...args: string[]) => start(args).result };
+  return {
+    root,
+    home,
+    name,
+    dir,
+    patchPath,
+    built,
+    hold,
+    releaseBuild,
+    manifest,
+    linkManifest,
+    mount,
+    start,
+    published,
+    unmodified,
+    run: (...args: string[]) => start(args).result,
+  };
 }
 
-test('without a live plugin the real dev:reload command does not build or change the profile', async t => {
+test('without a live plugin the real dev:reload command does not build or change the profile', async (t) => {
   const f = fixture(t);
   const result = await f.run();
-  assert.deepEqual({ code: result.code, built: existsSync(f.built), patch: readFileSync(f.patchPath, 'utf8') },
-    { code: 1, built: false, patch: originalPatch });
+  assert.deepEqual(
+    { code: result.code, built: existsSync(f.built), patch: readFileSync(f.patchPath, 'utf8') },
+    { code: 1, built: false, patch: originalPatch },
+  );
   assert.match(result.stderr, /unavailable/);
 });
 
 function hmrFixture(
-  reconcileProfile: ReloadHmr['reconcileProfile'] = async () => { throw Error('unexpected HMR'); },
+  reconcileProfile: ReloadHmr['reconcileProfile'] = async () => {
+    throw Error('unexpected HMR');
+  },
   transaction = new AsyncLocalStorage<boolean>(),
 ) {
   let queue = Promise.resolve();
   let watchers = 0;
   const hmr = {
-    config: { root: [] as string[] }, reconcileProfile, watchers: () => watchers,
+    config: { root: [] as string[] },
+    reconcileProfile,
+    watchers: () => watchers,
     runExclusive<T>(operation: () => Promise<T>): Promise<T> {
       if (transaction.getStore()) return Promise.reject(Error('HMR transactions cannot be nested'));
       const task = queue.then(() => transaction.run(true, operation));
-      queue = task.then(() => {}, () => {});
+      queue = task.then(
+        () => {},
+        () => {},
+      );
       return task;
     },
     watchConfig(filename: string, refresh: () => Promise<void>) {
       // Model DSH's public watcher contract with a real file event and transaction context.
       return transaction.exit(async () => {
         let running = Promise.resolve();
-        const watcher = watch(filename, { persistent: false }, () => { running = hmr.runExclusive(refresh).catch(() => {}); });
+        const watcher = watch(filename, { persistent: false }, () => {
+          running = hmr.runExclusive(refresh).catch(() => {});
+        });
         watchers++;
         return async () => {
           watcher.close();
@@ -135,7 +203,9 @@ function hmrFixture(
 
 function holdOperation() {
   let release!: () => void;
-  const promise = new Promise<void>(resolve => { release = resolve; });
+  const promise = new Promise<void>((resolve) => {
+    release = resolve;
+  });
   return { promise, release };
 }
 
@@ -147,19 +217,25 @@ async function until(condition: () => boolean) {
   }
 }
 
-async function request(endpoint: ReloadEndpoint, action: string, id: string, instance = endpoint.instance) {
+async function request(
+  endpoint: ReloadEndpoint,
+  action: string,
+  id: string,
+  instance = endpoint.instance,
+) {
   const response = await fetch(`http://127.0.0.1:${endpoint.port}/${action}/${id}`, {
-    method: 'POST', signal: AbortSignal.timeout(5000),
+    method: 'POST',
+    signal: AbortSignal.timeout(5000),
     headers: { authorization: `Bearer ${endpoint.token}`, 'x-super-bot-instance': instance },
   });
   return response.ok ? await response.json() : { status: response.status };
 }
 
-test('busy refusal and bounded wait report blockers, then require a receipt from the linked successor', async t => {
+test('busy refusal and bounded wait report blockers, then require a receipt from the linked successor', async (t) => {
   const f = fixture(t);
   let work = ['Worker task fixture-task, run fixture-run (running)'];
   let next: ReloadEndpoint | undefined;
-  const hmr = hmrFixture(async ids => {
+  const hmr = hmrFixture(async (ids) => {
     assert.deepEqual(ids, ['super-bot']);
     const build = readFileSync(f.built, 'utf8');
     assert.equal(f.published(), build);
@@ -182,34 +258,57 @@ test('busy refusal and bounded wait report blockers, then require a receipt from
   const done = await waiting.result;
   assert.equal(done.code, 0, done.stderr);
   assert.ok(next);
-  assert.match(done.stdout, /Granted by fixture[\s\S]*Waiting for fixture to publish[\s\S]*Applied fixture/);
+  assert.match(
+    done.stdout,
+    /Granted by fixture[\s\S]*Waiting for fixture to publish[\s\S]*Applied fixture/,
+  );
   assert.ok(done.stdout.includes(`${oldEndpoint.instance} → ${next.instance}`));
   assert.equal(next.pid, oldEndpoint.pid);
   assert.equal(readFileSync(f.patchPath, 'utf8'), originalPatch);
   assert.equal(readFileSync(f.manifest, 'utf8'), f.linkManifest);
 });
 
-test('result attribution needs matching staged source and a confirmed successor', async t => {
-  const f = fixture(t), store = new Store(':memory:');
+test('result attribution needs matching staged source and a confirmed successor', async (t) => {
+  const f = fixture(t),
+    store = new Store(':memory:');
   t.after(() => store.close());
   const bot = store.createBot('bot', { name: 'Bot', instructions: 'Synthetic reload' });
-  const task = store.createTask('task', { botId: bot.id, goal: 'Change source', scope: 'Source', acceptance: 'Check', reviewPolicy: 'human' });
+  const task = store.createTask('task', {
+    botId: bot.id,
+    goal: 'Change source',
+    scope: 'Source',
+    acceptance: 'Check',
+    reviewPolicy: 'human',
+  });
   const binding = store.beginBinding('binding', task.id, task.rowVersion, f.root);
   store.confirmBinding(binding.id, binding.requestedSessionId);
   const run = store.reserveRun('run', task.id, store.getTask(task.id).rowVersion);
-  store.saveRunMessage(run.id, 'input', '{}'); store.claimDispatch(run.id); store.inputEntered(run.id, 'input', 1);
+  store.saveRunMessage(run.id, 'input', '{}');
+  store.claimDispatch(run.id);
+  store.inputEntered(run.id, 'input', 1);
   const sha256 = createHash('sha256').update('verified source').digest('hex');
   const evidence = [{ path: join(f.root, 'src/change.ts'), sha256, bytes: 15 }];
-  const { resultId } = store.workerReport(run.id, 'ready', { kind: 'ready', summary: 'Changed', checks: 'Checked', evidence });
+  const { resultId } = store.workerReport(run.id, 'ready', {
+    kind: 'ready',
+    summary: 'Changed',
+    checks: 'Checked',
+    evidence,
+  });
   store.settleRun(run.id);
-  let match = false, mounts = 0;
+  let match = false,
+    mounts = 0;
   const reloadResult = {
-    evidence: (id: string) => store.devReloadResult(id, f.root).result.evidence.map(file => ({ ...file, sha256: match ? file.sha256 : 'wrong' })),
-    record: (receipt: Parameters<Store['recordDevReload']>[1]) => store.recordDevReload(f.root, receipt),
+    evidence: (id: string) =>
+      store
+        .devReloadResult(id, f.root)
+        .result.evidence.map((file) => ({ ...file, sha256: match ? file.sha256 : 'wrong' })),
+    record: (receipt: Parameters<Store['recordDevReload']>[1]) =>
+      store.recordDevReload(f.root, receipt),
   };
   const hmr = hmrFixture(async () => {
     mounts++;
-    old.close(); old.retired();
+    old.close();
+    old.retired();
     await f.mount(hmr, undefined, undefined, f.published(), undefined, reloadResult).ready;
     assert.equal(store.taskDetail(task.id).progress.reload, null);
     return {};
@@ -234,12 +333,14 @@ test('result attribution needs matching staged source and a confirmed successor'
   assert.equal(store.getTask(task.id).lifecycle, 'review');
 });
 
-test('an instance mounted in native HMR can apply two consecutive protected CLI reloads', { timeout: 10_000 }, async t => {
+test('an instance mounted in native HMR can apply two consecutive protected CLI reloads', {
+  timeout: 10_000,
+}, async (t) => {
   const f = fixture(t);
   const transaction = new AsyncLocalStorage<boolean>();
   let mounted: ReturnType<typeof f.mount>;
   let applications = 0;
-  const hmr = hmrFixture(async ids => {
+  const hmr = hmrFixture(async (ids) => {
     assert.equal(transaction.getStore(), true);
     assert.deepEqual(ids, ['super-bot']);
     mounted.close();
@@ -266,13 +367,17 @@ test('an instance mounted in native HMR can apply two consecutive protected CLI 
   assert.equal(readFileSync(f.manifest, 'utf8'), f.linkManifest);
 });
 
-test('copied discovery, mismatched live identity and competing CLI cannot authorize a second build', async t => {
+test('copied discovery, mismatched live identity and competing CLI cannot authorize a second build', async (t) => {
   const f = fixture(t);
   const host = f.mount(hmrFixture());
   const endpoint = await host.ready;
   const otherDir = join(f.home, 'profiles', 'other');
   mkdirSync(reloadDirectory(otherDir), { recursive: true, mode: 0o700 });
-  writeFileSync(join(reloadDirectory(otherDir), `${endpoint.instance}.json`), JSON.stringify(endpoint), { mode: 0o600 });
+  writeFileSync(
+    join(reloadDirectory(otherDir), `${endpoint.instance}.json`),
+    JSON.stringify(endpoint),
+    { mode: 0o600 },
+  );
   const foreign = await f.start([], 'other').result;
   assert.equal(foreign.code, 1);
   assert.match(foreign.stderr, /invalid reload discovery record/);
@@ -291,10 +396,12 @@ test('copied discovery, mismatched live identity and competing CLI cannot author
   f.unmodified();
 });
 
-test('an unavailable blocker inventory refuses safely and a different active instance makes ownership ambiguous', async t => {
+test('an unavailable blocker inventory refuses safely and a different active instance makes ownership ambiguous', async (t) => {
   const f = fixture(t);
   const hmr = hmrFixture();
-  await f.mount(hmr, undefined, () => { throw Error('native Agent inventory unavailable'); }).ready;
+  await f.mount(hmr, undefined, () => {
+    throw Error('native Agent inventory unavailable');
+  }).ready;
   const unknown = await f.run();
   assert.equal(unknown.code, 1);
   assert.match(unknown.stderr, /unknown: native Agent inventory unavailable/);
@@ -306,7 +413,7 @@ test('an unavailable blocker inventory refuses safely and a different active ins
   f.unmodified();
 });
 
-test('Ctrl-C during staging cancels permission and leaves active build and profile intact', async t => {
+test('Ctrl-C during staging cancels permission and leaves active build and profile intact', async (t) => {
   const f = fixture(t);
   writeFileSync(f.hold, 'hold staging');
   const endpoint = await f.mount(hmrFixture()).ready;
@@ -324,7 +431,7 @@ test('Ctrl-C during staging cancels permission and leaves active build and profi
   f.unmodified();
 });
 
-test('loss of the granting instance during staging cannot publish through a new instance', async t => {
+test('loss of the granting instance during staging cannot publish through a new instance', async (t) => {
   const f = fixture(t);
   writeFileSync(f.hold, 'hold staging');
   const hmr = hmrFixture();
@@ -344,13 +451,17 @@ test('loss of the granting instance during staging cannot publish through a new 
   f.unmodified();
 });
 
-test('a commit queued behind native recomposition rechecks expiry before publishing', async t => {
+test('a commit queued behind native recomposition rechecks expiry before publishing', async (t) => {
   const f = fixture(t);
   t.mock.timers.enable({ apis: ['Date'], now: Date.now() });
   let queued = false;
   const release = holdOperation();
   const hmr = hmrFixture();
-  hmr.runExclusive = async operation => { queued = true; await release.promise; return operation(); };
+  hmr.runExclusive = async (operation) => {
+    queued = true;
+    await release.promise;
+    return operation();
+  };
   const endpoint = await f.mount(hmr, undefined, undefined, '', 500).ready;
   const id = randomUUID();
   const lease = await request(endpoint, 'claim', id);
@@ -365,31 +476,38 @@ test('a commit queued behind native recomposition rechecks expiry before publish
   f.unmodified();
 });
 
-test('cancelling a queued CLI commit prevents a late native callback from publishing', async t => {
+test('cancelling a queued CLI commit prevents a late native callback from publishing', async (t) => {
   const f = fixture(t);
   const release = holdOperation();
-  let queued = false, checked = false;
+  let queued = false,
+    checked = false;
   const hmr = hmrFixture();
   const exclusive = hmr.runExclusive;
-  hmr.runExclusive = operation => exclusive(async () => {
-    queued = true;
-    await release.promise;
-    try { return await operation(); }
-    finally { checked = true; }
-  });
+  hmr.runExclusive = (operation) =>
+    exclusive(async () => {
+      queued = true;
+      await release.promise;
+      try {
+        return await operation();
+      } finally {
+        checked = true;
+      }
+    });
   const endpoint = await f.mount(hmr).ready;
   const cli = f.start();
   try {
     await until(() => queued);
     cli.child.kill('SIGINT');
     assert.equal((await cli.result).code, 130);
-  } finally { release.release(); }
+  } finally {
+    release.release();
+  }
   await until(() => checked);
   assert.equal((await request(endpoint, 'claim', randomUUID())).state, 'granted');
   f.unmodified();
 });
 
-test('an unobserved watcher trigger expires the queued request and releases admission', async t => {
+test('an unobserved watcher trigger expires the queued request and releases admission', async (t) => {
   const f = fixture(t);
   const hmr = hmrFixture();
   hmr.watchConfig = async () => async () => {};
@@ -409,7 +527,7 @@ test('an unobserved watcher trigger expires the queued request and releases admi
   f.unmodified();
 });
 
-test('native activity appearing after grant is diagnosed before publishing', async t => {
+test('native activity appearing after grant is diagnosed before publishing', async (t) => {
   const f = fixture(t);
   writeFileSync(f.hold, 'hold staging');
   let blockers: string[] = [];
@@ -424,8 +542,13 @@ test('native activity appearing after grant is diagnosed before publishing', asy
   f.unmodified();
 });
 
-for (const condition of ['different-build', 'missing-retirement', 'native-restart', 'activation-error'] as const) {
-  test(`published build remains unconfirmed on ${condition}`, async t => {
+for (const condition of [
+  'different-build',
+  'missing-retirement',
+  'native-restart',
+  'activation-error',
+] as const) {
+  test(`published build remains unconfirmed on ${condition}`, async (t) => {
     const f = fixture(t);
     const hmr = hmrFixture(async () => {
       if (condition === 'native-restart') return { restartReason: 'module-comparison' };
@@ -463,29 +586,64 @@ function scheduler(t: TestContext, root: string) {
     let idle = Promise.resolve();
     let settle = () => {};
     const agent = {
-      id, session: { id, header: { cwd: root } }, status: 'idle', inbox: { nextTurn: [], nextStep: [], remove: () => {} },
+      id,
+      session: { id, header: { cwd: root } },
+      status: 'idle',
+      inbox: { nextTurn: [], nextStep: [], remove: () => {} },
       model: { current: () => ({ provider: 'fixture', model: 'fixture' }), select: () => {} },
-      ctx: { on: () => () => {}, tools: { restrict: () => () => {}, guard: () => () => {} }, systemPrompt: { section: () => () => {} } },
+      ctx: {
+        on: () => () => {},
+        tools: { restrict: () => () => {}, guard: () => () => {} },
+        systemPrompt: { section: () => () => {} },
+      },
       whenIdle: () => idle,
-      followup: () => { wakes.push(id); agent.status = 'running'; idle = new Promise<void>(resolve => { settle = resolve; }); },
-      cancel: () => { agent.status = 'idle'; settle(); },
+      followup: () => {
+        wakes.push(id);
+        agent.status = 'running';
+        idle = new Promise<void>((resolve) => {
+          settle = resolve;
+        });
+      },
+      cancel: () => {
+        agent.status = 'idle';
+        settle();
+      },
     };
     return agent;
   }
   const managerAgent = agentFor(manager.requestedSessionId);
   agents.set(managerAgent.id, managerAgent);
   const ctx = {
-    effect: (install: () => unknown) => install(), on: () => () => {}, tools: { register: () => () => {} },
-    agents: { list: () => [...agents.values()], isOwnedBy: () => false }, jobs: { list: (id: string) => jobs.get(id) ?? [] },
-    sessionController: { resolveAgent: async (id: string) => {
-      resolved.push(id); await barriers.get(id); return { agent: agents.get(id) };
-    } },
+    effect: (install: () => unknown) => install(),
+    on: () => () => {},
+    tools: { register: () => () => {} },
+    agents: { list: () => [...agents.values()], isOwnedBy: () => false },
+    jobs: { list: (id: string) => jobs.get(id) ?? [] },
+    sessionController: {
+      resolveAgent: async (id: string) => {
+        resolved.push(id);
+        await barriers.get(id);
+        return { agent: agents.get(id) };
+      },
+    },
     workingDirectory: { get: () => root },
-    sessionProjections: { snapshot: () => ({ values: { modelSelection: { next: { provider: 'fixture', model: 'fixture' } } } }) },
+    sessionProjections: {
+      snapshot: () => ({
+        values: { modelSelection: { next: { provider: 'fixture', model: 'fixture' } } },
+      }),
+    },
   } as unknown as Context;
   const admission = new ReloadAdmission();
   const execution = new DshExecution(ctx, store, root, { fullAccess: false }, admission);
-  const managers = new Managers(ctx, store, execution, root, () => '', { fullAccess: false }, admission);
+  const managers = new Managers(
+    ctx,
+    store,
+    execution,
+    root,
+    () => '',
+    { fullAccess: false },
+    admission,
+  );
   execution.install();
   managers.install();
   t.after(async () => {
@@ -495,7 +653,13 @@ function scheduler(t: TestContext, root: string) {
     store.close();
   });
   function createTask(key: string) {
-    const task = store.createTask(`task-${key}`, { botId: bot.id, goal: key, scope: 'Fixture', acceptance: 'Inspect', reviewPolicy: 'human' });
+    const task = store.createTask(`task-${key}`, {
+      botId: bot.id,
+      goal: key,
+      scope: 'Fixture',
+      acceptance: 'Inspect',
+      reviewPolicy: 'human',
+    });
     store.settleManagerEvent(`manager-event:created:${task.id}`);
     const binding = store.beginBinding(`bind-${key}`, task.id, task.rowVersion, root);
     store.claimBindingCreation(binding.id);
@@ -505,14 +669,33 @@ function scheduler(t: TestContext, root: string) {
   }
   function notify() {
     store.enqueueManager(bot.id, 'df09-notice', 'Synthetic automatic wake', null);
-    return () => store.managerInfo(bot.id).notifications.find(event => event.id === 'manager-event:df09-notice');
+    return () =>
+      store
+        .managerInfo(bot.id)
+        .notifications.find((event) => event.id === 'manager-event:df09-notice');
   }
-  const pulse = async () => { t.mock.timers.tick(1000); await new Promise<void>(resolve => setImmediate(resolve)); };
+  const pulse = async () => {
+    t.mock.timers.tick(1000);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+  };
   const blockers = () => [...execution.reloadBlockers(), ...managers.reloadBlockers()];
-  return { admission, store, execution, blockers, managerAgent, wakes, resolved, barriers, jobs, createTask, pulse, notify };
+  return {
+    admission,
+    store,
+    execution,
+    blockers,
+    managerAgent,
+    wakes,
+    resolved,
+    barriers,
+    jobs,
+    createTask,
+    pulse,
+    notify,
+  };
 }
 
-test('once granted, Worker dispatch and Manager automatic wake cannot enter before publication', async t => {
+test('once granted, Worker dispatch and Manager automatic wake cannot enter before publication', async (t) => {
   const f = fixture(t);
   const s = scheduler(t, f.root);
   const { task, sessionId } = s.createTask('protected');
@@ -523,7 +706,9 @@ test('once granted, Worker dispatch and Manager automatic wake cannot enter befo
   writeFileSync(f.hold, 'hold staging');
   const cli = f.start();
   await until(() => existsSync(f.built));
-  await assert.rejects(s.execution.dispatch('dispatch', task.id, task.rowVersion), { code: 'reload-in-progress' });
+  await assert.rejects(s.execution.dispatch('dispatch', task.id, task.rowVersion), {
+    code: 'reload-in-progress',
+  });
   await s.pulse();
   assert.deepEqual(s.resolved, []);
   assert.deepEqual(s.wakes, []);
@@ -540,20 +725,24 @@ test('once granted, Worker dispatch and Manager automatic wake cannot enter befo
   assert.equal(run.sessionId, sessionId);
   assert.equal(s.store.heldRuns()[0]?.id, run.id);
   assert.equal((await s.execution.dispatch('dispatch', task.id, task.rowVersion)).id, run.id);
-  await assert.rejects(s.execution.dispatch('second', other.task.id, other.task.rowVersion), { code: 'capacity' });
+  await assert.rejects(s.execution.dispatch('second', other.task.id, other.task.rowVersion), {
+    code: 'capacity',
+  });
   await s.pulse();
   assert.deepEqual(s.wakes, [sessionId, s.managerAgent.id]);
   assert.equal(notice()?.attempts, 1);
   const busy = await request(endpoint, 'claim', randomUUID());
   assert.equal(busy.state, 'busy');
-  assert.ok(busy.blockers.some((text: string) => text.includes(run.id) && text.includes('resource held')));
+  assert.ok(
+    busy.blockers.some((text: string) => text.includes(run.id) && text.includes('resource held')),
+  );
   assert.ok(busy.blockers.some((text: string) => text.includes(s.managerAgent.id)));
   s.store.runRecovery(run.id, 'synthetic missing settlement');
   assert.equal(s.store.heldRuns()[0]?.id, run.id);
   assert.equal((await request(endpoint, 'claim', randomUUID())).state, 'busy');
 });
 
-test('Worker and Manager preflights already awaiting the host block a reload claim', async t => {
+test('Worker and Manager preflights already awaiting the host block a reload claim', async (t) => {
   const f = fixture(t);
   const s = scheduler(t, f.root);
   const { task, sessionId } = s.createTask('inflight');
@@ -574,11 +763,11 @@ test('Worker and Manager preflights already awaiting the host block a reload cla
   } finally {
     blocker.release();
     await worker;
-    await new Promise<void>(resolve => setImmediate(resolve));
+    await new Promise<void>((resolve) => setImmediate(resolve));
   }
 });
 
-test('native Manager jobs and queued input remain blockers after the model is idle', async t => {
+test('native Manager jobs and queued input remain blockers after the model is idle', async (t) => {
   const f = fixture(t);
   const s = scheduler(t, f.root);
   const endpoint = await f.mount(hmrFixture(), s.admission, s.blockers).ready;
@@ -589,7 +778,11 @@ test('native Manager jobs and queued input remain blockers after the model is id
   assert.ok(busy.blockers.includes(`Manager session ${session}, job bash-fixture (stopping)`));
   s.jobs.clear();
   s.managerAgent.inbox.nextStep.push({} as never);
-  assert.ok((await request(endpoint, 'claim', randomUUID())).blockers.includes(`Manager session ${session} (queued native input)`));
+  assert.ok(
+    (await request(endpoint, 'claim', randomUUID())).blockers.includes(
+      `Manager session ${session} (queued native input)`,
+    ),
+  );
   s.managerAgent.inbox.nextStep.length = 0;
   assert.equal((await request(endpoint, 'claim', randomUUID())).state, 'granted');
   f.unmodified();

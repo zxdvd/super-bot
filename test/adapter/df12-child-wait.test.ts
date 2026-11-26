@@ -15,10 +15,12 @@ import { SessionId } from '@deepseek-ai/dsh-session/types';
 import { apply } from '../../src/index.ts';
 import { Store } from '../../src/store.ts';
 
-const tick = () => new Promise<void>(resolve => setImmediate(resolve));
+const tick = () => new Promise<void>((resolve) => setImmediate(resolve));
 function deferred<T>() {
   let settle!: (value: T) => void;
-  const promise = new Promise<T>(resolve => { settle = resolve; });
+  const promise = new Promise<T>((resolve) => {
+    settle = resolve;
+  });
   return { promise, settle };
 }
 
@@ -36,8 +38,13 @@ async function fixture(t: TestContext, version: NativeVersion) {
   const bot = seed.createBot('bot', { name: 'DF-12 fixture', instructions: 'Synthetic' });
   const manager = seed.beginManager('manager', bot.id, cwd);
   seed.confirmManager(manager.id, manager.requestedSessionId);
-  const task = seed.createTask('task', { botId: bot.id, goal: 'Check children', scope: 'Own directory',
-    acceptance: 'Read final bytes', reviewPolicy: 'human' });
+  const task = seed.createTask('task', {
+    botId: bot.id,
+    goal: 'Check children',
+    scope: 'Own directory',
+    acceptance: 'Read final bytes',
+    reviewPolicy: 'human',
+  });
   const binding = seed.beginBinding('binding', task.id, task.rowVersion, cwd);
   seed.confirmBinding(binding.id, binding.requestedSessionId);
   seed.close();
@@ -45,16 +52,22 @@ async function fixture(t: TestContext, version: NativeVersion) {
   const events = new Context();
   const emit = events.emit as (...args: unknown[]) => void;
   const connection = new HostConnectionService(new Context(), [], {
-    isAuthenticated: () => false, authenticateApi: () => undefined,
+    isAuthenticated: () => false,
+    authenticateApi: () => undefined,
   } as unknown as ConstructorParameters<typeof HostConnectionService>[2]);
   const fetch = connection.createSharedFetchHandler('/api').fetch;
   const effects: Array<() => void | Promise<void>> = [];
   const tools = new Map<string, { execute: Function }>();
-  let resolves = 0, concluded = 0, waitCalls = 0;
+  let resolves = 0,
+    concluded = 0,
+    waitCalls = 0;
   const workerSession = Session.create(SessionId(binding.requestedSessionId));
   const worker = makeAgent(workerSession);
   const other = makeAgent(Session.create(SessionId('other-root')));
-  const registry = new Map([[worker.session.id, worker], [other.session.id, other]]);
+  const registry = new Map([
+    [worker.session.id, worker],
+    [other.session.id, other],
+  ]);
   const parents = new Map<object, FakeAgent>();
   let wait: ReturnType<typeof deferred<boolean>> | undefined;
   let nativeService: object | undefined;
@@ -65,72 +78,135 @@ async function fixture(t: TestContext, version: NativeVersion) {
     if (waitCalls === 2) afterEvidenceRead?.();
     return wait?.promise ?? Promise.resolve(false);
   }
-  const tree = version === 'rc.1' ? { waitForChildren: nativeWait } : {
-    waitForTreeWork: nativeWait,
-    rootOf(agent: FakeAgent) {
-      let root = agent;
-      while (parents.has(root)) root = parents.get(root)!;
-      return root;
-    },
-  };
+  const tree =
+    version === 'rc.1'
+      ? { waitForChildren: nativeWait }
+      : {
+          waitForTreeWork: nativeWait,
+          rootOf(agent: FakeAgent) {
+            let root = agent;
+            while (parents.has(root)) root = parents.get(root)!;
+            return root;
+          },
+        };
   nativeService = tree;
 
   function makeAgent(session: Session, parent?: object) {
     let idle = deferred<void>();
     const agent = {
-      id: session.id, session, status: 'idle', message: undefined as UserMessage | undefined,
-      ctx: undefined as unknown as Context, signal: new AbortController(),
+      id: session.id,
+      session,
+      status: 'idle',
+      message: undefined as UserMessage | undefined,
+      ctx: undefined as unknown as Context,
+      signal: new AbortController(),
       inbox: { nextStep: [], nextTurn: [], remove: () => {} },
       followup(message: UserMessage) {
-        agent.message = message; agent.status = 'running'; agent.signal = new AbortController(); idle = deferred<void>();
+        agent.message = message;
+        agent.status = 'running';
+        agent.signal = new AbortController();
+        idle = deferred<void>();
       },
       whenIdle: () => idle.promise,
-      cancel() { agent.signal.abort(); },
-      idle() { agent.status = 'idle'; idle.settle(); },
+      cancel() {
+        agent.signal.abort();
+      },
+      idle() {
+        agent.status = 'idle';
+        idle.settle();
+      },
     };
     agent.ctx = createScope(events, agent, { parent }).ctx;
-    Object.defineProperty(agent.ctx, 'tools', { value: { guard: () => () => {}, restrict: () => () => {} } });
+    Object.defineProperty(agent.ctx, 'tools', {
+      value: { guard: () => () => {}, restrict: () => () => {} },
+    });
     return agent;
   }
   type FakeAgent = ReturnType<typeof makeAgent>;
 
   const ctx = {
     connection,
-    get: (name: string) => name === 'subagents' ? nativeService : undefined,
+    get: (name: string) => (name === 'subagents' ? nativeService : undefined),
     on(name: string, fn: Function) {
       const off = (events.on as Function)(name, fn) as () => void;
       effects.push(off);
       return off;
     },
-    effect(start: () => unknown) { const off = start(); if (typeof off === 'function') effects.push(off as () => void); },
+    effect(start: () => unknown) {
+      const off = start();
+      if (typeof off === 'function') effects.push(off as () => void);
+    },
     inject: async () => {},
-    tools: { register(tool: { name: string; execute: Function }) { tools.set(tool.name, tool); return () => tools.delete(tool.name); } },
-    agents: { list: () => [...registry.values()], get: (id: SessionId) => registry.get(id),
-      ...(version === 'rc.1' ? { isOwnedBy: (id: SessionId, owner: FakeAgent) => parents.get(registry.get(id)!) === owner } : {}) },
-    jobs: { list: () => [] }, permissionPresets: { set: () => {} }, workingDirectory: { get: () => cwd },
-    sessionController: { resolveAgent(id: string) { resolves++; assert.equal(id, worker.id); return { agent: worker }; } },
-    sessionProjections: { snapshot: () => ({ values: { modelSelection: { next: { provider: 'fixture', model: 'fixture' } } } }) },
+    tools: {
+      register(tool: { name: string; execute: Function }) {
+        tools.set(tool.name, tool);
+        return () => tools.delete(tool.name);
+      },
+    },
+    agents: {
+      list: () => [...registry.values()],
+      get: (id: SessionId) => registry.get(id),
+      ...(version === 'rc.1'
+        ? {
+            isOwnedBy: (id: SessionId, owner: FakeAgent) =>
+              parents.get(registry.get(id)!) === owner,
+          }
+        : {}),
+    },
+    jobs: { list: () => [] },
+    permissionPresets: { set: () => {} },
+    workingDirectory: { get: () => cwd },
+    sessionController: {
+      resolveAgent(id: string) {
+        resolves++;
+        assert.equal(id, worker.id);
+        return { agent: worker };
+      },
+    },
+    sessionProjections: {
+      snapshot: () => ({
+        values: { modelSelection: { next: { provider: 'fixture', model: 'fixture' } } },
+      }),
+    },
     sessions: { flush: async () => true },
-    sessionPersistence: { async open(id: string, access: string) {
-      assert.equal(access, 'read');
-      if (id !== worker.id) throw Error('Unknown fixture session');
-      return { header: workerSession.header, inheritedEventCount: 0,
-        read: async () => ({ events: workerSession.snapshotEvents() }), close: async () => {} };
-    } },
+    sessionPersistence: {
+      async open(id: string, access: string) {
+        assert.equal(access, 'read');
+        if (id !== worker.id) throw Error('Unknown fixture session');
+        return {
+          header: workerSession.header,
+          inheritedEventCount: 0,
+          read: async () => ({ events: workerSession.snapshotEvents() }),
+          close: async () => {},
+        };
+      },
+    },
   } as unknown as Context;
-  async function close() { for (const off of effects.splice(0).reverse()) await off(); }
+  async function close() {
+    for (const off of effects.splice(0).reverse()) await off();
+  }
   t.after(async () => {
-    worker.cancel(); worker.idle(); wait?.settle(false);
+    worker.cancel();
+    worker.idle();
+    wait?.settle(false);
     await close();
     assert.ok(dataDir.startsWith(join(runtime, 'df12-fixture-')));
     assert.equal(realpathSync(dataDir), dataDir);
     rmSync(dataDir, { recursive: true });
   });
   async function api(action: string, data: Record<string, unknown> = {}) {
-    const response = await fetch(new Request('http://localhost/api/super-bot', {
-      method: 'POST', body: JSON.stringify({ type: 'client-request', rpcId: 'df12', method: 'super-bot',
-        payload: { action, id: task.id, sessionId: manager.requestedSessionId, ...data } }),
-    }), connection.browserPeer);
+    const response = await fetch(
+      new Request('http://localhost/api/super-bot', {
+        method: 'POST',
+        body: JSON.stringify({
+          type: 'client-request',
+          rpcId: 'df12',
+          method: 'super-bot',
+          payload: { action, id: task.id, sessionId: manager.requestedSessionId, ...data },
+        }),
+      }),
+      connection.browserPeer,
+    );
     assert.equal(response.status, 200);
     const result = (await response.json()).result;
     assert.equal(result.ok, true, JSON.stringify(result));
@@ -144,25 +220,38 @@ async function fixture(t: TestContext, version: NativeVersion) {
     return { startSeq: start.seq, inputSeq: input.seq };
   }
   function turnEnd(turn: number, reason: 'completed' | 'aborted' = 'completed') {
-    const end = workerSession.append('turn/end', { turn, reason: reason === 'completed' ? { kind: reason }
-      : { kind: reason, reason: { kind: 'user' } } });
+    const end = workerSession.append('turn/end', {
+      turn,
+      reason:
+        reason === 'completed' ? { kind: reason } : { kind: reason, reason: { kind: 'user' } },
+    });
     emit('session/event', workerSession, end);
     worker.idle();
   }
   function makeChild(id: string, parent = worker, local = true) {
     const child = makeAgent(Session.create(SessionId(id)), parent);
     child.status = 'running';
-    const info = { runId: `${id}-activation`, id: child.id, provider: 'fixture', local,
-      ...(version === 'rc.5' ? { parentSessionId: parent.id } : {}) };
+    const info = {
+      runId: `${id}-activation`,
+      id: child.id,
+      provider: 'fixture',
+      local,
+      ...(version === 'rc.5' ? { parentSessionId: parent.id } : {}),
+    };
     const route = (carrier: FakeAgent) => scopeTarget(tree, carrier);
     return {
-      child, info,
+      child,
+      info,
       start(carrier = version === 'rc.1' ? parent : worker) {
-        if (local) { registry.set(child.id, child); parents.set(child, parent); }
+        if (local) {
+          registry.set(child.id, child);
+          parents.set(child, parent);
+        }
         emit(route(carrier), 'subagent/start', info);
       },
       end(stopReason = 'completed', carrier = version === 'rc.1' ? parent : worker) {
-        child.idle(); registry.delete(child.id);
+        child.idle();
+        registry.delete(child.id);
         emit(route(carrier), 'subagent/end', { ...info, stopReason });
       },
       emit: (edge: 'start' | 'end', overrides: Record<string, unknown>) => {
@@ -172,43 +261,91 @@ async function fixture(t: TestContext, version: NativeVersion) {
   }
   await apply(ctx, { dataDir, fullAccess: true });
   const initial = await api('task.detail');
-  const run = await api('task.dispatch', { requestId: 'dispatch', expectedRowVersion: initial.task.rowVersion });
+  const run = await api('task.dispatch', {
+    requestId: 'dispatch',
+    expectedRowVersion: initial.task.rowVersion,
+  });
   return {
-    api, worker, other, run, startTurn, turnEnd, makeChild,
-    onEvidenceRead: (callback: () => void) => { afterEvidenceRead = callback; },
-    download: (resultId: string, preview = false, sessionId: string = manager.requestedSessionId) => fetch(new Request(
-      `http://localhost/api/super-bot-file?resultId=${resultId}&index=0&sessionId=${sessionId}${preview ? '&preview=1' : ''}`),
-    connection.browserPeer),
+    api,
+    worker,
+    other,
+    run,
+    startTurn,
+    turnEnd,
+    makeChild,
+    onEvidenceRead: (callback: () => void) => {
+      afterEvidenceRead = callback;
+    },
+    download: (resultId: string, preview = false, sessionId: string = manager.requestedSessionId) =>
+      fetch(
+        new Request(
+          `http://localhost/api/super-bot-file?resultId=${resultId}&index=0&sessionId=${sessionId}${preview ? '&preview=1' : ''}`,
+        ),
+        connection.browserPeer,
+      ),
     async dropAttachment(resultId: string) {
       await close();
       const db = new DatabaseSync(join(dataDir, 'ledger.sqlite'));
-      try { db.prepare('DELETE FROM result_attachments WHERE resultId = ?').run(resultId); }
-      finally { db.close(); }
+      try {
+        db.prepare('DELETE FROM result_attachments WHERE resultId = ?').run(resultId);
+      } finally {
+        db.close();
+      }
       await apply(ctx, { dataDir, fullAccess: true });
     },
     file,
     injectWrongTurn(turn: number) {
       const spoof = Session.create(worker.id);
       emit('session/event', spoof, spoof.append('turn/start', { turn }));
-      emit('session/event', spoof, spoof.append('user/message', worker.message!, { surfaceOp: 'append' }));
+      emit(
+        'session/event',
+        spoof,
+        spoof.append('user/message', worker.message!, { surfaceOp: 'append' }),
+      );
     },
-    childIdle(agent: FakeAgent) { agentEvents(agent.ctx, agent as unknown as Agent).emit('agent/status', { status: 'idle' }); },
+    childIdle(agent: FakeAgent) {
+      agentEvents(agent.ctx, agent as unknown as Agent).emit('agent/status', { status: 'idle' });
+    },
     wait: () => {
-      const pending = wait = deferred<boolean>();
-      return { settle(value: boolean) { if (wait === pending) wait = undefined; pending.settle(value); } };
+      const pending = (wait = deferred<boolean>());
+      return {
+        settle(value: boolean) {
+          if (wait === pending) wait = undefined;
+          pending.settle(value);
+        },
+      };
     },
-    loseService: () => { nativeService = undefined; },
-    resolves: () => resolves, concluded: () => concluded, waitCalls: () => waitCalls,
-    ready: (callId: string) => tools.get('super_bot_report')!.execute({ kind: 'ready', summary: 'Final facts',
-      checks: 'Read final bytes', files: [file] }, { agent: worker, callId, signal: worker.signal.signal,
-      concludeTurn: () => { concluded++; } }),
-    stopping: (turn: number, agent = worker) => agentEvents(agent.ctx, agent as unknown as Agent)
-      .serial('agent/turn-stopping', { turn, signal: agent.signal.signal }),
-    async reload() { await close(); await apply(ctx, { dataDir, fullAccess: true }); },
+    loseService: () => {
+      nativeService = undefined;
+    },
+    resolves: () => resolves,
+    concluded: () => concluded,
+    waitCalls: () => waitCalls,
+    ready: (callId: string) =>
+      tools.get('super_bot_report')!.execute(
+        { kind: 'ready', summary: 'Final facts', checks: 'Read final bytes', files: [file] },
+        {
+          agent: worker,
+          callId,
+          signal: worker.signal.signal,
+          concludeTurn: () => {
+            concluded++;
+          },
+        },
+      ),
+    stopping: (turn: number, agent = worker) =>
+      agentEvents(agent.ctx, agent as unknown as Agent).serial('agent/turn-stopping', {
+        turn,
+        signal: agent.signal.signal,
+      }),
+    async reload() {
+      await close();
+      await apply(ctx, { dataDir, fullAccess: true });
+    },
   };
 }
 
-test('ready downloads the exact bytes read before the final native quiet check', async t => {
+test('ready downloads the exact bytes read before the final native quiet check', async (t) => {
   const f = await fixture(t, 'rc.1');
   const submitted = Buffer.from([0, 255, 128, 10]);
   writeFileSync(f.file, submitted);
@@ -219,7 +356,10 @@ test('ready downloads the exact bytes read before the final native quiet check',
   f.turnEnd(1);
   const detail = await f.api('task.detail', { resultId });
   assert.equal(detail.linkedResult.evidence[0].bytes, submitted.length);
-  assert.equal(detail.linkedResult.evidence[0].sha256, createHash('sha256').update(submitted).digest('hex'));
+  assert.equal(
+    detail.linkedResult.evidence[0].sha256,
+    createHash('sha256').update(submitted).digest('hex'),
+  );
   assert.equal(detail.linkedResult.humanAcceptedAt, null);
   const response = await f.download(resultId);
   assert.equal(response.status, 200);
@@ -227,7 +367,7 @@ test('ready downloads the exact bytes read before the final native quiet check',
   assert.equal((await f.download(resultId, true)).status, 415);
 });
 
-test('text preview uses the same scoped, immutable bytes as download', async t => {
+test('text preview uses the same scoped, immutable bytes as download', async (t) => {
   const f = await fixture(t, 'rc.1');
   const submitted = Buffer.from('最终内容\n<b>literal markup</b>\n');
   writeFileSync(f.file, submitted);
@@ -259,32 +399,46 @@ test('text preview uses the same scoped, immutable bytes as download', async t =
 });
 
 for (const version of ['rc.1', 'rc.5'] as const) {
-  test(`${version} registered ready exposes and retains a same-Run native wait through task.detail`, async t => {
+  test(`${version} registered ready exposes and retains a same-Run native wait through task.detail`, async (t) => {
     const f = await fixture(t, version);
     const startTime = Date.now();
     let clock = startTime;
     t.mock.method(Date, 'now', () => clock);
     const turn = f.startTurn(1);
-    const one = f.makeChild('child-one'), two = f.makeChild('child-two');
+    const one = f.makeChild('child-one'),
+      two = f.makeChild('child-two');
     const joining = f.wait();
-    one.start(); two.start();
+    one.start();
+    two.start();
     const early = f.ready('ready-early');
     void early.catch(() => {});
     await tick();
     const live = await f.api('task.detail');
     assert.equal(f.waitCalls(), 1, 'the registered report reached the native tree service');
-    assert.equal(live.childWaits?.length, 1, 'the product detail must expose the registered ready wait');
+    assert.equal(
+      live.childWaits?.length,
+      1,
+      'the product detail must expose the registered ready wait',
+    );
     const [item] = live.childWaits as ChildWaitDetail[];
     assert.ok(item);
     assert.equal(item.runId, f.run.id);
-    assert.deepEqual({ turn: item.turn, startSeq: item.startSeq, inputSeq: item.inputSeq }, { turn: 1, ...turn });
+    assert.deepEqual(
+      { turn: item.turn, startSeq: item.startSeq, inputSeq: item.inputSeq },
+      { turn: 1, ...turn },
+    );
     assert.equal(item.source, 'ready');
     assert.equal(item.outcome, 'waiting');
     assert.equal(item.startedAt, startTime);
     assert.equal(item.endedAt, null);
     assert.equal(item.pendingCount, 2);
-    assert.deepEqual(item.children.map(c => [c.sessionId, c.parentSessionId]),
-      [[one.info.id, f.worker.id], [two.info.id, f.worker.id]]);
+    assert.deepEqual(
+      item.children.map((c) => [c.sessionId, c.parentSessionId]),
+      [
+        [one.info.id, f.worker.id],
+        [two.info.id, f.worker.id],
+      ],
+    );
     assert.equal(item.elapsedMs, 0);
     assert.equal(live.result, null);
     assert.equal(live.runHeld, true);
@@ -294,7 +448,8 @@ for (const version of ['rc.1', 'rc.5'] as const) {
     assert.equal(reopened.pendingCount, 1);
     assert.equal(reopened.elapsedMs, 12_000);
     clock += 25_000;
-    two.end(); joining.settle(true);
+    two.end();
+    joining.settle(true);
     assert.equal((await early).reason, 'subtree-joined');
     const stopped = await f.api('task.detail');
     assert.equal(stopped.childWaits.length, 1);
@@ -310,17 +465,25 @@ for (const version of ['rc.1', 'rc.5'] as const) {
     const review = await f.api('task.detail');
     assert.equal(review.task.lifecycle, 'review');
     assert.equal(review.result.humanAcceptedAt, null);
-    assert.deepEqual(review.childWaits, stopped.childWaits, 'fast clear ready and stopping probes add no wait');
+    assert.deepEqual(
+      review.childWaits,
+      stopped.childWaits,
+      'fast clear ready and stopping probes add no wait',
+    );
     await f.reload();
     assert.deepEqual((await f.api('task.detail')).childWaits, stopped.childWaits);
     assert.equal(f.resolves(), 1, 'detail and reload must not open native agents');
   });
 
-  test(`${version} native turn-stopping exposes only the tracked parent turn`, async t => {
+  test(`${version} native turn-stopping exposes only the tracked parent turn`, async (t) => {
     const f = await fixture(t, version);
     f.injectWrongTurn(2);
     await f.stopping(2);
-    assert.equal(f.waitCalls(), 0, 'a different Session object cannot claim the Run even with its exact message');
+    assert.equal(
+      f.waitCalls(),
+      0,
+      'a different Session object cannot claim the Run even with its exact message',
+    );
     f.startTurn(3);
     const child = f.makeChild('stopping-child');
     const joining = f.wait();
@@ -338,19 +501,28 @@ for (const version of ['rc.1', 'rc.5'] as const) {
     assert.equal(live.childWaits[0].runId, f.run.id);
     f.childIdle(child.child);
     assert.equal((await f.api('task.detail')).runHeld, true);
-    assert.equal((await f.api('task.detail')).run.finishedAt, null, 'a descendant going idle cannot close the parent');
-    child.end('error'); joining.settle(true);
+    assert.equal(
+      (await f.api('task.detail')).run.finishedAt,
+      null,
+      'a descendant going idle cannot close the parent',
+    );
+    child.end('error');
+    joining.settle(true);
     await stopping;
     f.turnEnd(3);
     await tick();
     const detail = await f.api('task.detail');
     assert.equal(detail.childWaits[0].outcome, 'converged');
     assert.equal(detail.childWaits[0].children[0].stopReason, 'error');
-    assert.equal(detail.task.status, 'recovery', 'native convergence does not supply a missing report');
+    assert.equal(
+      detail.task.status,
+      'recovery',
+      'native convergence does not supply a missing report',
+    );
     assert.equal(detail.runHeld, true);
   });
 
-  test(`${version} foreign owners and mismatched ends cannot change the known count`, async t => {
+  test(`${version} foreign owners and mismatched ends cannot change the known count`, async (t) => {
     const f = await fixture(t, version);
     f.startTurn(1);
     const child = f.makeChild('owned');
@@ -358,7 +530,10 @@ for (const version of ['rc.1', 'rc.5'] as const) {
     const nested = f.makeChild('nested', child.child);
     const foreign = f.makeChild('foreign', f.other, false);
     const joining = f.wait();
-    child.start(); external.start(); nested.start(); foreign.start(f.other);
+    child.start();
+    external.start();
+    nested.start();
+    foreign.start(f.other);
     if (version === 'rc.5') foreign.emit('start', {}); // Correct carrier, creator belongs to another tree.
     const ready = f.ready('owner-check');
     void ready.catch(() => {});
@@ -366,16 +541,24 @@ for (const version of ['rc.1', 'rc.5'] as const) {
     const read = async (): Promise<ChildWaitDetail> => (await f.api('task.detail')).childWaits[0];
     const before = await read();
     assert.equal(before.pendingCount, 3);
-    assert.deepEqual(before.children.map(c => [c.childId, c.parentSessionId, c.sessionId]), [
-      [child.info.id, f.worker.id, child.info.id], [external.info.id, f.worker.id, null],
-      [nested.info.id, child.info.id, nested.info.id],
-    ]);
+    assert.deepEqual(
+      before.children.map((c) => [c.childId, c.parentSessionId, c.sessionId]),
+      [
+        [child.info.id, f.worker.id, child.info.id],
+        [external.info.id, f.worker.id, null],
+        [nested.info.id, child.info.id, nested.info.id],
+      ],
+    );
     child.emit('start', {}); // duplicate
     child.emit('end', { id: 'wrong-child', stopReason: 'completed' });
     child.emit('end', { provider: 'wrong-provider', stopReason: 'completed' });
-    if (version === 'rc.5') child.emit('end', { parentSessionId: f.other.id, stopReason: 'completed' });
+    if (version === 'rc.5')
+      child.emit('end', { parentSessionId: f.other.id, stopReason: 'completed' });
     assert.equal((await read()).pendingCount, 3);
-    nested.end(); child.end(); external.end('aborted'); joining.settle(true);
+    nested.end();
+    child.end();
+    external.end('aborted');
+    joining.settle(true);
     assert.equal((await ready).reason, 'subtree-joined');
     const after = await read();
     assert.equal(after.outcome, 'converged');
@@ -385,7 +568,7 @@ for (const version of ['rc.1', 'rc.5'] as const) {
   });
 }
 
-test('a service change leaves an unknown wait without refreshing stale elapsed time', async t => {
+test('a service change leaves an unknown wait without refreshing stale elapsed time', async (t) => {
   const f = await fixture(t, 'rc.5');
   f.startTurn(1);
   const joining = f.wait();
@@ -412,7 +595,7 @@ test('a service change leaves an unknown wait without refreshing stale elapsed t
   assert.deepEqual((await f.api('task.detail')).childWaits, detail.childWaits);
 });
 
-test('stop records cancellation of the wait and a late child cannot settle the parent', async t => {
+test('stop records cancellation of the wait and a late child cannot settle the parent', async (t) => {
   const f = await fixture(t, 'rc.5');
   f.startTurn(1);
   const child = f.makeChild('external', f.worker, false);
@@ -429,12 +612,13 @@ test('stop records cancellation of the wait and a late child cannot settle the p
   assert.equal(ended.childWaits[0].children[0].stopReason, null);
   assert.equal(ended.runHeld, true);
   assert.equal(ended.result, null);
-  child.end('aborted'); joining.settle(true);
+  child.end('aborted');
+  joining.settle(true);
   await f.reload();
   assert.deepEqual((await f.api('task.detail')).childWaits, ended.childWaits);
 });
 
-test('reload while awaiting keeps the known start and leaves an unobserved end unknown', async t => {
+test('reload while awaiting keeps the known start and leaves an unobserved end unknown', async (t) => {
   const f = await fixture(t, 'rc.5');
   f.startTurn(1);
   const child = f.makeChild('external', f.worker, false);
@@ -457,7 +641,7 @@ test('reload while awaiting keeps the known start and leaves an unobserved end u
   joining.settle(true);
 });
 
-test('a retry in the same Worker shows only new owned members while retaining the old Run history', async t => {
+test('a retry in the same Worker shows only new owned members while retaining the old Run history', async (t) => {
   const f = await fixture(t, 'rc.5');
   f.startTurn(1);
   const first = f.makeChild('first');
@@ -465,16 +649,24 @@ test('a retry in the same Worker shows only new owned members while retaining th
   first.start();
   const early = f.ready('ready-first');
   await tick();
-  first.end(); joining.settle(true);
+  first.end();
+  joining.settle(true);
   assert.equal((await early).reason, 'subtree-joined');
   await f.ready('ready-to-review');
   await f.stopping(1);
   f.turnEnd(1);
   await tick();
   const reviewed = await f.api('task.detail');
-  const rejected = await f.api('result.reject', { requestId: 'rework', expectedRowVersion: reviewed.task.rowVersion,
-    resultId: reviewed.result.id, text: 'Retry synthetic fixture' });
-  const retry = await f.api('task.dispatch', { requestId: 'retry', expectedRowVersion: rejected.rowVersion });
+  const rejected = await f.api('result.reject', {
+    requestId: 'rework',
+    expectedRowVersion: reviewed.task.rowVersion,
+    resultId: reviewed.result.id,
+    text: 'Retry synthetic fixture',
+  });
+  const retry = await f.api('task.dispatch', {
+    requestId: 'retry',
+    expectedRowVersion: rejected.rowVersion,
+  });
   f.startTurn(2);
   const second = f.makeChild('second');
   const next = f.wait();
@@ -484,10 +676,19 @@ test('a retry in the same Worker shows only new owned members while retaining th
   void secondEarly.catch(() => {});
   await tick();
   const current = await f.api('task.detail');
-  assert.deepEqual(current.childWaits.map((item: ChildWaitDetail) => [item.runId, item.turn, item.outcome]),
-    [[retry.id, 2, 'waiting'], [f.run.id, 1, 'converged']]);
-  assert.deepEqual(current.childWaits[0].children.map((child: { childId: string }) => child.childId), ['second']);
+  assert.deepEqual(
+    current.childWaits.map((item: ChildWaitDetail) => [item.runId, item.turn, item.outcome]),
+    [
+      [retry.id, 2, 'waiting'],
+      [f.run.id, 1, 'converged'],
+    ],
+  );
+  assert.deepEqual(
+    current.childWaits[0].children.map((child: { childId: string }) => child.childId),
+    ['second'],
+  );
   assert.deepEqual(current.childWaits[1], reviewed.childWaits[0]);
-  second.end(); next.settle(true);
+  second.end();
+  next.settle(true);
   await secondEarly;
 });

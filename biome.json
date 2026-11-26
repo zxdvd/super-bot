@@ -1,0 +1,53 @@
+{
+  "$schema": "./node_modules/@biomejs/biome/configuration_schema.json",
+  "files": {
+    "includes": [
+      "src/**/*.{js,cjs,mjs,jsx,ts,cts,mts,tsx}",
+      "test/**/*.{js,cjs,mjs,jsx,ts,cts,mts,tsx}",
+      "scripts/**/*.{js,cjs,mjs,jsx,ts,cts,mts,tsx}"
+    ]
+  },
+  "vcs": {
+    "enabled": true,
+    "clientKind": "git",
+    "useIgnoreFile": true
+  },
+  "formatter": {
+    "indentStyle": "space",
+    "lineWidth": 100,
+    "expand": "never"
+  },
+  "javascript": {
+    "formatter": {
+      "quoteStyle": "single"
+    }
+  },
+  "linter": {
+    "rules": {
+      "preset": "none",
+      "correctness": {
+        "preset": "recommended",
+        "noConstantCondition": "error",
+        "noUnusedImports": "error",
+        "noUnusedPrivateClassMembers": "error",
+        "noUnusedVariables": "error",
+        "noVoidTypeReturn": "off",
+        "useExhaustiveDependencies": "off",
+        "useJsxKeyInIterable": "error"
+      },
+      "suspicious": {
+        "noDuplicateCase": "error",
+        "noDuplicateElseIf": "error",
+        "noDuplicateObjectKeys": "error",
+        "noFallthroughSwitchClause": "error",
+        "noMisleadingCharacterClass": "error",
+        "noUnsafeDeclarationMerging": "error",
+        "noDuplicateJsxProps": "error"
+      },
+      "a11y": {
+        "noSvgWithoutTitle": "error",
+        "useAriaPropsSupportedByRole": "error"
+      }
+    }
+  }
+}

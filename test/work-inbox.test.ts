@@ -2,16 +2,37 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { RESULT_FRESH_MS, type Task } from '../src/model.ts';
-import { ago, boardGroups, inboxGroups, stage, stageText, stageTone, unseenResult } from '../src/ui/work/format.ts';
+import {
+  ago,
+  boardGroups,
+  inboxGroups,
+  stage,
+  stageText,
+  stageTone,
+  unseenResult,
+} from '../src/ui/work/format.ts';
 
 const NOW = 1_800_000_000_000;
 let n = 0;
 function task(patch: Partial<Task>): Task {
   n++;
   return {
-    id: `t${n}`, botId: 'b', goal: `goal ${n}`, scope: 's', acceptance: 'a', reviewPolicy: 'human', lifecycle: 'open', controlMode: 'auto',
-    taskRevision: 1, rowVersion: 1, sessionId: null, createdAt: NOW - 1000, updatedAt: NOW - 1000, status: 'unscheduled',
-    botConfigRevision: 1, ...patch,
+    id: `t${n}`,
+    botId: 'b',
+    goal: `goal ${n}`,
+    scope: 's',
+    acceptance: 'a',
+    reviewPolicy: 'human',
+    lifecycle: 'open',
+    controlMode: 'auto',
+    taskRevision: 1,
+    rowVersion: 1,
+    sessionId: null,
+    createdAt: NOW - 1000,
+    updatedAt: NOW - 1000,
+    status: 'unscheduled',
+    botConfigRevision: 1,
+    ...patch,
   };
 }
 
@@ -21,11 +42,19 @@ test('stages collapse twelve statuses into six and keep the concrete reason as t
   assert.equal(stage(task({ status: 'recovery' })), 'needs-you');
   assert.equal(stage(task({ status: 'manual' })), 'waiting');
   assert.equal(stage(task({ status: 'needs-input', blockingAttention: null })), 'waiting');
-  assert.equal(stageText(task({ status: 'stopping', blockingAttention: 'approval' })), '原生审批待处理');
-  for (const status of ['running', 'queued', 'stopping'] as const) assert.equal(stage(task({ status })), 'running');
+  assert.equal(
+    stageText(task({ status: 'stopping', blockingAttention: 'approval' })),
+    '原生审批待处理',
+  );
+  for (const status of ['running', 'queued', 'stopping'] as const)
+    assert.equal(stage(task({ status })), 'running');
   assert.equal(stage(task({ status: 'paused' })), 'waiting');
   assert.equal(stage(task({ status: 'unscheduled' })), 'waiting');
-  assert.equal(stage(task({ lifecycle: 'review', status: 'paused' })), 'review', 'paused review is still review');
+  assert.equal(
+    stage(task({ lifecycle: 'review', status: 'paused' })),
+    'review',
+    'paused review is still review',
+  );
   assert.equal(stage(task({ lifecycle: 'completed', status: 'completed' })), 'done');
   assert.equal(stage(task({ lifecycle: 'cancelled', status: 'cancelled' })), 'cancelled');
   assert.equal(stageText(task({ status: 'approval' })), '原生审批待处理');
@@ -41,27 +70,63 @@ test('inbox separates active work from unscheduled work and orders blockers by u
   const recovery = task({ status: 'recovery', updatedAt: NOW - 900 });
   const running = task({ status: 'running' });
   const waiting = task({ status: 'unscheduled', updatedAt: NOW - 5 });
-  const fresh = task({ lifecycle: 'completed', status: 'completed', updatedAt: NOW - 60_000, deliveredAt: NOW - 10 });
+  const fresh = task({
+    lifecycle: 'completed',
+    status: 'completed',
+    updatedAt: NOW - 60_000,
+    deliveredAt: NOW - 10,
+  });
   const test = task({ goal: '【测试】指定活验', status: 'running', blockingAttention: 'input' });
   const ordinary = task({ goal: '修复并做活验', status: 'running', blockingAttention: 'input' });
-  const old = task({ lifecycle: 'completed', status: 'completed', updatedAt: NOW - RESULT_FRESH_MS - 1 });
+  const old = task({
+    lifecycle: 'completed',
+    status: 'completed',
+    updatedAt: NOW - RESULT_FRESH_MS - 1,
+  });
   const cancelled = task({ lifecycle: 'cancelled', status: 'cancelled' });
-  const groups = inboxGroups([waiting, old, review, running, fresh, input, cancelled, recovery, test, ordinary], {}, NOW);
-  assert.deepEqual(groups.attention.map(t => t.id), [recovery.id, input.id, ordinary.id]);
-  assert.deepEqual(groups.review.map(t => t.id), [review.id]);
-  assert.deepEqual(groups.fresh.map(t => t.id), [fresh.id]);
+  const groups = inboxGroups(
+    [waiting, old, review, running, fresh, input, cancelled, recovery, test, ordinary],
+    {},
+    NOW,
+  );
+  assert.deepEqual(
+    groups.attention.map((t) => t.id),
+    [recovery.id, input.id, ordinary.id],
+  );
+  assert.deepEqual(
+    groups.review.map((t) => t.id),
+    [review.id],
+  );
+  assert.deepEqual(
+    groups.fresh.map((t) => t.id),
+    [fresh.id],
+  );
   assert.equal(groups.attentionCount, 4);
-  assert.deepEqual(groups.blockedTests.map(t => t.id), [test.id]);
+  assert.deepEqual(
+    groups.blockedTests.map((t) => t.id),
+    [test.id],
+  );
   assert.deepEqual(groups.tests, []);
-  assert.deepEqual(groups.active.map(t => t.id), [running.id]);
-  assert.deepEqual(groups.waiting.map(t => t.id), [waiting.id]);
-  assert.deepEqual(new Set(groups.recent.map(t => t.id)), new Set([old.id, cancelled.id]));
+  assert.deepEqual(
+    groups.active.map((t) => t.id),
+    [running.id],
+  );
+  assert.deepEqual(
+    groups.waiting.map((t) => t.id),
+    [waiting.id],
+  );
+  assert.deepEqual(new Set(groups.recent.map((t) => t.id)), new Set([old.id, cancelled.id]));
 });
 
 test('a verified delivery stays new until opened regardless of acceptance', () => {
   const deliveredAt = NOW - 1000;
   const review = task({ lifecycle: 'review', status: 'review', deliveredAt });
-  const done = { ...review, lifecycle: 'completed', status: 'completed', updatedAt: NOW - 500 } as const;
+  const done = {
+    ...review,
+    lifecycle: 'completed',
+    status: 'completed',
+    updatedAt: NOW - 500,
+  } as const;
   assert.equal(unseenResult(review, undefined, NOW), true);
   assert.equal(unseenResult(done, deliveredAt, NOW), false);
   assert.equal(unseenResult(done, deliveredAt - 1, NOW), true);
@@ -70,7 +135,12 @@ test('a verified delivery stays new until opened regardless of acceptance', () =
 });
 
 test('inbox follows delivery activity before showing a result as awaiting acceptance', () => {
-  const delivering = task({ lifecycle: 'review', status: 'review', activity: 'working', managerReviewed: true });
+  const delivering = task({
+    lifecycle: 'review',
+    status: 'review',
+    activity: 'working',
+    managerReviewed: true,
+  });
   const uncertain = task({ lifecycle: 'review', status: 'review', activity: 'attention' });
   const review = task({ lifecycle: 'review', status: 'review', activity: 'review' });
   const groups = inboxGroups([review, uncertain, delivering], {}, NOW);
@@ -84,18 +154,33 @@ test('inbox follows delivery activity before showing a result as awaiting accept
 });
 
 test('recent tail is bounded and newest first', () => {
-  const finished = Array.from({ length: 12 }, (_, i) => task({ lifecycle: 'cancelled', status: 'cancelled', updatedAt: NOW - i * 1000 }));
+  const finished = Array.from({ length: 12 }, (_, i) =>
+    task({ lifecycle: 'cancelled', status: 'cancelled', updatedAt: NOW - i * 1000 }),
+  );
   const recent = inboxGroups(finished, {}, NOW, 5).recent;
-  assert.deepEqual(recent.map(t => t.id), finished.slice(0, 5).map(t => t.id));
+  assert.deepEqual(
+    recent.map((t) => t.id),
+    finished.slice(0, 5).map((t) => t.id),
+  );
 });
 
 test('board columns follow stages and leave cancelled tasks out', () => {
-  const tasks = [task({ status: 'running' }), task({ status: 'paused' }), task({ status: 'approval' }),
-    task({ lifecycle: 'review', status: 'review' }), task({ lifecycle: 'completed', status: 'completed' }),
-    task({ lifecycle: 'cancelled', status: 'cancelled' })];
+  const tasks = [
+    task({ status: 'running' }),
+    task({ status: 'paused' }),
+    task({ status: 'approval' }),
+    task({ lifecycle: 'review', status: 'review' }),
+    task({ lifecycle: 'completed', status: 'completed' }),
+    task({ lifecycle: 'cancelled', status: 'cancelled' }),
+  ];
   const board = boardGroups(tasks);
-  assert.deepEqual(Object.fromEntries(Object.entries(board).map(([k, v]) => [k, v.length])),
-    { waiting: 1, running: 1, 'needs-you': 1, review: 1, done: 1 });
+  assert.deepEqual(Object.fromEntries(Object.entries(board).map(([k, v]) => [k, v.length])), {
+    waiting: 1,
+    running: 1,
+    'needs-you': 1,
+    review: 1,
+    done: 1,
+  });
 });
 
 test('relative times are short', () => {

@@ -71,11 +71,16 @@ export interface FeishuSelfTestCandidate {
 }
 
 export type FeishuSelfTestView = { sessionId: string; expiresAt: number } & (
-  { state: 'waiting' | 'conflict' | 'expired' | 'interrupted' }
+  | { state: 'waiting' | 'conflict' | 'expired' | 'interrupted' }
   | { state: 'sending' | 'send-failed' | 'sent'; candidate: FeishuSelfTestCandidate }
 );
 
-export type FeishuConnectionState = 'connecting' | 'ready' | 'reconnecting' | 'reconnected' | 'stopped';
+export type FeishuConnectionState =
+  | 'connecting'
+  | 'ready'
+  | 'reconnecting'
+  | 'reconnected'
+  | 'stopped';
 
 export interface FeishuGroup {
   chatId: string;

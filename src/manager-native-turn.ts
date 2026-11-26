@@ -10,19 +10,24 @@ type InputKind = 'host' | 'feishu';
 type Position = { turn: number; step: number };
 type Assembly = { signal: AbortSignal; toolSet: ResolvedToolSet };
 type ToolCall = { name: string; token?: symbol };
-type Step = Assembly & Position & {
-  started: boolean;
-  expected: readonly UserMessage[];
-  cursor: number;
-  calls: Map<string, ToolCall>;
-  expanded: boolean;
-};
+type Step = Assembly &
+  Position & {
+    started: boolean;
+    expected: readonly UserMessage[];
+    cursor: number;
+    calls: Map<string, ToolCall>;
+    expanded: boolean;
+  };
 
 function inputKind(message: UserMessage): InputKind | undefined {
   const { source } = message;
   if (isFeishuSource(source)) {
-    if (typeof source.feishuMessageId === 'string' && source.feishuMessageId.length > 0 &&
-        Object.keys(source).every(key => key === 'kind' || key === 'feishuMessageId')) return 'feishu';
+    if (
+      typeof source.feishuMessageId === 'string' &&
+      source.feishuMessageId.length > 0 &&
+      Object.keys(source).every((key) => key === 'kind' || key === 'feishuMessageId')
+    )
+      return 'feishu';
     return;
   }
   // Both supported controllers publish these fields for a normal owner-transport or trusted local prompt.
@@ -50,7 +55,10 @@ export class ManagerNativeTurn {
   private step?: Step;
   private feeds = new Map<AbortSignal, FeishuInput>();
 
-  constructor(readonly agent: Agent, private readonly current: () => boolean) {
+  constructor(
+    readonly agent: Agent,
+    private readonly current: () => boolean,
+  ) {
     this.blockedInbox = new Set();
     this.blockPending();
   }
@@ -85,13 +93,26 @@ export class ManagerNativeTurn {
     }
   }
 
-  propose(position: Position, signal: AbortSignal, claimed: readonly UserMessage[], entered: readonly UserMessage[]): void {
+  propose(
+    position: Position,
+    signal: AbortSignal,
+    claimed: readonly UserMessage[],
+    entered: readonly UserMessage[],
+  ): void {
     if (this.restricted || position.turn !== this.turn) return;
     const assembly = this.assembly;
     this.assembly = undefined;
-    if (!assembly || assembly.signal !== signal || this.turnSignal !== signal || signal.aborted || this.step ||
-        position.step !== this.stepNumber + 1 || this.claims.length !== claimed.length ||
-        this.claims.some((message, i) => message !== claimed[i])) return this.restrict();
+    if (
+      !assembly ||
+      assembly.signal !== signal ||
+      this.turnSignal !== signal ||
+      signal.aborted ||
+      this.step ||
+      position.step !== this.stepNumber + 1 ||
+      this.claims.length !== claimed.length ||
+      this.claims.some((message, i) => message !== claimed[i])
+    )
+      return this.restrict();
     this.claims = [];
     for (const message of claimed) {
       const kind = inputKind(message);
@@ -107,9 +128,16 @@ export class ManagerNativeTurn {
       if (message === claimed[consumed]) consumed++;
       else if (!isHostContext(message)) return this.restrict();
     }
-    if (consumed !== claimed.length || entered.filter(isRuntimeContext).length > 1) return this.restrict();
+    if (consumed !== claimed.length || entered.filter(isRuntimeContext).length > 1)
+      return this.restrict();
     this.step = {
-      ...assembly, ...position, started: false, expected: entered, cursor: 0, calls: new Map(), expanded: false,
+      ...assembly,
+      ...position,
+      started: false,
+      expected: entered,
+      cursor: 0,
+      calls: new Map(),
+      expanded: false,
     };
   }
 
@@ -129,12 +157,19 @@ export class ManagerNativeTurn {
     const step = this.step;
     switch (event.type) {
       case 'step/start':
-        if (!step || step.started || step.turn !== event.data.turn || step.step !== event.data.step) return this.restrict();
+        if (!step || step.started || step.turn !== event.data.turn || step.step !== event.data.step)
+          return this.restrict();
         step.started = true;
         this.stepNumber = step.step;
         return;
       case 'step/end':
-        if (!step || step.turn !== event.data.turn || step.step !== event.data.step || !this.committed(step)) return this.restrict();
+        if (
+          !step ||
+          step.turn !== event.data.turn ||
+          step.step !== event.data.step ||
+          !this.committed(step)
+        )
+          return this.restrict();
         if (step.expanded) step.toolSet.dispose();
         this.step = undefined;
         return;
@@ -143,8 +178,14 @@ export class ManagerNativeTurn {
         this.commit(step, event.data, feed);
         return;
       case 'tool/call':
-        if (!step || step.turn !== event.data.turn || step.step !== event.data.step || !this.committed(step) ||
-            step.calls.has(event.data.callId)) return this.restrict();
+        if (
+          !step ||
+          step.turn !== event.data.turn ||
+          step.step !== event.data.step ||
+          !this.committed(step) ||
+          step.calls.has(event.data.callId)
+        )
+          return this.restrict();
         step.calls.set(event.data.callId, { name: event.data.name });
     }
   }
@@ -152,33 +193,58 @@ export class ManagerNativeTurn {
   private commit(step: Step, message: UserMessage, feed?: FeishuInput): void {
     let expected = step.expected[step.cursor];
     // The loop replaces its proposed runtime snapshot at commit; a refresh can also omit it.
-    if (expected && isRuntimeContext(expected) && !isRuntimeContext(message)) expected = step.expected[++step.cursor];
-    if (!expected || (isRuntimeContext(expected) ? !isRuntimeContext(message) : !isDeepStrictEqual(message, expected))) {
+    if (expected && isRuntimeContext(expected) && !isRuntimeContext(message))
+      expected = step.expected[++step.cursor];
+    if (
+      !expected ||
+      (isRuntimeContext(expected)
+        ? !isRuntimeContext(message)
+        : !isDeepStrictEqual(message, expected))
+    ) {
       return this.restrict();
     }
     step.cursor++;
     if (!isFeishuSource(message.source)) return;
     if (!feed || feed.signal.aborted || !feed.isCurrent()) return this.restrict();
-    if (!this.feeds.has(feed.signal)) feed.signal.addEventListener('abort', this.restrict, { once: true });
+    if (!this.feeds.has(feed.signal))
+      feed.signal.addEventListener('abort', this.restrict, { once: true });
     this.feeds.set(feed.signal, feed);
   }
 
   private committed(step: Step): boolean {
-    return step.started && (step.cursor === step.expected.length ||
-      (step.cursor === step.expected.length - 1 && isRuntimeContext(step.expected[step.cursor]!)));
+    return (
+      step.started &&
+      (step.cursor === step.expected.length ||
+        (step.cursor === step.expected.length - 1 && isRuntimeContext(step.expected[step.cursor]!)))
+    );
   }
 
   authorize(exec: Readonly<ToolExecution>, advance: 'prepare' | 'dispatch'): boolean {
     const step = this.step;
-    if (this.restricted || !step || !this.committed(step) || typeof exec.token !== 'symbol' || step.signal.aborted || exec.signal.aborted ||
-        exec.agent !== this.agent || exec.toolSet !== step.toolSet || exec.parent !== undefined ||
-        exec.rootCallId !== exec.callId || (advance === 'prepare' && exec.signal !== step.signal)) return false;
-    if (!this.current() || [...this.feeds.values()].some(feed => feed.signal.aborted || !feed.isCurrent())) {
+    if (
+      this.restricted ||
+      !step ||
+      !this.committed(step) ||
+      typeof exec.token !== 'symbol' ||
+      step.signal.aborted ||
+      exec.signal.aborted ||
+      exec.agent !== this.agent ||
+      exec.toolSet !== step.toolSet ||
+      exec.parent !== undefined ||
+      exec.rootCallId !== exec.callId ||
+      (advance === 'prepare' && exec.signal !== step.signal)
+    )
+      return false;
+    if (
+      !this.current() ||
+      [...this.feeds.values()].some((feed) => feed.signal.aborted || !feed.isCurrent())
+    ) {
       this.restrict();
       return false;
     }
     const call = step.calls.get(exec.callId);
-    if (!call || call.name !== exec.name || !step.toolSet.view(this.agent).has(exec.name)) return false;
+    if (!call || call.name !== exec.name || !step.toolSet.view(this.agent).has(exec.name))
+      return false;
     if (advance === 'dispatch') return call.token === exec.token;
     if (call.token !== undefined) return false;
     call.token = exec.token;
@@ -205,7 +271,8 @@ export class ManagerNativeTurn {
   };
 
   private blockPending(): void {
-    for (const message of [...this.agent.inbox.nextTurn, ...this.agent.inbox.nextStep]) this.blockedInbox.add(message.id);
+    for (const message of [...this.agent.inbox.nextTurn, ...this.agent.inbox.nextStep])
+      this.blockedInbox.add(message.id);
     this.inserted = new WeakSet();
   }
 

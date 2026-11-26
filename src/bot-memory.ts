@@ -1,6 +1,17 @@
 import { isUtf8 } from 'node:buffer';
 import { randomUUID } from 'node:crypto';
-import { closeSync, constants, fstatSync, lstatSync, mkdirSync, openSync, readSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
+import {
+  closeSync,
+  constants,
+  fstatSync,
+  lstatSync,
+  mkdirSync,
+  openSync,
+  readSync,
+  renameSync,
+  unlinkSync,
+  writeFileSync,
+} from 'node:fs';
 import { join } from 'node:path';
 import { AppError } from './model.ts';
 import { parseWorkLink, type WorkLink } from './work-links.ts';
@@ -43,7 +54,8 @@ function readMarkdown(path: string): string | undefined {
       bytes += count;
     }
     const content = buffer.subarray(0, bytes);
-    if (bytes > MAX_BYTES || !isUtf8(content) || content.includes(0)) throw new AppError('memory-format', 'Bot 记忆须为至多 16 KiB 的 UTF-8 Markdown。');
+    if (bytes > MAX_BYTES || !isUtf8(content) || content.includes(0))
+      throw new AppError('memory-format', 'Bot 记忆须为至多 16 KiB 的 UTF-8 Markdown。');
     return content.toString('utf8');
   } finally {
     closeSync(fd);
@@ -71,8 +83,10 @@ export class BotMemory {
   constructor(private dataDir: string) {}
 
   private path(botId: string, create = false): string | undefined {
-    if (!/^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/.test(botId)) throw new AppError('memory-path', '无效的 Bot 标识。');
-    const root = join(this.dataDir, 'memory'), path = join(root, botId);
+    if (!/^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/.test(botId))
+      throw new AppError('memory-path', '无效的 Bot 标识。');
+    const root = join(this.dataDir, 'memory'),
+      path = join(root, botId);
     if (directory(root, create) && directory(path, create)) return path;
   }
 
@@ -90,7 +104,8 @@ export class BotMemory {
     if (markdown === undefined) return;
     const header = conventionHeader.exec(markdown);
     const text = header && markdown.slice(header[0].length).trim();
-    if (!header || !text || text.length > CONVENTION_LIMIT) throw new AppError('memory-format', '工作约定文件格式无效。');
+    if (!header || !text || text.length > CONVENTION_LIMIT)
+      throw new AppError('memory-format', '工作约定文件格式无效。');
     return { text, generation: Number(header[1]), seq: Number(header[2]) };
   }
 
@@ -100,26 +115,40 @@ export class BotMemory {
 
   saveConvention(botId: string, text: string, generation: number, seq: number): void {
     const prior = this.readConvention(botId);
-    if (prior && (generation < prior.generation || (generation === prior.generation && seq <= prior.seq))) {
+    if (
+      prior &&
+      (generation < prior.generation || (generation === prior.generation && seq <= prior.seq))
+    ) {
       if (generation === prior.generation && seq === prior.seq && text === prior.text) return;
       throw new AppError('memory-stale', '这条消息对应的保存已处理或已有更新的工作约定。');
     }
     this.index(botId);
     const path = this.path(botId)!;
-    publish(path, CONVENTION_FILE, `# 工作约定\n\n<!-- super-bot: ${generation} ${seq} -->\n\n${text}\n`);
+    publish(
+      path,
+      CONVENTION_FILE,
+      `# 工作约定\n\n<!-- super-bot: ${generation} ${seq} -->\n\n${text}\n`,
+    );
   }
 
   readDecision(botId: string, entry: string): { text: string; source: WorkLink } {
     const path = this.path(botId);
     const index = path && readMarkdown(join(path, 'index.md'));
     const entries = index?.matchAll(/^- \[[^\]\r\n]+\]\(([^)\r\n]+)\)\s*$/gm);
-    if (!path || !decisionPath.test(entry) || !entries || !Array.from(entries).some(match => match[1] === entry)
-      || !directory(join(path, 'decisions'), false)) throw new AppError('memory-entry', '没有这条已索引的决策。');
+    if (
+      !path ||
+      !decisionPath.test(entry) ||
+      !entries ||
+      !Array.from(entries).some((match) => match[1] === entry) ||
+      !directory(join(path, 'decisions'), false)
+    )
+      throw new AppError('memory-entry', '没有这条已索引的决策。');
     const markdown = readMarkdown(join(path, entry));
     const header = /^\[来源\]\(\/(#[^)\r\n]+)\)\r?\n\r?\n/.exec(markdown ?? '');
     const source = header && parseWorkLink(header[1]!);
     const text = header && markdown!.slice(header[0].length).trim();
-    if (!source || source.kind === 'question' || !text) throw new AppError('memory-source', '决策正文或任务／成果来源缺失。');
+    if (!source || source.kind === 'question' || !text)
+      throw new AppError('memory-source', '决策正文或任务／成果来源缺失。');
     return { text, source };
   }
 }

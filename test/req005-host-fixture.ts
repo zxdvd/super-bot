@@ -23,11 +23,11 @@ export const wiringCancelled = '已取消接线验证。';
 export const pauseWiring = '暂停接线验证的自动管理';
 export const wiringPaused = '已暂停接线验证的自动管理。';
 
-
 export const startupGoal = '首次启动';
 export const startupRequest = '请先启动合成环境的实例，再只读核对实例状态。';
 export const startupContinue = '继续首次启动';
-export const startupResult = '首启资源已创建，目前未就绪。原操作回执仍待核对。请应用负责人核对配置；保留原实例。';
+export const startupResult =
+  '首启资源已创建，目前未就绪。原操作回执仍待核对。请应用负责人核对配置；保留原实例。';
 
 export const pendingGoal = '同步校验';
 export const pendingRequest = '请做同步校验，先检查本地基线。若尚缺条件，只汇报实际状态。';

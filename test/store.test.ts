@@ -17,46 +17,78 @@ test('persists across reopening and uses WAL on disk', () => {
     const reopened = new Store(file);
     assert.equal(reopened.get('session'), 'session-1');
     reopened.close();
-  } finally { rmSync(dir, { recursive: true, force: true }); }
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 test('refuses future schema without changing its version', () => {
   const dir = mkdtempSync(join(tmpdir(), 'super-bot-'));
   try {
     const file = join(dir, 'ledger.sqlite');
-    const db = new DatabaseSync(file); db.exec('PRAGMA user_version=42'); db.close();
+    const db = new DatabaseSync(file);
+    db.exec('PRAGMA user_version=42');
+    db.close();
     assert.throws(() => new Store(file), /更新版本/);
     const check = new DatabaseSync(file);
-    assert.equal(check.prepare('PRAGMA user_version').get()?.user_version, 42); check.close();
-  } finally { rmSync(dir, { recursive: true, force: true }); }
+    assert.equal(check.prepare('PRAGMA user_version').get()?.user_version, 42);
+    check.close();
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 test('commands are idempotent and conflicting reuse is rejected', () => {
   const store = new Store(':memory:');
   try {
-    const bot = store.createBot('bot-1',{name:'开发 Bot',instructions:'维护网站'});
-    assert.deepEqual(store.createBot('bot-1',{name:'开发 Bot',instructions:'维护网站'}),bot);
-    assert.throws(() => store.createBot('bot-1',{name:'另一个',instructions:'维护网站'}),/不同的内容/);
-    const input = {botId:bot.id,goal:'修复搜索',scope:'网站搜索',acceptance:'现有测试通过',reviewPolicy:'human' as const};
-    const task = store.createTask('task-1',input);
-    assert.deepEqual(store.createTask('task-1',input),task);
-    assert.equal(store.listTasks({botId:bot.id}).total,1);
-    assert.equal(store.db.prepare('SELECT count(*) AS n FROM inputs').get()?.n,1);
-  } finally { store.close(); }
+    const bot = store.createBot('bot-1', { name: '开发 Bot', instructions: '维护网站' });
+    assert.deepEqual(store.createBot('bot-1', { name: '开发 Bot', instructions: '维护网站' }), bot);
+    assert.throws(
+      () => store.createBot('bot-1', { name: '另一个', instructions: '维护网站' }),
+      /不同的内容/,
+    );
+    const input = {
+      botId: bot.id,
+      goal: '修复搜索',
+      scope: '网站搜索',
+      acceptance: '现有测试通过',
+      reviewPolicy: 'human' as const,
+    };
+    const task = store.createTask('task-1', input);
+    assert.deepEqual(store.createTask('task-1', input), task);
+    assert.equal(store.listTasks({ botId: bot.id }).total, 1);
+    assert.equal(store.db.prepare('SELECT count(*) AS n FROM inputs').get()?.n, 1);
+  } finally {
+    store.close();
+  }
 });
 
-test('GitLab task creation replays its committed receipt after the Manager is replaced', t => {
+test('GitLab task creation replays its committed receipt after the Manager is replaced', (t) => {
   const dir = mkdtempSync(join(tmpdir(), 'super-bot-create-receipt-'));
   t.after(() => rmSync(dir, { recursive: true, force: true }));
   const file = join(dir, 'ledger.sqlite');
   let store = new Store(file);
   try {
-    const bot = store.createBot('bot', { name: 'Release Bot', instructions: 'Track the fixture release' });
+    const bot = store.createBot('bot', {
+      name: 'Release Bot',
+      instructions: 'Track the fixture release',
+    });
     const manager = store.beginManager('manager', bot.id, dir);
     store.confirmManager(manager.id, manager.requestedSessionId);
     const reference = 'https://gitlab.fixture.invalid/team/project/-/merge_requests/11';
-    const source = { sessionId: manager.requestedSessionId, messageId: 'owner', seq: 4, text: `Publish ${reference}` };
-    const input = { botId: bot.id, goal: 'Publish the fixture', scope: 'One project', acceptance: 'Report the job', reviewPolicy: 'human' as const };
+    const source = {
+      sessionId: manager.requestedSessionId,
+      messageId: 'owner',
+      seq: 4,
+      text: `Publish ${reference}`,
+    };
+    const input = {
+      botId: bot.id,
+      goal: 'Publish the fixture',
+      scope: 'One project',
+      acceptance: 'Report the job',
+      reviewPolicy: 'human' as const,
+    };
     const task = store.createTask('create', input, source, undefined, { reference });
     store.releaseManager('replace', bot.id, manager.generation);
     const replacement = store.beginManager('replacement', bot.id, dir);
@@ -66,113 +98,220 @@ test('GitLab task creation replays its committed receipt after the Manager is re
 
     const before = store.taskDetail(task.id);
     assert.deepEqual(store.createTask('create', input, source, undefined, { reference }), task);
-    assert.throws(() => store.createTask('create', { ...input, goal: 'A different task' }, source, undefined, { reference }),
-      { code: 'idempotency-conflict' });
-    assert.throws(() => store.createTask('new-call', input, source, undefined, { reference }), { code: 'gitlab-release-scope' });
+    assert.throws(
+      () =>
+        store.createTask('create', { ...input, goal: 'A different task' }, source, undefined, {
+          reference,
+        }),
+      { code: 'idempotency-conflict' },
+    );
+    assert.throws(() => store.createTask('new-call', input, source, undefined, { reference }), {
+      code: 'gitlab-release-scope',
+    });
     assert.equal(store.listTasks({ botId: bot.id }).total, 1);
     assert.deepEqual(store.taskDetail(task.id), before);
-  } finally { store.close(); }
+  } finally {
+    store.close();
+  }
 });
 
-test('tasks can start paused without a scheduling race or changing legacy default request hashes',()=>{
-  const store=new Store(':memory:');try {
-    const bot=store.createBot('bot',{name:'Bot',instructions:'Files'});
-    const input={botId:bot.id,goal:'Later task',scope:'Own files',acceptance:'Read result',reviewPolicy:'human' as const};
-    const normal=store.createTask('normal',input);assert.equal(normal.controlMode,'auto');
-    assert.equal(store.createTask('normal',{...input,startPaused:false}).id,normal.id);
-    const paused=store.createTask('paused',{...input,startPaused:true});assert.equal(paused.status,'paused');assert.equal(paused.sessionId,null);
-    assert.equal(store.latestRun(paused.id),null);assert.throws(()=>store.createTask('paused',input),/不同的内容/);
-    assert.equal(store.controlTask('resume',paused.id,paused.rowVersion,'auto').status,'unscheduled');
-  }finally{store.close();}
+test('tasks can start paused without a scheduling race or changing legacy default request hashes', () => {
+  const store = new Store(':memory:');
+  try {
+    const bot = store.createBot('bot', { name: 'Bot', instructions: 'Files' });
+    const input = {
+      botId: bot.id,
+      goal: 'Later task',
+      scope: 'Own files',
+      acceptance: 'Read result',
+      reviewPolicy: 'human' as const,
+    };
+    const normal = store.createTask('normal', input);
+    assert.equal(normal.controlMode, 'auto');
+    assert.equal(store.createTask('normal', { ...input, startPaused: false }).id, normal.id);
+    const paused = store.createTask('paused', { ...input, startPaused: true });
+    assert.equal(paused.status, 'paused');
+    assert.equal(paused.sessionId, null);
+    assert.equal(store.latestRun(paused.id), null);
+    assert.throws(() => store.createTask('paused', input), /不同的内容/);
+    assert.equal(
+      store.controlTask('resume', paused.id, paused.rowVersion, 'auto').status,
+      'unscheduled',
+    );
+  } finally {
+    store.close();
+  }
 });
 
 test('failed audit write rolls back task, input, and idempotency record', () => {
   const store = new Store(':memory:');
   try {
-    const bot = store.createBot('bot-1',{name:'Bot',instructions:'测试'});
-    store.db.exec("CREATE TRIGGER reject_event BEFORE INSERT ON events WHEN NEW.kind='task.created' BEGIN SELECT RAISE(ABORT,'test fault'); END");
-    const input = {botId:bot.id,goal:'测试',scope:'临时目录',acceptance:'可读取',reviewPolicy:'human' as const};
-    assert.throws(() => store.createTask('task-1',input),/test fault/);
-    assert.equal(store.listTasks({botId:bot.id}).total,0);
-    assert.equal(store.db.prepare('SELECT count(*) AS n FROM inputs').get()?.n,0);
+    const bot = store.createBot('bot-1', { name: 'Bot', instructions: '测试' });
+    store.db.exec(
+      "CREATE TRIGGER reject_event BEFORE INSERT ON events WHEN NEW.kind='task.created' BEGIN SELECT RAISE(ABORT,'test fault'); END",
+    );
+    const input = {
+      botId: bot.id,
+      goal: '测试',
+      scope: '临时目录',
+      acceptance: '可读取',
+      reviewPolicy: 'human' as const,
+    };
+    assert.throws(() => store.createTask('task-1', input), /test fault/);
+    assert.equal(store.listTasks({ botId: bot.id }).total, 0);
+    assert.equal(store.db.prepare('SELECT count(*) AS n FROM inputs').get()?.n, 0);
     store.db.exec('DROP TRIGGER reject_event');
-    assert.ok(store.createTask('task-1',input).id);
-  } finally { store.close(); }
+    assert.ok(store.createTask('task-1', input).id);
+  } finally {
+    store.close();
+  }
 });
 
 test('stale edits fail and control changes do not increment task revision', () => {
   const store = new Store(':memory:');
   try {
-    const bot = store.createBot('b',{name:'Bot',instructions:'测试'});
-    const task = store.createTask('t',{botId:bot.id,goal:'测试',scope:'',acceptance:'',reviewPolicy:'human'});
-    assert.equal(task.status,'needs-input');
-    assert.equal(store.taskDetail(task.id).attentions.filter(a=>a.state==='open').length,1);
-    const revised = store.reviseTask('r',task.id,1,{goal:'测试',scope:'临时文件',acceptance:'文件包含内容'});
-    assert.equal(revised.taskRevision,2);
-    assert.equal(revised.status,'unscheduled');
-    assert.equal(store.taskDetail(task.id).attentions.filter(a=>a.state==='open').length,0);
-    assert.throws(()=>store.controlTask('stale',task.id,1,'paused'),/已经更新/);
-    const paused = store.controlTask('pause',task.id,2,'paused');
-    assert.equal(paused.taskRevision,2); assert.equal(paused.rowVersion,3); assert.equal(paused.status,'paused');
-  } finally { store.close(); }
+    const bot = store.createBot('b', { name: 'Bot', instructions: '测试' });
+    const task = store.createTask('t', {
+      botId: bot.id,
+      goal: '测试',
+      scope: '',
+      acceptance: '',
+      reviewPolicy: 'human',
+    });
+    assert.equal(task.status, 'needs-input');
+    assert.equal(store.taskDetail(task.id).attentions.filter((a) => a.state === 'open').length, 1);
+    const revised = store.reviseTask('r', task.id, 1, {
+      goal: '测试',
+      scope: '临时文件',
+      acceptance: '文件包含内容',
+    });
+    assert.equal(revised.taskRevision, 2);
+    assert.equal(revised.status, 'unscheduled');
+    assert.equal(store.taskDetail(task.id).attentions.filter((a) => a.state === 'open').length, 0);
+    assert.throws(() => store.controlTask('stale', task.id, 1, 'paused'), /已经更新/);
+    const paused = store.controlTask('pause', task.id, 2, 'paused');
+    assert.equal(paused.taskRevision, 2);
+    assert.equal(paused.rowVersion, 3);
+    assert.equal(paused.status, 'paused');
+  } finally {
+    store.close();
+  }
 });
 
 test('100 tasks have consistent filtered counts and stable pagination', () => {
   const store = new Store(':memory:');
   try {
-    const bot = store.createBot('b',{name:'Bot',instructions:'测试'});
-    const other = store.createBot('other',{name:'Other',instructions:'测试'});
-    for (let i=0;i<100;i++) store.createTask(`t${i}`,{botId:bot.id,goal:`任务 ${i}`,scope:'目录',acceptance:'检查',reviewPolicy:'human'});
-    store.createTask('other-task',{botId:other.id,goal:'不混入',scope:'',acceptance:'',reviewPolicy:'human'});
+    const bot = store.createBot('b', { name: 'Bot', instructions: '测试' });
+    const other = store.createBot('other', { name: 'Other', instructions: '测试' });
+    for (let i = 0; i < 100; i++)
+      store.createTask(`t${i}`, {
+        botId: bot.id,
+        goal: `任务 ${i}`,
+        scope: '目录',
+        acceptance: '检查',
+        reviewPolicy: 'human',
+      });
+    store.createTask('other-task', {
+      botId: other.id,
+      goal: '不混入',
+      scope: '',
+      acceptance: '',
+      reviewPolicy: 'human',
+    });
     const ids = new Set<string>();
-    for(let offset=0;offset<100;offset+=25){const page=store.listTasks({botId:bot.id,offset});assert.equal(page.total,100);assert.equal(page.counts.all,100);page.items.forEach(t=>ids.add(t.id));}
-    assert.equal(ids.size,100);
-    const found=store.listTasks({botId:bot.id,q:'任务 9'});assert.equal(found.total,11);assert.equal(found.counts.all,11);
-    assert.equal(store.listTasks({botId:bot.id,q:'%'}).total,0);
-  } finally { store.close(); }
+    for (let offset = 0; offset < 100; offset += 25) {
+      const page = store.listTasks({ botId: bot.id, offset });
+      assert.equal(page.total, 100);
+      assert.equal(page.counts.all, 100);
+      page.items.forEach((t) => ids.add(t.id));
+    }
+    assert.equal(ids.size, 100);
+    const found = store.listTasks({ botId: bot.id, q: '任务 9' });
+    assert.equal(found.total, 11);
+    assert.equal(found.counts.all, 11);
+    assert.equal(store.listTasks({ botId: bot.id, q: '%' }).total, 0);
+  } finally {
+    store.close();
+  }
 });
 
 test('exclusive database ownership prevents a second host and releases on close', () => {
-  const dir=mkdtempSync(join(tmpdir(),'super-bot-'));
+  const dir = mkdtempSync(join(tmpdir(), 'super-bot-'));
   try {
-    const file=join(dir,'ledger.sqlite'); const first=new Store(file);
-    assert.throws(()=>new Store(file),/另一宿主/);
-    first.close(); const next=new Store(file); next.close();
-  } finally {rmSync(dir,{recursive:true,force:true});}
+    const file = join(dir, 'ledger.sqlite');
+    const first = new Store(file);
+    assert.throws(() => new Store(file), /另一宿主/);
+    first.close();
+    const next = new Store(file);
+    next.close();
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
 
-test('session creation intent commits once and uncertain delivery never becomes a second creation',()=>{
-  const store=new Store(':memory:');
+test('session creation intent commits once and uncertain delivery never becomes a second creation', () => {
+  const store = new Store(':memory:');
   try {
-    const bot=store.createBot('b',{name:'Bot',instructions:'测试'});
-    const task=store.createTask('t',{botId:bot.id,goal:'写文件',scope:'专用目录',acceptance:'文件存在',reviewPolicy:'human'});
-    const binding=store.beginBinding('prepare',task.id,1,'/tmp/synthetic-task');
-    assert.deepEqual(store.beginBinding('prepare',task.id,1,'/tmp/synthetic-task'),binding);
-    assert.equal(store.claimBindingCreation(binding.id),true);
-    assert.equal(store.claimBindingCreation(binding.id),false);
-    store.bindingRecovery(binding.id);store.bindingRecovery(binding.id);
-    assert.equal(store.taskDetail(task.id).attentions.filter(a=>a.state==='open').length,1);
-    assert.equal(store.activeBinding(task.id)?.state,'recovery');
-    assert.throws(()=>store.confirmBinding(binding.id,'wrong-session'),/不同会话/);
-    const confirmed=store.confirmBinding(binding.id,binding.requestedSessionId);
-    assert.equal(confirmed.state,'ready');
-    assert.deepEqual(store.confirmBinding(binding.id,binding.requestedSessionId),confirmed);
-    assert.equal(store.taskDetail(task.id).attentions.filter(a=>a.state==='open').length,0);
-    assert.equal(store.getTask(task.id).sessionId,binding.requestedSessionId);
-    assert.equal(store.db.prepare('SELECT count(*) AS n FROM bindings').get()?.n,1);
-    assert.throws(()=>store.reviseTask('edit',task.id,store.getTask(task.id).rowVersion,{goal:'changed',scope:'scope',acceptance:'accept'}),/先核对执行状态/);
-  } finally {store.close();}
+    const bot = store.createBot('b', { name: 'Bot', instructions: '测试' });
+    const task = store.createTask('t', {
+      botId: bot.id,
+      goal: '写文件',
+      scope: '专用目录',
+      acceptance: '文件存在',
+      reviewPolicy: 'human',
+    });
+    const binding = store.beginBinding('prepare', task.id, 1, '/tmp/synthetic-task');
+    assert.deepEqual(store.beginBinding('prepare', task.id, 1, '/tmp/synthetic-task'), binding);
+    assert.equal(store.claimBindingCreation(binding.id), true);
+    assert.equal(store.claimBindingCreation(binding.id), false);
+    store.bindingRecovery(binding.id);
+    store.bindingRecovery(binding.id);
+    assert.equal(store.taskDetail(task.id).attentions.filter((a) => a.state === 'open').length, 1);
+    assert.equal(store.activeBinding(task.id)?.state, 'recovery');
+    assert.throws(() => store.confirmBinding(binding.id, 'wrong-session'), /不同会话/);
+    const confirmed = store.confirmBinding(binding.id, binding.requestedSessionId);
+    assert.equal(confirmed.state, 'ready');
+    assert.deepEqual(store.confirmBinding(binding.id, binding.requestedSessionId), confirmed);
+    assert.equal(store.taskDetail(task.id).attentions.filter((a) => a.state === 'open').length, 0);
+    assert.equal(store.getTask(task.id).sessionId, binding.requestedSessionId);
+    assert.equal(store.db.prepare('SELECT count(*) AS n FROM bindings').get()?.n, 1);
+    assert.throws(
+      () =>
+        store.reviseTask('edit', task.id, store.getTask(task.id).rowVersion, {
+          goal: 'changed',
+          scope: 'scope',
+          acceptance: 'accept',
+        }),
+      /先核对执行状态/,
+    );
+  } finally {
+    store.close();
+  }
 });
 
-test('failed binding event rolls back intent, outbox and task version together',()=>{
-  const store=new Store(':memory:');
+test('failed binding event rolls back intent, outbox and task version together', () => {
+  const store = new Store(':memory:');
   try {
-    const bot=store.createBot('b',{name:'Bot',instructions:'测试'});
-    const task=store.createTask('t',{botId:bot.id,goal:'写文件',scope:'专用目录',acceptance:'文件存在',reviewPolicy:'human'});
-    store.db.exec("CREATE TRIGGER reject_binding BEFORE INSERT ON events WHEN NEW.kind='session.preparing' BEGIN SELECT RAISE(ABORT,'binding fault'); END");
-    assert.throws(()=>store.beginBinding('prepare',task.id,1,'/tmp/test'),/binding fault/);
-    assert.equal(store.activeBinding(task.id),null);assert.equal(store.getTask(task.id).rowVersion,1);
-    assert.equal(store.db.prepare("SELECT count(*) AS n FROM outbox WHERE kind!='manager.notify'").get()?.n,0);
-    assert.equal(store.managerInfo(bot.id).pending,1);
-  }finally{store.close();}
+    const bot = store.createBot('b', { name: 'Bot', instructions: '测试' });
+    const task = store.createTask('t', {
+      botId: bot.id,
+      goal: '写文件',
+      scope: '专用目录',
+      acceptance: '文件存在',
+      reviewPolicy: 'human',
+    });
+    store.db.exec(
+      "CREATE TRIGGER reject_binding BEFORE INSERT ON events WHEN NEW.kind='session.preparing' BEGIN SELECT RAISE(ABORT,'binding fault'); END",
+    );
+    assert.throws(() => store.beginBinding('prepare', task.id, 1, '/tmp/test'), /binding fault/);
+    assert.equal(store.activeBinding(task.id), null);
+    assert.equal(store.getTask(task.id).rowVersion, 1);
+    assert.equal(
+      store.db.prepare("SELECT count(*) AS n FROM outbox WHERE kind!='manager.notify'").get()?.n,
+      0,
+    );
+    assert.equal(store.managerInfo(bot.id).pending, 1);
+  } finally {
+    store.close();
+  }
 });

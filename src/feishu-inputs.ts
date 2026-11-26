@@ -24,12 +24,7 @@ export type FeishuInput = {
   isCurrent: () => boolean;
 };
 
-type PendingInput = {
-  input: FeishuInput;
-  turn?: number;
-  entered: boolean;
-  confirm: () => void;
-};
+type PendingInput = { input: FeishuInput; turn?: number; entered: boolean; confirm: () => void };
 
 function digest(text: string) {
   // Hash the exact string, including whitespace and Unicode, without copying it into the ledger.
@@ -38,20 +33,27 @@ function digest(text: string) {
 
 export async function untilFeishuAbort<T>(promise: Promise<T>, signal: AbortSignal): Promise<T> {
   let abort!: () => void;
-  const aborted = new Promise<never>((_, reject) => { abort = () => reject(signal.reason); });
+  const aborted = new Promise<never>((_, reject) => {
+    abort = () => reject(signal.reason);
+  });
   signal.addEventListener('abort', abort, { once: true });
   if (signal.aborted) abort();
   try {
     const value = await Promise.race([promise, aborted]);
     signal.throwIfAborted();
     return value;
+  } finally {
+    signal.removeEventListener('abort', abort);
   }
-  finally { signal.removeEventListener('abort', abort); }
 }
 
-export function reserveFeishuInput(store: Store, input: FeishuInput): { message: UserMessage; acceptedAt: number } | undefined {
+export function reserveFeishuInput(
+  store: Store,
+  input: FeishuInput,
+): { message: UserMessage; acceptedAt: number } | undefined {
   const { received, config } = input;
-  if (input.signal.aborted || !input.isCurrent() || received.senderOpenId !== config.ownerOpenId) return;
+  if (input.signal.aborted || !input.isCurrent() || received.senderOpenId !== config.ownerOpenId)
+    return;
   const message = createUserMessage({
     // The native renderer labels every other source kind as context rather than a chat bubble.
     source: { kind: 'user', feishuMessageId: received.messageId },
@@ -60,13 +62,25 @@ export function reserveFeishuInput(store: Store, input: FeishuInput): { message:
   const acceptedAt = Date.now();
   store.db.exec('BEGIN IMMEDIATE');
   try {
-    const receipt = store.db.prepare(`
+    const receipt = store.db
+      .prepare(`
       INSERT INTO feishu_inbound_receipts (
         messageId, nativeMessageId, bindingId, botId, sessionId, senderOpenId, appId, textDigest, acceptedAt
       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(messageId) DO NOTHING
-    `).run(received.messageId, message.id, input.bindingId, input.botId, input.sessionId,
-      received.senderOpenId, config.appId, digest(received.text), acceptedAt);
-    if (receipt.changes === 1) recordGroupEvidence(store, input.bindingId, received.receiptKind, acceptedAt);
+    `)
+      .run(
+        received.messageId,
+        message.id,
+        input.bindingId,
+        input.botId,
+        input.sessionId,
+        received.senderOpenId,
+        config.appId,
+        digest(received.text),
+        acceptedAt,
+      );
+    if (receipt.changes === 1)
+      recordGroupEvidence(store, input.bindingId, received.receiptKind, acceptedAt);
     store.db.exec('COMMIT');
     if (receipt.changes === 1) return { message, acceptedAt };
   } catch (error) {
@@ -88,7 +102,9 @@ export class FeishuInputs {
 
   registerBindingCheck(check: (botId: string, bindingId: string) => boolean): () => void {
     this.currentBinding = check;
-    return () => { if (this.currentBinding === check) this.currentBinding = undefined; };
+    return () => {
+      if (this.currentBinding === check) this.currentBinding = undefined;
+    };
   }
 
   /** A saved owner decision may carry on only while its verified route still matches. */
@@ -99,33 +115,60 @@ export class FeishuInputs {
       LEFT JOIN feishu_group_bindings b ON b.id=r.bindingId AND b.botId=r.botId AND b.appId=r.appId AND b.ownerOpenId=r.senderOpenId
       WHERE r.nativeMessageId=?
     `);
-    return (source.messages ?? [source]).every(part => {
+    return (source.messages ?? [source]).every((part) => {
       const item = receipt.get(part.messageId);
-      return !item || typeof item.currentBinding === 'string' && this.currentBinding?.(botId, item.currentBinding) === true &&
-        item.sessionId === source.sessionId && item.botId === botId && item.nativeSeq === part.seq && item.textDigest === digest(part.text);
+      return (
+        !item ||
+        (typeof item.currentBinding === 'string' &&
+          this.currentBinding?.(botId, item.currentBinding) === true &&
+          item.sessionId === source.sessionId &&
+          item.botId === botId &&
+          item.nativeSeq === part.seq &&
+          item.textDigest === digest(part.text))
+      );
     });
   }
 
   private hasReceipt(sessionId: string, input: FeishuInput, message: UserMessage): boolean {
-    const { source } = message, { received, config } = input;
+    const { source } = message,
+      { received, config } = input;
     if (!isFeishuSource(source) || 'rpcId' in source || 'principal' in source) return false;
     const block = message.content[0];
-    if (input.signal.aborted || !input.isCurrent() || sessionId !== input.sessionId ||
-        received.senderOpenId !== config.ownerOpenId || source.feishuMessageId !== received.messageId ||
-        this.store.botForSession(sessionId)?.id !== input.botId || message.content.length !== 1 ||
-        block?.type !== 'text' || block.text !== received.text) return false;
-    const receipt = this.store.db.prepare(`
+    if (
+      input.signal.aborted ||
+      !input.isCurrent() ||
+      sessionId !== input.sessionId ||
+      received.senderOpenId !== config.ownerOpenId ||
+      source.feishuMessageId !== received.messageId ||
+      this.store.botForSession(sessionId)?.id !== input.botId ||
+      message.content.length !== 1 ||
+      block?.type !== 'text' ||
+      block.text !== received.text
+    )
+      return false;
+    const receipt = this.store.db
+      .prepare(`
       SELECT 1 FROM feishu_inbound_receipts WHERE messageId = ? AND nativeMessageId = ?
         AND bindingId = ? AND botId = ? AND sessionId = ? AND senderOpenId = ?
         AND appId = ? AND textDigest = ? AND nativeSeq IS NULL
-    `).get(source.feishuMessageId, message.id, input.bindingId, input.botId, sessionId, config.ownerOpenId,
-      config.appId, digest(block.text));
+    `)
+      .get(
+        source.feishuMessageId,
+        message.id,
+        input.bindingId,
+        input.botId,
+        sessionId,
+        config.ownerOpenId,
+        config.appId,
+        digest(block.text),
+      );
     return !!receipt;
   }
 
   private evidence(sessionId: string, message: UserMessage): PendingInput | undefined {
     const pending = this.pending.get(message.id);
-    if (pending && !pending.entered && this.hasReceipt(sessionId, pending.input, message)) return pending;
+    if (pending && !pending.entered && this.hasReceipt(sessionId, pending.input, message))
+      return pending;
   }
 
   authorize(sessionId: string, turn: number, message: UserMessage): boolean {
@@ -136,48 +179,74 @@ export class FeishuInputs {
     return true;
   }
 
-  consume(sessionId: string, turn: number, event: SessionEvent<'user/message'>): { source: ChatSource; input: FeishuInput } | undefined {
+  consume(
+    sessionId: string,
+    turn: number,
+    event: SessionEvent<'user/message'>,
+  ): { source: ChatSource; input: FeishuInput } | undefined {
     if (event.surfaceOp !== 'append') return;
     const pending = this.evidence(sessionId, event.data);
     if (!pending || pending.turn !== turn) return;
-    const recorded = this.store.db.prepare(`
+    const recorded = this.store.db
+      .prepare(`
       UPDATE feishu_inbound_receipts SET nativeSeq = ? WHERE nativeMessageId = ? AND nativeSeq IS NULL
-    `).run(event.seq, event.data.id);
+    `)
+      .run(event.seq, event.data.id);
     if (recorded.changes !== 1) return;
     pending.entered = true;
     pending.confirm();
     return {
-      source: { sessionId, messageId: event.data.id, seq: event.seq, text: pending.input.received.text },
+      source: {
+        sessionId,
+        messageId: event.data.id,
+        seq: event.seq,
+        text: pending.input.received.text,
+      },
       input: pending.input,
     };
   }
 
   hasProposedInput(sessionId: string, turn: number, messageId: string): boolean {
     const pending = this.pending.get(messageId);
-    return !!pending && !pending.entered && pending.input.sessionId === sessionId && pending.turn === turn;
+    return (
+      !!pending &&
+      !pending.entered &&
+      pending.input.sessionId === sessionId &&
+      pending.turn === turn
+    );
   }
 
   async submit(agent: Agent, input: FeishuInput, message: UserMessage): Promise<boolean> {
     if (!this.hasReceipt(agent.id, input, message)) return false;
     let confirm!: () => void;
-    const promise = new Promise<void>(resolve => { confirm = resolve; });
+    const promise = new Promise<void>((resolve) => {
+      confirm = resolve;
+    });
     const pending: PendingInput = { input, entered: false, confirm };
     this.pending.set(message.id, pending);
     const revoke = () => {
       // After pre-step approves a message, the Agent can be awaiting model preparation.
-      if (!pending.entered && pending.turn !== undefined) agent.cancel({ kind: 'user' }, { keepInbox: true });
+      if (!pending.entered && pending.turn !== undefined)
+        agent.cancel({ kind: 'user' }, { keepInbox: true });
     };
     input.signal.addEventListener('abort', revoke, { once: true });
     try {
       agent.followup(message);
       await untilFeishuAbort(Promise.race([promise, agent.whenIdle()]), input.signal);
       if (pending.entered) return true;
-      if (input.isCurrent()) throw new AppError('feishu-input-unconfirmed', '飞书输入未能进入原生会话，请检查 Bot 对话。');
+      if (input.isCurrent())
+        throw new AppError(
+          'feishu-input-unconfirmed',
+          '飞书输入未能进入原生会话，请检查 Bot 对话。',
+        );
       return false;
     } finally {
       input.signal.removeEventListener('abort', revoke);
       this.pending.delete(message.id);
-      if (!pending.entered && [...agent.inbox.nextTurn, ...agent.inbox.nextStep].some(item => item.id === message.id)) {
+      if (
+        !pending.entered &&
+        [...agent.inbox.nextTurn, ...agent.inbox.nextStep].some((item) => item.id === message.id)
+      ) {
         agent.inbox.remove(message.id);
       }
     }

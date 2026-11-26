@@ -4,9 +4,23 @@ import type { Context } from '@deepseek-ai/cordis';
 import { FeishuBridge } from './feishu-bridge.ts';
 import { FeishuGroups } from './feishu-groups.ts';
 import { FeishuSelfTest } from './feishu-self-test.ts';
-import { feishuCredentials, loadFeishuSettings, saveFeishuSettings, type SavedFeishuSettings } from './feishu-settings.ts';
-import type { FeishuBinding, FeishuConfig, FeishuCredentials, FeishuCredentialStatus, FeishuGroupDiagnosis, FeishuGroupEvidence,
-  FeishuSelfBinding, FeishuSettingsView, FeishuTransport } from './feishu-types.ts';
+import {
+  feishuCredentials,
+  loadFeishuSettings,
+  saveFeishuSettings,
+  type SavedFeishuSettings,
+} from './feishu-settings.ts';
+import type {
+  FeishuBinding,
+  FeishuConfig,
+  FeishuCredentials,
+  FeishuCredentialStatus,
+  FeishuGroupDiagnosis,
+  FeishuGroupEvidence,
+  FeishuSelfBinding,
+  FeishuSettingsView,
+  FeishuTransport,
+} from './feishu-types.ts';
 import type { Managers } from './manager.ts';
 import { AppError, requiredText } from './model.ts';
 import type { Store } from './store.ts';
@@ -22,11 +36,15 @@ export interface FeishuStatus {
 }
 
 type Runtime = { appId: string; transport: FeishuTransport } & (
-  { kind: 'bound'; groups: FeishuGroups; bridge: FeishuBridge }
+  | { kind: 'bound'; groups: FeishuGroups; bridge: FeishuBridge }
   | { kind: 'unbound'; connection: FeishuSettingsView['connection'] }
 );
 type Sdk = typeof import('./feishu-sdk.ts');
-type CredentialCheck = { result: FeishuCredentialStatus; controller: AbortController; pending?: Promise<void> };
+type CredentialCheck = {
+  result: FeishuCredentialStatus;
+  controller: AbortController;
+  pending?: Promise<void>;
+};
 
 function bindingView(binding: FeishuBinding | null): FeishuStatus['binding'] {
   if (!binding) return null;
@@ -70,7 +88,10 @@ const settingsFields: Record<string, readonly string[]> = {
 
 function sessionIdOf(payload: Record<string, unknown>): string {
   const id = payload.sessionId;
-  if (typeof id !== 'string' || !/^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/.test(id)) {
+  if (
+    typeof id !== 'string' ||
+    !/^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/.test(id)
+  ) {
     throw new AppError('feishu-settings-input', '测试会话标识无效，请从飞书设置重新开启。');
   }
   return id;
@@ -80,8 +101,15 @@ function startTokenOf(payload: Record<string, unknown>): string {
   return requiredText(payload.startToken, '测试开启凭据', 200);
 }
 
-export async function startFeishuHost(ctx: Context, store: Store, managers: Managers, legacyEnabled: boolean, profileDir?: string,
-  loadSdk: () => Promise<Sdk> = () => import('./feishu-sdk.ts'), admission = new ReloadAdmission()) {
+export async function startFeishuHost(
+  ctx: Context,
+  store: Store,
+  managers: Managers,
+  legacyEnabled: boolean,
+  profileDir?: string,
+  loadSdk: () => Promise<Sdk> = () => import('./feishu-sdk.ts'),
+  admission = new ReloadAdmission(),
+) {
   let active = true;
   let { saved, error: issue } = loadFeishuSettings(profileDir, legacyEnabled);
   let runtime: Runtime | undefined;
@@ -103,7 +131,11 @@ export async function startFeishuHost(ctx: Context, store: Store, managers: Mana
     const identity = { appId, ownerOpenId };
     const groups = new FeishuGroups(store, identity, transport, () => active && runtime === next);
     const next: Runtime = {
-      kind: 'bound', appId, transport, groups, bridge: new FeishuBridge(ctx, store, managers, groups, transport, identity, admission),
+      kind: 'bound',
+      appId,
+      transport,
+      groups,
+      bridge: new FeishuBridge(ctx, store, managers, groups, transport, identity, admission),
     };
     return next;
   }
@@ -112,25 +144,27 @@ export async function startFeishuHost(ctx: Context, store: Store, managers: Mana
     try {
       if (previous?.kind === 'bound') await previous.bridge.close();
       else previous?.transport.stop();
+    } catch {
+      ctx.logger.warn('[super-bot] 飞书连接关闭时出现问题。');
     }
-    catch { ctx.logger.warn('[super-bot] 飞书连接关闭时出现问题。'); }
   }
 
   async function activate(next: Runtime) {
     runtime = next;
     try {
       if (next.kind === 'bound') next.bridge.start();
-      else next.transport.start({
-        onMessage: () => {},
-        onPrivateMessage: message => {
-          if (runtime === next && next.connection === 'ready') selfTest.receive(message);
-        },
-        onConnection: state => {
-          if (runtime !== next) return;
-          next.connection = state === 'reconnected' ? 'ready' : state;
-          if (state !== 'ready') selfTest.interrupt();
-        },
-      });
+      else
+        next.transport.start({
+          onMessage: () => {},
+          onPrivateMessage: (message) => {
+            if (runtime === next && next.connection === 'ready') selfTest.receive(message);
+          },
+          onConnection: (state) => {
+            if (runtime !== next) return;
+            next.connection = state === 'reconnected' ? 'ready' : state;
+            if (state !== 'ready') selfTest.interrupt();
+          },
+        });
     } catch {
       runtime = undefined;
       issue = STARTUP_ISSUE;
@@ -141,15 +175,20 @@ export async function startFeishuHost(ctx: Context, store: Store, managers: Mana
   if (saved?.enabled) {
     try {
       await activate(prepare(saved, await loadSdk()));
-    } catch { issue = STARTUP_ISSUE; }
+    } catch {
+      issue = STARTUP_ISSUE;
+    }
     void refreshCredentialCheck();
   }
   if (issue && (profileDir || legacyEnabled)) ctx.logger.warn(`[super-bot] ${issue}`);
 
   function connectionStatus() {
     if (runtime?.kind === 'bound') return runtime.bridge.connectionStatus();
-    return { connection: runtime?.connection ?? (saved?.enabled ? 'offline' : 'disabled'),
-      lastMessageAt: null, error: runtime?.connection === 'stopped' ? STARTUP_ISSUE : undefined } as const;
+    return {
+      connection: runtime?.connection ?? (saved?.enabled ? 'offline' : 'disabled'),
+      lastMessageAt: null,
+      error: runtime?.connection === 'stopped' ? STARTUP_ISSUE : undefined,
+    } as const;
   }
 
   function selfBinding(): FeishuSelfBinding {
@@ -162,10 +201,18 @@ export async function startFeishuHost(ctx: Context, store: Store, managers: Mana
     const testStartToken = saved?.enabled && !saved.ownerOpenId ? selfTest.startToken() : undefined;
     const privateTestAt = saved?.selfTestEvidence?.confirmedAt;
     return {
-      appId: saved?.appId ?? '', ownerOpenId: saved?.ownerOpenId ?? '', configurationId, selfBinding: selfBinding(),
-      credentials: credentialCheck.result, privateTest: privateTestAt ? 'passed' : 'untested', ...(privateTestAt && { privateTestAt }),
-      hasSecret: Boolean(saved?.appSecret), enabled: saved?.enabled ?? false, connection: current.connection,
-      lastMessageAt: current.lastMessageAt, ...(error ? { error } : {}),
+      appId: saved?.appId ?? '',
+      ownerOpenId: saved?.ownerOpenId ?? '',
+      configurationId,
+      selfBinding: selfBinding(),
+      credentials: credentialCheck.result,
+      privateTest: privateTestAt ? 'passed' : 'untested',
+      ...(privateTestAt && { privateTestAt }),
+      hasSecret: Boolean(saved?.appSecret),
+      enabled: saved?.enabled ?? false,
+      connection: current.connection,
+      lastMessageAt: current.lastMessageAt,
+      ...(error ? { error } : {}),
       ...(testStartToken && { testStartToken }),
     };
   }
@@ -197,7 +244,11 @@ export async function startFeishuHost(ctx: Context, store: Store, managers: Mana
         if (!signal.aborted) current.result = 'unverified';
       }
     })();
-    try { await current.pending; } finally { current.pending = undefined; }
+    try {
+      await current.pending;
+    } finally {
+      current.pending = undefined;
+    }
   }
 
   async function verify(payload: Record<string, unknown>): Promise<FeishuSettingsView> {
@@ -240,7 +291,10 @@ export async function startFeishuHost(ctx: Context, store: Store, managers: Mana
   }
 
   function configurationChanged(): AppError {
-    return new AppError('feishu-configuration-changed', '飞书连接配置已变更，请核对当前设置后重试。');
+    return new AppError(
+      'feishu-configuration-changed',
+      '飞书连接配置已变更，请核对当前设置后重试。',
+    );
   }
 
   function assertConfiguration(payload: Record<string, unknown>) {
@@ -259,7 +313,12 @@ export async function startFeishuHost(ctx: Context, store: Store, managers: Mana
     const credentials = feishuCredentials(payload, saved);
     const previous = saved?.appId === credentials.appId ? saved : undefined;
     const next: SavedFeishuSettings = { ...previous, ...credentials, enabled: true };
-    if (previous?.enabled && runtime && sameCredentials(previous, next) && connectionStatus().connection !== 'stopped') {
+    if (
+      previous?.enabled &&
+      runtime &&
+      sameCredentials(previous, next) &&
+      connectionStatus().connection !== 'stopped'
+    ) {
       return settingsView();
     }
     return install(next, () => assertConfiguration(payload));
@@ -281,15 +340,22 @@ export async function startFeishuHost(ctx: Context, store: Store, managers: Mana
   function confirm(payload: Record<string, unknown>) {
     assertActive();
     assertConfiguration(payload);
-    const current = assertUnbound(), sessionId = sessionIdOf(payload);
+    const current = assertUnbound(),
+      sessionId = sessionIdOf(payload);
     const token = requiredText(payload.confirmationToken, '候选确认凭据', 200);
     const ownerOpenId = selfTest.confirmedOpenId(sessionId, token);
-    return install({ ...current, ownerOpenId, selfTestSkipped: undefined,
-      selfTestEvidence: { appId: current.appId, ownerOpenId, confirmedAt: Date.now() },
-    }, () => {
-      assertConfiguration(payload);
-      selfTest.confirmedOpenId(sessionId, token);
-    });
+    return install(
+      {
+        ...current,
+        ownerOpenId,
+        selfTestSkipped: undefined,
+        selfTestEvidence: { appId: current.appId, ownerOpenId, confirmedAt: Date.now() },
+      },
+      () => {
+        assertConfiguration(payload);
+        selfTest.confirmedOpenId(sessionId, token);
+      },
+    );
   }
 
   function serialize(work: () => unknown) {
@@ -301,7 +367,7 @@ export async function startFeishuHost(ctx: Context, store: Store, managers: Mana
   function invokeSettings(action: string, payload: Record<string, unknown>) {
     const fields = Object.hasOwn(settingsFields, action) ? settingsFields[action] : undefined;
     if (!fields) throw new AppError('not-found', '未知飞书设置操作。');
-    if (Object.keys(payload).some(key => key !== 'action' && !fields.includes(key))) {
+    if (Object.keys(payload).some((key) => key !== 'action' && !fields.includes(key))) {
       throw new AppError('feishu-settings-input', '请从当前 profile 的飞书设置执行此操作。');
     }
     if (action === 'feishu.settings.get') return settingsView();
@@ -315,12 +381,18 @@ export async function startFeishuHost(ctx: Context, store: Store, managers: Mana
     assertUnbound();
     const sessionId = sessionIdOf(payload);
     if (action === 'feishu.settings.test.status') return selfTest.status(sessionId);
-    if (action === 'feishu.settings.test.stop') return selfTest.stop(sessionId, startTokenOf(payload));
+    if (action === 'feishu.settings.test.stop')
+      return selfTest.stop(sessionId, startTokenOf(payload));
     if (runtime?.kind !== 'unbound' || runtime.connection !== 'ready') {
       throw new AppError('feishu-offline', '飞书长连接尚未就绪，请检查连接状态后重试。');
     }
     if (action === 'feishu.settings.test.start') {
-      return selfTest.start(sessionId, startTokenOf(payload), runtime.appId, runtime.transport.sendText.bind(runtime.transport));
+      return selfTest.start(
+        sessionId,
+        startTokenOf(payload),
+        runtime.appId,
+        runtime.transport.sendText.bind(runtime.transport),
+      );
     }
     return selfTest.retry(sessionId);
   }
@@ -329,19 +401,28 @@ export async function startFeishuHost(ctx: Context, store: Store, managers: Mana
     const bound = runtime?.kind === 'bound' ? runtime : undefined;
     const groupStatus = bound?.bridge.status(botId);
     const current = groupStatus ?? connectionStatus();
-    return { connection: current.connection, selfBinding: selfBinding(),
-      error: current.error ?? issue, binding: bindingView(bound?.groups.get(botId) ?? null),
-      evidence: groupStatus?.evidence ?? null };
+    return {
+      connection: current.connection,
+      selfBinding: selfBinding(),
+      error: current.error ?? issue,
+      binding: bindingView(bound?.groups.get(botId) ?? null),
+      evidence: groupStatus?.evidence ?? null,
+    };
   }
 
-  async function diagnose(current: Extract<Runtime, { kind: 'bound' }>, botId: string, bindingId: string): Promise<FeishuGroupDiagnosis> {
+  async function diagnose(
+    current: Extract<Runtime, { kind: 'bound' }>,
+    botId: string,
+    bindingId: string,
+  ): Promise<FeishuGroupDiagnosis> {
     const evidenceForBinding = () => {
       assertActive();
       if (runtime !== current || current.groups.get(botId)?.id !== bindingId) {
         throw new AppError('feishu-binding-changed', '飞书群绑定已变更，请刷新后重新排查。');
       }
       const { evidence } = current.bridge.status(botId);
-      if (evidence?.plainTextAt != null) throw new AppError('feishu-diagnosis-not-needed', '已收到普通群消息，请刷新验证结果。');
+      if (evidence?.plainTextAt != null)
+        throw new AppError('feishu-diagnosis-not-needed', '已收到普通群消息，请刷新验证结果。');
       return evidence;
     };
     evidenceForBinding();
@@ -358,7 +439,11 @@ export async function startFeishuHost(ctx: Context, store: Store, managers: Mana
     if (action.startsWith('feishu.settings.')) return invokeSettings(action, payload);
     const fields = Object.hasOwn(groupFields, action) ? groupFields[action] : undefined;
     if (!fields) throw new AppError('not-found', '未知飞书操作。');
-    if (Object.keys(payload).some(key => key !== 'action' && key !== 'botId' && !fields.includes(key))) {
+    if (
+      Object.keys(payload).some(
+        (key) => key !== 'action' && key !== 'botId' && !fields.includes(key),
+      )
+    ) {
       throw new AppError('invalid-input', '请从本端 Bot 的飞书群设置执行此操作。');
     }
     const botId = requiredText(payload.botId, 'Bot 标识', 200);
@@ -368,9 +453,11 @@ export async function startFeishuHost(ctx: Context, store: Store, managers: Mana
     if (saved?.enabled && !saved.ownerOpenId) {
       throw new AppError('feishu-self-unbound', '请先在飞书连接设置中绑定本人身份。');
     }
-    if (current?.kind !== 'bound') throw new AppError('feishu-unavailable', issue ?? '此 profile 未启用飞书群。');
+    if (current?.kind !== 'bound')
+      throw new AppError('feishu-unavailable', issue ?? '此 profile 未启用飞书群。');
     const { groups, bridge } = current;
-    if (action === 'feishu.diagnose') return diagnose(current, botId, requiredText(payload.bindingId, '绑定标识', 200));
+    if (action === 'feishu.diagnose')
+      return diagnose(current, botId, requiredText(payload.bindingId, '绑定标识', 200));
     if (action === 'feishu.unbind') {
       groups.unbind(botId, requiredText(payload.bindingId, '绑定标识', 200));
       return status(botId);
@@ -380,12 +467,20 @@ export async function startFeishuHost(ctx: Context, store: Store, managers: Mana
     }
     if (action === 'feishu.preview') {
       const preview = await groups.preview(botId, requiredText(payload.chatId, '群 ID', 200));
-      if (current !== runtime) throw new AppError('feishu-stopped', '飞书配置已变更，请刷新后重新预览。');
+      if (current !== runtime)
+        throw new AppError('feishu-stopped', '飞书配置已变更，请刷新后重新预览。');
       return preview;
     }
-    if (action === 'feishu.bind') await groups.bind(botId, requiredText(payload.confirmationToken, '群预览凭据', 200));
-    else await groups.create(botId, requiredText(payload.name, '群名', 60), requiredText(payload.requestId, '请求标识', 200));
-    if (current !== runtime) throw new AppError('feishu-stopped', '飞书配置已变更，请刷新后核对绑定。');
+    if (action === 'feishu.bind')
+      await groups.bind(botId, requiredText(payload.confirmationToken, '群预览凭据', 200));
+    else
+      await groups.create(
+        botId,
+        requiredText(payload.name, '群名', 60),
+        requiredText(payload.requestId, '请求标识', 200),
+      );
+    if (current !== runtime)
+      throw new AppError('feishu-stopped', '飞书配置已变更，请刷新后核对绑定。');
     return status(botId);
   }
 
@@ -394,9 +489,11 @@ export async function startFeishuHost(ctx: Context, store: Store, managers: Mana
       if (runtime?.kind === 'bound') runtime.groups.revokeRouting(botId, bindingId);
     },
     reloadBlockers(): string[] {
-      return [...(credentialCheck.pending ? ['飞书凭证核验中'] : []),
+      return [
+        ...(credentialCheck.pending ? ['飞书凭证核验中'] : []),
         ...(!selfTest.startToken() ? ['飞书私聊自测进行中'] : []),
-        ...(runtime?.kind === 'bound' ? runtime.bridge.reloadBlockers() : [])];
+        ...(runtime?.kind === 'bound' ? runtime.bridge.reloadBlockers() : []),
+      ];
     },
     async close() {
       active = false;
@@ -408,11 +505,17 @@ export async function startFeishuHost(ctx: Context, store: Store, managers: Mana
       await Promise.allSettled(inFlight);
     },
     async invoke(action: string, payload: Record<string, unknown>) {
-      const read = ['feishu.status', 'feishu.settings.get', 'feishu.settings.test.status'].includes(action);
+      const read = ['feishu.status', 'feishu.settings.get', 'feishu.settings.test.status'].includes(
+        action,
+      );
       if (read) return invoke(action, payload);
       const pending = admission.run('飞书请求 ' + action, () => invoke(action, payload));
       inFlight.add(pending);
-      try { return await pending; } finally { inFlight.delete(pending); }
+      try {
+        return await pending;
+      } finally {
+        inFlight.delete(pending);
+      }
     },
   };
 }

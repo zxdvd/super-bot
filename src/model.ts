@@ -1,8 +1,8 @@
 /** Values crossing the product/host boundary; no DSH or UI types. */
-import type {WorkdirRequest,WorkdirInfo} from './workdir.ts';
-import type {ClusterProbe,PriorTools,ProbeResult} from './read-only-recovery.ts';
-import type {WorkStage} from './work-stage.ts';
-export type {WorkdirRequest,WorkdirInfo};
+import type { WorkdirRequest, WorkdirInfo } from './workdir.ts';
+import type { ClusterProbe, PriorTools, ProbeResult } from './read-only-recovery.ts';
+import type { WorkStage } from './work-stage.ts';
+export type { WorkdirRequest, WorkdirInfo };
 export interface WorkspaceStatus {
   product: 'Super Bot';
   version: string;
@@ -15,7 +15,12 @@ export interface WorkspaceStatus {
 }
 
 export class AppError extends Error {
-  constructor(readonly code: string, message: string) { super(message); }
+  constructor(
+    readonly code: string,
+    message: string,
+  ) {
+    super(message);
+  }
 }
 
 export interface Bot {
@@ -25,7 +30,7 @@ export interface Bot {
   configRevision: number;
   managerSessionId: string | null;
   createdAt: number;
-  materials:ReferenceInfo[];
+  materials: ReferenceInfo[];
 }
 export const DEFAULT_BOT_RUNNING_TASKS = 5;
 
@@ -34,8 +39,14 @@ export interface BotCapacity {
   botLimit: number;
   botHeld: number;
 }
-export interface ReferenceInfo {path:string;sha256:string;bytes:number}
-export interface ReferenceMaterial extends ReferenceInfo {text:string}
+export interface ReferenceInfo {
+  path: string;
+  sha256: string;
+  bytes: number;
+}
+export interface ReferenceMaterial extends ReferenceInfo {
+  text: string;
+}
 export interface TaskBotContext {
   instructions: string;
   materials: ReferenceMaterial[];
@@ -51,7 +62,14 @@ export type TaskCloseRequest = {
   blocker?: { code: string; message: string };
 };
 export type WorkActivity = 'working' | 'attention' | 'review';
-export type BotWorkSummary = { id: string; name: string; sessionId: string | null; working: number; attention: number; review: number };
+export type BotWorkSummary = {
+  id: string;
+  name: string;
+  sessionId: string | null;
+  working: number;
+  attention: number;
+  review: number;
+};
 
 export interface Task {
   id: string;
@@ -67,23 +85,37 @@ export interface Task {
   sessionId: string | null;
   createdAt: number;
   updatedAt: number;
-  status: 'unscheduled' | 'needs-input' | 'approval' | 'paused' | 'manual' | 'completed' | 'cancelled' | 'review' | 'queued' | 'running' | 'stopping' | 'recovery' | 'blocked';
+  status:
+    | 'unscheduled'
+    | 'needs-input'
+    | 'approval'
+    | 'paused'
+    | 'manual'
+    | 'completed'
+    | 'cancelled'
+    | 'review'
+    | 'queued'
+    | 'running'
+    | 'stopping'
+    | 'recovery'
+    | 'blocked';
   /** Next actor from the ledger, supplied by work view queries. */
   activity?: WorkActivity | null;
   activityQuestion?: string;
-  managerReviewed?:boolean;
+  managerReviewed?: boolean;
   blockingAttention?: 'input' | 'approval' | 'recovery' | null;
   /** The Worker ended with a blocker and no concrete action is assigned to the owner. */
   waitingForPrerequisite?: true;
   stageState?: WorkStage['state'];
   deliveredAt?: number;
-  botConfigRevision:number;
+  botConfigRevision: number;
   /** What the Bot asked for when creating the task; null means the configured default. */
-  workdirRequest?:WorkdirRequest|null;
+  workdirRequest?: WorkdirRequest | null;
 }
 export const RESULT_FRESH_MS = 3 * 24 * 3600 * 1000;
 export const TEST_TASK_PREFIX = '【测试】';
-export const isTestTask = (task: Pick<Task, 'goal'>): boolean => task.goal.startsWith(TEST_TASK_PREFIX);
+export const isTestTask = (task: Pick<Task, 'goal'>): boolean =>
+  task.goal.startsWith(TEST_TASK_PREFIX);
 
 export interface TaskPage {
   items: Task[];
@@ -94,34 +126,100 @@ export interface TaskPage {
   counts: { all: number; open: number; review: number; completed: number; cancelled: number };
 }
 export type TaskInboxPage = TaskPage & { truncated: boolean; reviewTotal: number };
-export interface NewBot { name: string; instructions: string;referencePaths?:string[] }
-export function botDraft(input:NewBot):NewBot {
-  const paths=input.referencePaths??[];
-  if(!Array.isArray(paths)||paths.length>4)throw new AppError('invalid-input','最多指定四份本地参考文本。');
-  const referencePaths=[...new Set(paths.map(path=>requiredText(path,'参考文本路径',2000)))];
-  return {name:requiredText(input.name,'Bot 名称',80),instructions:requiredText(input.instructions,'Bot 职责'),...(referencePaths.length?{referencePaths}:{})};
+export interface NewBot {
+  name: string;
+  instructions: string;
+  referencePaths?: string[];
 }
-export interface NewTask { botId: string; goal: string; scope: string; acceptance: string; reviewPolicy: 'human' | 'bot'; startPaused?:boolean; workdir?:WorkdirRequest }
+export function botDraft(input: NewBot): NewBot {
+  const paths = input.referencePaths ?? [];
+  if (!Array.isArray(paths) || paths.length > 4)
+    throw new AppError('invalid-input', '最多指定四份本地参考文本。');
+  const referencePaths = [
+    ...new Set(paths.map((path) => requiredText(path, '参考文本路径', 2000))),
+  ];
+  return {
+    name: requiredText(input.name, 'Bot 名称', 80),
+    instructions: requiredText(input.instructions, 'Bot 职责'),
+    ...(referencePaths.length ? { referencePaths } : {}),
+  };
+}
+export interface NewTask {
+  botId: string;
+  goal: string;
+  scope: string;
+  acceptance: string;
+  reviewPolicy: 'human' | 'bot';
+  startPaused?: boolean;
+  workdir?: WorkdirRequest;
+}
 export interface Binding {
-  id: string; taskId: string; generation: number; taskRevision: number;
-  requestedSessionId: string; sessionId: string | null; cwd: string;
-  state: 'creating' | 'ready' | 'recovery' | 'released'; createdAt: number;
+  id: string;
+  taskId: string;
+  generation: number;
+  taskRevision: number;
+  requestedSessionId: string;
+  sessionId: string | null;
+  cwd: string;
+  state: 'creating' | 'ready' | 'recovery' | 'released';
+  createdAt: number;
   workdir?: WorkdirInfo | null;
 }
 export interface ExistingSessionGrant {
-  taskId:string;expectedRowVersion:number;sessionId:string;cwd:string;
-  fullHistoryApproved:boolean;directoryApproved:boolean;
+  taskId: string;
+  expectedRowVersion: number;
+  sessionId: string;
+  cwd: string;
+  fullHistoryApproved: boolean;
+  directoryApproved: boolean;
   source?: ChatSource;
 }
-export interface ExistingSessionPreview {sessionId:string;cwd:string;quiet:boolean;reason:string}
-export interface ManagerBinding {id:string;botId:string;generation:number;configRevision:number;requestedSessionId:string;sessionId:string|null;cwd:string;state:'creating'|'ready'|'recovery'|'released';createdAt:number}
-export interface ManagerEvent {id:string;taskId:string|null;payload:string;state:string;createdAt:number}
-export type ChatDeliveryStatus = { state: 'awaiting-review' | 'pending' | 'uncertain' | 'delivered' | 'handled'; reason?: string };
-export type UncertainDelivery = {
-  id: string; taskId: string; taskGoal: string; resultId: string;
-  reason: string; sessionId: string | null; at: number; turn?: number;
+export interface ExistingSessionPreview {
+  sessionId: string;
+  cwd: string;
+  quiet: boolean;
+  reason: string;
+}
+export interface ManagerBinding {
+  id: string;
+  botId: string;
+  generation: number;
+  configRevision: number;
+  requestedSessionId: string;
+  sessionId: string | null;
+  cwd: string;
+  state: 'creating' | 'ready' | 'recovery' | 'released';
+  createdAt: number;
+}
+export interface ManagerEvent {
+  id: string;
+  taskId: string | null;
+  payload: string;
+  state: string;
+  createdAt: number;
+}
+export type ChatDeliveryStatus = {
+  state: 'awaiting-review' | 'pending' | 'uncertain' | 'delivered' | 'handled';
+  reason?: string;
 };
-export type ReloadReceipt = { resultId: string; build: string; from: string; to: string; pid: number; at: number };
+export type UncertainDelivery = {
+  id: string;
+  taskId: string;
+  taskGoal: string;
+  resultId: string;
+  reason: string;
+  sessionId: string | null;
+  at: number;
+  turn?: number;
+};
+export type ReloadReceipt = {
+  resultId: string;
+  build: string;
+  from: string;
+  to: string;
+  pid: number;
+  at: number;
+};
 export type TaskProgress = {
   worker: { runId: string; summary: string; at: number } | null;
   runId: string | null;
@@ -130,13 +228,33 @@ export type TaskProgress = {
   reload: ReloadReceipt | null;
 };
 export interface Run {
-  id:string; taskId:string; bindingId:string; sessionId:string; taskRevision:number; generation:number;
-  inputId:string; state:'queued'|'running'|'settled'|'failed'|'cancelling'|'cancelled'|'interrupted';
-  createdAt:number; finishedAt:number|null; note:string;
+  id: string;
+  taskId: string;
+  bindingId: string;
+  sessionId: string;
+  taskRevision: number;
+  generation: number;
+  inputId: string;
+  state: 'queued' | 'running' | 'settled' | 'failed' | 'cancelling' | 'cancelled' | 'interrupted';
+  createdAt: number;
+  finishedAt: number | null;
+  note: string;
 }
-export interface RunInput {id:string; taskId:string; kind:string; content:string; state:string; messageId:string|null; messageJson:string|null; attentionId:string|null; createdAt:number}
-export type WorkerPriorInput = Pick<RunInput,'id'|'content'|'messageId'> & {
-  kind:'answer'|'rework'|'continuation';order:number;priorDirections?:string[];
+export interface RunInput {
+  id: string;
+  taskId: string;
+  kind: string;
+  content: string;
+  state: string;
+  messageId: string | null;
+  messageJson: string | null;
+  attentionId: string | null;
+  createdAt: number;
+}
+export type WorkerPriorInput = Pick<RunInput, 'id' | 'content' | 'messageId'> & {
+  kind: 'answer' | 'rework' | 'continuation';
+  order: number;
+  priorDirections?: string[];
 };
 
 export interface ModelRoute {
@@ -144,10 +262,11 @@ export interface ModelRoute {
   model: string;
   reasoningEffort: string | null;
 }
-export type WorkerModelPlan = ModelRoute & (
-  { source: 'role-override' | 'native-selection' } |
-  { source: 'manager-inheritance'; sourceSessionId: string }
-);
+export type WorkerModelPlan = ModelRoute &
+  (
+    | { source: 'role-override' | 'native-selection' }
+    | { source: 'manager-inheritance'; sourceSessionId: string }
+  );
 export interface ActualModelRequest extends ModelRoute {
   turn: number;
   step: number;
@@ -194,25 +313,52 @@ export interface RunChildWait {
 }
 export type ChildWaitDetail = RunChildWait & { elapsedMs: number | null };
 
-export interface Evidence {path:string;sha256:string;bytes:number}
+export interface Evidence {
+  path: string;
+  sha256: string;
+  bytes: number;
+}
 export type DeliveryLinks = Record<string, string>;
 export type DeliveryArtifacts = { links: DeliveryLinks; primaryLink?: string };
 export interface WorkReport {
-  kind:'progress'|'stage'|'waiting'|'ready'|'blocked'|'failed';summary:string;checks?:string;
-  evidence?:Evidence[];requestedFiles?:string[];links?:DeliveryLinks;primaryLink?:string;
-  stage?:string;evidenceRef?:string;
+  kind: 'progress' | 'stage' | 'waiting' | 'ready' | 'blocked' | 'failed';
+  summary: string;
+  checks?: string;
+  evidence?: Evidence[];
+  requestedFiles?: string[];
+  links?: DeliveryLinks;
+  primaryLink?: string;
+  stage?: string;
+  evidenceRef?: string;
 }
-export interface Result {id:string;runId:string;taskId:string;taskRevision:number;summary:string;checks:string;evidence:Evidence[];createdAt:number;humanAcceptedAt:number|null}
+export interface Result {
+  id: string;
+  runId: string;
+  taskId: string;
+  taskRevision: number;
+  summary: string;
+  checks: string;
+  evidence: Evidence[];
+  createdAt: number;
+  humanAcceptedAt: number | null;
+}
 export interface DeliveredResult extends Result, DeliveryArtifacts {
   deliveredAt: number;
   deliveryText?: string;
 }
 export interface Attention {
-  id: string; taskId: string; kind: 'input' | 'approval' | 'review' | 'recovery';
-  question: string; taskRevision: number; state: 'open' | 'responding' | 'resolved' | 'stale'; createdAt: number;
+  id: string;
+  taskId: string;
+  kind: 'input' | 'approval' | 'review' | 'recovery';
+  question: string;
+  taskRevision: number;
+  state: 'open' | 'responding' | 'resolved' | 'stale';
+  createdAt: number;
 }
 
-export function taskStatus(task: Pick<Task, 'lifecycle' | 'controlMode' | 'scope' | 'acceptance'>): Task['status'] {
+export function taskStatus(
+  task: Pick<Task, 'lifecycle' | 'controlMode' | 'scope' | 'acceptance'>,
+): Task['status'] {
   if (task.lifecycle === 'completed' || task.lifecycle === 'cancelled') return task.lifecycle;
   if (!task.scope || !task.acceptance) return 'needs-input';
   if (task.controlMode === 'paused' || task.controlMode === 'manual') return task.controlMode;
@@ -220,7 +366,8 @@ export function taskStatus(task: Pick<Task, 'lifecycle' | 'controlMode' | 'scope
 }
 
 export function requiredText(value: unknown, label: string, max = 10000): string {
-  if (typeof value !== 'string' || !value.trim()) throw new AppError('invalid-input', `请填写${label}。`);
+  if (typeof value !== 'string' || !value.trim())
+    throw new AppError('invalid-input', `请填写${label}。`);
   const text = value.trim();
   if (text.length > max) throw new AppError('invalid-input', `${label}不能超过 ${max} 字符。`);
   return text;
@@ -234,15 +381,29 @@ export function optionalText(value: unknown, label: string, max = 10000): string
  * A single message retains its original shape. For a multi-message turn, the top-level
  * identity is the latest message; text is complete and messages preserves each source.
  */
-export interface ChatSource { sessionId:string; messageId:string; seq:number; text:string; messages?:{messageId:string;seq:number;text:string}[] }
+export interface ChatSource {
+  sessionId: string;
+  messageId: string;
+  seq: number;
+  text: string;
+  messages?: { messageId: string; seq: number; text: string }[];
+}
 
 export type RecoveryDirection = {
   id: string;
   source: ChatSource;
   mode: 'read-only' | 'authorized-work';
 };
-export type RecoveryDirectionChange = {kind:'replace'|'revoke';ids?:string[]};
-export type RecoveryDirectionStatus = 'recorded'|'next-run'|'queued'|'entered'|'delivery-unknown'|'discarded'|'revoked'|'archived';
+export type RecoveryDirectionChange = { kind: 'replace' | 'revoke'; ids?: string[] };
+export type RecoveryDirectionStatus =
+  | 'recorded'
+  | 'next-run'
+  | 'queued'
+  | 'entered'
+  | 'delivery-unknown'
+  | 'discarded'
+  | 'revoked'
+  | 'archived';
 export interface RecoveryInstruction {
   id: string;
   source: ChatSource;
@@ -251,7 +412,7 @@ export interface RecoveryInstruction {
   mode?: RecoveryDirection['mode'];
   priorDirection?: ChatSource;
   directions?: RecoveryDirection[];
-  change?: {kind:RecoveryDirectionChange['kind'];removedIds:string[]};
+  change?: { kind: RecoveryDirectionChange['kind']; removedIds: string[] };
   stageRunId?: string;
   runId?: string;
 }
@@ -259,11 +420,11 @@ export interface RecoveryWorkContext {
   priorRunId: string;
   mode: NonNullable<RecoveryInstruction['mode']>;
   priorDirection?: string;
-  priorDirections?: {id:string;text:string}[];
+  priorDirections?: { id: string; text: string }[];
   directionIds?: string[];
-  priorReport?: Pick<WorkReport,'kind'|'summary'|'checks'>;
+  priorReport?: Pick<WorkReport, 'kind' | 'summary' | 'checks'>;
   priorCheck?: ProbeResult;
-  observations?: {probe:ClusterProbe;result:ProbeResult}[];
+  observations?: { probe: ClusterProbe; result: ProbeResult }[];
   priorReadQueries?: PriorTools['queries'];
   lateJobs?: string[];
   priorProgress?: string;
@@ -272,37 +433,64 @@ export interface RecoveryWorkContext {
 }
 
 /** Why a prepared task is waiting and which earlier task is entitled to the slot, if known. */
-export interface DispatchWait {code:'capacity';scope:'bot';holderTaskId:string|null;holderGoal:string|null}
+export interface DispatchWait {
+  code: 'capacity';
+  scope: 'bot';
+  holderTaskId: string | null;
+  holderGoal: string | null;
+}
 
 export interface RecoveryContinuation {
-  attentionId: string; bindingId: string; expectedBindingGeneration: number;
+  attentionId: string;
+  bindingId: string;
+  expectedBindingGeneration: number;
 }
 export type RecoveryInputKind = 'human' | 'task' | 'job-result' | 'child-result' | 'other';
 export interface RecoveryInput {
-  queue: 'next-turn' | 'next-step'; kind: RecoveryInputKind; count: number;
+  queue: 'next-turn' | 'next-step';
+  kind: RecoveryInputKind;
+  count: number;
 }
 export interface RecoveryDetail {
   attentionId: string | null;
   canContinue: boolean;
   worker: { sessionId: string; status: string | null; inputs: RecoveryInput[] | null } | null;
   jobs: { id: string; sessionId: string; status: string }[] | null;
-  subtree: { state: 'active' | 'clear' | 'unknown'; children: { sessionId: string; status: string }[] };
+  subtree: {
+    state: 'active' | 'clear' | 'unknown';
+    children: { sessionId: string; status: string }[];
+  };
 }
 
 /** Immutable process-observed boundary; quiet is evidence from the original process, not a fresh Job list. */
 export interface RunTurn {
-  runId:string; turn:number|null; startSeq:number|null; inputSeq:number|null;
-  endSeq:number|null; endKind:string|null; quiet:number; reportId:string|null;
+  runId: string;
+  turn: number | null;
+  startSeq: number | null;
+  inputSeq: number | null;
+  endSeq: number | null;
+  endKind: string | null;
+  quiet: number;
+  reportId: string | null;
 }
 export type LateJobProof = {
-  jobs: { id: string; registeredSeq: number; settledSeq: number; noticeSeq: number; consumedEndSeq: number }[];
+  jobs: {
+    id: string;
+    registeredSeq: number;
+    settledSeq: number;
+    noticeSeq: number;
+    consumedEndSeq: number;
+  }[];
   lastSeq: number;
 };
 export type LateJobRecovery = {
-  ids: string[]; rowVersion: number; deadline: number; instructionId?: string;
+  ids: string[];
+  rowVersion: number;
+  deadline: number;
+  instructionId?: string;
 } & (
-  { state: 'waiting'; terminalObserved?: boolean } |
-  { state: 'blocked'; reason: string } |
-  { state: 'ready'; proof: LateJobProof } |
-  { state: 'continued'; proof: LateJobProof; nextRunId: string }
+  | { state: 'waiting'; terminalObserved?: boolean }
+  | { state: 'blocked'; reason: string }
+  | { state: 'ready'; proof: LateJobProof }
+  | { state: 'continued'; proof: LateJobProof; nextRunId: string }
 );

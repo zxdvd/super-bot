@@ -11,13 +11,15 @@ export function openLedger(path: string): DatabaseSync {
   try {
     db.exec('PRAGMA busy_timeout=100; PRAGMA foreign_keys=ON; PRAGMA locking_mode=EXCLUSIVE;');
     const { user_version } = db.prepare('PRAGMA user_version').get() as { user_version: number };
-    if (user_version > schemaVersion) throw new AppError('schema-newer', '数据库来自更新版本，请升级插件。');
+    if (user_version > schemaVersion)
+      throw new AppError('schema-newer', '数据库来自更新版本，请升级插件。');
     db.exec('PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;');
     migrateLedger(db, user_version);
     return db;
   } catch (error) {
     db.close();
-    if ((error as { errcode?: number }).errcode === 5) throw new AppError('host-active', '另一宿主正在使用此工作台，请先关闭该宿主。');
+    if ((error as { errcode?: number }).errcode === 5)
+      throw new AppError('host-active', '另一宿主正在使用此工作台，请先关闭该宿主。');
     throw error;
   }
 }
@@ -128,18 +130,31 @@ function migrateLedger(db: DatabaseSync, fromVersion: number): void {
       );
       `);
 
-    const inputColumns = db.prepare('PRAGMA table_info(inputs)').all().map(row => row.name);
+    const inputColumns = db
+      .prepare('PRAGMA table_info(inputs)')
+      .all()
+      .map((row) => row.name);
     if (!inputColumns.includes('messageId')) {
-      db.exec('ALTER TABLE inputs ADD COLUMN messageId TEXT; ALTER TABLE inputs ADD COLUMN messageJson TEXT;');
+      db.exec(
+        'ALTER TABLE inputs ADD COLUMN messageId TEXT; ALTER TABLE inputs ADD COLUMN messageJson TEXT;',
+      );
     }
     if (!inputColumns.includes('attentionId')) {
       db.exec('ALTER TABLE inputs ADD COLUMN attentionId TEXT REFERENCES attentions(id);');
     }
-    const botColumns = db.prepare('PRAGMA table_info(bots)').all().map(row => row.name);
-    if (!botColumns.includes('materials')) db.exec("ALTER TABLE bots ADD COLUMN materials TEXT NOT NULL DEFAULT '[]';");
-    if (!botColumns.includes('deletedAt')) db.exec('ALTER TABLE bots ADD COLUMN deletedAt INTEGER;');
+    const botColumns = db
+      .prepare('PRAGMA table_info(bots)')
+      .all()
+      .map((row) => row.name);
+    if (!botColumns.includes('materials'))
+      db.exec("ALTER TABLE bots ADD COLUMN materials TEXT NOT NULL DEFAULT '[]';");
+    if (!botColumns.includes('deletedAt'))
+      db.exec('ALTER TABLE bots ADD COLUMN deletedAt INTEGER;');
 
-    const taskColumns = db.prepare('PRAGMA table_info(tasks)').all().map(row => row.name);
+    const taskColumns = db
+      .prepare('PRAGMA table_info(tasks)')
+      .all()
+      .map((row) => row.name);
     if (!taskColumns.includes('botConfigRevision')) {
       db.exec(`ALTER TABLE tasks ADD COLUMN botConfigRevision INTEGER NOT NULL DEFAULT 1;
         UPDATE tasks SET botConfigRevision=(SELECT configRevision FROM bots WHERE bots.id=tasks.botId);`);
@@ -151,10 +166,15 @@ function migrateLedger(db: DatabaseSync, fromVersion: number): void {
           'materials',json((SELECT materials FROM bots WHERE bots.id=tasks.botId))
         );`);
     }
-    if (!taskColumns.includes('workdirRequest')) db.exec('ALTER TABLE tasks ADD COLUMN workdirRequest TEXT;');
+    if (!taskColumns.includes('workdirRequest'))
+      db.exec('ALTER TABLE tasks ADD COLUMN workdirRequest TEXT;');
 
-    const bindingColumns = db.prepare('PRAGMA table_info(bindings)').all().map(row => row.name);
-    if (!bindingColumns.includes('workdir')) db.exec('ALTER TABLE bindings ADD COLUMN workdir TEXT;');
+    const bindingColumns = db
+      .prepare('PRAGMA table_info(bindings)')
+      .all()
+      .map((row) => row.name);
+    if (!bindingColumns.includes('workdir'))
+      db.exec('ALTER TABLE bindings ADD COLUMN workdir TEXT;');
     if (fromVersion > 0 && fromVersion < 11) {
       db.exec(`CREATE TABLE resources_next (runId TEXT PRIMARY KEY REFERENCES runs(id));
         INSERT INTO resources_next SELECT runId FROM resources;

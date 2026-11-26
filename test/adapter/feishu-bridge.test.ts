@@ -10,7 +10,12 @@ import type { DshExecution } from '../../src/dsh.ts';
 import { FeishuBridge } from '../../src/feishu-bridge.ts';
 import { GROUP_EVIDENCE_KEY_PREFIX } from '../../src/feishu-group-evidence.ts';
 import { FeishuGroups } from '../../src/feishu-groups.ts';
-import type { FeishuConnectionState, FeishuGroupTextMessage, FeishuHandlers, FeishuTransport } from '../../src/feishu-types.ts';
+import type {
+  FeishuConnectionState,
+  FeishuGroupTextMessage,
+  FeishuHandlers,
+  FeishuTransport,
+} from '../../src/feishu-types.ts';
 import { Managers } from '../../src/manager.ts';
 import { AppError, type ManagerBinding } from '../../src/model.ts';
 import { Store } from '../../src/store.ts';
@@ -31,13 +36,18 @@ type FixtureAgent = {
   followup(message: UserMessage): void;
   event(type: string, data: unknown, surfaceOp?: string, time?: number): Promise<object>;
   startTurn(): Promise<void>;
-  propose(message: UserMessage): Promise<{ kind: 'enter'; messages: UserMessage[] } | { kind: 'reject' }>;
+  propose(
+    message: UserMessage,
+  ): Promise<{ kind: 'enter'; messages: UserMessage[] } | { kind: 'reject' }>;
   enter(message?: UserMessage): Promise<UserMessage>;
-  assistant(text: string, options?: { tool?: boolean; interrupted?: boolean; time?: number; finish?: string }): Promise<object>;
+  assistant(
+    text: string,
+    options?: { tool?: boolean; interrupted?: boolean; time?: number; finish?: string },
+  ): Promise<object>;
   endTurn(kind?: string): Promise<void>;
 };
 
-const tick = () => new Promise<void>(resolve => setImmediate(resolve));
+const tick = () => new Promise<void>((resolve) => setImmediate(resolve));
 const identity = { appId: 'cli_synthetic', ownerOpenId: 'ou_owner' };
 const syntheticOrigin = 'http://127.0.0.1:3080';
 
@@ -52,7 +62,7 @@ async function fixture(t: TestContext) {
   let tool: any;
   const agents = new Map<string, FixtureAgent>();
   const emit = async (name: string, ...args: unknown[]) => {
-    await Promise.all([...(hooks.get(name) ?? [])].map(listener => listener(...args)));
+    await Promise.all([...(hooks.get(name) ?? [])].map((listener) => listener(...args)));
   };
   const on = (name: string, listener: Function) => {
     if (!hooks.has(name)) hooks.set(name, new Set());
@@ -61,30 +71,43 @@ async function fixture(t: TestContext) {
   };
   let delayedResolve: Promise<void> | undefined;
   const ctx = {
-    on, effect: (start: Function) => start(),
-    tools: { register: (item: any) => { tool = item; return () => {}; } },
+    on,
+    effect: (start: Function) => start(),
+    tools: {
+      register: (item: any) => {
+        tool = item;
+        return () => {};
+      },
+    },
     agents: { list: () => [...agents.values()], get: (id: string) => agents.get(id) },
     jobs: { list: () => [] },
-    sessionController: { resolveAgent: async (id: string) => {
-      await delayedResolve;
-      const agent = agents.get(id);
-      return agent ? { agent } : { error: 'synthetic missing' };
-    } },
+    sessionController: {
+      resolveAgent: async (id: string) => {
+        await delayedResolve;
+        const agent = agents.get(id);
+        return agent ? { agent } : { error: 'synthetic missing' };
+      },
+    },
     sessionProjections: { snapshot: () => ({ values: { modelSelection: { next: model } } }) },
     webServer: { getOrigin: () => syntheticOrigin },
     sessions: { flush: async () => true },
     sessionPersistence: {
       stat: async (id: string) => ({ eventCount: agents.get(id)!.history.length, sizeBytes: 100 }),
       open: async (id: string) => ({
-        header: { id }, read: async () => ({ events: agents.get(id)!.history }), close: async () => {},
+        header: { id },
+        read: async () => ({ events: agents.get(id)!.history }),
+        close: async () => {},
       }),
     },
   } as unknown as Context;
   let model: unknown = { provider: 'synthetic', model: 'synthetic' };
   function attach(binding: ManagerBinding) {
-    const id = binding.requestedSessionId, session = { id };
+    const id = binding.requestedSessionId,
+      session = { id };
     const history: any[] = [];
-    let turn = 0, settle = () => {}, idle = Promise.resolve();
+    let turn = 0,
+      settle = () => {},
+      idle = Promise.resolve();
     let preStep: Function;
     function event(type: string, data: unknown, surfaceOp?: string, time = advance()) {
       const value = { type, data, seq: history.length, time, ...(surfaceOp ? { surfaceOp } : {}) };
@@ -92,9 +115,16 @@ async function fixture(t: TestContext) {
       return emit('session/event', session, value).then(() => value);
     }
     const agent: FixtureAgent = {
-      id, session, history, status: 'idle', canceled: 0,
+      id,
+      session,
+      history,
+      status: 'idle',
+      canceled: 0,
       ctx: {
-        on: (_name: string, fn: Function) => { preStep = fn; return () => {}; },
+        on: (_name: string, fn: Function) => {
+          preStep = fn;
+          return () => {};
+        },
         tools: { restrict: () => () => {}, guard: () => () => {} },
         systemPrompt: { section: () => () => {} },
       },
@@ -102,15 +132,19 @@ async function fixture(t: TestContext) {
         nextTurn: [] as UserMessage[],
         nextStep: [] as UserMessage[],
         remove(messageId: string) {
-          this.nextTurn = this.nextTurn.filter(message => message.id !== messageId);
-          this.nextStep = this.nextStep.filter(message => message.id !== messageId);
+          this.nextTurn = this.nextTurn.filter((message) => message.id !== messageId);
+          this.nextStep = this.nextStep.filter((message) => message.id !== messageId);
         },
       },
       whenIdle: () => idle,
-      cancel: () => { agent.canceled++; },
+      cancel: () => {
+        agent.canceled++;
+      },
       occupy() {
         agent.status = 'running';
-        idle = new Promise<void>(resolve => { settle = resolve; });
+        idle = new Promise<void>((resolve) => {
+          settle = resolve;
+        });
       },
       release() {
         agent.status = 'idle';
@@ -119,11 +153,19 @@ async function fixture(t: TestContext) {
       followup(message: UserMessage) {
         agent.inbox.nextTurn.push(message);
         if (agent.status === 'idle') agent.occupy();
-        void event('agent/inbox/spliced', { target: 'next-turn', inserted: [message], start: agent.inbox.nextTurn.length - 1 });
+        void event('agent/inbox/spliced', {
+          target: 'next-turn',
+          inserted: [message],
+          start: agent.inbox.nextTurn.length - 1,
+        });
       },
       event,
-      async startTurn() { await event('turn/start', { turn: ++turn }); },
-      async propose(message: UserMessage): Promise<{ kind: 'enter'; messages: UserMessage[] } | { kind: 'reject' }> {
+      async startTurn() {
+        await event('turn/start', { turn: ++turn });
+      },
+      async propose(
+        message: UserMessage,
+      ): Promise<{ kind: 'enter'; messages: UserMessage[] } | { kind: 'reject' }> {
         agent.inbox.remove(message.id);
         return preStep({ turn, agent }, async () => ({ kind: 'enter', messages: [message] }));
       },
@@ -135,17 +177,39 @@ async function fixture(t: TestContext) {
         await event('user/message', decision.messages[0], 'append');
         return message;
       },
-      assistant(text: string, options: { tool?: boolean; interrupted?: boolean; time?: number; finish?: string } = {}) {
+      assistant(
+        text: string,
+        options: { tool?: boolean; interrupted?: boolean; time?: number; finish?: string } = {},
+      ) {
         const content: any[] = [{ type: 'text', text }];
         if (options.tool) content.push({ type: 'tool-call', name: 'synthetic' });
-        return event('assistant/message', {
-          turn, interrupted: options.interrupted,
-          message: { id: `reply-${history.length}`, role: 'assistant', source: { kind: 'model' }, content },
-          stream: [{ type: 'chunk', chunk: { type: 'finish', reason: { kind: options.finish ?? 'stop' } } }],
-        }, 'append', options.time);
+        return event(
+          'assistant/message',
+          {
+            turn,
+            interrupted: options.interrupted,
+            message: {
+              id: `reply-${history.length}`,
+              role: 'assistant',
+              source: { kind: 'model' },
+              content,
+            },
+            stream: [
+              {
+                type: 'chunk',
+                chunk: { type: 'finish', reason: { kind: options.finish ?? 'stop' } },
+              },
+            ],
+          },
+          'append',
+          options.time,
+        );
       },
       async endTurn(kind = 'completed') {
-        await event('turn/end', { turn, reason: { kind, ...(kind === 'error' ? { error: { code: 'Synthetic' } } : {}) } });
+        await event('turn/end', {
+          turn,
+          reason: { kind, ...(kind === 'error' ? { error: { code: 'Synthetic' } } : {}) },
+        });
         agent.release();
       },
     };
@@ -158,18 +222,25 @@ async function fixture(t: TestContext) {
     store.confirmManager(initial.id, initial.requestedSessionId);
     return { bot, initial, agent: attach(initial) };
   }
-  const a = provision('Alpha'), b = provision('Beta');
+  const a = provision('Alpha'),
+    b = provision('Beta');
   const sent: { chatId: string; text: string; uuid: string }[] = [];
   const reactions: string[] = [];
   let handlers: FeishuHandlers;
   let send: (_: (typeof sent)[number]) => Promise<void> = async () => {};
   let react: (messageId: string) => Promise<void> = async () => {};
   const transport: FeishuTransport = {
-    async diagnoseGroup() { return { ordinaryTextGrant: 'unknown', receiveSubscription: 'unknown' }; },
-    start(next) { handlers = next; },
+    async diagnoseGroup() {
+      return { ordinaryTextGrant: 'unknown', receiveSubscription: 'unknown' };
+    },
+    start(next) {
+      handlers = next;
+    },
     stop() {},
-    inspectGroup: async chatId => ({ chatId, name: chatId }),
-    createGroup: async () => { throw Error('synthetic fixture uses bound groups'); },
+    inspectGroup: async (chatId) => ({ chatId, name: chatId }),
+    createGroup: async () => {
+      throw Error('synthetic fixture uses bound groups');
+    },
     async sendText(chatId, text, uuid) {
       const item = { chatId, text, uuid };
       sent.push(item);
@@ -177,7 +248,9 @@ async function fixture(t: TestContext) {
     },
     async reactReceived(messageId, canDispatch) {
       assert.equal(canDispatch(), true);
-      const receipt = store.db.prepare('SELECT nativeSeq FROM feishu_inbound_receipts WHERE messageId=?').get(messageId);
+      const receipt = store.db
+        .prepare('SELECT nativeSeq FROM feishu_inbound_receipts WHERE messageId=?')
+        .get(messageId);
       assert.equal(typeof receipt?.nativeSeq, 'number');
       reactions.push(messageId);
       await react(messageId);
@@ -195,22 +268,38 @@ async function fixture(t: TestContext) {
     const preview = await groups.preview(botId, chatId);
     return groups.bind(botId, preview.confirmationToken);
   };
-  const aa = await bind(a.bot.id, 'oc_alpha'), bb = await bind(b.bot.id, 'oc_beta');
-  function connection(state: FeishuConnectionState) { advance(); handlers.onConnection(state); }
+  const aa = await bind(a.bot.id, 'oc_alpha'),
+    bb = await bind(b.bot.id, 'oc_beta');
+  function connection(state: FeishuConnectionState) {
+    advance();
+    handlers.onConnection(state);
+  }
   connection('ready');
-  const incoming = (id: string, text: string, options: Partial<FeishuGroupTextMessage> = {}) => handlers.onMessage({
-    chatId: 'oc_alpha', messageId: id, senderOpenId: identity.ownerOpenId, text, receiptKind: 'unclassified',
-    createdAt: advance(), ...options,
-  });
+  const incoming = (id: string, text: string, options: Partial<FeishuGroupTextMessage> = {}) =>
+    handlers.onMessage({
+      chatId: 'oc_alpha',
+      messageId: id,
+      senderOpenId: identity.ownerOpenId,
+      text,
+      receiptKind: 'unclassified',
+      createdAt: advance(),
+      ...options,
+    });
   function web(text: string, owner = true) {
-    return createUserMessage({ source: { kind: 'user', rpcId: 'synthetic-browser-request' as never,
-      ...(owner ? {} : { principal: { kind: 'share' } as never }) }, content: [{ type: 'text', text }] });
+    return createUserMessage({
+      source: {
+        kind: 'user',
+        rpcId: 'synthetic-browser-request' as never,
+        ...(owner ? {} : { principal: { kind: 'share' } as never }),
+      },
+      content: [{ type: 'text', text }],
+    });
   }
   let call = 0;
-  const runTool = (agent: typeof a.agent, args: object) => tool.execute(args, {
-    agent, callId: `call-${++call}`, signal: new AbortController().signal,
-  });
-  const receipt = (id: string) => store.db.prepare('SELECT * FROM feishu_inbound_receipts WHERE messageId=?').get(id);
+  const runTool = (agent: typeof a.agent, args: object) =>
+    tool.execute(args, { agent, callId: `call-${++call}`, signal: new AbortController().signal });
+  const receipt = (id: string) =>
+    store.db.prepare('SELECT * FROM feishu_inbound_receipts WHERE messageId=?').get(id);
   t.after(async () => {
     await bridge.close();
     for (const agent of agents.values()) agent.release();
@@ -219,12 +308,42 @@ async function fixture(t: TestContext) {
     rmSync(dir, { force: true, recursive: true });
   });
   return {
-    a, b, aa, bb, sent, reactions, advance, connection, incoming, bind, web, runTool, receipt, admission,
-    emit, get store() { return store; }, get groups() { return groups; }, get bridge() { return bridge; },
-    setSend(fn: typeof send) { send = fn; },
-    setReact(fn: typeof react) { react = fn; },
-    setModel(enabled: boolean) { model = enabled ? { provider: 'synthetic', model: 'synthetic' } : null; },
-    delayResolve(promise?: Promise<void>) { delayedResolve = promise; },
+    a,
+    b,
+    aa,
+    bb,
+    sent,
+    reactions,
+    advance,
+    connection,
+    incoming,
+    bind,
+    web,
+    runTool,
+    receipt,
+    admission,
+    emit,
+    get store() {
+      return store;
+    },
+    get groups() {
+      return groups;
+    },
+    get bridge() {
+      return bridge;
+    },
+    setSend(fn: typeof send) {
+      send = fn;
+    },
+    setReact(fn: typeof react) {
+      react = fn;
+    },
+    setModel(enabled: boolean) {
+      model = enabled ? { provider: 'synthetic', model: 'synthetic' } : null;
+    },
+    delayResolve(promise?: Promise<void>) {
+      delayedResolve = promise;
+    },
     async deleteBot(botId: string, force: boolean) {
       const receipt = managers.deleteBot(`deletion:${force}`, botId, 1, force, () => {});
       groups.revokeRouting(botId, receipt.feishuBindingId);
@@ -263,31 +382,45 @@ async function fixture(t: TestContext) {
   };
 }
 
-test('the group receives named shortcuts only for the exact committed assistant message', async t => {
-  const f = await fixture(t), { a, b } = f;
-  const taskId = '11111111-1111-4111-8111-111111111111', resultId = '22222222-2222-4222-8222-222222222222';
-  const doc = 'https://example.invalid/delivery', href = syntheticOrigin + workUrl({ kind: 'result', taskId, resultId });
+test('the group receives named shortcuts only for the exact committed assistant message', async (t) => {
+  const f = await fixture(t),
+    { a, b } = f;
+  const taskId = '11111111-1111-4111-8111-111111111111',
+    resultId = '22222222-2222-4222-8222-222222222222';
+  const doc = 'https://example.invalid/delivery',
+    href = syntheticOrigin + workUrl({ kind: 'result', taskId, resultId });
   const reply = `已完成。\n\n[查看完整交付](${href})`;
-  const lookups = t.mock.method(f.store, 'chatDeliveries', (sessionId: string, turn: number, endSeq: number, messageId?: string) => {
-    if (sessionId !== a.agent.id) return [];
-    const final = a.agent.history.find(event => event.type === 'assistant/message');
-    assert.equal(messageId, final.data.message.id);
-    assert.equal(turn, final.data.turn);
-    assert.equal(endSeq, a.agent.history.at(-1).seq);
-    return [{ taskId, resultId, links: { '交付说明': doc } }];
-  });
-  await a.agent.startTurn(); await a.agent.assistant(reply); await a.agent.endTurn();
-  await b.agent.startTurn(); await b.agent.assistant(reply); await b.agent.endTurn();
+  const lookups = t.mock.method(
+    f.store,
+    'chatDeliveries',
+    (sessionId: string, turn: number, endSeq: number, messageId?: string) => {
+      if (sessionId !== a.agent.id) return [];
+      const final = a.agent.history.find((event) => event.type === 'assistant/message');
+      assert.equal(messageId, final.data.message.id);
+      assert.equal(turn, final.data.turn);
+      assert.equal(endSeq, a.agent.history.at(-1).seq);
+      return [{ taskId, resultId, links: { 交付说明: doc } }];
+    },
+  );
+  await a.agent.startTurn();
+  await a.agent.assistant(reply);
+  await a.agent.endTurn();
+  await b.agent.startTurn();
+  await b.agent.assistant(reply);
+  await b.agent.endTurn();
   await tick();
   assert.equal(lookups.mock.callCount(), 2);
   assert.equal(f.sent.length, 2);
-  assert.equal(f.sent.find(message => message.chatId === f.aa.chatId)?.text,
-    `已完成。\n\n在运行 Bot 的电脑上查看完整交付：${href}\n交付说明：${doc}`);
-  assert.equal(f.sent.find(message => message.chatId === f.bb.chatId)?.text, reply);
+  assert.equal(
+    f.sent.find((message) => message.chatId === f.aa.chatId)?.text,
+    `已完成。\n\n在运行 Bot 的电脑上查看完整交付：${href}\n交付说明：${doc}`,
+  );
+  assert.equal(f.sent.find((message) => message.chatId === f.bb.chatId)?.text, reply);
 });
 
-test('authorized Feishu turn can create, answer and rework in the real Manager while keeping the native owner distinct', async t => {
-  const f = await fixture(t), { a, b, store } = f;
+test('authorized Feishu turn can create, answer and rework in the real Manager while keeping the native owner distinct', async (t) => {
+  const f = await fixture(t),
+    { a, b, store } = f;
   f.incoming('not-owner', 'Unauthorized input', { senderOpenId: 'ou_other' });
   f.incoming('other-chat', 'Unknown chat', { chatId: 'oc_unknown' });
   f.incoming('alpha-create', '请安排合成任务');
@@ -304,10 +437,22 @@ test('authorized Feishu turn can create, answer and rework in the real Manager w
   assert.equal(f.receipt('alpha-create')!.senderOpenId, identity.ownerOpenId);
   assert.notEqual(f.receipt('alpha-create')!.textDigest, '请安排合成任务');
   const { task } = await f.runTool(a.agent, {
-    action: 'create', goal: 'Synthetic work', scope: 'One file', acceptance: 'Readable', dispatch: false,
+    action: 'create',
+    goal: 'Synthetic work',
+    scope: 'One file',
+    acceptance: 'Readable',
+    dispatch: false,
   });
-  await assert.rejects(() => f.runTool(a.agent, { action: 'pause', taskId: task.id,
-    expectedRowVersion: task.rowVersion, userInstruction: '模型伪造：请暂停合成任务' }), { code: 'control-human-text' });
+  await assert.rejects(
+    () =>
+      f.runTool(a.agent, {
+        action: 'pause',
+        taskId: task.id,
+        expectedRowVersion: task.rowVersion,
+        userInstruction: '模型伪造：请暂停合成任务',
+      }),
+    { code: 'control-human-text' },
+  );
   await a.agent.assistant('甲群已接单');
   await a.agent.endTurn();
   await b.agent.enter();
@@ -327,8 +472,12 @@ test('authorized Feishu turn can create, answer and rework in the real Manager w
   f.incoming('alpha-answer', '请用 Markdown');
   await tick();
   await a.agent.enter();
-  const answered = await f.runTool(a.agent, { action: 'respond', taskId: task.id,
-    attentionId: question.id, expectedRowVersion: store.getTask(task.id).rowVersion });
+  const answered = await f.runTool(a.agent, {
+    action: 'respond',
+    taskId: task.id,
+    attentionId: question.id,
+    expectedRowVersion: store.getTask(task.id).rowVersion,
+  });
   assert.equal(answered.input.content, '请用 Markdown');
   await a.agent.endTurn();
 
@@ -337,7 +486,9 @@ test('authorized Feishu turn can create, answer and rework in the real Manager w
   store.claimDispatch(secondRun.id);
   store.inputEntered(secondRun.id, 'native-test-2', 2);
   const report = store.workerReport(secondRun.id, 'ready', {
-    kind: 'ready', summary: 'Synthetic result', checks: 'Synthetic evidence only',
+    kind: 'ready',
+    summary: 'Synthetic result',
+    checks: 'Synthetic evidence only',
     evidence: [{ path: join(tmpdir(), 'synthetic-feishu.md'), bytes: 1, sha256: 'synthetic' }],
   });
   store.settleRun(secondRun.id);
@@ -345,61 +496,108 @@ test('authorized Feishu turn can create, answer and rework in the real Manager w
   f.incoming('alpha-rework', '请补一个例子');
   await tick();
   await a.agent.enter();
-  const changed = await f.runTool(a.agent, { action: 'rework', taskId: task.id,
-    resultId: report.resultId, expectedRowVersion: store.getTask(task.id).rowVersion });
+  const changed = await f.runTool(a.agent, {
+    action: 'rework',
+    taskId: task.id,
+    resultId: report.resultId,
+    expectedRowVersion: store.getTask(task.id).rowVersion,
+  });
   assert.equal(changed.task.lifecycle, 'open');
   await a.agent.endTurn();
   await tick();
-  assert.deepEqual(f.sent.map(({ chatId, text }) => [chatId, text]), [
-    ['oc_alpha', '甲群已接单'], ['oc_beta', '乙群独立回答'],
-  ]);
+  assert.deepEqual(
+    f.sent.map(({ chatId, text }) => [chatId, text]),
+    [
+      ['oc_alpha', '甲群已接单'],
+      ['oc_beta', '乙群独立回答'],
+    ],
+  );
 });
 
-test('only the still-bound Feishu owner can control existing work after its native message enters', async t => {
-  const f = await fixture(t), { a, store } = f;
-  const task=store.createTask('task-control',{botId:a.bot.id,goal:'镜像升级',scope:'Read',acceptance:'Report',reviewPolicy:'human'});
-  const action=(kind:string,text:string)=>f.runTool(a.agent,{action:kind,taskId:task.id,
-    expectedRowVersion:store.getTask(task.id).rowVersion,userInstruction:text});
-  const pause='镜像升级先暂停。',resume='镜像升级恢复自动管理。';
-  f.incoming('alpha-pause',pause);
+test('only the still-bound Feishu owner can control existing work after its native message enters', async (t) => {
+  const f = await fixture(t),
+    { a, store } = f;
+  const task = store.createTask('task-control', {
+    botId: a.bot.id,
+    goal: '镜像升级',
+    scope: 'Read',
+    acceptance: 'Report',
+    reviewPolicy: 'human',
+  });
+  const action = (kind: string, text: string) =>
+    f.runTool(a.agent, {
+      action: kind,
+      taskId: task.id,
+      expectedRowVersion: store.getTask(task.id).rowVersion,
+      userInstruction: text,
+    });
+  const pause = '镜像升级先暂停。',
+    resume = '镜像升级恢复自动管理。';
+  f.incoming('alpha-pause', pause);
   await tick();
   await a.agent.enter();
-  assert.equal((await action('pause',pause)).task.controlMode,'paused');
+  assert.equal((await action('pause', pause)).task.controlMode, 'paused');
   await a.agent.endTurn();
 
-  f.incoming('alpha-resume',resume);
+  f.incoming('alpha-resume', resume);
   await tick();
   await a.agent.enter();
-  f.groups.unbind(a.bot.id,f.aa.id);
-  await assert.rejects(action('resume',resume),{code:'human-message-required'});
-  assert.equal(store.getTask(task.id).controlMode,'paused');
+  f.groups.unbind(a.bot.id, f.aa.id);
+  await assert.rejects(action('resume', resume), { code: 'human-message-required' });
+  assert.equal(store.getTask(task.id).controlMode, 'paused');
   await a.agent.endTurn();
 });
 
-test('a saved Feishu clarification loses authority when the current identity changes with its old binding still in SQLite', async t => {
-  const f=await fixture(t),{a,store}=f;
-  const make=(name:string)=>store.createTask(name,{botId:a.bot.id,goal:name,scope:'Read only',acceptance:'Report',reviewPolicy:'human'});
-  const first=make('甲'),second=make('乙');
-  f.incoming('old-owner-direction','先只查线上版本。');
+test('a saved Feishu clarification loses authority when the current identity changes with its old binding still in SQLite', async (t) => {
+  const f = await fixture(t),
+    { a, store } = f;
+  const make = (name: string) =>
+    store.createTask(name, {
+      botId: a.bot.id,
+      goal: name,
+      scope: 'Read only',
+      acceptance: 'Report',
+      reviewPolicy: 'human',
+    });
+  const first = make('甲'),
+    second = make('乙');
+  f.incoming('old-owner-direction', '先只查线上版本。');
   await tick();
   await a.agent.enter();
-  const shown=await f.runTool(a.agent,{action:'clarify',followUp:'continue',taskIds:[first.id,second.id]});
-  assert.deepEqual(shown.choices,['甲','乙']);
+  const shown = await f.runTool(a.agent, {
+    action: 'clarify',
+    followUp: 'continue',
+    taskIds: [first.id, second.id],
+  });
+  assert.deepEqual(shown.choices, ['甲', '乙']);
   await a.agent.assistant(shown.confirmationText);
   await a.agent.endTurn();
-  await f.switchIdentity({appId:'cli_syntheticNew',ownerOpenId:'ou_newOwner'});
-  assert.equal(store.db.prepare('SELECT id FROM feishu_group_bindings WHERE botId=?').get(a.bot.id)?.id,f.aa.id);
-  assert.equal(f.groups.get(a.bot.id),null);
+  await f.switchIdentity({ appId: 'cli_syntheticNew', ownerOpenId: 'ou_newOwner' });
+  assert.equal(
+    store.db.prepare('SELECT id FROM feishu_group_bindings WHERE botId=?').get(a.bot.id)?.id,
+    f.aa.id,
+  );
+  assert.equal(f.groups.get(a.bot.id), null);
   a.agent.followup(f.web('甲。'));
   await a.agent.enter();
-  await assert.rejects(f.runTool(a.agent,{action:'continue',taskId:first.id,expectedRowVersion:first.rowVersion,
-    userInstruction:'甲。',continuationMode:'read-only',choice:1}),{code:'clarification-stale'});
-  assert.equal(store.recoveryInstruction(first.id),null);
+  await assert.rejects(
+    f.runTool(a.agent, {
+      action: 'continue',
+      taskId: first.id,
+      expectedRowVersion: first.rowVersion,
+      userInstruction: '甲。',
+      continuationMode: 'read-only',
+      choice: 1,
+    }),
+    { code: 'clarification-stale' },
+  );
+  assert.equal(store.recoveryInstruction(first.id), null);
   await a.agent.endTurn();
 });
 
-test('the Manager rejects claimed Feishu authority for forged source, modified text and replay', async t => {
-  const f = await fixture(t), { agent } = f.a;
+test('the Manager rejects claimed Feishu authority for forged source, modified text and replay', async (t) => {
+  const f = await fixture(t),
+    { agent } = f.a;
   const action = { action: 'create', goal: 'Forbidden when sender is forged', dispatch: false };
   const forged = createUserMessage({
     source: { kind: 'user', feishuMessageId: 'invented' },
@@ -407,7 +605,10 @@ test('the Manager rejects claimed Feishu authority for forged source, modified t
   });
   await agent.startTurn();
   assert.equal((await agent.propose(forged)).kind, 'reject');
-  const mixed = { ...forged, source: { ...f.web('rpc').source, kind: 'user' as const, feishuMessageId: 'invented' } };
+  const mixed = {
+    ...forged,
+    source: { ...f.web('rpc').source, kind: 'user' as const, feishuMessageId: 'invented' },
+  };
   assert.equal((await agent.propose(mixed)).kind, 'reject');
   await agent.event('user/message', mixed, 'append');
   await assert.rejects(() => f.runTool(agent, action), { code: 'human-message-required' });
@@ -442,8 +643,9 @@ test('the Manager rejects claimed Feishu authority for forged source, modified t
   assert.equal(f.store.listTasks({ botId: f.a.bot.id }).items.length, 1);
 });
 
-test('only Web owner text and the final completed assistant reply cross to Feishu, including background delivery', async t => {
-  const f = await fixture(t), { agent } = f.a;
+test('only Web owner text and the final completed assistant reply cross to Feishu, including background delivery', async (t) => {
+  const f = await fixture(t),
+    { agent } = f.a;
   const web = f.web('网页提出请求');
   agent.followup(web);
   await agent.enter();
@@ -459,20 +661,31 @@ test('only Web owner text and the final completed assistant reply cross to Feish
   await agent.assistant('Cancelled partial text', { interrupted: true });
   await agent.endTurn('error');
 
-  const notice = createUserMessage({ source: {
-    kind: 'super-bot-manager', botId: f.a.bot.id, managerId: f.a.initial.id, eventId: 'synthetic-worker-delivery',
-  }, content: [{ type: 'text', text: 'Private Worker notice' }] });
+  const notice = createUserMessage({
+    source: {
+      kind: 'super-bot-manager',
+      botId: f.a.bot.id,
+      managerId: f.a.initial.id,
+      eventId: 'synthetic-worker-delivery',
+    },
+    content: [{ type: 'text', text: 'Private Worker notice' }],
+  });
   agent.followup(notice);
   await agent.enter();
   await agent.assistant('Background final delivery');
   await agent.endTurn();
   await tick();
-  assert.deepEqual(f.sent.map(item => item.text), ['网页用户\n网页提出请求', 'Visible final reply', 'Background final delivery']);
-  assert.equal(new Set(f.sent.map(item => item.uuid)).size, 3);
+  assert.deepEqual(
+    f.sent.map((item) => item.text),
+    ['网页用户\n网页提出请求', 'Visible final reply', 'Background final delivery'],
+  );
+  assert.equal(new Set(f.sent.map((item) => item.uuid)).size, 3);
 });
 
-test('disconnect, rebinding and restart drop stale events and never rerun work', async t => {
-  const f = await fixture(t), { a } = f, { agent } = a;
+test('disconnect, rebinding and restart drop stale events and never rerun work', async (t) => {
+  const f = await fixture(t),
+    { a } = f,
+    { agent } = a;
   const preBinding = f.aa.boundAt - 1;
   f.incoming('before-bind', 'Old Feishu message', { createdAt: preBinding });
   f.incoming('initial-accepted', 'Run exactly once');
@@ -496,10 +709,17 @@ test('disconnect, rebinding and restart drop stale events and never rerun work',
   assert.equal(f.receipt('offline-now'), undefined);
   assert.equal(f.receipt('offline-late'), undefined);
   assert.equal(f.receipt('before-bind'), undefined);
-  assert.deepEqual(f.sent.map(item => item.text), ['New final after reconnect']);
+  assert.deepEqual(
+    f.sent.map((item) => item.text),
+    ['New final after reconnect'],
+  );
 
   let resolve!: () => void;
-  f.delayResolve(new Promise<void>(done => { resolve = done; }));
+  f.delayResolve(
+    new Promise<void>((done) => {
+      resolve = done;
+    }),
+  );
   const oldBindingCreatedAt = f.advance();
   f.incoming('changing-binding', 'Manager resolution races with rebind');
   await tick();
@@ -529,7 +749,9 @@ test('disconnect, rebinding and restart drop stale events and never rerun work',
   assert.equal(agent.inbox.nextTurn.length, 0);
   const previousManagerTime = f.advance();
   const newSession = await f.replace(a.bot.id);
-  f.incoming('late-for-old-manager', 'Late input from previous manager generation', { createdAt: previousManagerTime });
+  f.incoming('late-for-old-manager', 'Late input from previous manager generation', {
+    createdAt: previousManagerTime,
+  });
   f.incoming('new-session', 'New message routes to the replacement Manager');
   await tick();
   assert.equal(agent.inbox.nextTurn.length, 0);
@@ -538,12 +760,16 @@ test('disconnect, rebinding and restart drop stale events and never rerun work',
   await newSession.enter();
   await newSession.assistant('New Manager, same Feishu group');
   await newSession.endTurn();
-  assert.deepEqual(f.sent.map(item => [item.chatId, item.text]), [
-    ['oc_alpha', 'New final after reconnect'], ['oc_alpha', 'New Manager, same Feishu group'],
-  ]);
+  assert.deepEqual(
+    f.sent.map((item) => [item.chatId, item.text]),
+    [
+      ['oc_alpha', 'New final after reconnect'],
+      ['oc_alpha', 'New Manager, same Feishu group'],
+    ],
+  );
 });
 
-test('authorized input without a selected model receives one actionable response and is never retried', async t => {
+test('authorized input without a selected model receives one actionable response and is never retried', async (t) => {
   const f = await fixture(t);
   f.setModel(false);
   f.incoming('needs-model', 'Can the Bot work?');
@@ -562,9 +788,12 @@ test('authorized input without a selected model receives one actionable response
   assert.deepEqual(f.reactions, []);
 });
 
-test('a receipt reaction follows native entry, never delays the response and is never retried', async t => {
-  const f = await fixture(t), { a } = f;
-  f.setReact(async () => { throw Error('synthetic missing reaction permission'); });
+test('a receipt reaction follows native entry, never delays the response and is never retried', async (t) => {
+  const f = await fixture(t),
+    { a } = f;
+  f.setReact(async () => {
+    throw Error('synthetic missing reaction permission');
+  });
   f.incoming('first-reaction', 'Original message');
   f.incoming('first-reaction', 'Duplicate event');
   await tick();
@@ -586,8 +815,9 @@ test('a receipt reaction follows native entry, never delays the response and is 
   assert.deepEqual(f.reactions, ['first-reaction']);
 });
 
-test('unknown send receipt retries only the same UUID and preserves the order of the group', async t => {
-  const f = await fixture(t), { agent } = f.a;
+test('unknown send receipt retries only the same UUID and preserves the order of the group', async (t) => {
+  const f = await fixture(t),
+    { agent } = f.a;
   f.setSend(async () => {
     if (f.sent.length === 1) throw new AppError('feishu-send-retryable', 'Synthetic lost receipt');
   });
@@ -598,19 +828,26 @@ test('unknown send receipt retries only the same UUID and preserves the order of
   await tick();
   assert.equal(f.sent.length, 1);
   const deadline = Date.now(); // mocked clock is intentionally unchanged while retries use a real timer
-  await new Promise(resolve => setTimeout(resolve, 1100));
+  await new Promise((resolve) => setTimeout(resolve, 1100));
   assert.equal(Date.now(), deadline);
-  assert.deepEqual(f.sent.map(item => item.text), [
-    '网页用户\nSend once with a stable ID', '网页用户\nSend once with a stable ID', 'Reply comes after the original user message',
-  ]);
+  assert.deepEqual(
+    f.sent.map((item) => item.text),
+    [
+      '网页用户\nSend once with a stable ID',
+      '网页用户\nSend once with a stable ID',
+      'Reply comes after the original user message',
+    ],
+  );
   assert.equal(f.sent[0]!.uuid, f.sent[1]!.uuid);
   assert.notEqual(f.sent[1]!.uuid, f.sent[2]!.uuid);
 });
 
-test('permanent delivery errors remain visible after a later success and expose no transport details', async t => {
-  const f = await fixture(t), { agent } = f.a;
+test('permanent delivery errors remain visible after a later success and expose no transport details', async (t) => {
+  const f = await fixture(t),
+    { agent } = f.a;
   f.setSend(async () => {
-    if (f.sent.length === 1) throw new AppError('feishu-send-failed', 'Fixture includes secret credentials');
+    if (f.sent.length === 1)
+      throw new AppError('feishu-send-failed', 'Fixture includes secret credentials');
   });
   agent.followup(f.web('Permissions refused'));
   await agent.enter();
@@ -619,13 +856,15 @@ test('permanent delivery errors remain visible after a later success and expose 
   await tick();
   assert.equal(f.sent.length, 2);
   assert.deepEqual(f.bridge.status(f.a.bot.id), {
-    connection: 'ready', evidence: { plainTextAt: null, botMentionAt: null },
+    connection: 'ready',
+    evidence: { plainTextAt: null, botMentionAt: null },
     error: '飞书投递未确认，请检查绑定群和应用权限。原文保留在 Bot 对话。',
   });
 });
 
-test('disconnect cancels a claimed input awaiting native admission without replaying the task', async t => {
-  const f = await fixture(t), { agent } = f.a;
+test('disconnect cancels a claimed input awaiting native admission without replaying the task', async (t) => {
+  const f = await fixture(t),
+    { agent } = f.a;
   f.incoming('between-step-and-append', 'Do not run after disconnection');
   await tick();
   const message = agent.inbox.nextTurn[0]!;
@@ -636,8 +875,10 @@ test('disconnect cancels a claimed input awaiting native admission without repla
   await tick();
   // Even a late surface event cannot grant the turn human authority.
   await agent.event('user/message', message, 'append');
-  await assert.rejects(() => f.runTool(agent, { action: 'create', goal: 'Should not run', dispatch: false }),
-    { code: 'human-message-required' });
+  await assert.rejects(
+    () => f.runTool(agent, { action: 'create', goal: 'Should not run', dispatch: false }),
+    { code: 'human-message-required' },
+  );
   await agent.endTurn();
   f.connection('reconnected');
   f.incoming('between-step-and-append', 'Redelivered with a fresh time');
@@ -647,11 +888,15 @@ test('disconnect cancels a claimed input awaiting native admission without repla
   assert.equal(f.sent.length, 0);
 });
 
-test('reconnect drops a group backlog behind an uncertain send and admits fresh replies immediately', async t => {
-  const f = await fixture(t), { agent } = f.a;
+test('reconnect drops a group backlog behind an uncertain send and admits fresh replies immediately', async (t) => {
+  const f = await fixture(t),
+    { agent } = f.a;
   let rejectOld!: (error: unknown) => void;
   f.setSend(async () => {
-    if (f.sent.length === 1) await new Promise<void>((_, reject) => { rejectOld = reject; });
+    if (f.sent.length === 1)
+      await new Promise<void>((_, reject) => {
+        rejectOld = reject;
+      });
   });
   agent.followup(f.web('Old in-flight user input'));
   await agent.enter();
@@ -667,14 +912,16 @@ test('reconnect drops a group backlog behind an uncertain send and admits fresh 
   await agent.endTurn();
   rejectOld(new AppError('feishu-send-retryable', 'Old uncertain send result'));
   await tick();
-  assert.deepEqual(f.sent.map(item => item.text), [
-    '网页用户\nOld in-flight user input', '网页用户\nFresh input', 'Fresh final reply',
-  ]);
+  assert.deepEqual(
+    f.sent.map((item) => item.text),
+    ['网页用户\nOld in-flight user input', '网页用户\nFresh input', 'Fresh final reply'],
+  );
   assert.match(f.bridge.status(f.a.bot.id).error ?? '', /断线时有一条飞书投递未确认/);
 });
 
-test('unlink revokes a claimed group message while native model preparation is pending', async t => {
-  const f = await fixture(t), { a, b } = f;
+test('unlink revokes a claimed group message while native model preparation is pending', async (t) => {
+  const f = await fixture(t),
+    { a, b } = f;
   f.incoming('before-unlink', 'Do not enter the old session after unlink');
   f.incoming('second-bot-retains-authority', 'Beta will still respond', { chatId: f.bb.chatId });
   await tick();
@@ -691,15 +938,20 @@ test('unlink revokes a claimed group message while native model preparation is p
   assert.ok(typeof f.receipt('second-bot-retains-authority')!.nativeSeq === 'number');
 });
 
-test('deleting a busy Bot revokes in-flight Feishu routing and leaves queued human chat and other Bots intact', async t => {
-  const f = await fixture(t), { a, b } = f;
+test('deleting a busy Bot revokes in-flight Feishu routing and leaves queued human chat and other Bots intact', async (t) => {
+  const f = await fixture(t),
+    { a, b } = f;
   const human = f.web('Keep this queued human message');
   a.agent.followup(human);
   await assert.rejects(f.deleteBot(a.bot.id, false), { code: 'manager-busy' });
   assert.equal(f.groups.get(a.bot.id)?.id, f.aa.id);
 
   let resolveAgent!: () => void;
-  f.delayResolve(new Promise<void>(resolve => { resolveAgent = resolve; }));
+  f.delayResolve(
+    new Promise<void>((resolve) => {
+      resolveAgent = resolve;
+    }),
+  );
   f.incoming('before-delete', 'Never admit this former group message');
   await tick();
   assert.ok(f.receipt('before-delete'));
@@ -708,8 +960,14 @@ test('deleting a busy Bot revokes in-flight Feishu routing and leaves queued hum
   f.delayResolve();
   await tick();
   assert.equal(a.agent.canceled, 1);
-  assert.deepEqual(a.agent.inbox.nextTurn.map(message => message.id), [human.id]);
-  assert.equal(a.agent.history.some(event => event.type === 'user/message'), false);
+  assert.deepEqual(
+    a.agent.inbox.nextTurn.map((message) => message.id),
+    [human.id],
+  );
+  assert.equal(
+    a.agent.history.some((event) => event.type === 'user/message'),
+    false,
+  );
   assert.equal(f.receipt('before-delete')?.nativeSeq, null);
   assert.equal(f.groups.findByChat(f.aa.chatId), null);
   await assert.rejects(f.runTool(a.agent, { action: 'list' }), { code: 'manager-scope' });
@@ -722,11 +980,14 @@ test('deleting a busy Bot revokes in-flight Feishu routing and leaves queued hum
   await b.agent.enter();
   await b.agent.endTurn();
   assert.equal(typeof f.receipt('unaffected-group')?.nativeSeq, 'number');
-  const replacement = f.store.createBot('replacement', { name: 'Replacement', instructions: 'Synthetic' });
+  const replacement = f.store.createBot('replacement', {
+    name: 'Replacement',
+    instructions: 'Synthetic',
+  });
   assert.equal((await f.bind(replacement.id, f.aa.chatId)).botId, replacement.id);
 });
 
-test('a bound group without an active Manager receives one request to reopen the local Bot', async t => {
+test('a bound group without an active Manager receives one request to reopen the local Bot', async (t) => {
   const f = await fixture(t);
   f.store.releaseManager('retire-for-unready-test', f.a.bot.id, f.a.initial.generation);
   f.incoming('no-active-manager', 'A work request needs its own active session');
@@ -739,7 +1000,7 @@ test('a bound group without an active Manager receives one request to reopen the
   assert.equal(f.bridge.status(f.a.bot.id).error, f.sent[0]!.text);
 });
 
-test('ordinary and bot-mention receipts persist per current binding without needing a model reply', async t => {
+test('ordinary and bot-mention receipts persist per current binding without needing a model reply', async (t) => {
   const f = await fixture(t);
   const { a, b } = f;
   const evidence = (botId = a.bot.id) => f.bridge.status(botId).evidence;
@@ -765,7 +1026,10 @@ test('ordinary and bot-mention receipts persist per current binding without need
   const alphaMentioned = f.receipt('mentioned-alpha')!.acceptedAt;
   f.incoming('beta-mention', 'Beta 独立', { chatId: f.bb.chatId, receiptKind: 'bot-mention' });
   assert.deepEqual(evidence(), { plainTextAt: alphaPlain, botMentionAt: alphaMentioned });
-  assert.deepEqual(evidence(b.bot.id), { plainTextAt: null, botMentionAt: f.receipt('beta-mention')!.acceptedAt });
+  assert.deepEqual(evidence(b.bot.id), {
+    plainTextAt: null,
+    botMentionAt: f.receipt('beta-mention')!.acceptedAt,
+  });
   await tick();
   assert.equal(f.receipt('plain-alpha')!.nativeSeq, null);
 
@@ -773,7 +1037,10 @@ test('ordinary and bot-mention receipts persist per current binding without need
   f.connection('reconnecting');
   f.incoming('disconnected', 'Disconnected', { receiptKind: 'plain' });
   f.connection('reconnected');
-  f.incoming('delayed-while-offline', 'Delayed while offline', { receiptKind: 'plain', createdAt: offline });
+  f.incoming('delayed-while-offline', 'Delayed while offline', {
+    receiptKind: 'plain',
+    createdAt: offline,
+  });
   await f.reopen();
   assert.deepEqual(evidence(), { plainTextAt: alphaPlain, botMentionAt: alphaMentioned });
   const former = f.advance();
@@ -783,22 +1050,31 @@ test('ordinary and bot-mention receipts persist per current binding without need
   const rebound = await f.bind(a.bot.id, f.aa.chatId);
   assert.notEqual(rebound.id, f.aa.id);
   f.incoming('plain-alpha', 'Replay of old message ID', { receiptKind: 'plain' });
-  f.incoming('late-for-former-binding', 'Old binding', { receiptKind: 'bot-mention', createdAt: former });
+  f.incoming('late-for-former-binding', 'Old binding', {
+    receiptKind: 'bot-mention',
+    createdAt: former,
+  });
   assert.deepEqual(evidence(), empty);
   assert.ok(evidence(b.bot.id)?.botMentionAt, 'unbinding Alpha preserves Beta evidence');
   f.incoming('new-mention', 'New binding', { receiptKind: 'bot-mention' });
-  assert.deepEqual(evidence(), { plainTextAt: null, botMentionAt: f.receipt('new-mention')!.acceptedAt });
+  assert.deepEqual(evidence(), {
+    plainTextAt: null,
+    botMentionAt: f.receipt('new-mention')!.acceptedAt,
+  });
 });
 
-test('a bot mention enters before subsequent plain text while its evidence lookup is still pending', async t => {
+test('a bot mention enters before subsequent plain text while its evidence lookup is still pending', async (t) => {
   const f = await fixture(t);
   const { a } = f;
   let prove!: (value: boolean) => void;
-  const botMentionProof = new Promise<boolean>(resolve => { prove = resolve; });
+  const botMentionProof = new Promise<boolean>((resolve) => {
+    prove = resolve;
+  });
   f.incoming('mention-pending', 'First @ message', { botMentionProof });
   f.incoming('plain-next', 'Second plain message', { receiptKind: 'plain' });
   await tick();
-  const content = (message: UserMessage) => message.content.map(block => block.type === 'text' ? block.text : '').join('');
+  const content = (message: UserMessage) =>
+    message.content.map((block) => (block.type === 'text' ? block.text : '')).join('');
   assert.equal(content(await a.agent.enter()), 'First @ message');
   await a.agent.endTurn();
   await tick();
@@ -808,19 +1084,31 @@ test('a bot mention enters before subsequent plain text while its evidence looku
   assert.equal(f.bridge.status(a.bot.id).evidence?.botMentionAt, null);
   prove(true);
   await tick();
-  assert.equal(f.bridge.status(a.bot.id).evidence?.botMentionAt, f.receipt('mention-pending')!.acceptedAt);
+  assert.equal(
+    f.bridge.status(a.bot.id).evidence?.botMentionAt,
+    f.receipt('mention-pending')!.acceptedAt,
+  );
   let disconnectedProof!: (value: boolean) => void;
   f.incoming('mention-pending-disconnect', 'Old epoch', {
-    botMentionProof: new Promise(resolve => { disconnectedProof = resolve; }),
+    botMentionProof: new Promise((resolve) => {
+      disconnectedProof = resolve;
+    }),
   });
   f.connection('reconnecting');
   f.connection('reconnected');
   disconnectedProof(true);
   await tick();
-  assert.equal(f.bridge.status(a.bot.id).evidence?.botMentionAt, f.receipt('mention-pending')!.acceptedAt);
+  assert.equal(
+    f.bridge.status(a.bot.id).evidence?.botMentionAt,
+    f.receipt('mention-pending')!.acceptedAt,
+  );
 
   let staleProof!: (value: boolean) => void;
-  f.incoming('mention-pending-unbind', 'Old binding', { botMentionProof: new Promise(resolve => { staleProof = resolve; }) });
+  f.incoming('mention-pending-unbind', 'Old binding', {
+    botMentionProof: new Promise((resolve) => {
+      staleProof = resolve;
+    }),
+  });
   f.groups.unbind(a.bot.id, f.aa.id);
   await f.bind(a.bot.id, f.aa.chatId);
   staleProof(true);
@@ -829,33 +1117,43 @@ test('a bot mention enters before subsequent plain text while its evidence looku
   assert.equal(f.store.get(GROUP_EVIDENCE_KEY_PREFIX + f.aa.id), null);
 });
 
-test('failed evidence persistence rolls back its receipt and allows the same delivery to succeed later', async t => {
+test('failed evidence persistence rolls back its receipt and allows the same delivery to succeed later', async (t) => {
   const f = await fixture(t);
   f.store.db.exec(`
     CREATE TRIGGER reject_synthetic_evidence BEFORE INSERT ON metadata
     WHEN NEW.key LIKE 'feishu-group-evidence:%'
     BEGIN SELECT RAISE(ABORT, 'Synthetic evidence persistence failure'); END;
   `);
-  assert.throws(() => f.incoming('retry-receipt', 'Original', { receiptKind: 'plain' }), /Synthetic evidence persistence failure/);
+  assert.throws(
+    () => f.incoming('retry-receipt', 'Original', { receiptKind: 'plain' }),
+    /Synthetic evidence persistence failure/,
+  );
   assert.equal(f.receipt('retry-receipt'), undefined);
   assert.equal(f.bridge.status(f.a.bot.id).evidence?.plainTextAt, null);
   f.store.db.exec('DROP TRIGGER reject_synthetic_evidence');
   f.incoming('retry-receipt', 'Original', { receiptKind: 'plain' });
-  assert.equal(f.bridge.status(f.a.bot.id).evidence?.plainTextAt, f.receipt('retry-receipt')!.acceptedAt);
+  assert.equal(
+    f.bridge.status(f.a.bot.id).evidence?.plainTextAt,
+    f.receipt('retry-receipt')!.acceptedAt,
+  );
   await tick();
   assert.equal(f.a.agent.inbox.nextTurn.length, 1);
   await f.a.agent.enter();
   await f.a.agent.endTurn();
 });
 
-test('protected reload and group intake exclude each other before the deduplication receipt', async t => {
+test('protected reload and group intake exclude each other before the deduplication receipt', async (t) => {
   const f = await fixture(t);
   const resume = f.admission.pause();
   assert.throws(() => f.incoming('retry-id', 'Synthetic incoming'), { code: 'reload-in-progress' });
   assert.equal(f.receipt('retry-id'), undefined);
   resume();
   let release!: () => void;
-  f.delayResolve(new Promise<void>(resolve => { release = resolve; }));
+  f.delayResolve(
+    new Promise<void>((resolve) => {
+      release = resolve;
+    }),
+  );
   try {
     await f.incoming('retry-id', 'Synthetic incoming');
     assert.ok(f.receipt('retry-id'));

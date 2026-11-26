@@ -5,8 +5,25 @@ import { readFile, writeFile } from 'node:fs/promises';
 import { createServer } from 'node:https';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
-import { closeTask, ownerAcceptance, ownerAcceptanceConfirm, ownerConfirm, ownerDetach, ownerInspect, ownerNewGoal, ownerOldGoal, ownerPrepare,
-  ownerRefuse, ownerRevise, ownerSessionTitle, stageArtifacts, stageGoal, stageRevoke, stageSupplement, stoppableGoal } from '../test/stage-host-fixture.ts';
+import {
+  closeTask,
+  ownerAcceptance,
+  ownerAcceptanceConfirm,
+  ownerConfirm,
+  ownerDetach,
+  ownerInspect,
+  ownerNewGoal,
+  ownerOldGoal,
+  ownerPrepare,
+  ownerRefuse,
+  ownerRevise,
+  ownerSessionTitle,
+  stageArtifacts,
+  stageGoal,
+  stageRevoke,
+  stageSupplement,
+  stoppableGoal,
+} from '../test/stage-host-fixture.ts';
 
 async function verifyStageInBrowser(host, bot, task) {
   const playwright = process.env.SUPER_BOT_TEST_PLAYWRIGHT;
@@ -17,7 +34,10 @@ async function verifyStageInBrowser(host, bot, task) {
     const page = await browser.newPage();
     page.setDefaultTimeout(12000);
     await page.goto(host.launchUrl, { waitUntil: 'domcontentloaded' });
-    await page.getByRole('button', { name: 'Continue', exact: true }).click({ timeout: 1500 }).catch(() => {});
+    await page
+      .getByRole('button', { name: 'Continue', exact: true })
+      .click({ timeout: 1500 })
+      .catch(() => {});
     await page.getByRole('button', { name: 'Super Bot', exact: true }).click();
     await page.locator('.bot-open').filter({ hasText: bot.name }).click();
     await page.getByRole('button', { name: /打开或收起当前 Bot 的工作/ }).click();
@@ -27,29 +47,69 @@ async function verifyStageInBrowser(host, bot, task) {
     await drawer.getByText('下一步 · 编排附录', { exact: true }).waitFor();
     const condition = drawer.getByRole('link', { name: /fixture\/docs.*42/ });
     assert.ok((await condition.getAttribute('href')).endsWith('/fixture/docs/-/pipelines/42'));
-  } finally { await browser.close(); }
+  } finally {
+    await browser.close();
+  }
 }
 
-export async function smokeTaskStages({ base, configure, launch, stop, call, makeBot, probe, wait }) {
-  const cert = join(base, 'test-ca.pem'), key = join(base, 'test-ca.key'), config = join(base, 'openssl.cnf');
-  await writeFile(config, '[req]\ndistinguished_name=dn\nx509_extensions=ext\n[dn]\n[ext]\nsubjectAltName=IP:127.0.0.1\nbasicConstraints=critical,CA:TRUE\n');
-  execFileSync('openssl', ['req', '-x509', '-newkey', 'rsa:2048', '-nodes', '-days', '1', '-subj', '/CN=Local Stage Test',
-    '-config', config, '-keyout', key, '-out', cert], { stdio: 'ignore' });
+export async function smokeTaskStages({
+  base,
+  configure,
+  launch,
+  stop,
+  call,
+  makeBot,
+  probe,
+  wait,
+}) {
+  const cert = join(base, 'test-ca.pem'),
+    key = join(base, 'test-ca.key'),
+    config = join(base, 'openssl.cnf');
+  await writeFile(
+    config,
+    '[req]\ndistinguished_name=dn\nx509_extensions=ext\n[dn]\n[ext]\nsubjectAltName=IP:127.0.0.1\nbasicConstraints=critical,CA:TRUE\n',
+  );
+  execFileSync(
+    'openssl',
+    [
+      'req',
+      '-x509',
+      '-newkey',
+      'rsa:2048',
+      '-nodes',
+      '-days',
+      '1',
+      '-subj',
+      '/CN=Local Stage Test',
+      '-config',
+      config,
+      '-keyout',
+      key,
+      '-out',
+      cert,
+    ],
+    { stdio: 'ignore' },
+  );
   let pipelineStatus = 'running';
   let heldRead;
   const observations = [];
-  const server = createServer({ cert: await readFile(cert), key: await readFile(key) }, (req, res) => {
-    if (req.url !== '/api/v4/projects/fixture%2Fdocs/pipelines/42' || req.method !== 'GET') {
-      res.writeHead(404).end();
-      return;
-    }
-    const respond = status => {
-      observations.push(status);
-      res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify({ id: 42, status }));
-    };
-    if (heldRead && !heldRead.respond) heldRead.respond = respond;
-    else respond(pipelineStatus);
-  });
+  const server = createServer(
+    { cert: await readFile(cert), key: await readFile(key) },
+    (req, res) => {
+      if (req.url !== '/api/v4/projects/fixture%2Fdocs/pipelines/42' || req.method !== 'GET') {
+        res.writeHead(404).end();
+        return;
+      }
+      const respond = (status) => {
+        observations.push(status);
+        res
+          .writeHead(200, { 'content-type': 'application/json' })
+          .end(JSON.stringify({ id: 42, status }));
+      };
+      if (heldRead && !heldRead.respond) heldRead.respond = respond;
+      else respond(pipelineStatus);
+    },
+  );
   server.listen(0, '127.0.0.1');
   await once(server, 'listening');
   try {
@@ -59,16 +119,27 @@ export async function smokeTaskStages({ base, configure, launch, stop, call, mak
     server.closeAllConnections();
   }
   async function exercise() {
-    await configure('web', { hmr: false, fullAccess: true, gitLabObserverOrigin: 'https://127.0.0.1:' + server.address().port });
+    await configure('web', {
+      hmr: false,
+      fullAccess: true,
+      gitLabObserverOrigin: 'https://127.0.0.1:' + server.address().port,
+    });
     let host = await launch('web', 'task-stages', { testCa: cert });
     const bot = await makeBot(host, '分阶段编写说明');
     await probe(host, 'select-test-model', bot.managerId);
     await probe(host, 'native-prompt', bot.managerId, stageGoal);
     const tasks = () => call(host, 'task.list', { botId: bot.id });
-    const task = await wait(async () => (await tasks()).items.find(item => item.goal === stageGoal), 'one writing task');
+    const task = await wait(
+      async () => (await tasks()).items.find((item) => item.goal === stageGoal),
+      'one writing task',
+    );
     const waiting = await wait(async () => {
       const detail = await call(host, 'task.detail', { id: task.id, sessionId: bot.managerId });
-      return detail.stage?.state === 'waiting' && detail.stage.observation?.stateLabel === 'running' && detail;
+      return (
+        detail.stage?.state === 'waiting' &&
+        detail.stage.observation?.stateLabel === 'running' &&
+        detail
+      );
     }, 'pipeline observed running without occupying a Worker');
     assert.equal(waiting.runHeld, false);
     assert.equal(waiting.result, null);
@@ -76,62 +147,96 @@ export async function smokeTaskStages({ base, configure, launch, stop, call, mak
     await probe(host, 'native-prompt', bot.managerId, stageSupplement);
     const supplemented = await wait(async () => {
       const detail = await call(host, 'task.detail', { id: task.id, sessionId: bot.managerId });
-      return detail.directionStatus === 'next-run' && detail.recoveryInstruction?.source.text === stageSupplement && detail;
+      return (
+        detail.directionStatus === 'next-run' &&
+        detail.recoveryInstruction?.source.text === stageSupplement &&
+        detail
+      );
     }, 'the original chat saves one additive directive');
     assert.equal(supplemented.stage.state, 'waiting');
     assert.equal(supplemented.stage.deadlineAt, waiting.stage.deadlineAt);
     assert.equal(supplemented.stage.nextStep, waiting.stage.nextStep);
     const firstManager = await probe(host, 'inspect-session', bot.managerId);
-    const ownerInput = firstManager.events.find(event => event.type === 'user/message' &&
-      event.data.id === supplemented.recoveryInstruction.source.messageId);
+    const ownerInput = firstManager.events.find(
+      (event) =>
+        event.type === 'user/message' &&
+        event.data.id === supplemented.recoveryInstruction.source.messageId,
+    );
     assert.equal(ownerInput?.seq, supplemented.recoveryInstruction.source.seq);
     await stop('web');
     pipelineStatus = 'success';
     host = await launch('web', 'task-stages-restarted', { testCa: cert });
-    const done = await wait(async () => {
-      const detail = await call(host, 'task.detail', { id: task.id, sessionId: bot.managerId });
-      return detail.task.managerReviewed && detail.chatDelivery?.state === 'delivered' && detail;
-    }, 'three intermediate stages followed by final delivery', 800);
+    const done = await wait(
+      async () => {
+        const detail = await call(host, 'task.detail', { id: task.id, sessionId: bot.managerId });
+        return detail.task.managerReviewed && detail.chatDelivery?.state === 'delivered' && detail;
+      },
+      'three intermediate stages followed by final delivery',
+      800,
+    );
     assert.ok(observations.includes('running'));
-    assert.deepEqual(observations.filter(state => state === 'success'), ['success']);
+    assert.deepEqual(
+      observations.filter((state) => state === 'success'),
+      ['success'],
+    );
     assert.equal(done.binding.sessionId, waiting.binding.sessionId);
     const worker = await probe(host, 'inspect-session', done.binding.sessionId);
     const manager = await probe(host, 'inspect-session', bot.managerId);
-    const inputs = worker.events.filter(event => event.type === 'user/message' && event.data.source.kind === 'super-bot');
+    const inputs = worker.events.filter(
+      (event) => event.type === 'user/message' && event.data.source.kind === 'super-bot',
+    );
     assert.equal(inputs.length, stageArtifacts.length + 1);
-    assert.equal(new Set(inputs.map(event => event.data.source.runId)).size, inputs.length);
-    assert.ok(inputs.every(event => event.data.source.taskId === task.id));
-    const augmentedInputs = inputs.filter(event => event.data.content.some(block => block.text?.includes(stageSupplement)));
+    assert.equal(new Set(inputs.map((event) => event.data.source.runId)).size, inputs.length);
+    assert.ok(inputs.every((event) => event.data.source.taskId === task.id));
+    const augmentedInputs = inputs.filter((event) =>
+      event.data.content.some((block) => block.text?.includes(stageSupplement)),
+    );
     assert.equal(augmentedInputs.length, 1);
     assert.equal(augmentedInputs[0].data.source.runId, inputs[2].data.source.runId);
-    const augmentedText = augmentedInputs[0].data.content.map(block => block.text).join('');
+    const augmentedText = augmentedInputs[0].data.content.map((block) => block.text).join('');
     assert.ok(augmentedText.includes(stageArtifacts[1].nextStep));
     assert.equal(augmentedText.split(stageSupplement).length - 1, 1);
     const attempts = [...firstManager.managerAttempts, ...manager.managerAttempts];
-    const nextSteps = attempts.filter(attempt => attempt.action === 'advance_stage');
-    assert.deepEqual(nextSteps.map(attempt => attempt.nextStep), stageArtifacts.map(item => item.nextStep));
-    assert.deepEqual(nextSteps.map(attempt => attempt.runId), inputs.slice(0,-1).map(event => event.data.source.runId));
-    assert.equal(attempts.filter(attempt => attempt.action === 'review').length, 1);
-    assert.equal(attempts.filter(attempt => attempt.action === 'rework').length, 0);
+    const nextSteps = attempts.filter((attempt) => attempt.action === 'advance_stage');
+    assert.deepEqual(
+      nextSteps.map((attempt) => attempt.nextStep),
+      stageArtifacts.map((item) => item.nextStep),
+    );
+    assert.deepEqual(
+      nextSteps.map((attempt) => attempt.runId),
+      inputs.slice(0, -1).map((event) => event.data.source.runId),
+    );
+    assert.equal(attempts.filter((attempt) => attempt.action === 'review').length, 1);
+    assert.equal(attempts.filter((attempt) => attempt.action === 'rework').length, 0);
     assert.equal(done.deliveredResult.id, done.result.id);
     assert.equal((await tasks()).total, 1);
     await probe(host, 'native-prompt', bot.managerId, ownerAcceptance);
-    const pendingAcceptance = await call(host, 'task.detail', { id: task.id, sessionId: bot.managerId });
+    const pendingAcceptance = await call(host, 'task.detail', {
+      id: task.id,
+      sessionId: bot.managerId,
+    });
     assert.equal(pendingAcceptance.task.lifecycle, 'review');
     const question = (await probe(host, 'inspect-session', bot.managerId)).assistantTexts.at(-1);
     assert.ok(question.includes('是否接受') && question.includes(done.result.id));
     await probe(host, 'native-prompt', bot.managerId, ownerAcceptanceConfirm);
     const accepted = await call(host, 'task.detail', { id: task.id, sessionId: bot.managerId });
     assert.equal(accepted.task.lifecycle, 'completed');
-    const ownerReceipt = accepted.events.filter(event => event.kind === 'result.accepted').map(event => JSON.parse(event.data));
+    const ownerReceipt = accepted.events
+      .filter((event) => event.kind === 'result.accepted')
+      .map((event) => JSON.parse(event.data));
     assert.equal(ownerReceipt.length, 1);
     assert.equal(ownerReceipt[0].resultId, done.result.id);
-    assert.deepEqual(ownerReceipt[0].source.messages.map(message => message.text), [ownerAcceptance, ownerAcceptanceConfirm]);
+    assert.deepEqual(
+      ownerReceipt[0].source.messages.map((message) => message.text),
+      [ownerAcceptance, ownerAcceptanceConfirm],
+    );
     pipelineStatus = 'running';
     heldRead = {};
     await probe(host, 'native-prompt', bot.managerId, stageGoal);
     const withdrawn = await wait(async () => {
-      const item = (await tasks()).items.find(item => item.goal === stageGoal && item.id !== task.id);
+      const item = (await tasks()).items.find(
+        (item) => item.goal === stageGoal && item.id !== task.id,
+      );
       if (!item || !heldRead.respond) return;
       const detail = await call(host, 'task.detail', { id: item.id });
       return detail.stage?.state === 'waiting' && detail;
@@ -142,7 +247,7 @@ export async function smokeTaskStages({ base, configure, launch, stop, call, mak
       return detail.stage?.state === 'superseded' && detail.directionStatus === 'revoked' && detail;
     }, 'the original chat withdraws the stage');
     heldRead.respond('success');
-    await new Promise(resolve => setTimeout(resolve, 1300));
+    await new Promise((resolve) => setTimeout(resolve, 1300));
     const afterWithdrawal = await call(host, 'task.detail', { id: withdrawn.task.id });
     assert.equal(afterWithdrawal.stage.state, 'superseded');
     assert.equal(afterWithdrawal.stage.observation, undefined);
@@ -150,7 +255,7 @@ export async function smokeTaskStages({ base, configure, launch, stop, call, mak
     assert.equal(afterWithdrawal.runHeld, false);
     await probe(host, 'native-prompt', bot.managerId, stoppableGoal);
     const stoppable = await wait(async () => {
-      const item = (await tasks()).items.find(item => item.goal === stoppableGoal);
+      const item = (await tasks()).items.find((item) => item.goal === stoppableGoal);
       if (!item) return;
       const detail = await call(host, 'task.detail', { id: item.id });
       if (!detail.binding || !detail.runHeld) return;
@@ -167,16 +272,27 @@ export async function smokeTaskStages({ base, configure, launch, stop, call, mak
     assert.equal((await tasks()).total, 3);
     await exerciseOwnerSessionActions(host, bot);
     console.log('PASS running task closed from its owner chat with one request');
-    console.log('PASS an in-flight HTTPS success after owner chat withdrawal did not reach a Worker');
-    console.log('PASS stage addition from the original chat survived restart and entered exactly one of four runs on the same Worker; one final chat delivery');
+    console.log(
+      'PASS an in-flight HTTPS success after owner chat withdrawal did not reach a Worker',
+    );
+    console.log(
+      'PASS stage addition from the original chat survived restart and entered exactly one of four runs on the same Worker; one final chat delivery',
+    );
   }
 
   async function exerciseOwnerSessionActions(host, bot) {
-    const draft = await call(host, 'task.create', { requestId: 'chat-owner-fixture', botId: bot.id, goal: ownerOldGoal,
-      scope: '只修改合成资料文件', acceptance: '会话已关联或已准备', reviewPolicy: 'human', startPaused: true });
+    const draft = await call(host, 'task.create', {
+      requestId: 'chat-owner-fixture',
+      botId: bot.id,
+      goal: ownerOldGoal,
+      scope: '只修改合成资料文件',
+      acceptance: '会话已关联或已准备',
+      reviewPolicy: 'human',
+      startPaused: true,
+    });
     const session = await probe(host, 'create-attach-session', undefined, ownerSessionTitle);
     const original = await probe(host, 'inspect-session', session.sessionId);
-    const prompt = text => probe(host, 'native-prompt', bot.managerId, text);
+    const prompt = (text) => probe(host, 'native-prompt', bot.managerId, text);
     const detail = () => call(host, 'task.detail', { id: draft.id, sessionId: bot.managerId });
     await prompt(ownerRevise);
     assert.equal((await detail()).task.goal, ownerNewGoal);
@@ -187,25 +303,51 @@ export async function smokeTaskStages({ base, configure, launch, stop, call, mak
     assert.equal((await detail()).binding, null);
     await prompt(ownerRefuse);
     await prompt(ownerConfirm);
-    assert.equal((await detail()).binding, null, 'confirmation after rejecting the preview cannot attach');
+    assert.equal(
+      (await detail()).binding,
+      null,
+      'confirmation after rejecting the preview cannot attach',
+    );
     await prompt(ownerInspect);
     const beforeRace = await detail();
-    await call(host, 'task.control', { requestId: 'owner-session-stale', id: draft.id,
-      sessionId: bot.managerId, expectedRowVersion: beforeRace.task.rowVersion, mode: 'paused' });
+    await call(host, 'task.control', {
+      requestId: 'owner-session-stale',
+      id: draft.id,
+      sessionId: bot.managerId,
+      expectedRowVersion: beforeRace.task.rowVersion,
+      mode: 'paused',
+    });
     await prompt(ownerConfirm);
-    assert.equal((await detail()).binding, null, 'confirmation naming the previous task version cannot attach');
+    assert.equal(
+      (await detail()).binding,
+      null,
+      'confirmation naming the previous task version cannot attach',
+    );
     await prompt(ownerInspect);
     await prompt(ownerConfirm);
     const attached = await detail();
     assert.equal(attached.binding.sessionId, session.sessionId);
     assert.equal(attached.task.controlMode, 'paused');
     assert.equal(attached.run, null);
-    const approval = JSON.parse(attached.events.find(event => event.kind === 'session.attached').data);
-    assert.deepEqual(approval.source.messages.map(message => message.text), [ownerInspect, ownerConfirm]);
+    const approval = JSON.parse(
+      attached.events.find((event) => event.kind === 'session.attached').data,
+    );
+    assert.deepEqual(
+      approval.source.messages.map((message) => message.text),
+      [ownerInspect, ownerConfirm],
+    );
     const history = await probe(host, 'inspect-session', session.sessionId);
-    assert.equal(history.historyMessageIds.filter(id => id === session.historyMessageId).length, 1);
+    assert.equal(
+      history.historyMessageIds.filter((id) => id === session.historyMessageId).length,
+      1,
+    );
     assert.equal(history.modelSteps, original.modelSteps);
-    assert.equal(history.events.some(event => event.type === 'user/message' && event.data.source.kind === 'super-bot'), false);
+    assert.equal(
+      history.events.some(
+        (event) => event.type === 'user/message' && event.data.source.kind === 'super-bot',
+      ),
+      false,
+    );
     await prompt(ownerDetach);
     assert.equal((await detail()).binding, null);
     await prompt(ownerPrepare);
@@ -214,6 +356,8 @@ export async function smokeTaskStages({ base, configure, launch, stop, call, mak
     assert.notEqual(prepared.binding.sessionId, session.sessionId);
     assert.equal(prepared.run, null);
     assert.equal(prepared.task.controlMode, 'paused');
-    console.log('PASS original owner chat accepted the delivered result, revised a goal, inspected an existing session, rejected stale/declined consent, attached on a short reply, detached and prepared a new Worker');
+    console.log(
+      'PASS original owner chat accepted the delivered result, revised a goal, inspected an existing session, rejected stale/declined consent, attached on a short reply, detached and prepared a new Worker',
+    );
   }
 }

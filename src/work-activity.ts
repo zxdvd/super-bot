@@ -77,7 +77,8 @@ function activities(scope: '' | 'bot' | 'tasks') {
 }
 
 export function botWorkSummaries(db: DatabaseSync): BotWorkSummary[] {
-  return db.prepare(`WITH managers_now AS (${managers}), activity AS (${activities('')})
+  return db
+    .prepare(`WITH managers_now AS (${managers}), activity AS (${activities('')})
     SELECT m.id,m.name,m.sessionId,
       count(a.id) FILTER (WHERE a.activity='working' AND instr(a.goal,?)!=1) AS working,
       count(a.id) FILTER (WHERE a.activity='attention') AS attention,
@@ -95,19 +96,26 @@ type TaskActivity = {
 };
 
 export function taskActivities(db: DatabaseSync, taskIds: string[]) {
-  const rows = db.prepare(`WITH managers_now AS (${managers}) ${activities('tasks')}`)
+  const rows = db
+    .prepare(`WITH managers_now AS (${managers}) ${activities('tasks')}`)
     .all({ $now: Date.now(), $taskIds: JSON.stringify(taskIds) }) as unknown as TaskActivity[];
-  return new Map(rows.map(row => [row.id, row]));
+  return new Map(rows.map((row) => [row.id, row]));
 }
 
 export function applyTaskActivity(task: Task, row?: TaskActivity, inbox = false): Task {
   if (!inbox && !row?.lateJob && !row?.observesExternalWork) return task;
-  return { ...task, activity: row?.activity ?? null,
-    ...(row?.lateJob === 'tracked' && task.blockingAttention === 'recovery' ? { blockingAttention: null } : {}) };
+  return {
+    ...task,
+    activity: row?.activity ?? null,
+    ...(row?.lateJob === 'tracked' && task.blockingAttention === 'recovery'
+      ? { blockingAttention: null }
+      : {}),
+  };
 }
 
 export function inboxActivity(db: DatabaseSync, botId: string) {
-  const rows = db.prepare(`WITH managers_now AS (${managers}) ${activities('bot')}`)
+  const rows = db
+    .prepare(`WITH managers_now AS (${managers}) ${activities('bot')}`)
     .all({ $now: Date.now(), $botId: botId }) as unknown as TaskActivity[];
   const byTask = new Map<string, TaskActivity>();
   let reviewTotal = 0;

@@ -1,6 +1,12 @@
 import { randomUUID } from 'node:crypto';
-import { isFeishuChatId, isFeishuOpenId, type FeishuPrivateTextMessage, type FeishuSelfTestCandidate,
-  type FeishuSelfTestView, type FeishuTransport } from './feishu-types.ts';
+import {
+  isFeishuChatId,
+  isFeishuOpenId,
+  type FeishuPrivateTextMessage,
+  type FeishuSelfTestCandidate,
+  type FeishuSelfTestView,
+  type FeishuTransport,
+} from './feishu-types.ts';
 import { AppError } from './model.ts';
 
 const WINDOW_MS = 3 * 60_000;
@@ -19,7 +25,9 @@ type Session = {
 };
 
 function live(session: Session): boolean {
-  return session.state !== 'conflict' && session.state !== 'expired' && session.state !== 'interrupted';
+  return (
+    session.state !== 'conflict' && session.state !== 'expired' && session.state !== 'interrupted'
+  );
 }
 
 function stale(): AppError {
@@ -38,20 +46,37 @@ export class FeishuSelfTest {
     return session && live(session) ? undefined : this.nextStartToken;
   }
 
-  start(sessionId: string, startToken: string, appId: string, sendText: FeishuTransport['sendText']): FeishuSelfTestView {
+  start(
+    sessionId: string,
+    startToken: string,
+    appId: string,
+    sendText: FeishuTransport['sendText'],
+  ): FeishuSelfTestView {
     const prior = this.current();
     if (prior?.sessionId === sessionId && prior.startToken === startToken) return this.view(prior);
     if (prior && live(prior)) {
-      throw new AppError('feishu-test-busy', '此连接已有进行中的私聊测试，请在原设置页完成或停止，也可等测试过期。');
+      throw new AppError(
+        'feishu-test-busy',
+        '此连接已有进行中的私聊测试，请在原设置页完成或停止，也可等测试过期。',
+      );
     }
     if (startToken !== this.nextStartToken) throw stale();
     this.nextStartToken = randomUUID();
     const startedAt = this.now();
     const timer = setTimeout(() => {
-      if (this.session?.sessionId === sessionId && live(this.session)) this.finish(this.session, 'expired');
+      if (this.session?.sessionId === sessionId && live(this.session))
+        this.finish(this.session, 'expired');
     }, WINDOW_MS).unref();
-    const session: Session = { sessionId, startToken, appId, startedAt,
-      expiresAt: startedAt + WINDOW_MS, sendText, state: 'waiting', timer };
+    const session: Session = {
+      sessionId,
+      startToken,
+      appId,
+      startedAt,
+      expiresAt: startedAt + WINDOW_MS,
+      sendText,
+      state: 'waiting',
+      timer,
+    };
     this.session = session;
     return this.view(session);
   }
@@ -64,8 +89,14 @@ export class FeishuSelfTest {
     const now = this.now();
     const session = this.current();
     if (!session || !live(session) || session.appId !== message.appId) return;
-    if (!Number.isSafeInteger(message.createdAt) || message.createdAt <= session.startedAt || message.createdAt > now
-      || !isFeishuOpenId(message.senderOpenId) || !isFeishuChatId(message.chatId)) return;
+    if (
+      !Number.isSafeInteger(message.createdAt) ||
+      message.createdAt <= session.startedAt ||
+      message.createdAt > now ||
+      !isFeishuOpenId(message.senderOpenId) ||
+      !isFeishuChatId(message.chatId)
+    )
+      return;
     const text = message.text.trim();
     if (!text) return;
     const candidate = session.candidate;
@@ -76,9 +107,15 @@ export class FeishuSelfTest {
       // A repeated message or another message from the same private chat leaves the original receipt in place.
       return;
     }
-    const preview = text.length <= 120 ? text : text.slice(0, 120).replace(/[\uD800-\uDBFF]$/u, '') + '…';
-    session.candidate = { chatId: message.chatId, openId: message.senderOpenId,
-      receivedAt: now, preview, confirmationToken: randomUUID() };
+    const preview =
+      text.length <= 120 ? text : text.slice(0, 120).replace(/[\uD800-\uDBFF]$/u, '') + '…';
+    session.candidate = {
+      chatId: message.chatId,
+      openId: message.senderOpenId,
+      receivedAt: now,
+      preview,
+      confirmationToken: randomUUID(),
+    };
     this.send(session, session.candidate);
   }
 
@@ -90,8 +127,15 @@ export class FeishuSelfTest {
 
   confirmedOpenId(sessionId: string, confirmationToken: string): string {
     const session = this.require(sessionId);
-    if (session.state !== 'sent' || !session.candidate || session.candidate.confirmationToken !== confirmationToken) {
-      throw new AppError('feishu-test-unconfirmed', '请核对当前测试候选，等收发通过后再确认本人身份。');
+    if (
+      session.state !== 'sent' ||
+      !session.candidate ||
+      session.candidate.confirmationToken !== confirmationToken
+    ) {
+      throw new AppError(
+        'feishu-test-unconfirmed',
+        '请核对当前测试候选，等收发通过后再确认本人身份。',
+      );
     }
     return session.candidate.openId;
   }
@@ -127,7 +171,10 @@ export class FeishuSelfTest {
     this.nextStartToken = randomUUID();
   }
 
-  private send(session: Session, { chatId, confirmationToken }: NonNullable<Session['candidate']>): void {
+  private send(
+    session: Session,
+    { chatId, confirmationToken }: NonNullable<Session['candidate']>,
+  ): void {
     session.state = 'sending';
     const sending = () => this.current() === session && session.state === 'sending';
     void (async () => {
@@ -142,7 +189,8 @@ export class FeishuSelfTest {
 
   private current(): Session | undefined {
     const session = this.session;
-    if (session && live(session) && this.now() >= session.expiresAt) this.finish(session, 'expired');
+    if (session && live(session) && this.now() >= session.expiresAt)
+      this.finish(session, 'expired');
     return session;
   }
 
@@ -162,7 +210,12 @@ export class FeishuSelfTest {
     const { sessionId, expiresAt, state } = session;
     if (state === 'sending' || state === 'send-failed' || state === 'sent') {
       const { openId, receivedAt, preview, confirmationToken } = session.candidate!;
-      return { sessionId, expiresAt, state, candidate: { openId, receivedAt, preview, confirmationToken } };
+      return {
+        sessionId,
+        expiresAt,
+        state,
+        candidate: { openId, receivedAt, preview, confirmationToken },
+      };
     }
     return { sessionId, expiresAt, state };
   }

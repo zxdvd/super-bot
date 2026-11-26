@@ -17,7 +17,9 @@ export function writeTransaction<T>(db: DatabaseSync, write: () => T): T {
 }
 
 function storedReceipt(db: DatabaseSync, id: string): StoredReceipt | undefined {
-  return db.prepare('SELECT hash,result FROM requests WHERE id=?').get(id) as StoredReceipt | undefined;
+  return db.prepare('SELECT hash,result FROM requests WHERE id=?').get(id) as
+    | StoredReceipt
+    | undefined;
 }
 
 function requestHash(action: string, payload: unknown): string {
@@ -26,17 +28,29 @@ function requestHash(action: string, payload: unknown): string {
 }
 
 function readResult<T>(receipt: StoredReceipt, hash: string): T {
-  if (receipt.hash !== hash) throw new AppError('idempotency-conflict', '同一请求标识不能用于不同的内容。');
+  if (receipt.hash !== hash)
+    throw new AppError('idempotency-conflict', '同一请求标识不能用于不同的内容。');
   return JSON.parse(receipt.result) as T;
 }
 
-export function readCommandReceipt<T>(db: DatabaseSync, requestId: string, action: string, payload: unknown): T | undefined {
+export function readCommandReceipt<T>(
+  db: DatabaseSync,
+  requestId: string,
+  action: string,
+  payload: unknown,
+): T | undefined {
   const id = requiredText(requestId, '请求标识', 200);
   const receipt = storedReceipt(db, id);
   return receipt ? readResult<T>(receipt, requestHash(action, payload)) : undefined;
 }
 
-export function runCommand<T>(db: DatabaseSync, requestId: string, action: string, payload: unknown, apply: () => T): T {
+export function runCommand<T>(
+  db: DatabaseSync,
+  requestId: string,
+  action: string,
+  payload: unknown,
+  apply: () => T,
+): T {
   const id = requiredText(requestId, '请求标识', 200);
   const hash = requestHash(action, payload);
   return writeTransaction(db, () => {

@@ -2,7 +2,15 @@ import type { Agent } from '@deepseek-ai/dsh-agent';
 import { createUserMessage, type UserMessage } from '@deepseek-ai/dsh-llm';
 import type { Session } from '@deepseek-ai/dsh-session';
 import { materialPrompt } from './materials.ts';
-import type { Binding, RecoveryWorkContext, Run, RunInput, Task, TaskBotContext, WorkerPriorInput } from './model.ts';
+import type {
+  Binding,
+  RecoveryWorkContext,
+  Run,
+  RunInput,
+  Task,
+  TaskBotContext,
+  WorkerPriorInput,
+} from './model.ts';
 import { workdirSummary } from './workdir.ts';
 
 declare module '@deepseek-ai/dsh-llm' {
@@ -29,7 +37,12 @@ In ready, use summary for what changed and checks for commands actually run, the
 For ordinary non-code work, keep the report brief and use the checks and files relevant to that task.
 In super_bot_report ready, register each actual external deliverable in links as a distinct display name mapped to its full HTTP(S) URL. Register each URL once and use its display name in summary and checks. When one deliverable is the user's main next action, set primaryLink to its exact registered display name. Keep references in the report. If a requested openable deliverable is missing, explain what is missing and why. Omit links for local-only work. Include file evidence and checks even when a document is the only deliverable.`;
 
-export function workerStandingPrompt(task:Task,binding:Binding,context:TaskBotContext,fullAccess:boolean):string {
+export function workerStandingPrompt(
+  task: Task,
+  binding: Binding,
+  context: TaskBotContext,
+  fullAccess: boolean,
+): string {
   const convention = context.workConvention;
   const conventionPrompt = convention
     ? `\nWork convention recorded for this task (${convention.source}). Follow it within the current task scope and authorization:\n${convention.text}`
@@ -43,7 +56,7 @@ export function workerStandingPrompt(task:Task,binding:Binding,context:TaskBotCo
     `Goal: ${task.goal}`,
     `Authorized scope: ${task.scope}`,
     `Acceptance criteria: ${task.acceptance}`,
-    `Working directory: ${workdirSummary(binding.cwd,binding.workdir)}. Work only inside it; do not change other checkouts or directories.`,
+    `Working directory: ${workdirSummary(binding.cwd, binding.workdir)}. Work only inside it; do not change other checkouts or directories.`,
     'If task inputs conflict, follow the higher input order within the authorized scope.',
     permissions,
     CODE_DELIVERY,
@@ -52,85 +65,149 @@ export function workerStandingPrompt(task:Task,binding:Binding,context:TaskBotCo
   ].join('\n');
 }
 
-const runHeader = (id:string) => `You are executing a NEW attempt of one Super Bot task.\nCurrent run: ${id}.`;
+const runHeader = (id: string) =>
+  `You are executing a NEW attempt of one Super Bot task.\nCurrent run: ${id}.`;
 
-function previousInputText(input:WorkerPriorInput):string {
-  const earlier=input.priorDirections?.map(text=>`Previously received owner direction:\n${text}`).join('\n\n');
-  return `Restored task input order: ${input.order}.\n${earlier?`${earlier}\n\n`:''}Previously received task input (${input.kind}): ${input.content}`;
+function previousInputText(input: WorkerPriorInput): string {
+  const earlier = input.priorDirections
+    ?.map((text) => `Previously received owner direction:\n${text}`)
+    .join('\n\n');
+  return `Restored task input order: ${input.order}.\n${earlier ? `${earlier}\n\n` : ''}Previously received task input (${input.kind}): ${input.content}`;
 }
-const inputLabel = (kind:string) => kind==='stage'?'Authorized stage continuation':'Additional user input';
+const inputLabel = (kind: string) =>
+  kind === 'stage' ? 'Authorized stage continuation' : 'Additional user input';
 
-type WorkerPromptPlan = {mode:'full'|'delta';carried:readonly WorkerPriorInput[];inputOrder:number};
+type WorkerPromptPlan = {
+  mode: 'full' | 'delta';
+  carried: readonly WorkerPriorInput[];
+  inputOrder: number;
+};
 
 export function createWorkerRunMessage(
-  run:Run,input:RunInput,standing:string,{mode,carried,inputOrder}:WorkerPromptPlan,
-  recovery?:{note:string|null},context?:RecoveryWorkContext&{outputDirectory?:string},
-):UserMessage {
+  run: Run,
+  input: RunInput,
+  standing: string,
+  { mode, carried, inputOrder }: WorkerPromptPlan,
+  recovery?: { note: string | null },
+  context?: RecoveryWorkContext & { outputDirectory?: string },
+): UserMessage {
   const sections = [runHeader(run.id)];
   if (mode === 'full') sections.push(standing);
   sections.push(...carried.map(previousInputText));
   if (recovery) {
-    sections.push('The user confirmed recovery and requested this new attempt. Check the current files and the prior blocker before proceeding within the same authorized scope.');
+    sections.push(
+      'The user confirmed recovery and requested this new attempt. Check the current files and the prior blocker before proceeding within the same authorized scope.',
+    );
     if (recovery.note) sections.push(`Prior recovery reason: ${recovery.note}`);
   }
   if (context) {
-    const {priorDirections,priorDirection,directionIds,...facts}=context;
+    const { priorDirections, priorDirection, directionIds, ...facts } = context;
     sections.push(`Earlier attempt and observed facts (use as evidence): ${JSON.stringify(facts)}`);
-    if(priorDirections)sections.push(...priorDirections.map(({text})=>`Retained owner direction:\n${text}`));
-    else if(priorDirection)sections.push(`Retained owner direction:\n${priorDirection}`);
-    sections.push('Continue the current assignment from all applicable owner directions in order and the verified state. Retain the substantive directions and limits when the latest message only confirms proceeding or selects this task. Treat the standing goal as background for this attempt. Read prior reports and receipts as evidence. Preserve observed effects and uncertainty. If a resource was created but is unready, report both facts. Use waiting for a specific decision or permission the owner must supply. Report a blocked external dependency with the responsible party or condition.');
-    if(context.lateJobs)sections.push(`The old attempt ended before these background Job results were consumed. Use the saved progress, original native Job result messages and current files as evidence. Prior external effects remain unverified. Preserve the materials already collected. Continue only with reading existing regular files and writing the requested report under ${context.outputDirectory}. Do not repeat background work, modify existing inputs, perform an external action or claim an unverified external effect succeeded. If the task specifically needs an external action or unavailable evidence, report the remaining business requirement and the exact missing evidence.`);
-    else sections.push(context.mode==='read-only'?
-      'Use only the read-only tools available for this continuation and report the actual observations.' :
-      'Perform only the concrete next step the owner authorized within the standing scope. Check current facts first and stop before any action that could duplicate an observed effect.');
+    if (priorDirections)
+      sections.push(...priorDirections.map(({ text }) => `Retained owner direction:\n${text}`));
+    else if (priorDirection) sections.push(`Retained owner direction:\n${priorDirection}`);
+    sections.push(
+      'Continue the current assignment from all applicable owner directions in order and the verified state. Retain the substantive directions and limits when the latest message only confirms proceeding or selects this task. Treat the standing goal as background for this attempt. Read prior reports and receipts as evidence. Preserve observed effects and uncertainty. If a resource was created but is unready, report both facts. Use waiting for a specific decision or permission the owner must supply. Report a blocked external dependency with the responsible party or condition.',
+    );
+    if (context.lateJobs)
+      sections.push(
+        `The old attempt ended before these background Job results were consumed. Use the saved progress, original native Job result messages and current files as evidence. Prior external effects remain unverified. Preserve the materials already collected. Continue only with reading existing regular files and writing the requested report under ${context.outputDirectory}. Do not repeat background work, modify existing inputs, perform an external action or claim an unverified external effect succeeded. If the task specifically needs an external action or unavailable evidence, report the remaining business requirement and the exact missing evidence.`,
+      );
+    else
+      sections.push(
+        context.mode === 'read-only'
+          ? 'Use only the read-only tools available for this continuation and report the actual observations.'
+          : 'Perform only the concrete next step the owner authorized within the standing scope. Check current facts first and stop before any action that could duplicate an observed effect.',
+      );
   }
-  if (input.kind === 'answer' || input.kind === 'rework' || input.kind === 'continuation' || input.kind === 'stage') {
+  if (
+    input.kind === 'answer' ||
+    input.kind === 'rework' ||
+    input.kind === 'continuation' ||
+    input.kind === 'stage'
+  ) {
     sections.push(`Task input order: ${inputOrder}.`);
     sections.push(`${inputLabel(input.kind)} (${input.kind}): ${input.content}`);
-    sections.push(input.kind==='stage'
-      ? 'Perform only the recorded next step within the existing scope. Preserve earlier results and observed effects. Do not repeat completed work or broaden authorization. Recheck relevant facts before acting.'
-      : 'Continue from the current state and apply this input within the existing authorized scope. Use waiting if the input requires clarification or exceeds that scope.');
+    sections.push(
+      input.kind === 'stage'
+        ? 'Perform only the recorded next step within the existing scope. Preserve earlier results and observed effects. Do not repeat completed work or broaden authorization. Recheck relevant facts before acting.'
+        : 'Continue from the current state and apply this input within the existing authorized scope. Use waiting if the input requires clarification or exceeds that scope.',
+    );
   } else {
     sections.push('Continue from the current verified state within the existing authorized scope.');
   }
-  sections.push('Reports from previous attempts do not complete this run. Re-check current facts and perform the authorized work. Submit a fresh super_bot_report for this run.');
+  sections.push(
+    'Reports from previous attempts do not complete this run. Re-check current facts and perform the authorized work. Submit a fresh super_bot_report for this run.',
+  );
   return createUserMessage({
-    source:{kind:'super-bot',taskId:run.taskId,runId:run.id,inputId:run.inputId,taskRevision:run.taskRevision,
-      generation:run.generation,bindingId:run.bindingId,promptMode:mode,
-      ...(context?.directionIds?.length?{ownerDirectionIds:context.directionIds}:{}),
-      ...(carried.length?{carriedInputIds:carried.map(prior=>prior.id)}:{})},
-    content:[{type:'text',text:sections.join('\n\n')}],
+    source: {
+      kind: 'super-bot',
+      taskId: run.taskId,
+      runId: run.id,
+      inputId: run.inputId,
+      taskRevision: run.taskRevision,
+      generation: run.generation,
+      bindingId: run.bindingId,
+      promptMode: mode,
+      ...(context?.directionIds?.length ? { ownerDirectionIds: context.directionIds } : {}),
+      ...(carried.length ? { carriedInputIds: carried.map((prior) => prior.id) } : {}),
+    },
+    content: [{ type: 'text', text: sections.join('\n\n') }],
   });
 }
 
-type WorkerSource = Extract<UserMessage['source'],{kind:'super-bot'}>;
-function matchesBinding(source:WorkerSource,run:Run):boolean {
-  return source.taskId === run.taskId && source.taskRevision === run.taskRevision
-    && source.bindingId === run.bindingId && source.generation === run.generation;
+type WorkerSource = Extract<UserMessage['source'], { kind: 'super-bot' }>;
+function matchesBinding(source: WorkerSource, run: Run): boolean {
+  return (
+    source.taskId === run.taskId &&
+    source.taskRevision === run.taskRevision &&
+    source.bindingId === run.bindingId &&
+    source.generation === run.generation
+  );
 }
 
-function hasStandingContext(messages:ReturnType<Session['deriveMessages']>,run:Run,standing:string):boolean {
-  return messages.some(message=>{
+function hasStandingContext(
+  messages: ReturnType<Session['deriveMessages']>,
+  run: Run,
+  standing: string,
+): boolean {
+  return messages.some((message) => {
     const source = message.source;
-    return message.role === 'user' && source.kind === 'super-bot' && source.promptMode === 'full'
-      && matchesBinding(source,run) && message.content[0]?.type === 'text'
-      && message.content[0].text.startsWith(`${runHeader(source.runId)}\n\n${standing}\n\n`);
+    return (
+      message.role === 'user' &&
+      source.kind === 'super-bot' &&
+      source.promptMode === 'full' &&
+      matchesBinding(source, run) &&
+      message.content[0]?.type === 'text' &&
+      message.content[0].text.startsWith(`${runHeader(source.runId)}\n\n${standing}\n\n`)
+    );
   });
 }
 
-function hasPreviousInput(messages:ReturnType<Session['deriveMessages']>,run:Run,previous:WorkerPriorInput):boolean {
-  return messages.some(message=>{
+function hasPreviousInput(
+  messages: ReturnType<Session['deriveMessages']>,
+  run: Run,
+  previous: WorkerPriorInput,
+): boolean {
+  return messages.some((message) => {
     const source = message.source;
-    if (message.role !== 'user' || source.kind !== 'super-bot' || !matchesBinding(source,run)) return false;
+    if (message.role !== 'user' || source.kind !== 'super-bot' || !matchesBinding(source, run))
+      return false;
     const block = message.content[0];
     if (block?.type !== 'text') return false;
-    return (message.id === previous.messageId && source.inputId === previous.id
-      && block.text.includes(`\n\n${inputLabel(previous.kind)} (${previous.kind}): ${previous.content}\n\n`))
-      || (source.carriedInputIds?.includes(previous.id) && block.text.includes(`\n\n${previousInputText(previous)}\n\n`));
+    return (
+      (message.id === previous.messageId &&
+        source.inputId === previous.id &&
+        block.text.includes(
+          `\n\n${inputLabel(previous.kind)} (${previous.kind}): ${previous.content}\n\n`,
+        )) ||
+      (source.carriedInputIds?.includes(previous.id) &&
+        block.text.includes(`\n\n${previousInputText(previous)}\n\n`))
+    );
   });
 }
 
-function canRefreshWorkerContext(agent:Agent):boolean {
+function canRefreshWorkerContext(agent: Agent): boolean {
   if (typeof agent.session?.deriveMessages !== 'function') return false;
   try {
     const prompt = agent.ctx.systemPrompt;
@@ -141,45 +218,66 @@ function canRefreshWorkerContext(agent:Agent):boolean {
   }
 }
 
-export function workerPromptPlan(agent:Agent,run:Run,standing:string,previous:readonly WorkerPriorInput[]=[]):WorkerPromptPlan {
-  const inputOrder = previous.length+1;
+export function workerPromptPlan(
+  agent: Agent,
+  run: Run,
+  standing: string,
+  previous: readonly WorkerPriorInput[] = [],
+): WorkerPromptPlan {
+  const inputOrder = previous.length + 1;
   if (canRefreshWorkerContext(agent) && agent.session.id === run.sessionId) {
     try {
       const messages = agent.session.deriveMessages();
-      const carried = previous.filter(prior=>!hasPreviousInput(messages,run,prior));
-      const mode = hasStandingContext(messages,run,standing) ? 'delta' : 'full';
+      const carried = previous.filter((prior) => !hasPreviousInput(messages, run, prior));
+      const mode = hasStandingContext(messages, run, standing) ? 'delta' : 'full';
       return { mode, carried, inputOrder };
     } catch {
       // A missing or unreadable native projection is no proof of continuity.
     }
   }
-  return { mode:'full', carried:previous, inputOrder };
+  return { mode: 'full', carried: previous, inputOrder };
 }
 
 export function registerWorkerContext(
-  agent:Agent,run:Run,standing:string,message:UserMessage,previous:readonly WorkerPriorInput[],entered:()=>boolean,authorized:()=>boolean,
-):()=>void {
-  if (message.source.kind !== 'super-bot' || !message.source.promptMode || !canRefreshWorkerContext(agent)) return ()=>{};
+  agent: Agent,
+  run: Run,
+  standing: string,
+  message: UserMessage,
+  previous: readonly WorkerPriorInput[],
+  entered: () => boolean,
+  authorized: () => boolean,
+): () => void {
+  if (
+    message.source.kind !== 'super-bot' ||
+    !message.source.promptMode ||
+    !canRefreshWorkerContext(agent)
+  )
+    return () => {};
   const block = message.content[0];
-  if (block?.type !== 'text') return ()=>{};
+  if (block?.type !== 'text') return () => {};
   return agent.ctx.systemPrompt.context({
-    name:'super-bot-worker-task',
-    order:9000,
-    interpolate:false,
-    required:true,
-    text:({agent:subject,signal})=>{
+    name: 'super-bot-worker-task',
+    order: 9000,
+    interpolate: false,
+    required: true,
+    text: ({ agent: subject, signal }) => {
       if (subject !== agent || signal?.aborted || !authorized()) return '';
       const wasEntered = entered();
       const messages = agent.session.deriveMessages();
-      const inputVisible = messages.some(candidate=>candidate.id===message.id
-        && candidate.role==='user' && candidate.source.kind==='super-bot'
-        && candidate.content[0]?.type==='text' && candidate.content[0].text===block.text);
+      const inputVisible = messages.some(
+        (candidate) =>
+          candidate.id === message.id &&
+          candidate.role === 'user' &&
+          candidate.source.kind === 'super-bot' &&
+          candidate.content[0]?.type === 'text' &&
+          candidate.content[0].text === block.text,
+      );
       // The original input is about to enter this request or is restored below if it was shadowed.
       if (!inputVisible) messages.push(message);
       const missing = [];
-      if (!hasStandingContext(messages,run,standing)) missing.push(standing);
+      if (!hasStandingContext(messages, run, standing)) missing.push(standing);
       for (const prior of previous) {
-        if (!hasPreviousInput(messages,run,prior)) missing.push(previousInputText(prior));
+        if (!hasPreviousInput(messages, run, prior)) missing.push(previousInputText(prior));
       }
       if (wasEntered && !inputVisible) missing.push(block.text);
       return missing.join('\n\n');

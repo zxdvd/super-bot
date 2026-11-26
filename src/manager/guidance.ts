@@ -176,8 +176,12 @@ const CHAT_FOLLOW_UP = [
   `If capacity is unavailable, return and await a later event.`,
 ].join(' ');
 
-export function managerPrompt(bot: Pick<Bot, 'name' | 'configRevision' | 'instructions'>,
-  materials: readonly ReferenceMaterial[], fullAccess: boolean, policy: WorkdirPolicy): string {
+export function managerPrompt(
+  bot: Pick<Bot, 'name' | 'configRevision' | 'instructions'>,
+  materials: readonly ReferenceMaterial[],
+  fullAccess: boolean,
+  policy: WorkdirPolicy,
+): string {
   const identity = `You are the user-facing persistent Bot ${bot.name}. Configuration revision: ${bot.configRevision}. Responsibility: ${bot.instructions}`;
   return [
     identity + materialPrompt(materials),
@@ -188,7 +192,11 @@ export function managerPrompt(bot: Pick<Bot, 'name' | 'configRevision' | 'instru
     DELIVERY_GUIDANCE,
     DELIVERY_ARTIFACTS,
     TASK_ADMISSION,
-    [EXECUTION_STATUS, fullAccess ? MANAGER_FULL_ACCESS_GUIDANCE : FILES_ACCESS_GUIDANCE, CHAT_FOLLOW_UP].join(' '),
+    [
+      EXECUTION_STATUS,
+      fullAccess ? MANAGER_FULL_ACCESS_GUIDANCE : FILES_ACCESS_GUIDANCE,
+      CHAT_FOLLOW_UP,
+    ].join(' '),
     CHAT_WORK_GUIDANCE,
     STAGE_GUIDANCE,
     GITLAB_RELEASE_GUIDANCE,

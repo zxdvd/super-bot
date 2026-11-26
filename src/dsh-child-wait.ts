@@ -21,8 +21,11 @@ export class ChildWaitObservation {
   private published = false;
   private ended = false;
 
-  constructor(private boundary: Pick<RunChildWait, 'runId' | 'turn' | 'startSeq' | 'inputSeq' | 'source'>,
-    active: Iterable<ChildWaitMember>, private record: RecordEdge) {
+  constructor(
+    private boundary: Pick<RunChildWait, 'runId' | 'turn' | 'startSeq' | 'inputSeq' | 'source'>,
+    active: Iterable<ChildWaitMember>,
+    private record: RecordEdge,
+  ) {
     for (const member of active) this.members.set(member.nativeRunId, member);
   }
 
@@ -46,9 +49,13 @@ export class ChildWaitObservation {
 
   private snapshot(outcome?: EndOutcome, endedAt: number | null = null): RunChildWait {
     const children = [...this.members.values()];
-    const active = children.filter(child => child.endedAt === null).length;
+    const active = children.filter((child) => child.endedAt === null).length;
     return {
-      ...this.boundary, id: this.id, startedAt: this.startedAt, endedAt, children,
+      ...this.boundary,
+      id: this.id,
+      startedAt: this.startedAt,
+      endedAt,
+      children,
       outcome: outcome ?? (active ? 'waiting' : 'checking'),
       pendingCount: outcome === 'converged' || outcome === 'clear' ? 0 : active || null,
     };

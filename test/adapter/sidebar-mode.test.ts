@@ -6,8 +6,15 @@ import { installBotSidebar } from '../../src/ui/BotSidebar.tsx';
 import type { WorkspaceApi } from '../../src/ui/work/api.ts';
 
 test('sidebar mode switches only its own workspaces registration and keeps one footer toggle', () => {
-  type Entry = { name: string; priority?: number; render: (props: { wide: boolean }) => ReactElement };
-  const native = { name: 'sidebar.workspaces', render: () => assert.fail('plugin must not render the native list') };
+  type Entry = {
+    name: string;
+    priority?: number;
+    render: (props: { wide: boolean }) => ReactElement;
+  };
+  const native = {
+    name: 'sidebar.workspaces',
+    render: () => assert.fail('plugin must not render the native list'),
+  };
   const entries = new Set<Entry>([native]);
   const registrations = new Set<string>();
   const slots = {
@@ -15,20 +22,32 @@ test('sidebar mode switches only its own workspaces registration and keeps one f
       assert.ok(!registrations.has(name));
       registrations.add(name);
       const release = register();
-      return () => { assert.ok(registrations.delete(name)); release(); };
+      return () => {
+        assert.ok(registrations.delete(name));
+        release();
+      };
     },
     register(options: Omit<Entry, 'render'>, render: Entry['render']) {
       const entry = { ...options, render };
       entries.add(entry);
-      return () => { assert.ok(entries.delete(entry)); };
+      return () => {
+        assert.ok(entries.delete(entry));
+      };
     },
   } as Context['slots'];
   const unexpected = () => assert.fail('switching sidebar mode must not use the chat API');
-  const api: WorkspaceApi = { call: unexpected, openSession: unexpected, beginNavigation: unexpected, openBot: unexpected };
+  const api: WorkspaceApi = {
+    call: unexpected,
+    openSession: unexpected,
+    beginNavigation: unexpected,
+    openBot: unexpected,
+  };
   const dispose = installBotSidebar(slots, api);
-  const visibleList = () => [...entries].filter(e => e.name === native.name).sort((a, b) =>
-    (a.priority ?? 0) - (b.priority ?? 0))[0];
-  const footer = [...entries].find(e => e.name === 'sidebar.footer.action')!;
+  const visibleList = () =>
+    [...entries]
+      .filter((e) => e.name === native.name)
+      .sort((a, b) => (a.priority ?? 0) - (b.priority ?? 0))[0];
+  const footer = [...entries].find((e) => e.name === 'sidebar.footer.action')!;
   const { mode } = footer.render({ wide: true }).props;
   const states: boolean[] = [];
   const unsubscribe = mode.subscribe(() => states.push(mode.getSnapshot()));

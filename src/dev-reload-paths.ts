@@ -35,15 +35,23 @@ export function isLinkedCheckout(dir: string, root: string): boolean {
   const manifest = JSON.parse(readFileSync(join(dir, 'package.json'), 'utf8'));
   const link = manifest.dependencies?.[reloadPackage];
   const installed = join(dir, 'node_modules', reloadPackage);
-  return typeof link === 'string' && link.startsWith('link:') && existsSync(installed)
-    && realpathSync(resolve(dir, link.slice(5))) === root && realpathSync(installed) === root;
+  return (
+    typeof link === 'string' &&
+    link.startsWith('link:') &&
+    existsSync(installed) &&
+    realpathSync(resolve(dir, link.slice(5))) === root &&
+    realpathSync(installed) === root
+  );
 }
 
 export function liveReloadEndpoints(dir: string): ReloadEndpoint[] {
   const directory = reloadDirectory(dir);
   if (!existsSync(directory)) return [];
   const info = lstatSync(directory);
-  if (!info.isDirectory() || (process.getuid && (info.uid !== process.getuid() || (info.mode & 0o077)))) {
+  if (
+    !info.isDirectory() ||
+    (process.getuid && (info.uid !== process.getuid() || info.mode & 0o077))
+  ) {
     throw Error('unsafe reload discovery directory');
   }
   const live: ReloadEndpoint[] = [];
@@ -53,7 +61,11 @@ export function liveReloadEndpoints(dir: string): ReloadEndpoint[] {
     let endpoint: ReloadEndpoint;
     try {
       const file = lstatSync(path);
-      if (!file.isFile() || file.size > 8192 || (process.getuid && (file.uid !== process.getuid() || (file.mode & 0o077)))) {
+      if (
+        !file.isFile() ||
+        file.size > 8192 ||
+        (process.getuid && (file.uid !== process.getuid() || file.mode & 0o077))
+      ) {
         throw Error('unsafe reload discovery file');
       }
       endpoint = JSON.parse(readFileSync(path, 'utf8'));
@@ -61,13 +73,22 @@ export function liveReloadEndpoints(dir: string): ReloadEndpoint[] {
       if ((error as NodeJS.ErrnoException).code === 'ENOENT') continue;
       throw error;
     }
-    if (endpoint.protocol !== reloadProtocol || endpoint.dir !== dir || `${endpoint.instance}.json` !== entry
-      || !Number.isInteger(endpoint.pid) || endpoint.pid < 1 || !Number.isInteger(endpoint.port)
-      || endpoint.port < 1 || endpoint.port > 65535 || !/^[0-9a-f]{64}$/.test(endpoint.token)) {
+    if (
+      endpoint.protocol !== reloadProtocol ||
+      endpoint.dir !== dir ||
+      `${endpoint.instance}.json` !== entry ||
+      !Number.isInteger(endpoint.pid) ||
+      endpoint.pid < 1 ||
+      !Number.isInteger(endpoint.port) ||
+      endpoint.port < 1 ||
+      endpoint.port > 65535 ||
+      !/^[0-9a-f]{64}$/.test(endpoint.token)
+    ) {
       throw Error('invalid reload discovery record');
     }
-    try { process.kill(endpoint.pid, 0); }
-    catch (error) {
+    try {
+      process.kill(endpoint.pid, 0);
+    } catch (error) {
       if ((error as NodeJS.ErrnoException).code === 'ESRCH') continue;
       throw error;
     }
