@@ -10,3 +10,5 @@ export const restoreReleasePermission =
   'Die Berechtigung ist jetzt eingerichtet. Nimm bitte denselben Auftrag wieder auf.';
 export const releaseProject = 'fixture/release';
 export const releaseSha = 'a'.repeat(40);
+
+export const releaseLocalNote = '保持原作业跟踪，同时在原任务目录保存一份交接说明。';

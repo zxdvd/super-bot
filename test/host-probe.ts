@@ -20,7 +20,7 @@ import type { JobOutcome } from '@deepseek-ai/dsh-jobs';
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import { mkdir, writeFile } from 'node:fs/promises';
-import { existsSync } from 'node:fs';
+import { readFileSync, existsSync } from 'node:fs';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { join } from 'node:path';
@@ -41,6 +41,10 @@ import {
   ownerPrepare,
   ownerRevise,
   ownerSessionTitle,
+  rosterGoal,
+  rosterDirection,
+  rosterDraft,
+  rosterFinal,
   stageArtifacts,
   stageGoal,
   stageRevoke,
@@ -54,6 +58,7 @@ import {
   prepareRelease,
   publishOrdinal,
   releaseFixtureGoal,
+  releaseLocalNote,
   releaseStatusQuestion,
   restoreReleasePermission,
   showReleaseChoices,
@@ -453,6 +458,7 @@ class ProbeAdapter extends LlmAdapter {
         trigger?.source?.kind === 'user' &&
         [
           approveRelease,
+          releaseLocalNote,
           approveFixtureDeployment,
           confirmReleaseChoice,
           publishOrdinal,
@@ -471,6 +477,16 @@ class ProbeAdapter extends LlmAdapter {
           );
           assert.ok(target);
           yield* probeTool('super_bot_manage', { action: 'detail', taskId: target.id });
+          return;
+        }
+        if (prior.action === 'detail' && value?.task && text === releaseLocalNote) {
+          yield* probeTool('super_bot_manage', {
+            action: 'continue',
+            taskId: value.task.id,
+            expectedRowVersion: value.task.rowVersion,
+            userInstruction: text,
+            continuationMode: 'authorized-work',
+          });
           return;
         }
         if (prior.action === 'detail' && value?.stage) {
@@ -552,6 +568,7 @@ class ProbeAdapter extends LlmAdapter {
       const continuationTarget = stageFollowUp
         ? stageGoal
         : new Map([
+            [rosterDirection, rosterGoal],
             [imageScope, imageGoal],
             [startupContinue, startupGoal],
             [pendingContinue, pendingGoal],
@@ -644,11 +661,11 @@ class ProbeAdapter extends LlmAdapter {
           taskId: value.task.id,
           expectedRowVersion: value.task.rowVersion,
           userInstruction: text,
+          ...(text === rosterDirection ? { continuationMode: 'authorized-work' } : {}),
           ...(stageFollowUp
-            ? {
-                stageFollowUp,
-                ...(stageFollowUp === 'append' ? { continuationMode: 'read-only' } : {}),
-              }
+            ? stageFollowUp === 'append'
+              ? { continuationMode: 'read-only' }
+              : { stageFollowUp }
             : {}),
           ...([startupContinue, pendingContinue].includes(text)
             ? { useLatestDirection: true }
@@ -661,7 +678,7 @@ class ProbeAdapter extends LlmAdapter {
         continuationNotice &&
         prior?.action === 'detail' &&
         currentTask &&
-        req005Goals.includes(currentTask.goal)
+        (req005Goals.includes(currentTask.goal) || currentTask.goal === rosterGoal)
       ) {
         plan = {
           action: 'continue',
@@ -777,6 +794,13 @@ class ProbeAdapter extends LlmAdapter {
             goal: releaseFixtureGoal + ' ' + text.slice(prepareRelease.length),
             scope: '只操作该合成合并请求的发布作业',
             acceptance: '核对合成发布作业，在原聊天报告准确链接和已确认状态',
+          };
+        else if (trigger?.source?.kind === 'user' && text === rosterGoal)
+          plan = {
+            action: 'create',
+            goal: rosterGoal,
+            scope: '只在本地整理名单',
+            acceptance: '原名单有 26 项，交付实际文件',
           };
         else if (trigger?.source?.kind === 'user' && text === stoppableGoal)
           plan = {
@@ -1274,7 +1298,58 @@ class ProbeAdapter extends LlmAdapter {
       const calls = later.flatMap((m) =>
         m.content.filter((b) => b.type === 'tool-call').map((b) => b.name),
       );
+      if (goal === rosterGoal) {
+        const file = join(cwd, 'roster.txt');
+        const original = !previous.length;
+        if (!original) assert.ok(body.includes(rosterDirection));
+        if (original && !calls.includes('bash')) {
+          yield* probeTool('bash', { description: '查看任务目录', command: 'pwd' });
+          return;
+        }
+        if (!original && !calls.includes('read')) {
+          yield* probeTool('read', { file_path: file });
+          return;
+        }
+        if (!calls.includes('write')) {
+          if (!original) assert.equal(readFileSync(file, 'utf8'), rosterDraft);
+          yield* probeTool('write', {
+            file_path: file,
+            content: original ? rosterDraft : rosterFinal,
+          });
+          return;
+        }
+        if (!calls.includes('super_bot_report')) {
+          if (original && options.sessionId) {
+            await new Promise<void>((release) =>
+              this.stalled.set(options.sessionId!, { release, signal: options.signal }),
+            );
+            this.stalled.delete(options.sessionId);
+            options.signal?.throwIfAborted();
+          }
+          yield* probeTool('super_bot_report', {
+            kind: 'ready',
+            summary: original ? '名单草稿已整理。' : '原名单仅补齐了第 26 项。',
+            files: [file],
+            checks: '已保存 26 项合成名单。',
+          });
+        } else yield { type: 'finish', reason: { kind: 'stop' } };
+        return;
+      }
       if (goal.startsWith(releaseFixtureGoal)) {
+        if (body.includes(releaseLocalNote)) {
+          const file = join(cwd, 'handoff.md');
+          if (!calls.includes('write'))
+            yield* probeTool('write', { file_path: file, content: '合成交接说明' });
+          else if (!calls.includes('super_bot_report'))
+            yield* probeTool('super_bot_report', {
+              kind: 'ready',
+              summary: '已生成本地交接说明。',
+              checks: '原作业单独跟踪。',
+              files: [file],
+            });
+          else yield { type: 'finish', reason: { kind: 'stop' } };
+          return;
+        }
         const mr = goal.slice(releaseFixtureGoal.length + 1);
         if (body.includes('Call super_bot_gitlab_play with no arguments')) {
           assert.ok(options.tools?.some((tool) => tool.name === 'super_bot_gitlab_play'));

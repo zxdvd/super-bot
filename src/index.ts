@@ -686,16 +686,16 @@ export async function apply(
           ok: true,
           value: await execution.reconcileBinding(requiredText(payload.id, '会话关联标识', 200)),
         };
-      if (endpoint === 'task.control')
-        return {
-          ok: true,
-          value: store.controlTask(
-            requiredText(payload.requestId, '请求标识', 200),
-            taskInScope(payload, true).id,
-            payload.expectedRowVersion as number,
-            payload.mode as ControlMode,
-          ),
-        };
+      if (endpoint === 'task.control') {
+        const value = store.controlTask(
+          requiredText(payload.requestId, '请求标识', 200),
+          taskInScope(payload, true).id,
+          payload.expectedRowVersion as number,
+          payload.mode as ControlMode,
+        );
+        if (payload.mode === 'auto') execution.resumeUnsentTask(value.id);
+        return { ok: true, value };
+      }
       if (endpoint === 'task.revise')
         return {
           ok: true,

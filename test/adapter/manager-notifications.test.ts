@@ -4,10 +4,12 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { createHash } from 'node:crypto';
 import type { Context } from '@deepseek-ai/cordis';
 import { Store } from '../../src/store.ts';
 import { Managers } from '../../src/manager.ts';
 import type { DshExecution } from '../../src/dsh.ts';
+import type { ChatSource } from '../../src/model.ts';
 
 function fixture(t: TestContext, options = { managerWakesPerHour: 20 }) {
   t.mock.timers.enable({ apis: ['Date', 'setInterval', 'setTimeout'] });
@@ -28,6 +30,12 @@ function fixture(t: TestContext, options = { managerWakesPerHour: 20 }) {
     events: any[] = [],
     durable: any[] = [],
     hooks = new Map<string, Function>();
+  let workerReady = true,
+    workerBlocked = false,
+    workerUnavailable = false;
+  const workerAttempts: string[] = [];
+  let unsentSourceCheck: (source: ChatSource, botId: string) => boolean;
+  let unsentRefreshCalls = 0;
   const agent: any = {
     id: 'unprepared',
     session: { id: 'unprepared' },
@@ -107,6 +115,50 @@ function fixture(t: TestContext, options = { managerWakesPerHour: 20 }) {
     dispatch: () => {
       throw Error('No Worker execution during notification recovery');
     },
+    registerUnsentDispatchSourceCheck: (check: typeof unsentSourceCheck) => {
+      unsentSourceCheck = check;
+    },
+    resumeUnsentDispatches: () => {
+      unsentRefreshCalls++;
+    },
+    canWakeRecoveryContinuation: () => workerReady,
+    continueRecovery: async (
+      taskId: string,
+      rowVersion: number,
+      managerId: string,
+      authorize: () => void,
+    ) => {
+      authorize();
+      workerAttempts.push(taskId);
+      if (workerUnavailable)
+        return {
+          status: 'waiting',
+          code: 'session-unavailable',
+          message: 'Synthetic temporary Worker failure',
+        };
+      if (workerBlocked) return { status: 'blocked', message: 'Synthetic exact blocker' };
+      if (store.dispatchBlocker(taskId)) {
+        store.recordCapacityWait(`fixture-wait:${taskId}`, taskId, rowVersion);
+        return { status: 'waiting', code: 'capacity' };
+      }
+      const instruction = store.recoveryInstruction(taskId)!;
+      const run = store.reserveRecoveryContinuation(
+        taskId,
+        rowVersion,
+        managerId,
+        {
+          context: {
+            priorRunId: instruction.priorRunId,
+            mode: 'read-only',
+            effectUncertain: false,
+            probes: [],
+          },
+          authorizedProbes: [],
+        },
+        { provider: 'fake', model: 'fake', reasoningEffort: null, source: 'native-selection' },
+      );
+      return { status: 'started', run };
+    },
   } as unknown as DshExecution;
   let managers = new Managers(ctx, store, execution, dir, () => '', options);
   managers.install();
@@ -120,6 +172,34 @@ function fixture(t: TestContext, options = { managerWakesPerHour: 20 }) {
     agent.id = b.requestedSessionId;
     agent.session = { id: agent.id };
     return b;
+  };
+  const pendingDirection = () => {
+    const task = store.createTask('create-worker-task', {
+      botId: bot.id,
+      goal: 'Synthetic original task',
+      scope: 'Synthetic directory only',
+      acceptance: 'A follow-up is delivered',
+      reviewPolicy: 'human',
+    });
+    const binding = store.beginBinding('bind-worker', task.id, task.rowVersion, dir);
+    store.confirmBinding(binding.id, binding.requestedSessionId);
+    const run = store.reserveRun('old-run', task.id, store.getTask(task.id).rowVersion);
+    store.saveRunMessage(run.id, 'old-input', '{}');
+    assert.equal(store.claimDispatch(run.id), true);
+    store.inputEnqueued(run.id);
+    store.inputEntered(run.id, 'old-input', 1);
+    store.settleManagerEvent(`manager-event:created:${task.id}`);
+    const { instruction } = store.saveRecoveryInstruction(
+      task.id,
+      store.getTask(task.id).rowVersion,
+      { sessionId: agent.id, messageId: 'follow-up-owner', seq: 7, text: '只读检查精简名单。' },
+      'read-only',
+    );
+    const finishRun = () => {
+      store.workerReport(run.id, 'old-report', { kind: 'waiting', summary: 'Old Worker output' });
+      store.settleRun(run.id);
+    };
+    return { task, run, instruction, finishRun };
   };
   const pulse = async (ms = 1000) => {
     t.mock.timers.tick(ms);
@@ -182,6 +262,25 @@ function fixture(t: TestContext, options = { managerWakesPerHour: 20 }) {
     durable,
     enqueue,
     ready,
+    pendingDirection,
+    workerAttempts,
+    setWorkerReady: (value: boolean) => {
+      workerReady = value;
+    },
+    setWorkerBlocked: (value: boolean) => {
+      workerBlocked = value;
+    },
+    setWorkerUnavailable: (value: boolean) => {
+      workerUnavailable = value;
+    },
+    workerReturned: (sessionId: string) =>
+      hooks.get('agent/created')?.({
+        agent: { ...agent, id: sessionId, session: { id: sessionId } },
+      }),
+    authorizeUnsent: (source: ChatSource) => unsentSourceCheck(source, bot.id),
+    registerBindingCheck: (check: (botId: string, bindingId: string) => boolean) =>
+      managers.registerFeishuBindingCheck(check),
+    unsentRefreshCalls: () => unsentRefreshCalls,
     pulse,
     row,
     end,
@@ -223,6 +322,249 @@ function fixture(t: TestContext, options = { managerWakesPerHour: 20 }) {
     },
   };
 }
+
+test('saved direction dispatches after the old Worker settles without a Manager model turn', async (t) => {
+  const f = fixture(t);
+  try {
+    f.ready();
+    const { task, run, instruction, finishRun } = f.pendingDirection();
+    await f.pulse();
+    assert.deepEqual(f.workerAttempts, []);
+    assert.deepEqual(f.messages, []);
+    finishRun();
+    f.setSelected(false);
+    await f.pulse();
+    const next = f.store.latestRun(task.id)!;
+    assert.notEqual(next.id, run.id);
+    assert.equal(next.sessionId, run.sessionId);
+    assert.equal(f.store.getRunInput(next.id).content, instruction.source.text);
+    assert.equal(f.store.recoveryInstruction(task.id)?.runId, next.id);
+    await f.reload();
+    await f.pulse();
+    assert.equal(f.store.latestRun(task.id)?.id, next.id);
+    assert.deepEqual(f.workerAttempts, [task.id]);
+    assert.deepEqual(f.messages, []);
+  } finally {
+    await f.close();
+  }
+});
+
+test('restart resumes the saved direction even if the old notification was already settled', async (t) => {
+  const f = fixture(t);
+  try {
+    f.ready();
+    const { task, instruction, finishRun } = f.pendingDirection();
+    finishRun();
+    const notice = `manager-event:continuation:${instruction.id}`;
+    f.store.settleManagerEvent(notice);
+    f.store.settleManagerEvent(`${notice}:settled`);
+    assert.equal(f.store.managerEvent(notice)?.state, 'done');
+    await f.reload();
+    await f.pulse();
+    assert.deepEqual(f.workerAttempts, [task.id]);
+    assert.deepEqual(f.messages, []);
+    const next = f.store.latestRun(task.id)!;
+    assert.equal(f.store.getRunInput(next.id).content, instruction.source.text);
+    assert.equal(f.store.recoveryInstruction(task.id)?.runId, next.id);
+  } finally {
+    await f.close();
+  }
+});
+
+test('a blocker retains the direction and retries only after conditions change', async (t) => {
+  const f = fixture(t);
+  try {
+    f.ready();
+    f.setSelected(false);
+    const { task, instruction, finishRun } = f.pendingDirection();
+    finishRun();
+    f.setWorkerBlocked(true);
+    await f.pulse();
+    await f.pulse();
+    const notice = `manager-event:continuation:${instruction.id}`;
+    assert.equal(f.store.managerEvent(notice)?.state, 'pending');
+    assert.equal(f.store.recoveryInstruction(task.id)?.runId, undefined);
+    assert.deepEqual(f.workerAttempts, [task.id]);
+    f.setWorkerReady(false);
+    await f.pulse();
+    f.setWorkerBlocked(false);
+    f.setWorkerReady(true);
+    await f.pulse();
+    assert.deepEqual(f.workerAttempts, [task.id, task.id]);
+    assert.ok(f.store.recoveryInstruction(task.id)?.runId);
+    assert.deepEqual(f.messages, []);
+  } finally {
+    await f.close();
+  }
+});
+
+test('explicit pause and then revocation prevent the stored direction from auto-dispatching', async (t) => {
+  const f = fixture(t);
+  try {
+    const manager = f.ready();
+    const { task, run, instruction, finishRun } = f.pendingDirection();
+    finishRun();
+    const paused = f.store.controlTask(
+      'pause',
+      task.id,
+      f.store.getTask(task.id).rowVersion,
+      'paused',
+    );
+    await f.pulse();
+    assert.deepEqual(f.workerAttempts, []);
+    const revoked = f.store.saveRecoveryInstruction(
+      task.id,
+      paused.rowVersion,
+      {
+        sessionId: manager.requestedSessionId,
+        messageId: 'cancel-direction',
+        seq: 8,
+        text: '撤回补充。',
+      },
+      undefined,
+      false,
+      false,
+      { kind: 'revoke', ids: [instruction.id] },
+    );
+    f.store.controlTask('resume', task.id, revoked.task.rowVersion, 'auto');
+    await f.pulse();
+    assert.deepEqual(f.workerAttempts, []);
+    assert.equal(f.store.latestRun(task.id)?.id, run.id);
+  } finally {
+    await f.close();
+  }
+});
+
+test('a continuation waits in FIFO and retries once when a Worker slot opens', async (t) => {
+  const f = fixture(t);
+  try {
+    f.ready();
+    f.setSelected(false);
+    const { task, finishRun } = f.pendingDirection();
+    finishRun();
+    f.store.setBotCapacity('one-worker-slot', f.bot.id, null, 1);
+    const other = f.store.createTask('other-task', {
+      botId: f.bot.id,
+      goal: 'Occupy the only Worker slot',
+      scope: 'Synthetic only',
+      acceptance: 'Worker starts',
+      reviewPolicy: 'human',
+    });
+    const binding = f.store.beginBinding('other-binding', other.id, other.rowVersion, '/tmp');
+    f.store.confirmBinding(binding.id, binding.requestedSessionId);
+    const old = f.store.reserveRun('occupy-slot', other.id, f.store.getTask(other.id).rowVersion);
+    f.store.settleManagerEvent(`manager-event:created:${other.id}`);
+    await f.pulse();
+    await f.pulse();
+    assert.deepEqual(f.workerAttempts, [task.id]);
+    assert.equal(f.store.dispatchWait(task.id)?.code, 'capacity');
+    f.store.requestStop('free-slot', other.id, f.store.getTask(other.id).rowVersion, old.id);
+    f.store.settleCancelled(old.id);
+    await f.pulse();
+    assert.deepEqual(f.workerAttempts, [task.id, task.id]);
+    assert.ok(f.store.recoveryInstruction(task.id)?.runId);
+    assert.deepEqual(f.messages, []);
+  } finally {
+    await f.close();
+  }
+});
+
+test('a previously unavailable Worker becoming available re-arms its exact saved direction', async (t) => {
+  const f = fixture(t);
+  try {
+    f.ready();
+    f.setSelected(false);
+    const { task, run, finishRun } = f.pendingDirection();
+    finishRun();
+    f.setWorkerBlocked(true);
+    await f.pulse();
+    await f.pulse();
+    assert.deepEqual(f.workerAttempts, [task.id]);
+    f.workerReturned('unrelated-session');
+    await f.pulse();
+    assert.deepEqual(f.workerAttempts, [task.id]);
+    f.setWorkerBlocked(false);
+    f.workerReturned(run.sessionId);
+    await f.pulse();
+    assert.deepEqual(f.workerAttempts, [task.id, task.id]);
+    assert.ok(f.store.recoveryInstruction(task.id)?.runId);
+  } finally {
+    await f.close();
+  }
+});
+
+test('temporary Worker failure retries the stored direction after an interval without a native event or model turn', async (t) => {
+  const f = fixture(t);
+  try {
+    f.ready();
+    const { task, run, instruction, finishRun } = f.pendingDirection();
+    finishRun();
+    f.setWorkerUnavailable(true);
+    await f.pulse();
+    assert.deepEqual(f.workerAttempts, [task.id]);
+    assert.equal(f.store.latestRun(task.id)?.id, run.id);
+    f.setWorkerUnavailable(false);
+    await f.pulse(29999);
+    assert.deepEqual(f.workerAttempts, [task.id]);
+    await f.pulse(1);
+    assert.deepEqual(f.workerAttempts, [task.id, task.id]);
+    const next = f.store.latestRun(task.id)!;
+    assert.equal(f.store.getRunInput(next.id).content, instruction.source.text);
+    assert.equal(f.store.recoveryInstruction(task.id)?.runId, next.id);
+    await f.pulse(60000);
+    assert.equal(f.store.taskRuns(task.id).length, 2);
+    assert.deepEqual(f.messages, []);
+  } finally {
+    await f.close();
+  }
+});
+
+test('restart leaves a direction from a revoked Feishu binding unexecuted', async (t) => {
+  const f = fixture(t);
+  try {
+    f.ready();
+    const { task, run, instruction, finishRun } = f.pendingDirection();
+    f.store.db
+      .prepare(`INSERT INTO feishu_inbound_receipts
+        (messageId,nativeMessageId,bindingId,botId,sessionId,senderOpenId,appId,textDigest,acceptedAt,nativeSeq)
+        VALUES (?,?,?,?,?,?,?,?,?,?)`)
+      .run(
+        'fixture-feishu-event',
+        instruction.source.messageId,
+        'unbound-group',
+        task.botId,
+        instruction.source.sessionId,
+        'former-owner',
+        'fixture-app',
+        createHash('sha256').update(instruction.source.text, 'utf16le').digest('hex'),
+        Date.now(),
+        instruction.source.seq,
+      );
+    f.store.db
+      .prepare(`INSERT INTO feishu_group_bindings
+        (id,botId,appId,ownerOpenId,chatId,name,boundAt) VALUES (?,?,?,?,?,?,?)`)
+      .run('unbound-group', task.botId, 'fixture-app', 'former-owner', 'fixture-chat', 'Test', 0);
+    finishRun();
+    await f.reload();
+    assert.equal(f.authorizeUnsent(instruction.source), false, 'the account has not loaded yet');
+    const release = f.registerBindingCheck((_botId, bindingId) => bindingId === 'unbound-group');
+    assert.equal(
+      f.unsentRefreshCalls(),
+      1,
+      'loading the binding rechecks definitely unsent inputs',
+    );
+    assert.equal(f.authorizeUnsent(instruction.source), true);
+    f.store.db.prepare('DELETE FROM feishu_group_bindings WHERE botId=?').run(task.botId);
+    assert.equal(f.authorizeUnsent(instruction.source), false, 'a withdrawn binding revokes it');
+    await f.pulse();
+    assert.deepEqual(f.workerAttempts, []);
+    assert.deepEqual(f.messages, []);
+    assert.equal(f.store.latestRun(task.id)?.id, run.id);
+    release();
+  } finally {
+    await f.close();
+  }
+});
 
 test('not enabled / creating / missing model retains the original notification across restart, then wakes once when ready', async (t) => {
   const f = fixture(t);

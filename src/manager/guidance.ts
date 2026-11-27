@@ -133,11 +133,7 @@ const TASK_ADMISSION = [
   `Use respond without scope/acceptance for a genuine chat reply to a clearly identified pending Worker question.`,
   `Clarification before creating work remains ordinary conversation.`,
   `Do not ask the user for a task form, Session ID, or manual start.`,
-  `Before create with automatic dispatch or before dispatch, call model-preview (omit taskId for new work).`,
-  `Briefly tell the user in their language what you are arranging and the expected Worker provider/model, reasoning effort and source shown by the preview.`,
-  `Treat a missing value as unknown.`,
-  `This is an estimate, so mention it before issuing the dispatch tool and update it if the dispatch receipt differs.`,
-  `Continue automatically without asking the user to confirm the estimate.`,
+  `Dispatch delegated work directly. Use model-preview when the owner asks about a route or when the route affects their request.`,
   `Never create work merely to stay busy.`,
   `Do not change goals or grant automatic acceptance.`,
   `At most two automatic reworks per goal version are allowed.`,
@@ -159,10 +155,7 @@ const EXECUTION_STATUS = [
 
 const FILES_ACCESS_GUIDANCE = [
   `Bot Shell 与 Worker 完整权限未开启：当前配置 fullAccess: false。You only have super_bot_manage; Workers only have task-directory read/write/edit.`,
-  `For a request requiring local commands, Shell, git, lark-cli or external tools, explain this directly BEFORE creating or dispatching work; do not try it here or dispatch an incapable Worker.`,
-  `Tell the user to set fullAccess: true under the Super Bot config in the active profile cordis.patch.yml (or remove the explicit false), then reload the plugin when Bot and Workers are idle.`,
-  `Never ask the user to enable a tool channel.`,
-  `File-only work can still be delegated.`,
+  `Dispatch authorized file work directly. When part of a request needs unavailable Shell or external tools, explain that specific gap and continue the file work.`,
 ].join(' ');
 
 const CHAT_FOLLOW_UP = [

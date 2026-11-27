@@ -33,7 +33,7 @@ const signal = new AbortController().signal;
 function fixture(
   t: TestContext,
   cluster?: { probe: ClusterProbe; auth: string; result: ProbeResult },
-  state: 'settled' | 'interrupted' | 'running' = 'settled',
+  state: 'settled' | 'interrupted' | 'aborted' | 'unproven' | 'running' = 'settled',
 ) {
   const cwd = mkdtempSync(join(realpathSync(tmpdir()), 'sb-verified-recovery-'));
   let store = new Store(join(cwd, 'ledger.sqlite'));
@@ -75,7 +75,8 @@ function fixture(
   store.inputEnqueued(run.id);
   store.inputEntered(run.id, automatic.id, 1);
   store.associateRunTurn(run.id, 1, 0, 1);
-  const endKind = state === 'interrupted' ? 'error' : 'completed';
+  const interrupted = state !== 'running' && state !== 'settled';
+  const endKind = state === 'aborted' ? 'aborted' : interrupted ? 'error' : 'completed';
   if (state !== 'running') {
     store.workerReport(run.id, 'blocked', {
       kind: 'blocked',
@@ -84,9 +85,8 @@ function fixture(
     });
     if (cluster)
       store.recordPreflightReceipt(run.id, 'read', cluster.probe, cluster.auth, cluster.result);
-    store.observeRunEnd(run.id, cluster ? 6 : 5, endKind, true);
-    if (state === 'interrupted')
-      store.runRecovery(run.id, 'Lost process handle after observed end.');
+    store.observeRunEnd(run.id, cluster ? 6 : 5, endKind, state !== 'unproven');
+    if (interrupted) store.runRecovery(run.id, 'Lost process handle after observed end.');
     else store.settleRun(run.id);
   }
   const path = join(cwd, 'fixture.txt');
@@ -162,14 +162,30 @@ function fixture(
     },
     whenIdle: () => new Promise(() => {}),
   };
-  const options = { nativeCode: '', beforeResolve: async () => {}, beforeRead: async () => {} };
+  const options = {
+    nativeCode: '',
+    beforeResolve: async () => {},
+    beforeRead: async () => {},
+    readHistory: async () => structuredClone(events),
+    resolveFailure: '',
+    oldSessionInStorage: false,
+    createFailures: 0,
+  };
+  const replacements = new Map<string, typeof agent>();
+  const createRequests: string[] = [];
   let calls = 0;
   const execution = (ledger = store) =>
     new DshExecution(
       {
         workingDirectory: { get: () => cwd },
         jobs: { list: () => jobs },
-        agents: { get: () => agent, list: () => [agent] },
+        agents: {
+          get: (id: string) =>
+            replacements.get(id) ??
+            (id === agent.id && !options.resolveFailure ? agent : undefined),
+          list: () => [...(options.resolveFailure ? [] : [agent]), ...replacements.values()],
+          isOwnedBy: () => false,
+        },
         permissionPresets: { set: () => {} },
         sessionProjections: {
           snapshot: () => ({
@@ -177,17 +193,44 @@ function fixture(
           }),
         },
         sessions: { flush: async () => true },
+        sessionTitle: { get: () => ({ source: { kind: 'user' } }) },
+        workspaceRegistry: {
+          create: async (path: string) => {
+            assert.equal(path, cwd);
+            return { id: 'existing-workspace', attachSession: async () => {} };
+          },
+        },
         sessionPersistence: {
+          stat: async () =>
+            options.oldSessionInStorage ? { eventCount: events.length } : undefined,
           open: async () => ({
             header: session,
-            read: async () => ({ events: structuredClone(events) }),
+            read: async () => ({ events: await options.readHistory() }),
             close: async () => {},
           }),
         },
         sessionController: {
-          resolveAgent: async () => {
+          resolveAgent: async (id: string) => {
             await options.beforeResolve();
-            return { agent };
+            if (id === agent.id)
+              return options.resolveFailure
+                ? { error: { code: options.resolveFailure } }
+                : { agent };
+            const replacement = replacements.get(id);
+            return replacement ? { agent: replacement } : { error: { code: 'session/not-found' } };
+          },
+          create: async ({ sessionId }: { sessionId: string }) => {
+            createRequests.push(sessionId);
+            if (options.createFailures > 0) {
+              options.createFailures--;
+              throw new Error('Synthetic startup unavailable');
+            }
+            replacements.set(sessionId, {
+              ...agent,
+              id: sessionId,
+              session: { ...session, id: sessionId, header: { cwd } } as typeof session,
+            });
+            return { sessionId };
           },
         },
         effect: () => {},
@@ -240,6 +283,8 @@ function fixture(
     calls: () => calls,
     execution,
     sent,
+    replacements,
+    createRequests,
     guards,
     inspect: (e = execution()) => e.inspectAutoRecovery(id, version, run.id, manager.id, () => {}),
     perform: (e = execution()) =>
@@ -646,27 +691,45 @@ test('the newest owner instruction waits for native activity and is then deliver
   assert.equal(f.sent.length, 1);
 });
 
-test('interrupted execution with an unverified external operation keeps its slot and accepts no replacement Run', async (t) => {
-  const f = fixture(t, undefined, 'interrupted'),
-    { store, task, run, manager } = f;
-  f.events[3]!.data.name = 'bash';
-  const source = {
-    sessionId: manager.requestedSessionId,
-    messageId: 'inspect-after-write',
-    seq: 6,
-    text: '只查上一轮写入的结果',
-  };
-  const saved = store.saveRecoveryInstruction(task.id, f.version, source, 'read-only');
-  const output = await f
-    .execution()
-    .continueRecovery(task.id, saved.task.rowVersion, manager.id, () => {});
-  assert.equal(output.status, 'blocked');
-  assert.match(output.message, /未确认的外部效果/);
-  assert.equal(store.heldRuns()[0]?.id, run.id);
-  assert.equal(store.getRunInput(run.id).state, 'entered');
-  assert.equal(store.recoveryInstruction(task.id)?.runId, undefined);
-  assert.equal(f.sent.length, 0);
-});
+for (const state of ['interrupted', 'aborted', 'unproven'] as const)
+  test(`${state} Worker waits for active Job and requires an attributable quiet end before continuing`, async (t) => {
+    const f = fixture(t, undefined, state),
+      { store, task, run, manager } = f;
+    f.events[3]!.data.name = 'bash';
+    const source = {
+      sessionId: manager.requestedSessionId,
+      messageId: 'local-change',
+      seq: 6,
+      text: '沿用原有 26 人名单，只补本地文件里的缺口。',
+    };
+    const saved = store.saveRecoveryInstruction(task.id, f.version, source, 'authorized-work');
+    const execution = f.execution();
+    const next = () =>
+      execution.continueRecovery(task.id, saved.task.rowVersion, manager.id, () => {});
+    f.jobs.push({ id: 'same-worker-job', owner: run.sessionId, status: 'running' });
+    assert.equal(execution.canWakeRecoveryContinuation(task.id), false);
+    const waited = await next();
+    assert.equal(waited.status, 'waiting');
+    assert.equal(waited.code, 'job-active');
+    assert.equal(store.heldRuns()[0]?.id, run.id);
+    assert.equal(f.sent.length, 0);
+
+    f.jobs[0]!.status = 'completed';
+    const outcome = await next();
+    if (state === 'unproven') {
+      assert.equal(outcome.status, 'blocked');
+      assert.equal(outcome.code, 'recovery-unproven');
+      assert.equal(store.heldRuns()[0]?.id, run.id);
+      assert.equal(store.recoveryInstruction(task.id)?.runId, undefined);
+      assert.equal(f.sent.length, 0);
+    } else {
+      assert.equal(outcome.status, 'started');
+      assert.equal(store.heldRuns()[0]?.id, outcome.run?.id);
+      assert.equal(store.getRunInput(outcome.run!.id).content, source.text);
+      assert.equal((await next()).status, 'already-started');
+      assert.equal(f.sent.length, 1);
+    }
+  });
 
 test('a stored capacity wait and plain owner confirmation retain the last concrete direction', async (t) => {
   const f = fixture(t),
@@ -826,7 +889,7 @@ for (const kind of ['ready', 'waiting'] as const)
     assert.equal(f.sent.length, 1);
   });
 
-test('concrete owner authorization permits newly scoped work only with proven clean earlier tools', async (t) => {
+test('a settled Worker can accept the authorized next step while its old native history cannot be read', async (t) => {
   const f = fixture(t),
     { store, task, manager } = f;
   const source = {
@@ -836,24 +899,97 @@ test('concrete owner authorization permits newly scoped work only with proven cl
     text: '用当前授权范围内的新步骤处理待办',
   };
   const saved = store.saveRecoveryInstruction(task.id, f.version, source, 'authorized-work');
-  f.events[3]!.data.name = 'bash';
-  const blocked = await f
-    .execution()
-    .continueRecovery(task.id, saved.task.rowVersion, manager.id, () => {});
-  assert.equal(blocked.status, 'blocked');
-  assert.equal(f.sent.length, 0);
-  assert.equal(store.recoveryInstruction(task.id)?.runId, undefined);
-  f.events[3]!.data.name = 'read';
+  f.options.readHistory = async () => {
+    assert.fail('a settled Worker does not need its old native history read for the new direction');
+  };
   const continued = await f
     .execution()
     .continueRecovery(task.id, saved.task.rowVersion, manager.id, () => {});
   assert.equal(continued.status, 'started');
   assert.ok(continued.run);
+  assert.equal(store.getRunInput(continued.run.id).content, source.text);
   assert.equal(store.recoveryWorkPlan(continued.run.id)?.context.mode, 'authorized-work');
   assert.equal(
     f.guards[0]!({ name: 'write', arguments: { file_path: f.args.file_path } }),
     undefined,
   );
+  assert.equal(f.sent.length, 1);
+});
+
+for (const reason of ['missing', 'temporarily-unavailable', 'retained-log', 'taken-over'] as const)
+  test(`continuation replaces a settled Worker only for confirmed native absence (${reason})`, async (t) => {
+    const f = fixture(t),
+      { store, task, manager, run } = f;
+    const direction = '只补现有工作目录名单里的一处缺口。';
+    const saved = store.saveRecoveryInstruction(
+      task.id,
+      f.version,
+      {
+        sessionId: manager.requestedSessionId,
+        messageId: 'replacement-direction',
+        seq: 6,
+        text: direction,
+      },
+      'authorized-work',
+    );
+    if (reason === 'taken-over')
+      store.controlTask('takeover', task.id, saved.task.rowVersion, 'manual');
+    f.options.resolveFailure =
+      reason === 'temporarily-unavailable' ? 'gateway/internal' : 'session/not-found';
+    f.options.oldSessionInStorage = reason === 'retained-log';
+    const beforeBinding = store.activeBinding(task.id)!;
+    const continued = await f
+      .execution()
+      .continueRecovery(task.id, store.getTask(task.id).rowVersion, manager.id, () => {});
+    if (reason === 'missing') {
+      assert.equal(continued.status, 'started');
+      assert.equal(f.replacements.size, 1);
+      const binding = store.activeBinding(task.id)!;
+      assert.equal(binding.cwd, beforeBinding.cwd);
+      assert.equal(binding.generation, beforeBinding.generation + 1);
+      assert.equal(store.getBinding(beforeBinding.id).state, 'released');
+      assert.equal(store.getRun(run.id).bindingId, beforeBinding.id);
+      assert.equal(store.runFinalReport(run.id)?.summary, 'File unavailable');
+      assert.equal(continued.run?.taskId, task.id);
+      assert.equal(continued.run?.bindingId, binding.id);
+      assert.equal(store.getRunInput(continued.run!.id).content, direction);
+      assert.equal(f.sent.length, 1);
+    } else {
+      assert.equal(continued.status, reason === 'temporarily-unavailable' ? 'waiting' : 'blocked');
+      if (reason === 'temporarily-unavailable') assert.equal(continued.code, 'session-unavailable');
+      assert.equal(f.replacements.size, 0);
+      assert.equal(store.activeBinding(task.id)?.id, beforeBinding.id);
+      assert.equal(f.sent.length, 0);
+    }
+  });
+
+test('a replacement that did not reach the Host retries the same requested Session ID after ledger reopen', async (t) => {
+  const f = fixture(t),
+    { store, task, manager } = f;
+  const source = {
+    sessionId: manager.requestedSessionId,
+    messageId: 'retry-replacement',
+    seq: 7,
+    text: '补本地名单。',
+  };
+  const saved = store.saveRecoveryInstruction(task.id, f.version, source, 'authorized-work');
+  f.options.resolveFailure = 'session/not-found';
+  f.options.createFailures = 1;
+  const first = await f
+    .execution()
+    .continueRecovery(task.id, saved.task.rowVersion, manager.id, () => {});
+  assert.equal(first.code, 'session-recovery');
+  assert.equal(f.sent.length, 0);
+  const requested = store.activeBinding(task.id)!.requestedSessionId;
+  const reopened = f.reopen();
+  const continued = await f
+    .execution(reopened)
+    .continueRecovery(task.id, reopened.getTask(task.id).rowVersion, manager.id, () => {});
+  assert.equal(continued.status, 'started');
+  assert.deepEqual(f.createRequests, [requested, requested]);
+  assert.equal(f.replacements.size, 1);
+  assert.equal(reopened.taskRuns(task.id).length, 2);
+  assert.equal(reopened.getRunInput(continued.run!.id).content, source.text);
   assert.equal(f.sent.length, 1);
 });
 
@@ -1007,16 +1143,9 @@ test('legacy pending instructions are retained until explicitly replaced or revo
   assert.equal(f.sent.length, 0);
 });
 
-test('a durable fixed Git query allows the authorized next step, while a successful legacy bash record remains unknown', async (t) => {
+test('explicit recovery inspection verifies the exact fixed Git query and reports a legacy bash result as uncertain', async (t) => {
   const f = fixture(t),
-    { store, task, run, manager } = f;
-  const source = {
-    sessionId: manager.requestedSessionId,
-    messageId: 'continue-work',
-    seq: 7,
-    text: 'Carry out the authorized next step',
-  };
-  const saved = store.saveRecoveryInstruction(task.id, f.version, source, 'authorized-work');
+    { store, run } = f;
   const call = f.events[3]!.data,
     result = f.events[4]!;
   call.name = 'bash';
@@ -1030,10 +1159,8 @@ test('a durable fixed Git query allows the authorized next step, while a success
       content: [{ type: 'text', text: '?? current.txt' }],
     },
   };
-  const continued = () =>
-    f.execution().continueRecovery(task.id, saved.task.rowVersion, manager.id, () => {});
-  const legacy = await continued();
-  assert.equal(legacy.status, 'blocked');
+  const legacy = await f.inspect();
+  assert.equal(legacy.status, 'needs-human');
   assert.match(legacy.message, /bash 缺少可信的只读/);
 
   call.name = WORKER_QUERY_TOOL;
@@ -1046,27 +1173,30 @@ test('a durable fixed Git query allows the authorized next step, while a success
     result: { status: 'ok', message: 'Verified Git status', porcelain: '?? current.txt\n' },
   };
   result.data.message.content[0].text = JSON.stringify(receipt.result);
-  const missing = await continued();
-  assert.equal(missing.status, 'blocked');
+  const missing = await f.inspect();
+  assert.equal(missing.status, 'needs-human');
   assert.match(missing.message, new RegExp(WORKER_QUERY_TOOL));
   store.recordReadQueryReceipt(run.id, 'read', receipt);
   result.data.message.content[0].text = JSON.stringify({ ...receipt.result, porcelain: '' });
-  assert.equal((await continued()).status, 'blocked');
+  assert.equal((await f.inspect()).status, 'needs-human');
   result.data.message.content[0].text = JSON.stringify(receipt.result);
   call.arguments = JSON.stringify({ kind: GIT_STATUS_QUERY, command: 'touch guarded' });
-  assert.equal((await continued()).status, 'blocked');
+  assert.equal((await f.inspect()).status, 'needs-human');
   call.arguments = JSON.stringify({ kind: GIT_STATUS_QUERY });
   const reopened = f.reopen();
-  const success = await f
-    .execution(reopened)
-    .continueRecovery(task.id, saved.task.rowVersion, manager.id, () => {});
-  assert.equal(success.status, 'started');
-  assert.equal(reopened.recoveryWorkPlan(success.run!.id)?.context.effectUncertain, false);
+  const confirmed = await f.inspect(f.execution(reopened));
+  assert.equal(confirmed.status, 'blocked');
   assert.equal(
-    reopened.recoveryWorkPlan(success.run!.id)?.context.priorReadQueries?.[0]?.kind,
+    'priorTools' in confirmed && Array.isArray(confirmed.priorTools) && confirmed.priorTools.length,
+    0,
+  );
+  assert.equal(
+    'priorReadQueries' in confirmed &&
+      Array.isArray(confirmed.priorReadQueries) &&
+      confirmed.priorReadQueries[0]?.kind,
     GIT_STATUS_QUERY,
   );
-  assert.equal(f.sent.length, 1);
+  assert.equal(f.sent.length, 0);
 });
 
 test('pinned sandboxed Git reads actual status and cannot execute repo-configured helpers', async (t) => {

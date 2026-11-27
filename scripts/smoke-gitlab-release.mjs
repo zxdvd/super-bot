@@ -12,6 +12,7 @@ import {
   prepareRelease,
   publishOrdinal,
   releaseFixtureGoal,
+  releaseLocalNote,
   releaseProject,
   releaseSha,
   releaseStatusQuestion,
@@ -259,6 +260,26 @@ export async function smokeGitLabRelease({
     const lost = await reported(uncertain, 'unknown');
     assert.equal(posts(12).length, 1);
     assert.equal(lost.gitLabRelease.status, 'manual');
+    await probe(host, 'native-prompt', uncertain.bot.managerId, releaseLocalNote);
+    const local = await wait(async () => {
+      const state = await taskDetail(uncertain.task);
+      return (
+        state.directionStatus === 'entered' &&
+        !state.runHeld &&
+        state.result?.runId === state.run.id &&
+        state
+      );
+    }, 'independent local work completes while the job receipt is unknown');
+    assert.equal(await readFile(join(local.binding.cwd, 'handoff.md'), 'utf8'), '合成交接说明');
+    const worker = await probe(host, 'inspect-session', local.binding.sessionId);
+    const localInput = worker.events.filter(
+      (e) => e.type === 'user/message' && e.data.source?.runId === local.run.id,
+    );
+    assert.equal(localInput.length, 1);
+    assert.ok(
+      localInput[0].data.content.some((part) => part.text?.includes(lost.gitLabRelease.url)),
+    );
+    assert.equal(posts(12).length, 1);
     await stop('web', true);
     host = await launch('web', 'gitlab-release-restarted', options);
     assert.equal(

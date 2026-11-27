@@ -457,7 +457,10 @@ test('chat previews model provenance before dispatch and snapshots the chosen ro
   await f.mount();
   const preview = (scope: typeof a, id: string, taskId = scope.task.id) =>
     f.manage(id, scope, { action: 'model-preview', taskId }, scope === a ? manager : other);
-  assert.deepEqual(await preview(a, 'unselected'), { current: null, expected: null });
+  assert.deepEqual(await preview(a, 'unselected'), {
+    current: null,
+    expected: { ...medium, source: 'host-default' },
+  });
   await assert.rejects(preview(a, 'cross-bot', b.task.id), { code: 'manager-scope' });
   assert.deepEqual((await f.call('task.model-history')).value, { taskId: a.task.id, runs: [] });
   assert.equal(f.resolveCount(), 0);

@@ -35,6 +35,7 @@ export interface WorkStage {
   };
   reason?: string;
   deadlineAt?: number;
+  /** The observation deadline passed. A current, authorized wait can still be tracked. */
   expired?: boolean;
   planVersion?: number;
   planSource?: ChatSource;
@@ -53,8 +54,22 @@ export type DueStage = {
 
 export type StageFollowUp = 'append' | 'replace' | 'revoke';
 
+export function stageFollowUpForDirection(
+  stage: WorkStage | null,
+  requested: StageFollowUp | undefined,
+  hasDirection: boolean,
+): StageFollowUp | undefined {
+  return (
+    requested ??
+    (hasDirection && stage?.nextStep && stage.state !== 'superseded' && stage.state !== 'dispatched'
+      ? 'append'
+      : undefined)
+  );
+}
+
 export const STAGE_WAIT_MS = 24 * 60 * 60 * 1000;
 export const STAGE_OBSERVE_MS = 30_000;
+export const STAGE_OVERDUE_OBSERVE_MS = 60 * 60 * 1000;
 
 export function stageReadyKey(stage: Pick<WorkStage, 'runId' | 'planVersion'>): string {
   return `stage-ready:${stage.runId}${stage.planVersion === undefined ? '' : `:${stage.planVersion}`}`;
@@ -130,6 +145,10 @@ export function stageConditionText(condition: StageCondition): string {
     : `GitLab ${condition.project} 流水线 #${condition.number} 成功`;
 }
 
+export function stageOverdueReason(condition: StageCondition): string {
+  return `在首次核对期限内尚未确认 ${stageConditionText(condition)}。`;
+}
+
 export const STAGE_GUIDANCE = [
   `Use stage reports for concrete milestone evidence while the same task has outstanding acceptance work.`,
   `In detail, stage is a settled Worker checkpoint.`,
@@ -139,19 +158,19 @@ export const STAGE_GUIDANCE = [
   `Only the overall deliverable enters normal review.`,
 
   `When current facts show a necessary dependency, save its exact GitLab object and sourceOrigin from known evidence.`,
-  `The host tracks the exact object independently of model turns until the persisted deadline, including when the trusted reader is temporarily unavailable.`,
+  `The host tracks the exact object independently of model turns, including if the reader is temporarily unavailable or the observation deadline has passed.`,
+  `An overdue observation is still tracked, and a stage ready to run can wait for capacity without expiring.`,
   `Explain the actual wait or blocker and who can resolve it.`,
   `Use block_stage only while stage.state is awaiting-decision, if the dependency identity is unknown or the next step needs permission.`,
 
   `When an owner wants to hold a stage after a plan was already saved, use pause.`,
   `Use continue with stageFollowUp:replace or stageFollowUp:revoke only when the owner actually changes or withdraws the saved step.`,
   `Keep an unchanged wait quiet.`,
-  `For an explicit owner addition that leaves the plan intact, use continue with stageFollowUp:append, the current owner text and continuationMode.`,
+  `For an addition to a saved stage, use continue with the current owner text and continuationMode. The host appends by default and also accepts stageFollowUp:append.`,
   `The new note accompanies the saved step, even when the note itself requests a read-only check.`,
-  `If the owner narrows the whole task, changes the execution direction or withdraws the planned step, use continue with stageFollowUp:replace or stageFollowUp:revoke.`,
   `For a replacement with a new precise prerequisite, use advance_stage with stageFollowUp:replace and the complete current owner message in userInstruction.`,
 
-  `Explicit owner requests may retry the same expired wait using advance_stage with its unchanged step and condition.`,
+  `After an explicit request to resume a paused stage with an unchanged plan, use resume. The host retains the original prerequisite and next step.`,
   `A failed business check or external condition needs a new owner decision.`,
   `Do not use advance_stage to repeat a write or expand permission.`,
 ].join(' ');

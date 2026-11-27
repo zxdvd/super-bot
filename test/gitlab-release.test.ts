@@ -376,6 +376,92 @@ function release(store: Store, key: string, prep = arrange(store, key)) {
   return { run, task, ...store.beginGitLabRelease(run.id) };
 }
 
+for (const lifecycle of ['review', 'completed'] as const) {
+  test(`a previously claimed job is still observed when the independent local result is ${lifecycle}`, (t) => {
+    const store = new Store(':memory:');
+    t.after(() => store.close());
+    const prepared = arrange(store, 'local-handoff');
+    const { run, task, stageRunId, url } = release(store, 'local-handoff', prepared);
+    assert.equal(store.claimGitLabRelease(run.id), true);
+    const claimed = store.gitLabReleaseReceipt(stageRunId)!;
+    const unknown = releaseReadback(claimed, { code: 503 }, true);
+    store.recordGitLabRelease(claimed, unknown, true);
+    store.workerReport(run.id, 'track', {
+      kind: 'stage',
+      stage: 'Release follow-up',
+      summary: 'Waiting for the exact job response',
+      evidenceRef: url,
+      checks: 'Formal action already claimed',
+    });
+    store.settleRun(run.id);
+    const source = {
+      ...prepared.source,
+      messageId: 'local-only',
+      seq: 11,
+      text: 'Write the local handoff note while tracking the same job.',
+    };
+    const { task: updated } = store.saveRecoveryInstruction(
+      task.id,
+      store.getTask(task.id).rowVersion,
+      source,
+      'authorized-work',
+    );
+    const manager = store.activeManager(task.botId)!;
+    const local = store.reserveRecoveryContinuation(
+      task.id,
+      updated.rowVersion,
+      manager.id,
+      {
+        context: {
+          priorRunId: run.id,
+          mode: 'authorized-work',
+          effectUncertain: false,
+          probes: [],
+        },
+        authorizedProbes: [],
+      },
+      { provider: 'fixture', model: 'fixture', reasoningEffort: null, source: 'native-selection' },
+    );
+    store.saveRunMessage(local.id, 'handoff', '{}');
+    assert.equal(store.claimDispatch(local.id), true);
+    store.inputEnqueued(local.id);
+    store.inputEntered(local.id, 'handoff', 13);
+    store.workerReport(local.id, 'result', {
+      kind: 'ready',
+      summary: 'Saved local handoff',
+      checks: 'Read the saved handoff again',
+      evidence: [{ path: '/tmp/handoff.md', sha256: 'fixture', bytes: 64 }],
+    });
+    store.settleRun(local.id);
+    assert.equal(store.getTask(task.id).lifecycle, 'review');
+    assert.equal(store.taskDetail(task.id).directionStatus, 'entered');
+    const success = releaseReadback(unknown, { code: 200, data: { ...job, status: 'success' } });
+    if (lifecycle === 'completed') {
+      const { task: pending, result } = store.taskDetail(task.id);
+      store.acceptResult('accept-handoff', task.id, pending.rowVersion, result!.id);
+    } else {
+      const paused = store.controlTask(
+        'pause-handoff',
+        task.id,
+        store.getTask(task.id).rowVersion,
+        'paused',
+      );
+      assert.equal(store.dueGitLabReleases(1, unknown.nextCheckAt!).length, 0);
+      assert.equal(store.recordGitLabRelease(unknown, success).state, 'unknown');
+      store.controlTask('resume-handoff', task.id, paused.rowVersion, 'auto');
+    }
+    assert.equal(store.getTask(task.id).lifecycle, lifecycle);
+    assert.equal(store.dueGitLabReleases(1, unknown.nextCheckAt!)[0]?.stageRunId, stageRunId);
+
+    store.recordGitLabRelease(unknown, success);
+    const detail = store.taskDetail(task.id);
+    assert.equal(detail.result?.runId, local.id);
+    assert.equal(detail.gitLabRelease?.state, 'success');
+    assert.equal(detail.gitLabRelease?.runId, run.id);
+    assert.equal(detail.gitLabRelease?.target.jobId, target.jobId);
+  });
+}
+
 test('an exact GitLab release receipt stays active after its notice until the observer reaches a blocker', (t) => {
   const store = new Store(':memory:');
   t.after(() => store.close());
@@ -406,6 +492,85 @@ test('an exact GitLab release receipt stays active after its notice until the ob
   const expired = releaseReadback(tracking, { code: 503 }, false, tracking.deadlineAt);
   store.recordGitLabRelease(tracking, expired);
   assertActivity('attention');
+});
+
+test('an unclaimed release queued after exact readback can still run once after the old deadline', (t) => {
+  const store = new Store(':memory:');
+  t.after(() => store.close());
+  const { run, task, stageRunId, url } = release(store, 'unclaimed-after-capacity');
+  const receipt = store.gitLabReleaseReceipt(stageRunId)!;
+  const unavailable = releaseReadback(receipt, { code: 503 });
+  assert.equal(store.recordGitLabRelease(receipt, unavailable, true).state, 'unsubmitted');
+
+  store.associateRunTurn(run.id, 1, 11, 12);
+  store.workerReport(run.id, 'readback', {
+    kind: 'stage',
+    stage: 'Release check',
+    summary: 'Waiting for trusted readback',
+    evidenceRef: url,
+    checks: 'No submission claimed',
+  });
+  store.observeRunEnd(run.id, 13, 'completed', true);
+  store.settleRun(run.id);
+  const manual = releaseReadback(unavailable, { code: 200, data: job });
+  store.recordGitLabRelease(unavailable, manual);
+  assert.equal(store.taskDetail(task.id).stage?.state, 'ready');
+
+  const next = enter(store, task.id, 'unclaimed-dispatch');
+  const now = receipt.deadlineAt + 1;
+  const resumed = store.beginGitLabRelease(next.id, now);
+  assert.deepEqual(resumed.target, receipt.target);
+  assert.ok(resumed.deadlineAt > now);
+  assert.equal(store.claimGitLabRelease(next.id, now), true);
+  assert.equal(store.claimGitLabRelease(next.id, now), false);
+});
+
+test('an ordinary continuation cannot claim an earlier formal job with an unknown receipt', (t) => {
+  const store = new Store(':memory:');
+  t.after(() => store.close());
+  const prepared = arrange(store, 'ordinary-while-formal-unknown');
+  const { bot, source, task } = prepared;
+  const { run, stageRunId } = release(store, 'ordinary-while-formal-unknown', prepared);
+  assert.equal(store.claimGitLabRelease(run.id), true);
+  const claimed = store.gitLabReleaseReceipt(stageRunId)!;
+  const lost = releaseReadback(claimed, { code: 503 }, true);
+  assert.equal(lost.state, 'unknown');
+  store.recordGitLabRelease(claimed, lost, true, true);
+  const { instruction } = store.saveRecoveryInstruction(
+    task.id,
+    store.getTask(task.id).rowVersion,
+    {
+      ...source,
+      messageId: 'independent-file-edit',
+      seq: 20,
+      text: 'Only update the local notes.',
+    },
+    'authorized-work',
+  );
+  store.workerReport(run.id, 'release-readback', {
+    kind: 'stage',
+    stage: 'Release check',
+    summary: 'Formal job still unconfirmed',
+    evidenceRef: lost.url,
+    checks: 'The existing claim requires readback',
+  });
+  store.settleRun(run.id);
+  assert.equal(store.closeRunNeedsReadback(store.getRun(run.id), false), true);
+  const next = store.reserveRecoveryContinuation(
+    task.id,
+    store.getTask(task.id).rowVersion,
+    store.activeManager(bot.id)!.id,
+    {
+      context: { priorRunId: run.id, mode: 'authorized-work', effectUncertain: true, probes: [] },
+      authorizedProbes: [],
+    },
+    { provider: 'fixture', model: 'fixture', reasoningEffort: null, source: 'native-selection' },
+  );
+  assert.equal(store.getRunInput(next.id).content, instruction.source.text);
+  assert.equal(store.gitLabReleaseForRun(next), null);
+  assert.throws(() => store.beginGitLabRelease(next.id), { code: 'gitlab-release-stale' });
+  assert.throws(() => store.claimGitLabRelease(next.id), { code: 'gitlab-release-stale' });
+  assert.equal(store.gitLabReleaseReceipt(stageRunId)?.state, 'unknown');
 });
 
 test('schema 14 migrates and keeps globally single formal claim through lost receipt and reopen', (t) => {

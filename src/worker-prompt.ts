@@ -145,8 +145,10 @@ export function createWorkerRunMessage(
     if (recovery.note) sections.push(`Prior recovery reason: ${recovery.note}`);
   }
   if (context) {
-    const { priorDirections, priorDirection, directionIds, ...facts } = context;
-    sections.push(`Earlier attempt and observed facts (use as evidence): ${JSON.stringify(facts)}`);
+    const { priorDirections, priorDirection, directionIds, effectUncertain, ...facts } = context;
+    sections.push(
+      `Earlier attempt and observed facts (use as evidence): ${JSON.stringify(effectUncertain ? { ...facts, effectUncertain } : facts)}`,
+    );
     if (priorDirections)
       sections.push(...priorDirections.map(({ text }) => `Retained owner direction:\n${text}`));
     else if (priorDirection) sections.push(`Retained owner direction:\n${priorDirection}`);
@@ -162,6 +164,10 @@ export function createWorkerRunMessage(
         `Report a blocked external dependency with the responsible party or condition.`,
       ].join(' '),
     );
+    if (context.priorRelease)
+      sections.push(
+        'The host tracks the recorded release job. Leave submission and retry to its formal release action; continue the other owner directions.',
+      );
     if (context.lateJobs)
       sections.push(
         [
@@ -178,7 +184,7 @@ export function createWorkerRunMessage(
       sections.push(
         context.mode === 'read-only'
           ? 'Use only the read-only tools available for this continuation and report the actual observations.'
-          : 'Perform only the concrete next step the owner authorized within the standing scope. Check current facts first and stop before any action that could duplicate an observed effect.',
+          : 'Perform the current owner directions within the standing scope. Use earlier work as context. If the same external action may already have run, check that exact target and track the original action. Leave that action pending if its effect is unknown. Continue independent authorized work.',
       );
   }
   if (

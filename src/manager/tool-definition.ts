@@ -20,7 +20,7 @@ export const MANAGER_TOOL = {
     `Start goal with 【测试】 only if the user explicitly requests a test or live-test task.`,
     `Checks requested as part of ordinary work do not make it a test task.`,
     `create (or the first dispatch of a task without a session) accepts an optional workdir {mode: existing|isolated|worktree|hook, path, repo, name, base, branch, under, args}; see the working-directory rules in your instructions.`,
-    `Use model-preview (taskId optional) for the expected Worker model, reasoning effort and source before dispatch.`,
+    `Use model-preview (taskId optional) when the owner asks which model will run.`,
     `Dispatch returns immediately; do not poll for completion.`,
     `Important events wake you later.`,
     `Inspect result files via detail before review.`,
@@ -173,7 +173,7 @@ export const MANAGER_TOOL = {
         type: 'string',
         enum: ['append', 'replace', 'revoke'],
         description:
-          'For an authenticated owner change to a settled stage. Append preserves the saved prerequisite and step. Replace or revoke withdraws the old plan. For advance_stage, only replace with the exact owner message.',
+          'An ordinary direction appends to a saved stage and preserves its prerequisite and step. Use replace or revoke only when the owner changes or withdraws that plan. For advance_stage, only replace with the exact owner message.',
       },
       lateJobFollowUp: {
         type: 'string',

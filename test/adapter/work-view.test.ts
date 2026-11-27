@@ -261,7 +261,7 @@ test('compact model chips preserve unknowns, manual model guidance and the close
   assert.equal(unknown.props.label, 'Worker 模型未知');
   assert.match(unknown.props.description, /Worker 当前原生选择：未知 · 下次派发预计未知/);
   assert.equal(noDuplicate, false);
-  assert.match(hint.props.children, /手动开始前请在 Worker 会话选择模型/);
+  assert.match(hint.props.children, /宿主配置的模型/);
   const current = { provider: 'fixture', model: 'fixture-model', reasoningEffort: null };
   const [effortUnknown, nextUnknown] = preview({ current, expected: null });
   assert.equal(effortUnknown.props.label, 'fixture-model · 档位未知');
@@ -275,7 +275,7 @@ test('compact model chips preserve unknowns, manual model guidance and the close
   const [native, next, manual] = preview({ current: null, expected });
   assert.equal(native.props.label, 'Worker 模型未知');
   assert.match(next.props.description, /下次派发预计.*由 Bot 派发时继承/);
-  assert.ok(manual);
+  assert.equal(manual, false);
   assert.equal(preview({ current, expected }, false)[1], false);
 });
 

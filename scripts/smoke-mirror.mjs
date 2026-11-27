@@ -512,7 +512,20 @@ async function restrictedTransport(role, taskId) {
 
 const files = {};
 try {
-  if (process.env.SUPER_BOT_TEST_TASK_STAGES === '1') {
+  if (process.env.SUPER_BOT_TEST_DISPATCH_HOST) {
+    const { smokeDispatchContinuity } = await import('./smoke-dispatch-continuity.mjs');
+    await smokeDispatchContinuity({
+      base,
+      bundle,
+      configure,
+      launch,
+      stop,
+      call,
+      makeBot,
+      probe,
+      wait,
+    });
+  } else if (process.env.SUPER_BOT_TEST_TASK_STAGES === '1') {
     const { smokeTaskStages } = await import('./smoke-task-stages.mjs');
     await smokeTaskStages({ base, configure, launch, stop, call, makeBot, probe, wait });
   } else if (process.env.SUPER_BOT_TEST_GITLAB_RELEASE === '1') {

@@ -13,7 +13,6 @@ const managers = `SELECT b.id, b.name, b.createdAt, m.sessionId FROM bots b
 const releaseDeadline = `json_extract(release.snapshot,'$.deadlineAt')`;
 const expiredLateJob = `t.controlMode='auto' AND json_extract(late.value,'$.state')='waiting'
   AND coalesce(json_extract(late.value,'$.deadline'),0)<=$now`;
-const stageDeadline = `json_extract(stage.details,'$.deadlineAt')`;
 
 function activities(scope: '' | 'bot' | 'tasks') {
   return `SELECT t.id, t.botId, t.goal,
@@ -36,7 +35,6 @@ function activities(scope: '' | 'bot' | 'tasks') {
       AND r.state IN ('queued','running','cancelling')) THEN 'working'
     WHEN t.lifecycle='open' AND t.controlMode='auto' AND stage.state='blocked' THEN 'attention'
     WHEN t.lifecycle='open' AND t.controlMode='auto' AND close.key IS NULL AND (
-      stage.state IN ('waiting','ready') AND ${stageDeadline}<=$now OR
       json_extract(release.snapshot,'$.state') IN ('failed','needs-permission','expired') OR
       release.nextCheckAt IS NOT NULL AND ${releaseDeadline}<=$now) THEN 'attention'
     WHEN t.lifecycle='open' AND t.controlMode='auto' AND (
@@ -51,7 +49,6 @@ function activities(scope: '' | 'bot' | 'tasks') {
     WHEN late.value IS NOT NULL AND t.controlMode='auto' AND NOT (${expiredLateJob}) THEN 'working'
     WHEN t.lifecycle='open' AND t.controlMode='auto' AND close.key IS NULL AND (
       stage.state='waiting' AND stage.nextCheckAt IS NOT NULL AND stage.observerOrigin IS NOT NULL
-        AND (${stageDeadline} IS NULL OR ${stageDeadline}>$now)
         AND EXISTS (SELECT 1 FROM bindings b WHERE b.id=latest.bindingId AND b.state='ready' AND b.sessionId=t.sessionId)
       OR release.nextCheckAt IS NOT NULL AND ${releaseDeadline}>$now) THEN 'working'
     WHEN t.controlMode='auto' AND m.sessionId IS NOT NULL AND t.id IN

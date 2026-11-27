@@ -87,9 +87,10 @@ export class FeishuBridge {
     this.running = true;
     this.connection = 'connecting';
     this.connectionError = undefined;
+    // Persisted instructions need the current owner binding even while the transport reconnects.
+    // New incoming messages still require the live connection epoch below.
     const stopBindingCheck = this.managers.registerFeishuBindingCheck?.(
-      (botId, bindingId) =>
-        !!this.epoch && this.running && this.groups.get(botId)?.id === bindingId,
+      (botId, bindingId) => this.running && this.groups.get(botId)?.id === bindingId,
     );
     if (stopBindingCheck) this.disposers.push(stopBindingCheck);
     this.disposers.push(this.groups.onUnbound((bindingId) => this.revokeBinding(bindingId)));

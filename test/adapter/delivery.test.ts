@@ -1032,13 +1032,12 @@ for (const mode of [undefined, true, false])
           String(f.guard(name)),
           mode === false ? /fullAccess: false/ : /not available.*Worker/,
         );
-      assert.match(f.prompt(), /lark-cli/);
-      assert.match(f.prompt(), /Never ask the user to enable a tool channel/);
       if (mode === false) {
         assert.match(f.prompt(), /Bot Shell 与 Worker 完整权限未开启/);
-        assert.match(f.prompt(), /fullAccess: true.*cordis.patch.yml/);
-        assert.match(f.prompt(), /BEFORE creating or dispatching/);
+        assert.match(f.prompt(), /continue the file work/);
       } else {
+        assert.match(f.prompt(), /lark-cli/);
+        assert.match(f.prompt(), /Never ask the user to enable a tool channel/);
         assert.match(f.prompt(), /Run short read-only\/status queries directly/);
         assert.match(f.prompt(), /read the target, make only the requested edit, and read it back/);
         assert.match(f.prompt(), /use a research subagent only if the host actually provides one/);

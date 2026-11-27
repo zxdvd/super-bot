@@ -33,3 +33,10 @@ export const ownerRefuse = '先别关联。';
 export const ownerConfirm = '好，就用它。';
 export const ownerDetach = `解除「${ownerNewGoal}」的执行会话关联，保留材料。`;
 export const ownerPrepare = `先为「${ownerNewGoal}」准备新执行会话，暂时不运行。`;
+
+export const rosterGoal = '整理合成名单，保存本地草稿。';
+export const rosterDirection = '沿用原有 26 人名单，只补第 26 项缺少的负责人，写入原文件。';
+export const rosterDraft =
+  Array.from({ length: 26 }, (_, i) => [i + 1, i === 25 ? '待补' : '保留'].join(' ')).join('\n') +
+  '\n';
+export const rosterFinal = rosterDraft.replace('26 待补', '26 已补');

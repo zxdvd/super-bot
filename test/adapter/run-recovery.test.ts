@@ -1,7 +1,7 @@
 /** Crash-window reconciliation uses only durable facts and the original process's quiet certificate. */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, realpathSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
@@ -11,7 +11,7 @@ import { DshExecution } from '../../src/dsh.ts';
 import { verifyRunTurn, type RunEvent } from '../../src/run-proof.ts';
 import schemaVersion from '../../schema-version.json' with { type: 'json' };
 
-function attempt(store: Store) {
+function reserveAttempt(store: Store, cwd = '/tmp/sb-crash-proof') {
   const bot = store.createBot('bot', { name: 'Crash proof', instructions: 'Synthetic only' });
   const task = store.createTask('task', {
     botId: bot.id,
@@ -20,10 +20,14 @@ function attempt(store: Store) {
     acceptance: 'Read',
     reviewPolicy: 'human',
   });
-  const b = store.beginBinding('binding', task.id, task.rowVersion, '/tmp/sb-crash-proof');
+  const b = store.beginBinding('binding', task.id, task.rowVersion, cwd);
   store.confirmBinding(b.id, b.requestedSessionId);
   const version = store.getTask(task.id).rowVersion,
     run = store.reserveRun('dispatch', task.id, version);
+  return { task, run, version };
+}
+function attempt(store: Store, cwd?: string, kind: 'ready' | 'blocked' = 'ready') {
+  const { task, run, version } = reserveAttempt(store, cwd);
   const source = {
     kind: 'super-bot',
     runId: run.id,
@@ -39,7 +43,7 @@ function attempt(store: Store) {
   store.inputEntered(run.id, message.id, 1);
   store.associateRunTurn(run.id, 1, 0, 1);
   const report = store.workerReport(run.id, 'report-call', {
-    kind: 'ready',
+    kind,
     summary: 'Candidate',
     checks: 'Checked',
     evidence: [{ path: '/tmp/sb-crash-proof/result.md', sha256: 'synthetic', bytes: 9 }],
@@ -51,6 +55,216 @@ function attempt(store: Store) {
   ];
   return { task, run, events, report, version };
 }
+
+for (const window of [
+  'initial',
+  'identified',
+  'transient',
+  'transient-paused',
+  'continuation',
+  'paused',
+  'paused-resumed',
+  'feishu-revoked',
+  'claimed',
+] as const)
+  test(`restart delivers the same input only in the unclaimed ${window} window`, async (t) => {
+    const transient = window === 'transient' || window === 'transient-paused';
+    if (transient) t.mock.timers.enable({ apis: ['setTimeout'] });
+    const dir = mkdtempSync(join(realpathSync(tmpdir()), 'sb-unsent-'));
+    const path = join(dir, 'ledger.sqlite');
+    let store = new Store(path);
+    try {
+      const continuation = window === 'continuation' || window === 'feishu-revoked';
+      let { run, task } = continuation
+        ? attempt(store, dir, 'blocked')
+        : reserveAttempt(store, dir);
+      const followUp = 'Apply only the missing local roster entry';
+      if (continuation) {
+        store.observeRunEnd(run.id, 2, 'completed', true);
+        store.settleRun(run.id);
+        const manager = store.beginManager('manager', task.botId, dir);
+        store.confirmManager(manager.id, manager.requestedSessionId);
+        const saved = store.saveRecoveryInstruction(
+          task.id,
+          store.getTask(task.id).rowVersion,
+          { sessionId: manager.requestedSessionId, messageId: 'owner', seq: 1, text: followUp },
+          'authorized-work',
+        );
+        run = store.reserveRecoveryContinuation(
+          task.id,
+          saved.task.rowVersion,
+          manager.id,
+          {
+            context: {
+              priorRunId: run.id,
+              mode: 'authorized-work',
+              effectUncertain: false,
+              probes: [],
+            },
+            authorizedProbes: [],
+          },
+          {
+            provider: 'fixture',
+            model: 'fixture',
+            reasoningEffort: null,
+            source: 'native-selection',
+          },
+        );
+        if (window === 'feishu-revoked') {
+          store.db
+            .prepare('INSERT INTO feishu_inbound_receipts VALUES (?,?,?,?,?,?,?,?,?,?)')
+            .run(
+              'feishu-message',
+              'owner',
+              'revoked-binding',
+              task.botId,
+              manager.requestedSessionId,
+              'fixture-owner',
+              'fixture-app',
+              'synthetic-digest',
+              1,
+              1,
+            );
+        }
+      }
+      if (window === 'paused' || window === 'paused-resumed')
+        store.controlTask('pause', task.id, store.getTask(task.id).rowVersion, 'paused');
+      if (window === 'claimed') {
+        store.saveRunMessage(run.id, 'possibly-sent', '{}');
+        assert.equal(store.claimDispatch(run.id), true);
+      }
+      if (window === 'identified') {
+        const message = {
+          id: 'identified-but-unclaimed',
+          role: 'user',
+          source: {
+            kind: 'super-bot',
+            runId: run.id,
+            inputId: run.inputId,
+            generation: run.generation,
+            taskId: task.id,
+            taskRevision: task.taskRevision,
+          },
+          content: [{ type: 'text', text: followUp }],
+        };
+        store.saveRunMessage(run.id, message.id, JSON.stringify(message));
+      }
+      store.close();
+      store = new Store(path);
+      const sent: any[] = [];
+      const noop = () => {};
+      let idle = Promise.resolve();
+      let endIdle = noop;
+      const listeners = new Map<string, Function>();
+      const session = { id: run.sessionId };
+      const agent = {
+        id: run.sessionId,
+        session,
+        status: 'idle',
+        ctx: { on: () => noop, tools: { guard: () => noop } },
+        inbox: { nextTurn: [], nextStep: [], remove: noop },
+        followup: (message: any) => {
+          sent.push(message);
+          agent.status = 'running';
+          idle = new Promise<void>((resolve) => {
+            endIdle = resolve;
+          });
+          listeners.get('session/event')?.(session, {
+            type: 'turn/start',
+            seq: 0,
+            data: { turn: 1 },
+          });
+          listeners.get('session/event')?.(session, {
+            type: 'user/message',
+            seq: 1,
+            surfaceOp: 'append',
+            data: message,
+          });
+        },
+        whenIdle: () => idle,
+        cancel: () => {
+          agent.status = 'idle';
+          endIdle();
+        },
+      };
+      let resolves = 0;
+      const ctx = {
+        effect: (fn: Function) => fn(),
+        on: (name: string, fn: Function) => {
+          listeners.set(name, fn);
+          return noop;
+        },
+        tools: { register: () => noop },
+        agents: { get: () => agent, list: () => [agent] },
+        jobs: { list: () => [] },
+        workingDirectory: { get: () => dir },
+        permissionPresets: { set: noop },
+        sessionController: {
+          resolveAgent: async () => {
+            resolves++;
+            if (transient && resolves === 1) return { error: { code: 'gateway/internal' } };
+            return { agent };
+          },
+        },
+      } as unknown as Context;
+      const mount = () => {
+        const execution = new DshExecution(ctx, store, dir);
+        execution.registerUnsentDispatchSourceCheck(() => false);
+        execution.install();
+        return execution;
+      };
+      const first = mount();
+      await first.whenReconciled();
+      if (transient) {
+        assert.equal(store.isUnsentDispatch(store.getRun(run.id)), true);
+        assert.equal(sent.length, 0);
+        if (window === 'transient-paused')
+          store.controlTask(
+            'pause-after-failure',
+            task.id,
+            store.getTask(task.id).rowVersion,
+            'paused',
+          );
+        t.mock.timers.tick(29999);
+        await first.whenReconciled();
+        assert.equal(resolves, 1);
+        t.mock.timers.tick(1);
+        await first.whenReconciled();
+      }
+      if (window === 'paused-resumed') {
+        assert.equal(sent.length, 0);
+        store.controlTask('resume', task.id, store.getTask(task.id).rowVersion, 'auto');
+        first.resumeUnsentTask(task.id);
+        await first.whenReconciled();
+      }
+      const admitted =
+        window === 'initial' ||
+        window === 'identified' ||
+        window === 'continuation' ||
+        window === 'transient' ||
+        window === 'paused-resumed';
+      assert.equal(sent.length, Number(admitted));
+      assert.equal(resolves, Number(admitted) + Number(transient));
+      if (admitted) {
+        assert.equal(store.getRunInput(run.id).state, 'entered');
+        assert.equal(sent[0].source.runId, run.id);
+        assert.equal(sent[0].source.inputId, run.inputId);
+        if (window === 'identified') assert.equal(sent[0].id, 'identified-but-unclaimed');
+        if (window === 'continuation') assert.ok(sent[0].content[0].text.includes(followUp));
+      }
+      await first.dispose();
+      store.close();
+      store = new Store(path);
+      const second = mount();
+      await second.whenReconciled();
+      await second.dispose();
+      assert.equal(sent.length, Number(admitted));
+      assert.equal(store.taskRuns(task.id).length, continuation ? 2 : 1);
+    } finally {
+      store.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
 function adapter(store: Store, events: RunEvent[], sessionId: string) {
   let reads = 0;
   const hooks = new Map<string, Function>();

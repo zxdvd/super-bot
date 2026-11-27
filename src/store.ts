@@ -3,8 +3,11 @@ import { settledBlockerSql } from './settled-blocker.ts';
 import {
   readStageCondition,
   stageConditionText,
+  stageFollowUpForDirection,
+  stageOverdueReason,
   stageReadyKey,
   STAGE_OBSERVE_MS,
+  STAGE_OVERDUE_OBSERVE_MS,
   STAGE_WAIT_MS,
   type DueStage,
   type StageFollowUp,
@@ -110,6 +113,15 @@ const DELIVERY_ATTEMPT_LIMIT = 3;
 const DELIVERY_RETRY_DELAY_MS = 30000;
 const RESULT_DELIVERY_REASON = '成果仍待在原对话交付。请在最终可见回复中附上当前版本的成果链接。';
 const BOT_CAPACITY_KEY = 'bot-capacity:';
+const GITLAB_READBACK_STATES: readonly ReleaseReceipt['state'][] = [
+  'claim-pending',
+  'tracking',
+  'unknown',
+];
+const STAGE_HAS_OWNER_FOLLOW_UP = `EXISTS (SELECT 1 FROM metadata m WHERE m.key='recovery-instruction:' || t.id
+  AND json_extract(m.value,'$.taskRevision')=t.taskRevision AND json_extract(m.value,'$.priorRunId')=r.id
+  AND json_extract(m.value,'$.stageRunId') IS NOT r.id
+  AND json_extract(m.value,'$.mode') IS NOT NULL AND json_extract(m.value,'$.runId') IS NULL)`;
 const JOB_RECOVERY_WAIT =
   '旧轮已结束，仍在等待后台 Job 终态和原生结果消费。Bot 会继续核对，原任务未交付。';
 type RecoveryWorkPlan = {
@@ -660,6 +672,7 @@ export class Store {
   ): ManagerEvent | undefined {
     const blocked = new Set<string>();
     for (const event of this.dueManagerEvents(botId, -1)) {
+      if (!canWake(event)) continue;
       if (event.id.startsWith('manager-event:continuation:')) {
         const task = event.taskId && this.getTask(event.taskId);
         const instruction = task && this.recoveryInstruction(task.id);
@@ -673,7 +686,6 @@ export class Store {
         )
           continue;
       }
-      if (!canWake(event)) continue;
       if (event.taskId && event.id.startsWith('manager-event:gitlab-release:')) {
         const current = this.gitLabReleaseDetail(this.getTask(event.taskId));
         const latest =
@@ -711,9 +723,7 @@ export class Store {
         if (
           this.stageOwnerFollowUp(task, run!) ||
           (stage.state === 'ready' &&
-            (task.status !== 'unscheduled' ||
-              (stage.deadlineAt !== undefined && stage.deadlineAt <= Date.now()) ||
-              this.dispatchBlocker(task.id)))
+            (task.status !== 'unscheduled' || this.dispatchBlocker(task.id)))
         )
           continue;
       }
@@ -2275,8 +2285,10 @@ export class Store {
     expectedRowVersion: number,
     cwd: string,
     workdir?: WorkdirInfo,
+    replaces?: string,
   ): Binding {
-    return this.command(requestId, 'session.prepare', { taskId, expectedRowVersion, cwd }, () => {
+    const payload = { taskId, expectedRowVersion, cwd, ...(replaces ? { replaces } : {}) };
+    return this.command(requestId, 'session.prepare', payload, () => {
       const task = this.getTask(taskId);
       if (task.rowVersion !== expectedRowVersion)
         throw new AppError('version-conflict', '任务已经更新，请刷新后再准备会话。');
@@ -2284,7 +2296,21 @@ export class Store {
       if (task.lifecycle !== 'open' || !task.scope || !task.acceptance)
         throw new AppError('not-ready', '请先补全任务范围和验收条件。');
       const existing = this.activeBinding(taskId);
-      if (existing) return existing;
+      if (replaces) {
+        const prior = this.latestRun(taskId);
+        if (
+          existing?.id !== replaces ||
+          existing.state !== 'ready' ||
+          existing.cwd !== cwd ||
+          task.controlMode !== 'auto' ||
+          prior?.finishedAt == null ||
+          !['settled', 'failed', 'cancelled'].includes(prior.state) ||
+          this.heldRuns().some((run) => run.taskId === taskId)
+        )
+          throw new AppError('binding-stale', '原会话关联、工作目录或执行状态已变更。');
+        this.db.prepare("UPDATE bindings SET state='released' WHERE id=?").run(replaces);
+        this.db.prepare('UPDATE tasks SET sessionId=NULL WHERE id=?').run(taskId);
+      } else if (existing) return existing;
       const generation = this.nextBindingGeneration(taskId);
       const binding: Binding = {
         id: randomUUID(),
@@ -2326,6 +2352,13 @@ export class Store {
       this.db
         .prepare('UPDATE tasks SET rowVersion=rowVersion+1,updatedAt=? WHERE id=?')
         .run(Date.now(), taskId);
+      if (replaces) {
+        this.set(
+          `session-replaces:${binding.id}`,
+          this.get(`session-replaces:${replaces}`) ?? replaces,
+        );
+        this.event('session.replacing', taskId, { oldBindingId: replaces, bindingId: binding.id });
+      }
       this.event('session.preparing', taskId, { bindingId: binding.id, generation });
       return binding;
     });
@@ -2729,6 +2762,13 @@ export class Store {
       .prepare("SELECT taskId FROM bindings WHERE sessionId=? AND state='ready'")
       .get(sessionId)?.taskId as string | undefined;
   }
+  pendingWorkerTaskForSession(sessionId: string): string | undefined {
+    return this.db
+      .prepare(
+        "SELECT taskId FROM bindings WHERE requestedSessionId=? AND state IN ('creating','recovery')",
+      )
+      .get(sessionId)?.taskId as string | undefined;
+  }
   nativeIntervention(sessionId: string, messageId: string): boolean {
     const binding = this.db
       .prepare("SELECT * FROM bindings WHERE sessionId=? AND state='ready'")
@@ -2919,12 +2959,7 @@ export class Store {
     const previousStage =
       previous && previous.bindingId === b.id ? this.currentStage(task, previous) : null;
     const stage = recovering ? null : previousStage;
-    if (
-      stage &&
-      (stage.state !== 'ready' ||
-        this.stageOwnerFollowUp(task, previous!) ||
-        (stage.deadlineAt !== undefined && stage.deadlineAt <= Date.now()))
-    ) {
+    if (stage && (stage.state !== 'ready' || this.stageOwnerFollowUp(task, previous!))) {
       throw new AppError('stage-pending', '请先核对阶段前置或待处理的用户指示。');
     }
     const pending = this.pendingInput(taskId);
@@ -3027,24 +3062,85 @@ export class Store {
       return this.getRunInput(id);
     });
   }
-  claimDispatch(id: string): boolean {
-    const run = this.getRun(id);
+  isUnsentDispatch(run: Run): boolean {
+    return (
+      run.state === 'queued' &&
+      run.finishedAt === null &&
+      !!this.db
+        .prepare(`SELECT 1 FROM inputs i JOIN outbox o ON o.id='input:' || i.id
+        WHERE i.id=? AND i.taskId=? AND i.state='accepted' AND o.taskId=i.taskId
+        AND o.kind='input.deliver' AND o.state='pending' AND o.attempts=0
+        AND json_extract(o.payload,'$.runId')=? AND json_extract(o.payload,'$.inputId')=i.id`)
+        .get(run.inputId, run.taskId, run.id)
+    );
+  }
+  unsentDispatchFeishuSources(run: Run): ChatSource[] {
+    const direction = this.recoveryInstruction(run.taskId);
+    const work = this.recoveryWorkPlan(run.id);
+    const sources: ChatSource[] = [];
+    const recovered = this.ownerRecoveryForRun(run.id);
+    if (recovered?.source) sources.push(recovered.source);
+    if (direction?.runId === run.id)
+      sources.push(direction.source, ...(direction.directions ?? []).map((item) => item.source));
+    for (const id of work?.context.directionIds ?? []) {
+      const value = this.get(`recovery-direction-source:${id}`);
+      if (value) sources.push(JSON.parse(value));
+    }
+    const stageRow = this.db
+      .prepare(`SELECT details FROM work_stages WHERE taskId=?
+      AND state='dispatched' AND json_extract(details,'$.dispatchedRunId')=?`)
+      .get(run.taskId, run.id);
+    const stage = stageRow && (JSON.parse(String(stageRow.details)) as WorkStage);
+    if (stage?.planSource) sources.push(stage.planSource);
+    const release = this.gitLabReleaseForRun(run);
+    if (release) sources.push(release.plan.source);
+    const { kind } = this.getRunInput(run.id);
+    const reliesOnTaskSource =
+      (kind === 'dispatch' && !recovered) || (kind === 'stage' && !stage?.planSource && !release);
+    const inputs = this.db
+      .prepare(`SELECT json_extract(data,'$.source') AS source FROM events
+      WHERE taskId=? AND json_type(data,'$.source')='object'
+      AND ((kind IN ('attention.answered','result.rejected') AND json_extract(data,'$.inputId')=?)
+        OR (?=1 AND ((kind='task.created' AND ?=1) OR (kind='task.revised' AND json_extract(data,'$.taskRevision')=?))))`)
+      .all(run.taskId, run.inputId, Number(reliesOnTaskSource), run.taskRevision, run.taskRevision);
+    for (const { source } of inputs) sources.push(JSON.parse(String(source)));
+    const inbound = this.db.prepare(
+      'SELECT 1 FROM feishu_inbound_receipts WHERE nativeMessageId=?',
+    );
+    return sources.filter((source) =>
+      (source.messages ?? [source]).some(({ messageId }) => inbound.get(messageId)),
+    );
+  }
+  dispatchBinding(run: Run): Binding & { sessionId: string } {
     const task = this.getTask(run.taskId);
     const b = this.activeBinding(run.taskId);
+    this.assertNoTaskClose(run.taskId);
     if (
       task.controlMode !== 'auto' ||
       task.lifecycle !== 'open' ||
+      this.isBotDeleted(task.botId) ||
       task.taskRevision !== run.taskRevision ||
       b?.id !== run.bindingId ||
       b.state !== 'ready' ||
-      run.state !== 'queued'
+      b.taskRevision !== run.taskRevision ||
+      b.generation !== run.generation ||
+      b.sessionId !== run.sessionId ||
+      task.sessionId !== run.sessionId ||
+      run.state !== 'queued' ||
+      run.finishedAt !== null ||
+      this.latestRun(task.id)?.id !== run.id
     )
       throw new AppError('dispatch-stale', '派发条件已经改变，没有投递。');
+    return { ...b, sessionId: run.sessionId };
+  }
+  claimDispatch(id: string): boolean {
+    const run = this.getRun(id);
+    this.dispatchBinding(run);
     if (!this.getRunInput(id).messageId) throw new AppError('input-missing', '输入尚未生成。');
     return (
       this.db
         .prepare(
-          "UPDATE outbox SET state='sending',attempts=attempts+1 WHERE id IN (?,?) AND state='pending'",
+          "UPDATE outbox SET state='sending',attempts=attempts+1 WHERE id IN (?,?) AND state='pending' AND attempts=0",
         )
         .run(`input:${run.inputId}`, `run:${id}`).changes === 1
     );
@@ -3555,7 +3651,7 @@ export class Store {
     const target = stage?.observation?.releaseJob;
     return stage && plan && target ? { stage, plan, target } : null;
   }
-  private gitLabReleaseDetail(task: Task): ReleaseReceipt | null {
+  gitLabReleaseDetail(task: Task): ReleaseReceipt | null {
     const row = this.db
       .prepare(`SELECT r.snapshot FROM gitlab_release_receipts r JOIN work_stages s ON s.runId=r.stageRunId
       WHERE r.taskId=? AND s.taskRevision=? ORDER BY r.rowid DESC LIMIT 1`)
@@ -3616,7 +3712,9 @@ export class Store {
             releaseKey(previous.target) === releaseKey(target) &&
             !['needs-permission', 'unsubmitted'].includes(previous.state));
         const deadlineAt =
-          previous?.state === 'unsubmitted' && releaseKey(previous.target) === releaseKey(target)
+          previous?.state === 'unsubmitted' &&
+          releaseKey(previous.target) === releaseKey(target) &&
+          (previous.deadlineAt > now || readback)
             ? previous.deadlineAt
             : now + RELEASE_WAIT_MS;
         const receipt: ReleaseReceipt = {
@@ -3677,10 +3775,12 @@ export class Store {
   dueGitLabReleases(limit: number, now = Date.now()): ReleaseReceipt[] {
     return this.db
       .prepare(`SELECT r.snapshot FROM gitlab_release_receipts r JOIN work_stages s ON s.runId=r.stageRunId
-      JOIN tasks t ON t.id=r.taskId AND t.taskRevision=s.taskRevision AND t.lifecycle='open' AND t.controlMode='auto'
+      JOIN tasks t ON t.id=r.taskId AND t.taskRevision=s.taskRevision AND t.controlMode='auto'
       JOIN bots ON bots.id=t.botId AND bots.deletedAt IS NULL
-      WHERE r.nextCheckAt<=? ORDER BY r.nextCheckAt,r.stageRunId LIMIT ?`)
-      .all(now, limit)
+      WHERE (t.lifecycle='open' OR (t.lifecycle IN ('review','completed')
+        AND json_extract(r.snapshot,'$.state') IN (SELECT value FROM json_each(?))))
+        AND r.nextCheckAt<=? ORDER BY r.nextCheckAt,r.stageRunId LIMIT ?`)
+      .all(JSON.stringify(GITLAB_READBACK_STATES), now, limit)
       .map((row) => JSON.parse(String(row.snapshot)) as ReleaseReceipt);
   }
   private scheduleUnsubmittedGitLabRelease(
@@ -3724,7 +3824,6 @@ export class Store {
         detail: '已恢复读取，同一作业处于 manual，正式入口尚未认领。',
         at: now,
       },
-      deadlineAt: previous.deadlineAt,
       ...(typeof opened === 'number' ? { releaseOpenedAt: opened } : {}),
     };
     this.db
@@ -3754,9 +3853,12 @@ export class Store {
       const task = this.getTask(previous.taskId);
       // The Worker can record a response to a request it already made. Background
       // observations that return after pause, takeover or replan are discarded.
+      // A local result can enter review while the original job still needs readback.
       const fresh =
         this.getRun(previous.runId).taskRevision === task.taskRevision &&
-        task.lifecycle === 'open' &&
+        (task.lifecycle === 'open' ||
+          (['review', 'completed'].includes(task.lifecycle) &&
+            GITLAB_READBACK_STATES.includes(previous.state))) &&
         task.controlMode === 'auto' &&
         !this.isBotDeleted(task.botId);
       if (
@@ -4042,7 +4144,7 @@ export class Store {
             JSON.stringify(stage.condition) === JSON.stringify(condition)
               ? stage.releaseOpenedAt
               : undefined,
-          deadlineAt: repeated ? undefined : now + STAGE_WAIT_MS,
+          deadlineAt: condition && !repeated ? now + STAGE_WAIT_MS : undefined,
           ...(source || retry || releaseSelection || releaseDirected || releaseClarification
             ? { planVersion: task.rowVersion + 1 }
             : {}),
@@ -4132,12 +4234,17 @@ export class Store {
       JOIN bots ON bots.id=t.botId AND bots.deletedAt IS NULL
       JOIN runs r ON r.id=s.runId AND r.sessionId=t.sessionId AND r.finishedAt IS NOT NULL
       JOIN bindings b ON b.id=r.bindingId AND b.state='ready' AND b.sessionId=t.sessionId
-      WHERE r.id=(SELECT id FROM runs WHERE taskId=t.id ORDER BY createdAt DESC,rowid DESC LIMIT 1) AND
-        (s.state IN ('waiting','ready') AND coalesce(json_extract(s.details,'$.deadlineAt'),0)<=? OR
-         s.state='blocked' AND json_extract(s.details,'$.observation.state')='unavailable'
-          AND json_extract(s.details,'$.deadlineAt') IS NULL OR
-         s.state='blocked' AND json_type(s.details,'$.observation.releaseChoices[0]')='text'
-          AND EXISTS (SELECT 1 FROM gitlab_release_plans p WHERE p.stageRunId=s.runId))
+      WHERE r.id=(SELECT id FROM runs WHERE taskId=t.id ORDER BY createdAt DESC,rowid DESC LIMIT 1)
+        AND NOT ${STAGE_HAS_OWNER_FOLLOW_UP} AND
+        (s.state='waiting' AND coalesce(json_extract(s.details,'$.expired'),0)=0
+          AND json_type(s.details,'$.condition')='object'
+          AND coalesce(json_extract(s.details,'$.deadlineAt'),0)<=? OR
+         s.state='blocked' AND json_extract(s.details,'$.nextStep') IS NOT NULL AND (
+           json_extract(s.details,'$.expired')=1 OR
+           json_extract(s.details,'$.observation.state')='unavailable'
+             AND json_extract(s.details,'$.deadlineAt') IS NULL OR
+           json_type(s.details,'$.observation.releaseChoices[0]')='text'
+             AND EXISTS (SELECT 1 FROM gitlab_release_plans p WHERE p.stageRunId=s.runId)))
       ORDER BY coalesce(json_extract(s.details,'$.deadlineAt'),0),s.runId LIMIT 16`)
       .all(now);
     for (const row of candidates) {
@@ -4149,33 +4256,49 @@ export class Store {
         this.refreshLegacyGitLabChoices(task, run, stage, now);
         continue;
       }
-      const deadlineAt = stage.deadlineAt ?? (stage.observation?.at ?? stage.at) + STAGE_WAIT_MS;
-      this.command(
-        `stage-supervise:${run.id}:${stage.planVersion ?? 0}:${deadlineAt}:${stage.deadlineAt === undefined ? 'legacy' : 'expire'}`,
-        'stage.supervise',
-        { taskId: task.id, runId: run.id, deadlineAt },
-        () => {
-          if (deadlineAt <= now && stage.nextStep) {
-            this.expireStage(task, { ...stage, deadlineAt }, now);
-          } else if (stage.deadlineAt === undefined) {
-            const legacyUnavailable = stage.state === 'blocked' && !!stage.condition;
-            this.db
-              .prepare(`UPDATE work_stages SET details=json_set(details,'$.deadlineAt',?),
-              state=CASE WHEN ? THEN 'waiting' ELSE state END,
-              nextCheckAt=CASE WHEN ? THEN ? ELSE nextCheckAt END,
-              observerOrigin=coalesce(observerOrigin,?) WHERE runId=?`)
-              .run(
+      writeTransaction(this.db, () => {
+        const previouslyBlocked = stage.state === 'blocked';
+        if (previouslyBlocked && (!stage.condition || stage.observation?.state === 'satisfied')) {
+          // Old versions discarded ready stages at the deadline and settled their notices.
+          const ready = {
+            ...stage,
+            state: undefined,
+            expired: undefined,
+            reason: undefined,
+            deadlineAt: undefined,
+            planVersion: task.rowVersion + 1,
+          };
+          this.db
+            .prepare("UPDATE work_stages SET state='ready',details=? WHERE runId=?")
+            .run(JSON.stringify(ready), run.id);
+          this.db
+            .prepare('UPDATE tasks SET rowVersion=rowVersion+1,updatedAt=? WHERE id=?')
+            .run(now, task.id);
+          this.enqueueStageReady(task.botId, task.id, { ...ready, state: 'ready' });
+        } else if (stage.condition) {
+          const deadlineAt =
+            stage.deadlineAt ?? (stage.observation?.at ?? stage.at) + STAGE_WAIT_MS;
+          const overdue = deadlineAt <= now;
+          const reason = overdue ? stageOverdueReason(stage.condition) : stage.reason;
+          this.db
+            .prepare(`UPDATE work_stages SET state='waiting',details=?,
+              nextCheckAt=coalesce(nextCheckAt,?),observerOrigin=coalesce(observerOrigin,?) WHERE runId=?`)
+            .run(
+              JSON.stringify({
+                ...stage,
+                state: undefined,
                 deadlineAt,
-                Number(legacyUnavailable),
-                Number(legacyUnavailable),
-                now,
-                stage.condition?.sourceOrigin ?? null,
-                run.id,
-              );
-          }
-          return {};
-        },
-      );
+                expired: overdue || undefined,
+                reason,
+              }),
+              now,
+              stage.condition.sourceOrigin,
+              run.id,
+            );
+          if (overdue && !stage.expired)
+            this.event('stage.overdue', task.id, { runId: run.id, deadlineAt, reason });
+        }
+      });
     }
   }
   private refreshLegacyGitLabChoices(task: Task, run: Run, stage: WorkStage, now: number): void {
@@ -4217,38 +4340,6 @@ export class Store {
         .run(now, task.id);
     });
   }
-  private expireStage(task: Task, stage: WorkStage, now: number): void {
-    const last = stage.observation?.detail ? `最近一次核对：${stage.observation.detail}` : '';
-    const reason =
-      stage.state === 'ready'
-        ? this.dispatchBlocker(task.id)
-          ? '已到执行名额等待期限，原阶段下一步尚未派发。请确认是否继续等待。'
-          : '已到接续派发期限，已保存的下一步仍未派出。请核对当前派发状态并确认是否继续。'
-        : `已到外部条件核对期限，尚未确认 ${stage.condition ? stageConditionText(stage.condition) : '指定条件'}。${last}请确认是否继续跟踪。`;
-    this.db
-      .prepare("UPDATE work_stages SET state='blocked',details=?,nextCheckAt=NULL WHERE runId=?")
-      .run(JSON.stringify({ ...stage, state: undefined, expired: true, reason }), stage.runId);
-    this.settleManagerEvent(`manager-event:${stageReadyKey(stage)}`);
-    this.settleManagerEvent(
-      `manager-event:stage-unavailable:${stage.runId}:${stage.planVersion ?? 0}`,
-    );
-    this.db.prepare('DELETE FROM waits WHERE taskId=?').run(task.id);
-    this.db
-      .prepare('UPDATE tasks SET rowVersion=rowVersion+1,updatedAt=? WHERE id=?')
-      .run(now, task.id);
-    this.event('stage.expired', task.id, {
-      runId: stage.runId,
-      deadlineAt: stage.deadlineAt,
-      reason,
-    });
-    this.enqueueManager(
-      task.botId,
-      `stage-blocked:${stage.runId}:${task.rowVersion}`,
-      reason,
-      task.id,
-      8,
-    );
-  }
   dueStages(limit: number, now = Date.now()): DueStage[] {
     return this.db
       .prepare(`SELECT s.runId,s.taskId,s.nextCheckAt AS checkAt,t.rowVersion,s.observerOrigin AS origin,
@@ -4258,14 +4349,10 @@ export class Store {
       JOIN runs r ON r.id=s.runId AND r.sessionId=t.sessionId AND r.finishedAt IS NOT NULL
       JOIN bindings b ON b.id=r.bindingId AND b.state='ready' AND b.sessionId=t.sessionId
       WHERE s.state='waiting' AND s.nextCheckAt<=? AND s.observerOrigin IS NOT NULL
-        AND coalesce(json_extract(s.details,'$.deadlineAt'),?)>=?
         AND r.id=(SELECT id FROM runs WHERE taskId=t.id ORDER BY createdAt DESC,rowid DESC LIMIT 1)
-        AND NOT EXISTS (SELECT 1 FROM metadata m WHERE m.key='recovery-instruction:' || t.id
-          AND json_extract(m.value,'$.taskRevision')=t.taskRevision AND json_extract(m.value,'$.priorRunId')=r.id
-          AND json_extract(m.value,'$.stageRunId') IS NOT r.id
-          AND json_extract(m.value,'$.mode') IS NOT NULL AND json_extract(m.value,'$.runId') IS NULL)
+        AND NOT ${STAGE_HAS_OWNER_FOLLOW_UP}
       ORDER BY s.nextCheckAt,s.runId LIMIT ?`)
-      .all(now, now, now, limit)
+      .all(now, limit)
       .map((row) => ({ ...row, condition: JSON.parse(String(row.condition)) }) as DueStage);
   }
   recordStageObservation(due: DueStage, observation: StageObservation, now = Date.now()): void {
@@ -4293,10 +4380,7 @@ export class Store {
       return;
     // No asynchronous work between the fresh checks and commit in this single-owner ledger.
     writeTransaction(this.db, () => {
-      if (stage.deadlineAt !== undefined && now >= stage.deadlineAt) {
-        this.expireStage(task, stage, now);
-        return;
-      }
+      const overdue = stage.deadlineAt !== undefined && now >= stage.deadlineAt;
       const failures =
         observation.state === 'transient' || observation.state === 'unavailable'
           ? Number(row.failures) + 1
@@ -4305,7 +4389,7 @@ export class Store {
         observation.state === 'transient' && failures >= 5
           ? {
               state: 'unavailable',
-              detail: `GitLab 连续读取暂不可用。最近一次核对：${observation.detail} 本端会在期限内低频重查指定对象。`,
+              detail: `GitLab 连续读取暂不可用。最近一次核对：${observation.detail} 本端会低频重查指定对象。`,
             }
           : observation;
       const state =
@@ -4318,14 +4402,22 @@ export class Store {
         outcome.state === 'unavailable'
           ? Math.min(5 * 60_000 * failures, 15 * 60_000)
           : STAGE_OBSERVE_MS * 2 ** Math.min(Math.max(failures - 1, 0), 4);
-      const next = state === 'waiting' ? now + delay : null;
+      const next = state === 'waiting' ? now + (overdue ? STAGE_OVERDUE_OBSERVE_MS : delay) : null;
       const details: WorkStage = {
         ...stage,
         state,
         observation: { ...outcome, at: now },
         ...(outcome.releaseMergeOpen ? { releaseOpenedAt: stage.releaseOpenedAt ?? now } : {}),
-        deadlineAt: state === 'ready' ? now + STAGE_WAIT_MS : stage.deadlineAt,
-        reason: state === 'blocked' || outcome.state === 'unavailable' ? outcome.detail : undefined,
+        deadlineAt: state === 'waiting' ? stage.deadlineAt : undefined,
+        expired: state === 'waiting' ? stage.expired : undefined,
+        reason:
+          state === 'blocked'
+            ? outcome.detail
+            : state === 'waiting' && overdue
+              ? stageOverdueReason(due.condition)
+              : outcome.state === 'unavailable'
+                ? outcome.detail
+                : undefined,
       };
       this.db
         .prepare('UPDATE work_stages SET state=?,details=?,nextCheckAt=?,failures=? WHERE runId=?')
@@ -4342,7 +4434,7 @@ export class Store {
         });
       }
       const unavailableKey = `stage-unavailable:${stage.runId}:${stage.planVersion ?? 0}`;
-      if (outcome.state === 'unavailable') {
+      if (outcome.state === 'unavailable' && !overdue) {
         this.enqueueManager(
           task.botId,
           unavailableKey,
@@ -4350,7 +4442,8 @@ export class Store {
           task.id,
           8,
         );
-      } else this.settleManagerEvent(`manager-event:${unavailableKey}`);
+      } else if (outcome.state !== 'unavailable')
+        this.settleManagerEvent(`manager-event:${unavailableKey}`);
       if (state !== 'waiting') {
         this.db
           .prepare('UPDATE tasks SET rowVersion=rowVersion+1,updatedAt=? WHERE id=?')
@@ -4890,6 +4983,23 @@ export class Store {
     }
     return instruction;
   }
+  /** A saved owner direction remains eligible even if its chat notification is gone. */
+  pendingWorkerContinuations(botId: string, managerSessionId: string) {
+    return this.db
+      .prepare(`SELECT t.id,t.rowVersion FROM tasks t
+      JOIN metadata m ON m.key='recovery-instruction:' || t.id
+      JOIN runs r ON r.id=json_extract(m.value,'$.priorRunId') AND r.taskId=t.id
+      WHERE t.botId=? AND t.lifecycle='open' AND t.controlMode='auto'
+        AND r.finishedAt IS NOT NULL
+        AND r.id=(SELECT id FROM runs WHERE taskId=t.id ORDER BY createdAt DESC,rowid DESC LIMIT 1)
+        AND json_extract(m.value,'$.taskRevision')=t.taskRevision
+        AND json_extract(m.value,'$.source.sessionId')=?
+        AND json_extract(m.value,'$.mode') IN ('read-only','authorized-work')
+        AND json_extract(m.value,'$.runId') IS NULL
+        AND json_extract(m.value,'$.stageRunId') IS NULL
+      ORDER BY t.updatedAt,t.id`)
+      .all(botId, managerSessionId) as { id: string; rowVersion: number }[];
+  }
   private writeRecoveryInstruction(
     taskId: string,
     { directions, ...instruction }: RecoveryInstruction,
@@ -5009,13 +5119,14 @@ export class Store {
         const previous = this.recoveryInstruction(taskId);
         const stage = this.currentStage(task, run),
           activeStage = stage && !['superseded', 'dispatched'].includes(stage.state) ? stage : null;
-        const stageFollowUp =
-          extra?.stageFollowUp ??
-          (activeStage && mode && !keepPendingDirection ? 'replace' : undefined);
+        const stageFollowUp = stageFollowUpForDirection(
+          activeStage,
+          extra?.stageFollowUp,
+          !!(mode || change),
+        );
         if (
           (stageFollowUp && !activeStage) ||
           (stageFollowUp === 'append' && !mode && !change) ||
-          (stageFollowUp === 'append' && resumeManagement) ||
           (stageFollowUp === 'replace' && (!mode || change || keepPendingDirection)) ||
           (stageFollowUp === 'revoke' &&
             (mode || change || keepPendingDirection || extra?.earlier?.length))
@@ -5168,6 +5279,8 @@ export class Store {
       manager = this.activeManager(task.botId);
     if (task.rowVersion !== rowVersion)
       throw new AppError('version-conflict', '任务或用户指示已经更新。');
+    const replacement =
+      !!binding && !!run && this.get(`session-replaces:${binding.id}`) === run.bindingId;
     if (
       !manager ||
       manager.id !== managerId ||
@@ -5178,6 +5291,7 @@ export class Store {
       throw new AppError('manager-scope', '原管理会话的授权已改变。');
     if (task.controlMode !== 'auto' || task.lifecycle !== 'open')
       throw new AppError('recovery-human-control', '任务已暂停、接管或结束。');
+    this.assertNoTaskClose(taskId);
     if (
       !instruction ||
       instruction.runId ||
@@ -5186,11 +5300,13 @@ export class Store {
       instruction.source.sessionId !== manager.sessionId ||
       !run ||
       instruction.priorRunId !== run.id ||
-      run.bindingId !== binding?.id ||
-      binding.state !== 'ready' ||
-      !binding.sessionId ||
-      run.sessionId !== binding.sessionId ||
-      run.generation !== binding.generation ||
+      !binding ||
+      (!replacement &&
+        (run.bindingId !== binding.id ||
+          binding.state !== 'ready' ||
+          !binding.sessionId ||
+          run.sessionId !== binding.sessionId ||
+          run.generation !== binding.generation)) ||
       run.taskRevision !== task.taskRevision ||
       binding.taskRevision !== task.taskRevision
     ) {
@@ -5199,9 +5315,9 @@ export class Store {
     if (run.finishedAt === null) throw new AppError('run-active', '上次执行仍在进行。');
     if (
       this.db
-        .prepare(`SELECT 1 FROM attentions WHERE taskId=? AND state IN ('open','responding','stale')
-      AND ((kind='approval' AND taskRevision=?) OR (state!='stale' AND id!=? AND kind IN ('input','recovery')))`)
-        .get(taskId, task.taskRevision, `run:${run.id}`) ||
+        .prepare(`SELECT 1 FROM attentions WHERE taskId=? AND state IN ('open','responding')
+      AND ((kind='approval' AND taskRevision=?) OR (id NOT IN (?,?) AND kind IN ('input','recovery')))`)
+        .get(taskId, task.taskRevision, `run:${run.id}`, `binding:${binding.id}`) ||
       this.db
         .prepare(
           "SELECT 1 FROM inputs WHERE taskId=? AND kind!='goal' AND state IN ('accepted','enqueued','unknown')",
@@ -5214,7 +5330,7 @@ export class Store {
         '还有未处理的输入、原生审批或执行占用，旧输入仍保留。',
       );
     }
-    return { task, run, binding: { ...binding, sessionId: binding.sessionId }, instruction };
+    return { task, run, binding, instruction };
   }
   verifyInterruptedEnd(taskId: string, rowVersion: number, managerId: string): void {
     const { task, run } = this.continuationTarget(taskId, rowVersion, managerId);
@@ -5222,8 +5338,9 @@ export class Store {
     if (
       run.state !== 'interrupted' ||
       this.getRunInput(run.id).state !== 'entered' ||
-      !proof?.quiet ||
-      proof.endSeq === null
+      proof?.quiet !== 1 ||
+      proof.endSeq === null ||
+      !['completed', 'error', 'aborted'].includes(proof.endKind ?? '')
     ) {
       throw new AppError('recovery-unproven', '没有可归属的原轮结束证据，保留占用。');
     }
@@ -5257,8 +5374,7 @@ export class Store {
         if (
           work.context.priorRunId !== run.id ||
           work.context.mode !== instruction.mode ||
-          (work.context.mode === 'authorized-work' && work.context.effectUncertain) ||
-          !this.verifiedBlocker(run)
+          (!['settled', 'failed', 'cancelled'].includes(run.state) && !this.verifiedBlocker(run))
         ) {
           throw new AppError('recovery-unproven', '原轮结束或后续执行的归属无法确认。');
         }
@@ -5330,6 +5446,12 @@ export class Store {
   ): { probe: ClusterProbe; auth: string | null; result: ProbeResult } | null {
     const value = this.get(`worker-preflight:${runId}:${callId}`);
     return value ? JSON.parse(value) : null;
+  }
+  preflightReceipts(runId: string): NonNullable<ReturnType<Store['preflightReceipt']>>[] {
+    return this.db
+      .prepare('SELECT value FROM metadata WHERE key GLOB ? ORDER BY rowid')
+      .all(`worker-preflight:${runId}:*`)
+      .map(({ value }) => JSON.parse(String(value)));
   }
   recordPreflightReceipt(
     runId: string,
@@ -5476,9 +5598,18 @@ export class Store {
       () => {
         const target = this.recoveryTarget(taskId, expectedRowVersion, continuation);
         this.closeRecovery(target, 'auto', undefined, source, ownerFact);
-        return this.allocateRun(this.getTask(taskId), target.binding, true, expectedModel);
+        const next = this.allocateRun(this.getTask(taskId), target.binding, true, expectedModel);
+        this.set(
+          `run-owner-recovery:${next.id}`,
+          JSON.stringify({ source, note: target.run?.note ?? null }),
+        );
+        return next;
       },
     );
+  }
+  ownerRecoveryForRun(runId: string): { source?: ChatSource; note: string | null } | undefined {
+    const value = this.get(`run-owner-recovery:${runId}`);
+    return value ? JSON.parse(value) : undefined;
   }
   private closeRecovery(
     { task, run, attentions }: ReturnType<Store['recoveryTarget']>,
@@ -5766,13 +5897,23 @@ export class Store {
     });
   }
   closeRunNeedsReadback(run: Run, activeRun: boolean): boolean {
-    if (
-      !activeRun &&
-      run.state !== 'cancelled' &&
-      run.state !== 'interrupted' &&
-      !this.verifiedBlocker(run)
-    )
-      return false;
+    if (!activeRun && run.state !== 'cancelled' && run.state !== 'interrupted') {
+      const settlement = this.verifiedBlocker(run);
+      if (!settlement) return false;
+      // A normally finished run awaiting a newer owner direction already released its lease.
+      const supersededByDirection =
+        run.state === 'settled' &&
+        this.db
+          .prepare(
+            "SELECT 1 FROM metadata WHERE key=? AND json_type(value,'$.supersededBy')='text'",
+          )
+          .get(`run-verified-end:${run.id}`);
+      if (
+        (settlement === 'settled-failure' || supersededByDirection) &&
+        !this.gitLabReleaseForRun(run)
+      )
+        return false;
+    }
     return !this.db
       .prepare(`SELECT 1 FROM events WHERE taskId=? AND json_extract(data,'$.runId')=? AND
       (kind='run.cancelled' AND json_extract(data,'$.unsent')=1 OR

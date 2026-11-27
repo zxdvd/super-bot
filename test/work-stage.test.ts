@@ -11,6 +11,7 @@ import { stageText } from '../src/ui/work/format.ts';
 import {
   gitLabObservationOrigin,
   readStageCondition,
+  STAGE_OVERDUE_OBSERVE_MS,
   STAGE_WAIT_MS,
   type StageCondition,
 } from '../src/work-stage.ts';
@@ -262,10 +263,6 @@ test('a GitLab wait frees the slot and survives restart, pause, old observations
       store.getTask(task.id).rowVersion,
       appendix,
       'read-only',
-      false,
-      false,
-      undefined,
-      { stageFollowUp: 'append' },
     );
   assert.equal(add().instruction.stageRunId, run.id);
   assert.equal(add().instruction.directions?.length, 1);
@@ -382,9 +379,14 @@ test('an unavailable observer can recover the original plan; terminal failed che
   );
 });
 
-test('transient reads back off and wait only until the original deadline', (t) => {
-  const store = new Store(':memory:');
-  t.after(() => store.close());
+test('overdue reads back off and resume the saved plan after restart and an explicit pause', (t) => {
+  const directory = mkdtempSync(join(tmpdir(), 'super-bot-stage-overdue-'));
+  const path = join(directory, 'ledger.sqlite');
+  let store = new Store(path);
+  t.after(() => {
+    store.close();
+    rmSync(directory, { recursive: true, force: true });
+  });
   const { bot, task } = createBound(store, 'retry');
   const run = enter(store, task.id, 'prepare');
   checkpoint(store, run, 'fixture');
@@ -421,20 +423,51 @@ test('transient reads back off and wait only until the original deadline', (t) =
   store.superviseStages(plan.deadlineAt! + 1);
   store.recordStageObservation(
     last,
-    { state: 'satisfied', detail: 'late success' },
+    { state: 'unavailable', detail: 'HTTP 503' },
     plan.deadlineAt! + 2,
   );
-  assert.equal(store.dueStages(1, plan.deadlineAt! + STAGE_WAIT_MS).length, 0);
   const stage = store.taskDetail(task.id).stage;
-  assert.equal(stage?.state, 'blocked');
+  assert.equal(stage?.state, 'waiting');
   assert.equal(stage?.expired, true);
-  assert.match(stage!.reason!, /HTTP 503/);
+  assert.match(stage!.reason!, /尚未确认.*流水线 #42/);
+  assert.match(stage!.observation!.detail, /HTTP 503/);
+  assert.equal(
+    store.taskDetail(task.id).events.filter((event) => event.kind === 'stage.overdue').length,
+    1,
+  );
+  assert.equal(
+    store.taskInbox(bot.id).items.find((item) => item.id === task.id)?.activity,
+    'working',
+  );
+  const nextCheck = plan.deadlineAt! + 2 + STAGE_OVERDUE_OBSERVE_MS;
+  assert.equal(store.dueStages(1, nextCheck - 1).length, 0);
   assert.equal(
     store
       .managerNotifications(bot.id)
       .filter((event) => event.id.startsWith('manager-event:stage-blocked:')).length,
-    1,
+    0,
   );
+
+  store.close();
+  store = new Store(path);
+  const due = store.dueStages(1, nextCheck)[0]!;
+  assert.deepEqual(due.condition, pipeline);
+  const paused = store.controlTask('pause-overdue', task.id, due.rowVersion, 'paused');
+  store.recordStageObservation(due, { state: 'satisfied', detail: 'late while paused' }, nextCheck);
+  assert.equal(store.dueStages(1, nextCheck).length, 0);
+  assert.equal(store.taskDetail(task.id).stage?.state, 'waiting');
+  store.controlTask('resume-overdue', task.id, paused.rowVersion, 'auto');
+  const resumed = store.dueStages(1, nextCheck)[0]!;
+  store.recordStageObservation(
+    resumed,
+    { state: 'satisfied', detail: 'pipeline succeeded' },
+    nextCheck,
+  );
+  assert.equal(store.taskDetail(task.id).stage?.state, 'ready');
+  assert.equal(store.taskDetail(task.id).stage?.expired, undefined);
+  const next = enter(store, task.id, 'after-overdue');
+  assert.match(store.getRunInput(next.id).content, /pipeline succeeded/);
+  assert.equal(store.dueStages(1, nextCheck + STAGE_WAIT_MS).length, 0);
 });
 
 test('a newer pending owner instruction takes priority over a ready stage', (t) => {
@@ -465,6 +498,10 @@ test('a newer pending owner instruction takes priority over a ready stage', (t) 
       text: 'Pause the automatic next step and only read the test logs',
     },
     'read-only',
+    false,
+    false,
+    undefined,
+    { stageFollowUp: 'replace' },
   );
   assert.equal(store.taskDetail(task.id).task.status, 'blocked');
   assert.equal(store.taskDetail(task.id).stage?.state, 'superseded');
@@ -557,7 +594,7 @@ test('an exact replacement invalidates the old observation and owner revocation 
   });
 });
 
-test('a capacity wait expires once across restart and frees its FIFO place', (t) => {
+test('a ready stage keeps its FIFO place across restart, even with a legacy deadline', (t) => {
   const directory = mkdtempSync(join(tmpdir(), 'super-bot-stage-capacity-'));
   const path = join(directory, 'ledger.sqlite');
   let store = new Store(path);
@@ -566,6 +603,8 @@ test('a capacity wait expires once across restart and frees its FIFO place', (t)
     rmSync(directory, { recursive: true, force: true });
   });
   const { bot, task } = createBound(store, 'capacity-stage');
+  const manager = store.beginManager('capacity-manager', bot.id, '/tmp/manager-fixture');
+  store.confirmManager(manager.id, manager.requestedSessionId);
   store.setBotCapacity('stage-capacity', bot.id, null, 1);
   const run = enter(store, task.id, 'capacity-stage-start');
   checkpoint(store, run, 'capacity-evidence');
@@ -581,29 +620,100 @@ test('a capacity wait expires once across restart and frees its FIFO place', (t)
     undefined,
     origin,
   );
+  assert.equal(stage.deadlineAt, undefined);
+  const later = createBound(store, 'later-waiter', bot.id);
+  store.recordCapacityWait('later-wait', later.task.id, later.task.rowVersion);
   assert.equal(store.taskDetail(task.id).wait?.code, 'capacity');
   assert.equal(store.botCapacity(bot.id).botHeld, 1);
+  const oldDeadline = Date.now() - 1;
+  store.db
+    .prepare("UPDATE work_stages SET details=json_set(details,'$.deadlineAt',?) WHERE runId=?")
+    .run(oldDeadline, run.id);
   store.close();
   store = new Store(path);
-  store.superviseStages(stage.deadlineAt! - 1);
-  assert.equal(store.taskDetail(task.id).stage?.state, 'ready');
-  store.superviseStages(stage.deadlineAt!);
-  store.superviseStages(stage.deadlineAt! + 1);
+  store.superviseStages(oldDeadline + STAGE_WAIT_MS);
   const detail = store.taskDetail(task.id);
-  assert.equal(detail.stage?.expired, true);
-  assert.match(detail.stage!.reason!, /执行名额等待期限/);
-  assert.equal(detail.wait, null);
+  assert.equal(detail.stage?.state, 'ready');
+  assert.equal(detail.wait?.code, 'capacity');
+  const appendix = 'Add the elapsed time to the final report.';
+  const saved = store.saveRecoveryInstruction(
+    task.id,
+    detail.task.rowVersion,
+    { sessionId: manager.requestedSessionId, messageId: 'capacity-note', seq: 1, text: appendix },
+    'authorized-work',
+  );
+  assert.equal(saved.instruction.stageRunId, run.id);
   assert.equal(
-    store
-      .managerNotifications(bot.id)
-      .filter((event) => event.id.startsWith('manager-event:stage-blocked:')).length,
-    1,
+    store.taskInbox(bot.id).items.find((item) => item.id === task.id)?.activity,
+    'working',
   );
   store.workerReport(otherRun.id, 'capacity-finish', finalReport);
   store.settleRun(otherRun.id);
-  const later = createBound(store, 'waiter-after-expiry', bot.id);
-  assert.equal(enter(store, later.task.id, 'later-dispatch').state, 'queued');
-  assert.equal(store.latestRun(task.id)?.id, run.id);
+  assert.equal(store.taskDetail(later.task.id).wait?.holderTaskId, task.id);
+  assert.equal(store.nextManagerEvent(bot.id)?.id, `manager-event:stage-ready:${run.id}`);
+  const next = enter(store, task.id, 'dispatch-after-capacity');
+  assert.match(store.getRunInput(next.id).content, /Complete the release/);
+  assert.equal(store.getRunInput(next.id).content.split(appendix).length - 1, 1);
+  assert.equal(store.botCapacity(bot.id).botHeld, 1);
+  assert.equal(store.taskDetail(task.id).stages[0]?.dispatchedRunId, next.id);
+});
+
+test('legacy expired stages recover only the still-authorized plan', (t) => {
+  const store = new Store(':memory:');
+  t.after(() => store.close());
+  const { bot, task } = createBound(store, 'legacy-ready');
+  const nextTask = createBound(store, 'legacy-wait', bot.id).task;
+  const readyRun = enter(store, task.id, 'legacy-ready-start');
+  const waitingRun = enter(store, nextTask.id, 'legacy-wait-start');
+  checkpoint(store, readyRun, 'legacy-ready-evidence');
+  checkpoint(store, waitingRun, 'legacy-wait-evidence');
+  const advance = (run: Run, condition?: StageCondition) =>
+    store.advanceStage(
+      `legacy-advance-${run.id}`,
+      bot.id,
+      run.taskId,
+      store.getTask(run.taskId).rowVersion,
+      run.id,
+      'Finish the delegated verification',
+      condition,
+      origin,
+    );
+  advance(readyRun);
+  advance(waitingRun, pipeline);
+  const deadlineAt = Date.now() - 1;
+  for (const run of [readyRun, waitingRun]) {
+    store.settleManagerEvent(`manager-event:stage-ready:${run.id}`);
+    store.db.prepare('DELETE FROM waits WHERE taskId=?').run(run.taskId);
+    store.db
+      .prepare(`UPDATE work_stages SET state='blocked',nextCheckAt=NULL,
+        details=json_set(details,'$.expired',json('true'),'$.deadlineAt',?) WHERE runId=?`)
+      .run(deadlineAt, run.id);
+  }
+  const paused = store.controlTask(
+    'legacy-pause',
+    task.id,
+    store.getTask(task.id).rowVersion,
+    'paused',
+  );
+  store.superviseStages();
+  assert.equal(store.taskDetail(task.id).stage?.state, 'blocked');
+  assert.equal(store.taskDetail(nextTask.id).stage?.state, 'waiting');
+  const due = store.dueStages(1)[0]!;
+  assert.deepEqual(due.condition, pipeline);
+  store.recordStageObservation(due, { state: 'satisfied', detail: 'same pipeline succeeded' });
+  assert.equal(store.taskDetail(nextTask.id).stage?.state, 'ready');
+
+  store.controlTask('legacy-resume', task.id, paused.rowVersion, 'auto');
+  store.superviseStages();
+  const stage = store.taskDetail(task.id).stage;
+  assert.equal(stage?.state, 'ready');
+  assert.notEqual(stage?.planVersion, undefined);
+  assert.equal(
+    store.managerEvent(`manager-event:stage-ready:${readyRun.id}:${stage?.planVersion}`)?.state,
+    'pending',
+  );
+  const next = enter(store, task.id, 'legacy-ready-resumed');
+  assert.match(store.getRunInput(next.id).content, /Finish the delegated verification/);
 });
 
 test('the reader uses exact GitLab IDs with a fixed HTTPS origin and fails closed on unknown states', async () => {

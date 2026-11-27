@@ -32,6 +32,7 @@ import {
 import type { BotDeletionReceipt, Store } from './store.ts';
 import {
   gitLabObservationOrigin,
+  stageFollowUpForDirection,
   stageReadyKey,
   STAGE_GUIDANCE,
   type WorkStage,
@@ -47,7 +48,13 @@ import {
 import { gitLabReader } from './gitlab-client.ts';
 import { selectedModel, modelFailureNote, type DshExecution } from './dsh.ts';
 import { previewEvidence, verifyEvidence } from './evidence.ts';
-import { configureRole, fullAccessEnabled, runtimeLimits, type RuntimeOptions } from './runtime.ts';
+import {
+  configureRole,
+  fullAccessEnabled,
+  runtimeLimits,
+  WORKER_SESSION_RETRY_MS,
+  type RuntimeOptions,
+} from './runtime.ts';
 import { readMaterials } from './materials.ts';
 import { CONVENTION_FILE, CONVENTION_LIMIT } from './bot-memory.ts';
 import { nameAutomaticSession } from './sidebar.ts';
@@ -205,13 +212,6 @@ function selectedOption<T>(options: readonly T[], choice: unknown): T | undefine
     : undefined;
 }
 
-function matchesContinuationNotice(eventId: string, instructionId: string): boolean {
-  const original = `manager-event:continuation:${instructionId}`;
-  return (
-    eventId === original || eventId === `${original}:restart` || eventId === `${original}:settled`
-  );
-}
-
 function conventionExcerpt(value: unknown, source: Pick<ChatSource, 'text'>): string {
   const text = requiredText(value, '工作约定', CONVENTION_LIMIT);
   if (
@@ -299,7 +299,9 @@ export class Managers {
     return manager;
   }
   registerFeishuBindingCheck(check: (botId: string, bindingId: string) => boolean): () => void {
-    return this.feishuInputs.registerBindingCheck(check);
+    const dispose = this.feishuInputs.registerBindingCheck(check);
+    this.execution.resumeUnsentDispatches?.();
+    return dispose;
   }
   checkStageSources(taskId: string): void {
     const task = this.store.getTask(taskId);
@@ -337,7 +339,7 @@ export class Managers {
       await untilFeishuAbort(this.finishing.get(agent.id) ?? Promise.resolve(), input.signal);
       if (this.closed || input.signal.aborted || !input.isCurrent()) return false;
       this.authority(agent.id, manager.id);
-      if (!selectedModel(this.ctx, agent))
+      if (!(selectedModel(this.ctx, agent) ?? agent.model?.current?.()))
         throw new AppError('feishu-model-required', '请先在 Bot 管理对话中选择并配置模型。');
       if (agent.status !== 'idle' || agent.inbox.nextTurn.length || agent.inbox.nextStep.length) {
         throw new AppError('feishu-manager-busy', '管理会话仍有排队输入，请在原生对话中核对。');
@@ -1085,10 +1087,11 @@ export class Managers {
       const stageNotice = notice && this.store.managerEvent(notice.eventId);
       if (
         stageNotice?.taskId &&
-        this.lateJobNotice(stageNotice) &&
+        (this.lateJobNotice(stageNotice) ||
+          stageNotice.id.startsWith('manager-event:continuation-blocked:')) &&
         (data.taskId !== stageNotice.taskId || data.action !== 'detail')
       ) {
-        throw new AppError('recovery-only', '此通知只读取原任务的后台核对和续轮状态。');
+        throw new AppError('recovery-only', '此通知只读取原任务的续轮状态。');
       }
       if (
         stageNotice?.taskId &&
@@ -1482,57 +1485,12 @@ export class Managers {
     if (data.action === 'continue') {
       if (notice) {
         checkRecoveryNotice();
-        if (
-          data.userInstruction !== undefined ||
-          data.continuationMode !== undefined ||
-          data.directionChange !== undefined ||
-          data.stageFollowUp !== undefined ||
-          data.lateJobFollowUp !== undefined ||
-          data.directionIds !== undefined ||
-          data.earlierDirections !== undefined ||
-          data.useEarlierDirection !== undefined ||
-          data.choice !== undefined ||
-          data.ownerFact !== undefined ||
-          data.useLatestDirection ||
-          data.resumeManagement
-        ) {
-          throw new AppError('recovery-scope', '自动通知不能补充用户指令。');
-        }
-        const instruction = this.pendingRecoveryInstruction(task.id);
-        if (
-          !instruction ||
-          (event!.id.startsWith('manager-event:continuation:') &&
-            !matchesContinuationNotice(event!.id, instruction.id))
-        ) {
-          return {
-            status: 'already-handled',
-            message: '此通知没有待处理的用户补充，无需再次执行或追问。',
-          };
-        }
-        const check = () => {
-          checkRecoveryNotice();
-          if (
-            this.store.recoveryInstruction(task.id)?.id !== instruction.id ||
-            !this.currentInstructionSources(instruction, bot.id)
-          ) {
-            throw new AppError('recovery-scope', '原后续指示、飞书绑定或当前用户已改变。');
-          }
-        };
-        check();
-        const outcome = await this.execution.continueRecovery(
-          task.id,
-          data.expectedRowVersion as number,
-          manager.id,
-          check,
-          agent,
-        );
-        const current = this.store.recoveryInstruction(task.id);
+        const pending = this.pendingRecoveryInstruction(task.id);
         return {
-          ...outcome,
-          directionStatus:
-            current?.id === instruction.id
-              ? this.store.recoveryDirectionStatus(current)
-              : 'archived',
+          status: pending ? 'waiting' : 'already-handled',
+          message: pending
+            ? '宿主会按已保存的用户指示安排接续。请读取该任务的当前状态。'
+            : '此通知没有待派发的用户补充。',
         };
       }
       const { owner, check } = this.ownerTurn(agent, authorize);
@@ -1623,10 +1581,12 @@ export class Managers {
         };
       }
       const pending = this.pendingRecoveryInstruction(task.id);
-      const stageSupplement = stageFollowUp === 'append' && this.store.latestRun(task.id);
-      const earlierInstruction = stageSupplement
-        ? this.store.stageSupplement(task.id, stageSupplement.id)
-        : pending;
+      const stage = this.store.taskStage(task);
+      const appendingToStage = stageFollowUpForDirection(stage, stageFollowUp, !!(mode || change));
+      const earlierInstruction =
+        stage && appendingToStage === 'append'
+          ? this.store.stageSupplement(task.id, stage.runId)
+          : pending;
       const retained =
         earlierInstruction?.directions?.filter(
           (direction) => !change || change.ids?.includes(direction.id) === false,
@@ -1714,8 +1674,20 @@ export class Managers {
         },
         agent,
       );
-      if (outcome.status === 'blocked')
-        this.store.settleManagerEvent(`manager-event:continuation:${saved.instruction.id}`);
+      if (
+        outcome.status === 'blocked' ||
+        outcome.code === 'capacity' ||
+        outcome.code === 'session-unavailable'
+      )
+        this.continuationAttempts.set(task.id, {
+          rowVersion: saved.task.rowVersion,
+          managerSessionId: agent.id,
+          waitingForCapacity: outcome.code === 'capacity',
+          retryAt:
+            outcome.code === 'session-unavailable'
+              ? Date.now() + WORKER_SESSION_RETRY_MS
+              : undefined,
+        });
       return { ...outcome, directionStatus: receipt() };
     }
     if (
@@ -1752,23 +1724,15 @@ export class Managers {
         );
         return { task: this.store.getTask(task.id), run: this.store.getRun(stop.runId), stop };
       }
-      if (data.action === 'close')
+      if (data.action === 'close' || data.action === 'cancel')
         return this.execution.closeTask(requestId, task.id, rowVersion, authorizeControl);
-      if (data.action === 'cancel')
-        await this.execution.endTaskLink(
-          'task.cancel',
-          requestId,
-          task.id,
-          rowVersion,
-          authorizeControl,
-        );
-      else
-        this.store.controlTask(
-          requestId,
-          task.id,
-          rowVersion,
-          data.action === 'pause' ? 'paused' : 'auto',
-        );
+      this.store.controlTask(
+        requestId,
+        task.id,
+        rowVersion,
+        data.action === 'pause' ? 'paused' : 'auto',
+      );
+      if (data.action === 'resume') this.execution.resumeUnsentTask?.(task.id);
       return { task: this.store.getTask(task.id), run: this.store.latestRun(task.id) };
     }
     if (data.action === 'respond' || data.action === 'rework') {
@@ -1967,29 +1931,40 @@ export class Managers {
         return this.preparedDispatch(receipt.prepared, true);
       }
       current();
-      if (task.status === 'recovery')
-        throw new AppError(
-          'recovery-required',
-          '请按当前账本在原任务中核对上次执行和最新用户指示。',
-        );
-      const detail = this.store.taskDetail(task.id),
-        instruction = this.store.recoveryInstruction(task.id);
+      const detail = this.store.taskDetail(task.id);
       if (
-        (instruction?.mode && !instruction.runId && !instruction.stageRunId) ||
+        detail.recoveryInstruction?.mode &&
+        !detail.recoveryInstruction.runId &&
+        !detail.recoveryInstruction.stageRunId
+      ) {
+        return {
+          status: 'waiting',
+          task: detail.task,
+          directionStatus: detail.directionStatus,
+          message: '后续指示已记录，Bot 正在原任务中安排执行。',
+        };
+      }
+      if (
+        task.status === 'recovery' ||
         (!detail.stage && detail.recoveryCheck) ||
         task.status === 'blocked'
       ) {
         throw new AppError(
-          'recovery-scope',
-          '请在原任务中继续当前已授权的下一步，避免重做原始任务。',
+          task.status === 'recovery' ? 'recovery-required' : 'recovery-scope',
+          '沿用原任务的已授权指示；缺少下一步时，请先结合原聊天和任务现状确定要做的事。',
         );
       }
       const binding = this.store.activeBinding(task.id),
         workdir = parseWorkdirRequest(data.workdir);
-      if (binding && workdir)
+      if (
+        binding &&
+        workdir &&
+        !(workdir.mode === 'existing' && workdir.path === binding.cwd) &&
+        JSON.stringify(workdir) !== JSON.stringify(task.workdirRequest)
+      )
         throw new AppError(
           'workdir-locked',
-          `任务已在 ${binding.cwd} 工作；如需换目录，请先让用户解除会话关联。`,
+          `任务已在 ${binding.cwd} 工作；若用户要求迁移，请用会话管理工具在原任务内处理。`,
         );
       if (!binding) {
         const prepared = await this.execution.prepareSession(
@@ -2146,15 +2121,28 @@ export class Managers {
 
   install(): void {
     this.store.resetUnconfirmedManagerEvents();
+    this.execution.registerUnsentDispatchSourceCheck?.(
+      (source, botId) => !this.closed && this.feishuInputs.hasCurrentSource(source, botId),
+    );
     this.ctx.effect(() =>
       this.ctx.tools.register(
         { ...MANAGER_TOOL, execute: (args, exec) => this.manage(args, exec) },
         { when: ({ agent }) => this.store.managerForSession(agent.id)?.state === 'ready' },
       ),
     );
+    const retryContinuationsFor = (sessionId: string) => {
+      const workerTaskId =
+        this.store.workerTaskForSession(sessionId) ??
+        this.store.pendingWorkerTaskForSession(sessionId);
+      if (workerTaskId) this.continuationAttempts.delete(workerTaskId);
+      for (const [taskId, attempt] of this.continuationAttempts)
+        if (attempt.managerSessionId === sessionId) this.continuationAttempts.delete(taskId);
+    };
     this.ctx.on('agent/created', ({ agent }) => {
+      retryContinuationsFor(agent.id);
       this.attachScope(agent);
     });
+    this.ctx.on('session/created', (session) => retryContinuationsFor(session.id));
     this.ctx.on('agent/disposed', ({ agent }) => {
       const scope = this.scopes.get(agent.id);
       if (scope && scope.agent !== agent) return;
@@ -2172,6 +2160,8 @@ export class Managers {
       if (this.closed) return;
       const scope = this.scopes.get(_session.id);
       if (scope && scope.agent.session !== _session) return;
+      if (event.type === 'model/selection' || event.type === 'working-directory/change')
+        retryContinuationsFor(_session.id);
       const nativeTurn = scope?.nativeTurn;
       const liveTurn = this.nativeTurns.get(_session.id);
       if (event.type === 'turn/end' && liveTurn !== undefined && event.data.turn !== liveTurn)
@@ -2293,7 +2283,12 @@ export class Managers {
           this.restoreDeliveryScope(_session.id, source.eventId, event.data.id);
           this.store.managerEventEntered(source.eventId, event.data.id);
           const eventRecord = this.store.managerEvent(source.eventId);
-          if (eventRecord && this.lateJobNotice(eventRecord)) nativeTurn?.restrict();
+          if (
+            eventRecord &&
+            (this.lateJobNotice(eventRecord) ||
+              eventRecord.id.startsWith('manager-event:continuation-blocked:'))
+          )
+            nativeTurn?.restrict();
           if (
             eventRecord?.taskId &&
             this.isRecoveryNotice(eventRecord) &&
@@ -3191,6 +3186,10 @@ export class Managers {
   }
   private pumping = false;
   private retryAfter = new Map<string, number>();
+  private continuationAttempts = new Map<
+    string,
+    { rowVersion: number; managerSessionId: string; waitingForCapacity: boolean; retryAt?: number }
+  >();
   private nativeTurns = new Map<string, number>();
   private notificationTurns = new Map<
     string,
@@ -3242,17 +3241,92 @@ export class Managers {
       )
     );
   }
+  private async dispatchSavedContinuation(
+    botId: string,
+    manager: ManagerBinding,
+  ): Promise<boolean> {
+    const sessionId = manager.sessionId;
+    if (!sessionId) return false;
+    for (const { id, rowVersion } of this.store.pendingWorkerContinuations(botId, sessionId)) {
+      if (!this.execution.canWakeRecoveryContinuation(id)) {
+        this.continuationAttempts.delete(id);
+        continue;
+      }
+      const attempt = this.continuationAttempts.get(id);
+      if (
+        attempt?.rowVersion === rowVersion &&
+        attempt.managerSessionId === sessionId &&
+        (!attempt.waitingForCapacity || this.store.dispatchBlocker(id)) &&
+        (attempt.retryAt === undefined || attempt.retryAt > Date.now())
+      )
+        continue;
+      const instruction = this.store.recoveryInstruction(id);
+      if (!instruction || !this.currentInstructionSources(instruction, botId)) continue;
+      const resolved = await this.ctx.sessionController.resolveAgent(SessionId(sessionId));
+      if ('error' in resolved)
+        throw new AppError('manager-unavailable', '管理会话暂不可用，已保存的指示仍待执行。');
+      const agent = resolved.agent;
+      const idle = () =>
+        agent.status === 'idle' && !agent.inbox.nextTurn.length && !agent.inbox.nextStep.length;
+      if (this.closed || !idle()) return false;
+      const check = () => {
+        this.authority(agent.id, manager.id);
+        if (this.closed || !idle())
+          throw new AppError('manager-busy', 'Bot 正在处理更新的消息，已保存指示等待接续。');
+        const task = this.store.getTask(id);
+        if (
+          task.controlMode !== 'auto' ||
+          task.lifecycle !== 'open' ||
+          this.pendingRecoveryInstruction(id)?.id !== instruction.id ||
+          !this.currentInstructionSources(instruction, botId)
+        )
+          throw new AppError('recovery-scope', '原后续指示或授权已经改变。');
+      };
+      const outcome = await this.execution.continueRecovery(
+        id,
+        rowVersion,
+        manager.id,
+        check,
+        agent,
+      );
+      if (outcome.status === 'started' || outcome.status === 'already-started') {
+        this.continuationAttempts.delete(id);
+        for (const suffix of ['', ':settled', ':restart'])
+          this.store.settleManagerEvent(`manager-event:continuation:${instruction.id}${suffix}`);
+        return true;
+      }
+      this.continuationAttempts.set(id, {
+        rowVersion,
+        managerSessionId: sessionId,
+        waitingForCapacity: outcome.code === 'capacity',
+        retryAt:
+          outcome.code === 'session-unavailable' ? Date.now() + WORKER_SESSION_RETRY_MS : undefined,
+      });
+      if (
+        outcome.status === 'blocked' &&
+        outcome.code !== 'session-unavailable' &&
+        this.store.getTask(id).rowVersion === rowVersion
+      )
+        this.store.enqueueManager(
+          botId,
+          `continuation-blocked:${instruction.id}`,
+          outcome.message,
+          id,
+        );
+      return false;
+    }
+    return false;
+  }
   private nextManagerEvent(botId: string): ManagerEvent | undefined {
     return this.store.nextManagerEvent(botId, (event) => {
       const late = this.lateJobNotice(event);
       if (late?.state === 'ready' && this.store.lateJobTarget(late.runId))
         return this.store.lateJobCanDispatch(late.runId);
-      if (!event.taskId || !event.id.startsWith('manager-event:continuation:')) return true;
-      const instruction = this.pendingRecoveryInstruction(event.taskId);
-      return (
-        !instruction ||
-        (this.currentInstructionSources(instruction, botId) &&
-          this.execution.canWakeRecoveryContinuation(event.taskId))
+      if (event.id.startsWith('manager-event:continuation:')) return false;
+      return !(
+        event.taskId &&
+        event.id.startsWith('manager-event:capacity:') &&
+        this.pendingRecoveryInstruction(event.taskId)
       );
     });
   }
@@ -3274,9 +3348,13 @@ export class Managers {
     }
     const runId = this.recoveryNoticeRun(event);
     if (runId) return this.store.latestRun(event.taskId)?.id !== runId;
-    if (event.id.startsWith('manager-event:continuation:')) {
+    if (event.id.startsWith('manager-event:continuation-blocked:')) {
       const instruction = this.pendingRecoveryInstruction(event.taskId);
-      return !instruction || !matchesContinuationNotice(event.id, instruction.id);
+      return (
+        !instruction ||
+        event.id !== `manager-event:continuation-blocked:${instruction.id}` ||
+        !this.currentInstructionSources(instruction, this.store.getTask(event.taskId).botId)
+      );
     }
     return false;
   }
@@ -3285,10 +3363,8 @@ export class Managers {
     if (instruction) {
       return [
         `This task already has a saved owner follow-up.`,
-        `Read detail for its current rowVersion, then call continue for this exact task without userInstruction.`,
-        `It may resume the saved next step when the previous execution is reconciled.`,
-        `If it reports blocked, use inspect-recovery and recover-preflight for an eligible, previously authorized read-only check.`,
-        `Report the actual outcome here.`,
+        `The host schedules it directly from the ledger as soon as the work can proceed.`,
+        `Read detail and report its actual state without retrying or dispatching it from this notice.`,
         `Do not ask the user to repeat their instruction or authorize the task again.`,
         `Finish without any action if this notice was already handled.`,
       ].join(' ');
@@ -3405,6 +3481,7 @@ export class Managers {
             this.waking.has(bot.id)
           )
             continue;
+          if (await this.dispatchSavedContinuation(bot.id, manager)) continue;
           const recover = this.store.claimManagerReconciliation(bot.id);
           if (recover.length) {
             problemEventId = recover[0]!.id;
@@ -3547,7 +3624,7 @@ export class Managers {
             );
             continue;
           }
-          if (!selectedModel(this.ctx, agent)) {
+          if (!(selectedModel(this.ctx, agent) ?? agent.model?.current?.())) {
             if (event)
               this.store.deferManagerEvent(
                 event.id,
@@ -3556,7 +3633,7 @@ export class Managers {
               );
             this.store.managerProblem(
               bot.id,
-              '请打开管理对话，明确选择并配置模型；任务通知已保留，尚未自动调用模型。',
+              '当前没有可用的管理模型。任务通知已保留，配置恢复后会继续。',
             );
             continue;
           }
@@ -3566,13 +3643,15 @@ export class Managers {
               ? this.deliveryNotice(event.taskId, payload.resultId, payload.deliveryText)
               : this.lateJobNotice(event)
                 ? 'Read detail for this exact task. Briefly report the newest Job recovery fact and who takes the next step. Clearly distinguish the ended old attempt, a pending or entered Worker continuation, and actual report delivery. The host handles safe continuation. Ask for help only if detail identifies a specific missing fact or permission.'
-                : this.isRecoveryNotice(event)
-                  ? this.recoveryNoticeInstructions(event)
-                  : event.id.startsWith('manager-event:gitlab-release:')
-                    ? 'Read detail for this exact task and report gitLabRelease.detail and its exact job link in your reply. Use current observed status. Do not dispatch, retry or poll this job.'
-                    : /^manager-event:stage-(settled|blocked|unavailable):/.test(event.id)
-                      ? `Read detail for this exact task. Preserve its original owner scope. ${STAGE_GUIDANCE} ${GITLAB_RELEASE_GUIDANCE} Briefly state actual progress and current next action when information changed. Report a blocked condition without attempting to bypass it.`
-                      : `Read current ledger state. Do not assume the event is still current. Do not manufacture new tasks. If a new result is ready, follow the delivery instructions and put its single exact result link in the final reply. For a pending Worker question, follow detail's questionReplyInstruction. Keep pre-creation clarification conversational. Do not repeat stale notices. Finish after useful bounded work; do not poll.${this.questionNotice(bot.id, event)}`;
+                : event.id.startsWith('manager-event:continuation-blocked:')
+                  ? 'Read detail for this exact task. Briefly report the recorded blocker and whether the saved direction is still pending. The host schedules the Worker when conditions change. Ask only for a specific fact, decision, or permission that the host cannot obtain.'
+                  : this.isRecoveryNotice(event)
+                    ? this.recoveryNoticeInstructions(event)
+                    : event.id.startsWith('manager-event:gitlab-release:')
+                      ? 'Read detail for this exact task and report gitLabRelease.detail and its exact job link in your reply. Use current observed status. Do not dispatch, retry or poll this job.'
+                      : /^manager-event:stage-(settled|blocked|unavailable):/.test(event.id)
+                        ? `Read detail for this exact task. Preserve its original owner scope. ${STAGE_GUIDANCE} ${GITLAB_RELEASE_GUIDANCE} Briefly state actual progress and current next action when information changed. Report a blocked condition without attempting to bypass it.`
+                        : `Read current ledger state. Do not assume the event is still current. Do not manufacture new tasks. If a new result is ready, follow the delivery instructions and put its single exact result link in the final reply. For a pending Worker question, follow detail's questionReplyInstruction. Keep pre-creation clarification conversational. Do not repeat stale notices. Finish after useful bounded work; do not poll.${this.questionNotice(bot.id, event)}`;
           const message = createUserMessage({
             source: {
               kind: 'super-bot-manager',
@@ -3601,6 +3680,7 @@ export class Managers {
             this.recoveryScopes.set(agent.id, { taskId: event.taskId, messageId: message.id });
           } else if (
             this.lateJobNotice(event) ||
+            event.id.startsWith('manager-event:continuation-blocked:') ||
             event.id.startsWith('manager-event:gitlab-release:') ||
             /^manager-event:stage-(settled|blocked|unavailable):/.test(event.id)
           ) {

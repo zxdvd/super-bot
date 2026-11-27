@@ -26,9 +26,14 @@ import {
   gitWorkingTreeStatus,
   parseGitStatusQuery,
 } from './git-status-query.ts';
-import { freezeMessage, ToolCallId, type UserMessage } from '@deepseek-ai/dsh-llm';
+import {
+  freezeMessage,
+  ReasoningEffortId,
+  ToolCallId,
+  type UserMessage,
+} from '@deepseek-ai/dsh-llm';
 import type { Session } from '@deepseek-ai/dsh-session';
-import { verifyRunTurn } from './run-proof.ts';
+import { verifyRunBoundary, verifyRunTurn } from './run-proof.ts';
 import { verifyLateJobs, verifyLateJobScope } from './dsh-late-job-proof.ts';
 import { SessionId } from '@deepseek-ai/dsh-session/types';
 import { realpath } from 'node:fs/promises';
@@ -57,6 +62,7 @@ import {
 import type {
   ChildWaitDetail,
   ChildWaitMember,
+  ChatSource,
   RecoveryContinuation,
   RecoveryDetail,
   RecoveryInput,
@@ -83,7 +89,12 @@ import {
   evidencePaths,
   type CapturedEvidence,
 } from './evidence.ts';
-import { configureRole, fullAccessEnabled, type RuntimeOptions } from './runtime.ts';
+import {
+  configureRole,
+  fullAccessEnabled,
+  WORKER_SESSION_RETRY_MS,
+  type RuntimeOptions,
+} from './runtime.ts';
 import {
   createWorkerRunMessage,
   registerWorkerContext,
@@ -216,6 +227,9 @@ export class DshExecution {
   private treeChecks = new Map<string, TreeCheck>();
   private turnStarts = new WeakMap<Session, { turn: number; seq: number }>();
   private finishing = new Map<string, Promise<void>>();
+  private resuming = new Map<string, Promise<void>>();
+  private unsentRetryTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  private unsentSourceCheck?: (source: ChatSource, botId: string) => boolean;
   private lateJobTimers = new Map<string, ReturnType<typeof setTimeout>>();
   private lateJobChecks = new Map<string, Promise<void>>();
   private closing = new Map<string, Promise<void>>();
@@ -777,6 +791,8 @@ export class DshExecution {
       }
       if (event.type === 'job/settled' || event.type === 'turn/end')
         this.scheduleLateJobForSession(session.id);
+      if (event.type === 'job/settled' || event.type === 'model/selection')
+        this.resumeUnsentForSession(session.id);
       // Queue/steer must not look like takeover. Only a human user/message that
       // starts a new turn while no automatic turn is running marks intervention.
       // Do not cancel: that would abort the user's own turn. Release immediately;
@@ -804,14 +820,18 @@ export class DshExecution {
       }
     });
     this.ctx.on('agent/status', ({ agent, status }) => {
-      if (status === 'idle') this.scheduleLateJobForSession(agent.id);
+      if (status === 'idle') {
+        this.scheduleLateJobForSession(agent.id);
+        this.resumeUnsentForSession(agent.id);
+      }
     });
-    // Startup checks durable facts without opening or waking any Agent.
+    // Only a durable, unclaimed input may be delivered at startup.
     for (const run of this.store.heldRuns())
       if (!this.store.isBotDeleted(this.store.getTask(run.taskId).botId)) {
         const proof = this.store.runTurn(run.id);
         if (run.finishedAt === null) {
-          if (!proof?.quiet || proof.endSeq === null)
+          if (this.store.isUnsentDispatch(run)) this.scheduleUnsentDispatch(run);
+          else if (!proof?.quiet || proof.endSeq === null)
             this.store.runRecovery(
               run.id,
               proof
@@ -874,7 +894,140 @@ export class DshExecution {
 
   /** Useful to callers/tests before inspecting startup reconciliation; never executes model work. */
   async whenReconciled(): Promise<void> {
-    await Promise.all([...this.finishing.values(), ...this.closing.values()]);
+    await Promise.all([
+      ...this.finishing.values(),
+      ...this.closing.values(),
+      ...this.resuming.values(),
+    ]);
+  }
+  private resumeUnsentForSession(sessionId: string): void {
+    if (this.disposed) return;
+    const taskId = this.store.workerTaskForSession(sessionId);
+    const run = taskId && this.store.latestRun(taskId);
+    if (run && run.sessionId === sessionId && this.store.isUnsentDispatch(run))
+      this.scheduleUnsentDispatch(run);
+  }
+  registerUnsentDispatchSourceCheck(check: (source: ChatSource, botId: string) => boolean): void {
+    this.unsentSourceCheck = check;
+  }
+  resumeUnsentDispatches(): void {
+    if (this.disposed) return;
+    for (const run of this.store.heldRuns())
+      if (this.store.isUnsentDispatch(run)) this.scheduleUnsentDispatch(run, undefined, true);
+  }
+  resumeUnsentTask(taskId: string): void {
+    if (this.disposed) return;
+    const run = this.store.latestRun(taskId);
+    if (run && this.store.isUnsentDispatch(run)) this.scheduleUnsentDispatch(run, undefined, true);
+  }
+  private async resolveDispatchAgent(sessionId: Agent['id']) {
+    const resolved = await Promise.resolve()
+      .then(() => this.ctx.sessionController.resolveAgent(sessionId))
+      .catch(() => {
+        throw new AppError('session-unavailable', '原生 Worker 暂不可用，已保存指示并等待重试。');
+      });
+    if ('error' in resolved) {
+      if (resolved.error.code === 'session/not-found') return resolved;
+      if (resolved.error.code === 'session/agent-busy')
+        throw new AppError('session-mismatch', '原生会话由其他执行归属管理。');
+      throw new AppError('session-unavailable', '原生 Worker 暂不可用，已保存指示并等待重试。');
+    }
+    if (resolved.agent.id !== sessionId)
+      throw new AppError('session-mismatch', '宿主返回了不同的 Worker 会话。');
+    return resolved;
+  }
+  private scheduleUnsentDispatch(run: Run, authorize = () => {}, rearm = false): Promise<void> {
+    const existing = this.resuming.get(run.id);
+    if (existing)
+      return rearm
+        ? existing.then(() => {
+            if (!this.disposed && this.store.isUnsentDispatch(this.store.getRun(run.id)))
+              return this.scheduleUnsentDispatch(run, authorize);
+          })
+        : existing;
+    clearTimeout(this.unsentRetryTimers.get(run.id));
+    this.unsentRetryTimers.delete(run.id);
+    const resume = Promise.resolve()
+      .then(async () => {
+        const validate = () => {
+          authorize();
+          const current = this.store.getRun(run.id);
+          if (this.disposed || !this.store.isUnsentDispatch(current))
+            throw new AppError('dispatch-stale', '输入已经发送或任务授权已变更。');
+          const binding = this.store.dispatchBinding(current);
+          const botId = this.store.getTask(current.taskId).botId;
+          if (
+            this.store
+              .unsentDispatchFeishuSources(current)
+              .some(
+                (source) =>
+                  this.store.botForSession(source.sessionId)?.id !== botId ||
+                  !this.unsentSourceCheck?.(source, botId),
+              )
+          )
+            throw new AppError('dispatch-stale', '飞书来源的原授权不再有效，输入仍未发送。');
+          return binding;
+        };
+        const binding = validate();
+        const leave = this.reloadAdmission.tryEnter(`Worker task ${run.taskId} unsent input`);
+        if (!leave) return;
+        try {
+          const resolved = await this.resolveDispatchAgent(SessionId(binding.sessionId));
+          validate();
+          if ('error' in resolved)
+            throw new AppError('session-not-found', '原生 Worker 不存在，已保留未发送的输入。');
+          const agent = resolved.agent;
+          this.assertQuiet(agent);
+          this.assertDirectory(agent, binding.cwd);
+          configureRole(
+            this.ctx,
+            agent,
+            'worker',
+            this.options,
+            !!this.store.gitLabReleaseForRun(run),
+          );
+          const model = this.store.runModelPlan(run.id);
+          if (!this.options.workerModel && model?.source === 'manager-inheritance')
+            agent.model.select({
+              provider: model.provider,
+              model: model.model,
+              reasoningEffort: model.reasoningEffort
+                ? ReasoningEffortId(model.reasoningEffort)
+                : undefined,
+            });
+          validate();
+          this.deliverRun(run, agent, binding, this.store.ownerRecoveryForRun(run.id));
+        } finally {
+          leave();
+        }
+      })
+      .catch((error) => {
+        if (
+          !this.disposed &&
+          error instanceof AppError &&
+          error.code === 'session-unavailable' &&
+          this.store.isUnsentDispatch(this.store.getRun(run.id))
+        ) {
+          const timer = setTimeout(() => {
+            this.unsentRetryTimers.delete(run.id);
+            this.scheduleUnsentDispatch(run);
+          }, WORKER_SESSION_RETRY_MS);
+          timer.unref();
+          this.unsentRetryTimers.set(run.id, timer);
+          return;
+        }
+        if (
+          !this.disposed &&
+          !(error instanceof AppError && ['dispatch-stale', 'task-closing'].includes(error.code))
+        )
+          this.store.note('run.unsent-deferred', run.taskId, {
+            runId: run.id,
+            code: error instanceof AppError ? error.code : 'unavailable',
+          });
+      })
+      .finally(() => this.resuming.delete(run.id));
+    this.resuming.set(run.id, resume);
+    return resume;
   }
   private scheduleReconciliation(runId: string, session?: Session): void {
     const done = Promise.resolve()
@@ -1047,15 +1200,7 @@ export class DshExecution {
         if (JSON.stringify(fresh) !== JSON.stringify(pending.proof))
           throw new AppError('late-job-unproven', '签收 Job 结果后出现了新的会话活动。');
         verifyLateJobScope(events, proof);
-        const model = selectedModel(this.ctx, agent);
-        const inherited =
-          !this.options.workerModel && !model ? selectedModel(this.ctx, manager) : undefined;
-        const plan = workerModelPlan(
-          model ? modelRoute(model) : null,
-          this.options.workerModel,
-          inherited ? { sessionId: manager.id, model: modelRoute(inherited) } : undefined,
-        );
-        if (!plan) throw new AppError('model-required', '原 Worker 缺少可核实的模型。');
+        const { plan, inherited } = this.dispatchModel(agent, manager);
         const next = this.store.reserveLateJobContinuation(runId, pending.proof, plan);
         try {
           configureRole(this.ctx, agent, 'worker', this.options);
@@ -1428,7 +1573,12 @@ export class DshExecution {
       taskId,
       expectedRowVersion: rowVersion,
     });
-    if (receipt) return this.store.getRun(receipt.id);
+    if (receipt) {
+      const existing = this.store.getRun(receipt.id);
+      if (this.store.isUnsentDispatch(existing))
+        await this.scheduleUnsentDispatch(existing, authorize);
+      return this.store.getRun(receipt.id);
+    }
     return this.reloadAdmission.run(`Worker task ${taskId} dispatch preflight`, () =>
       this.dispatchRun(requestId, taskId, rowVersion, authorize, manager),
     );
@@ -1466,24 +1616,10 @@ export class DshExecution {
     const agent = resolved.agent;
     this.assertQuiet(agent);
     this.assertDirectory(agent, b.cwd);
-    const current = selectedModel(this.ctx, agent);
-    const inherited =
-      !this.options.workerModel &&
-      !current &&
-      manager &&
-      this.store.botForSession(manager.id)?.id === task.botId
-        ? selectedModel(this.ctx, manager)
-        : undefined;
-    const plan = workerModelPlan(
-      current ? modelRoute(current) : null,
-      this.options.workerModel,
-      inherited && manager ? { sessionId: manager.id, model: modelRoute(inherited) } : undefined,
+    const { plan, inherited } = this.dispatchModel(
+      agent,
+      manager && this.store.botForSession(manager.id)?.id === task.botId ? manager : undefined,
     );
-    if (!plan)
-      throw new AppError(
-        'model-required',
-        '请先打开任务会话，明确选择并配置模型，再回来开始执行。宿主默认路由不算已选择。',
-      );
     const run = this.store.reserveRun(requestId, taskId, rowVersion, plan);
     try {
       configureRole(this.ctx, agent, 'worker', this.options, !!this.store.gitLabReleaseForRun(run));
@@ -2176,6 +2312,22 @@ export class DshExecution {
         : '强制删除已撤销执行授权并释放调度名额；历史执行或外部效果仍未核对。',
     );
   }
+  private dispatchModel(agent: Agent, manager?: Agent) {
+    const current = selectedModel(this.ctx, agent);
+    const inherited =
+      !this.options.workerModel && !current && manager
+        ? selectedModel(this.ctx, manager)
+        : undefined;
+    const plan = workerModelPlan(
+      current ? modelRoute(current) : null,
+      this.options.workerModel,
+      inherited && manager ? { sessionId: manager.id, model: modelRoute(inherited) } : undefined,
+      agent.model?.current?.(),
+    );
+    if (!plan) throw new AppError('model-required', '此 Worker 和宿主都没有可用的模型配置。');
+    return { plan, inherited };
+  }
+
   async modelPreview(
     botId: string,
     taskId?: string,
@@ -2200,7 +2352,16 @@ export class DshExecution {
       managerId && !current && !this.options.workerModel
         ? { sessionId: managerId, model: await observe(managerId, managerAgent) }
         : undefined;
-    return { current, expected: workerModelPlan(current, this.options.workerModel, inherited) };
+    const liveWorker = workerId ? this.ctx.agents.get?.(SessionId(workerId)) : undefined;
+    return {
+      current,
+      expected: workerModelPlan(
+        current,
+        this.options.workerModel,
+        inherited,
+        liveWorker?.model?.current?.(),
+      ),
+    };
   }
 
   async modelHistory(taskId: string): Promise<RunModels[]> {
@@ -2696,12 +2857,14 @@ export class DshExecution {
     if (!run || run.finishedAt === null || this.running.has(run.id) || this.finishing.has(run.id))
       return false;
     if (this.store.lateJobTarget(run.id)) return false;
-    if (this.store.verifiedBlocker(run) && this.store.dispatchBlocker(taskId)) return false;
     if (!binding?.sessionId) return true;
     const agent = this.ctx.agents.get(SessionId(binding.sessionId));
     if (
       agent &&
-      (agent.status !== 'idle' || agent.inbox.nextTurn.length || agent.inbox.nextStep.length)
+      (agent.status !== 'idle' ||
+        agent.inbox.nextTurn.length ||
+        agent.inbox.nextStep.length ||
+        this.recoveryTreeChecks.has(agent))
     )
       return false;
     const activity = this.observeRecoveryActivity(binding.sessionId, agent, run.id);
@@ -2721,6 +2884,7 @@ export class DshExecution {
       status: 'started' | 'already-started' | 'waiting' | 'blocked';
       message: string;
       run?: Run;
+      code?: string;
     };
     return this.reloadAdmission.run(
       `Worker task ${taskId} continuation`,
@@ -2734,67 +2898,114 @@ export class DshExecution {
         const saved = this.store.recoveryInstruction(taskId);
         if (!saved)
           return { status: 'blocked', message: '上一轮状态已记录，当前没有新的已授权后续指示。' };
-        if (saved.runId)
+        if (saved.runId) {
+          const assigned = this.store.getRun(saved.runId);
+          if (this.store.isUnsentDispatch(assigned))
+            await this.scheduleUnsentDispatch(assigned, authorize);
           return {
             status: 'already-started',
             run: this.store.getRun(saved.runId),
             message: '这条用户指示已有执行记录。',
           };
+        }
         if (this.store.lateJobTarget(saved.priorRunId))
           return {
             status: 'waiting',
+            code: 'late-job-pending',
             message: '后台 Job 的原生结果仍在核对或等待接续，Bot 会继续跟进。',
           };
         try {
-          const { task, run, binding, instruction } = validate();
-          const resolved = await this.ctx.sessionController.resolveAgent(
-            SessionId(binding.sessionId),
-          );
+          const { task, run, instruction, binding: currentBinding } = validate();
+          const interrupted = run.state === 'interrupted' && !this.store.verifiedBlocker(run);
+          const waitForCapacity = (): Outcome => {
+            this.store.recordCapacityWait(
+              `continuation:${instruction.id}:${rowVersion}`,
+              taskId,
+              rowVersion,
+            );
+            return {
+              status: 'waiting',
+              code: 'capacity',
+              message: '已保存用户指示，等待此 Bot 的 Worker 执行名额。',
+            };
+          };
+          if (instruction.mode && !interrupted && this.store.dispatchBlocker(taskId))
+            return waitForCapacity();
+          let binding = currentBinding;
+          const prepareReplacement = async () => {
+            binding = await this.completeWorkerBinding(binding, validate, true);
+            rowVersion++;
+            validate();
+          };
+          if (!binding.sessionId && instruction.mode) await prepareReplacement();
+          if (!binding.sessionId)
+            throw new AppError('session-unavailable', '原生 Worker 尚未准备。');
+          let resolved = await this.resolveDispatchAgent(SessionId(binding.sessionId));
           validate();
-          if ('error' in resolved || resolved.agent.id !== binding.sessionId)
-            throw new AppError('session-unavailable', '无法确认原生 Worker 的活动状态。');
+          if (
+            'error' in resolved &&
+            resolved.error.code === 'session/not-found' &&
+            instruction.mode
+          ) {
+            const oldSession = SessionId(binding.sessionId);
+            const persisted = await this.ctx.sessionPersistence.stat(oldSession);
+            const path = await realpath(binding.cwd);
+            validate();
+            if (persisted || path !== binding.cwd || this.ctx.agents.get(oldSession))
+              throw new AppError(
+                'session-replacement-unproven',
+                '原生 Worker 的缺失状态或工作目录无法确认。',
+              );
+            if (this.liveWorkerJobs(oldSession).length)
+              throw new AppError('job-active', '原生 Worker 仍有后台工作。');
+            binding = this.store.beginBinding(
+              `session-replace:${binding.id}`,
+              taskId,
+              rowVersion,
+              path,
+              binding.workdir ?? undefined,
+              binding.id,
+            );
+            rowVersion++;
+            await prepareReplacement();
+            if (!binding.sessionId)
+              throw new AppError('session-unavailable', '替代 Worker 尚未准备。');
+            resolved = await this.resolveDispatchAgent(SessionId(binding.sessionId));
+            validate();
+          }
+          if ('error' in resolved)
+            throw new AppError('session-not-found', '找不到当前关联的 Worker 会话。');
           const agent = resolved.agent,
             tree = originalService(this.nativeSubagents());
           this.assertRecoveryQuiet(agent, run.id);
           this.assertDirectory(agent, binding.cwd);
+          const mode = instruction.mode;
+          if (!mode) return { status: 'blocked', message: '当前没有新的已授权后续指示。' };
+          if (interrupted) {
+            const proof = this.store.runTurn(run.id),
+              input = this.store.getRunInput(run.id);
+            if (input.state !== 'entered' || !proof?.quiet || proof.endSeq === null)
+              throw new AppError(
+                'recovery-unproven',
+                '尚未找到可归属的旧轮结束证据，保留旧轮占用。',
+              );
+            verifyRunBoundary(run, input, proof, await readRunEvents(this.ctx, run, agent.session));
+            validate();
+          }
           await this.confirmRecoveryTree(agent);
-          validate();
-          const proof = this.store.runTurn(run.id);
-          const checks =
-            proof?.quiet && proof.endSeq !== null
-              ? await this.readRecoveryTools(run, binding.cwd, proof, agent)
-              : null;
           validate();
           this.assertRecoveryQuiet(agent, run.id);
           this.assertDirectory(agent, binding.cwd);
           if (tree !== originalService(this.nativeSubagents()))
             throw new AppError('child-unknown', '原生子树服务已变更，请重新核对。');
-          const receipts = (checks ? this.boundPreflightReceipts(run.id, checks.clusters) : []).map(
-            (call) => call.receipt,
-          );
-          const priorCheck = this.store.recoveryCheck(run.id);
-          const priorWork = this.store.recoveryWorkPlan(run.id);
-          const uncertainty = unknownPriorEffects(
-            checks,
-            receipts.some((item) => !item),
-            priorCheck?.effectUncertain === true || priorWork?.context.effectUncertain === true,
-          );
-          const effectUncertain = !!uncertainty;
-          if (!this.store.verifiedBlocker(run)) {
-            if (!checks || run.state !== 'interrupted')
-              throw new AppError(
-                'recovery-unproven',
-                '尚未找到可归属的旧轮结束或后台收敛证据，保留旧轮占用。',
-              );
-            if (effectUncertain)
-              throw new AppError(
-                'effect-uncertain',
-                `原轮还有未确认的外部效果，保留旧轮占用。${uncertainty} 请核对操作回执或按现有授权查询目标状态。`,
-              );
+          if (interrupted) {
             this.store.verifyInterruptedEnd(taskId, rowVersion, managerId);
             rowVersion = this.store.getTask(taskId).rowVersion;
-            validate();
           }
+          if (this.store.dispatchBlocker(taskId)) return waitForCapacity();
+          const priorCheck = this.store.recoveryCheck(run.id),
+            priorWork = this.store.recoveryWorkPlan(run.id),
+            receipts = this.store.preflightReceipts(run.id);
           const byProbe = <T extends { probe: ReadProbe | ReturnType<typeof parseClusterProbe> }>(
             items: T[],
           ): T[] => [...new Map(items.map((item) => [JSON.stringify(item.probe), item])).values()];
@@ -2819,63 +3030,28 @@ export class DshExecution {
               ? [{ probe: priorCheck.evidence.probe, result: priorCheck.resolution }]
               : []),
           ]);
-          const mode = instruction.mode;
-          if (!mode || (mode === 'authorized-work' && effectUncertain)) {
-            const detail = observations.at(-1)?.result.message;
-            return {
-              status: 'blocked',
-              message: [
-                detail,
-                effectUncertain
-                  ? `${uncertainty} 现有记录只支持已有授权的具体只读核对。`
-                  : '旧轮已结束。请按已有证据核对缺失的前置或具体有授权的下一步。',
-              ]
-                .filter(Boolean)
-                .join(' '),
-            };
-          }
-          if (this.store.dispatchBlocker(taskId)) {
-            this.store.recordCapacityWait(
-              `continuation:${instruction.id}:${rowVersion}`,
-              taskId,
-              rowVersion,
-            );
-            return {
-              status: 'waiting',
-              message: '已保存用户指示，等待此 Bot 的 Worker 执行名额。',
-            };
-          }
+          const release = this.store.gitLabReleaseDetail(task);
           const work: RecoveryWorkContext = {
+            ...(release && { priorRelease: { url: release.url, state: release.state } }),
             priorRunId: run.id,
             mode,
             priorReport: this.store.runFinalReport(run.id),
             priorCheck: priorCheck?.resolution ?? priorWork?.context.priorCheck,
-            effectUncertain,
+            effectUncertain:
+              priorCheck?.effectUncertain === true || priorWork?.context.effectUncertain === true,
             priorDirections: instruction.directions
               ?.filter((direction) => direction.id !== instruction.id)
               .map(({ id, source }) => ({ id, text: source.text })),
             directionIds: instruction.directions?.map((direction) => direction.id),
-            priorReadQueries: checks?.queries,
             probes: authorizedProbes.map(({ probe }) => probe),
             observations,
           };
-          const current = selectedModel(this.ctx, agent);
-          const inherited =
-            !this.options.workerModel &&
-            !current &&
-            manager &&
-            this.store.botForSession(manager.id)?.id === task.botId
-              ? selectedModel(this.ctx, manager)
-              : undefined;
-          const plan = workerModelPlan(
-            current ? modelRoute(current) : null,
-            this.options.workerModel,
-            inherited && manager
-              ? { sessionId: manager.id, model: modelRoute(inherited) }
+          const { plan, inherited } = this.dispatchModel(
+            agent,
+            manager && this.store.botForSession(manager.id)?.id === task.botId
+              ? manager
               : undefined,
           );
-          if (!plan)
-            throw new AppError('model-required', 'Worker 缺少可核实的模型选择，后续指示已保留。');
           validate();
           const next = this.store.reserveRecoveryContinuation(
             taskId,
@@ -2903,6 +3079,7 @@ export class DshExecution {
           }
           return {
             status: 'blocked',
+            code: 'worker-delivery-unknown',
             run: this.store.getRun(next.id),
             message: '后续执行的投递待核对，已保留原指示。',
           };
@@ -2915,12 +3092,14 @@ export class DshExecution {
           const waiting = [
             'run-active',
             'session-busy',
+            'session-unavailable',
             'job-active',
             'child-active',
             'capacity',
           ].includes(error.code);
           return {
             status: waiting ? 'waiting' : 'blocked',
+            code: error.code,
             message:
               error.code === 'run-active' ? '已记下指示，将在原任务的下一轮处理。' : error.message,
           };
@@ -3166,14 +3345,7 @@ export class DshExecution {
         return this.store.getTask(taskId);
       }
       this.assertDirectory(agent, binding.cwd);
-      const modelRequired = () =>
-        new AppError('model-required', '请先在原生会话明确选择模型，再核对并继续。');
-      const selected = selectedModel(this.ctx, agent);
-      const plan = workerModelPlan(
-        selected ? modelRoute(selected) : null,
-        this.options.workerModel,
-      );
-      if (!plan) throw modelRequired();
+      const { plan } = this.dispatchModel(agent);
       const run = this.store.continueRunRecovery(
         requestId,
         taskId,
@@ -3185,7 +3357,6 @@ export class DshExecution {
       );
       try {
         configureRole(this.ctx, agent, 'worker', this.options);
-        if (!selectedModel(this.ctx, agent)) throw modelRequired();
         this.assertRecoveryQuiet(agent, target.run?.id);
         return this.deliverRun(run, agent, binding, { note: target.run?.note ?? null });
       } catch {
@@ -3413,6 +3584,8 @@ export class DshExecution {
   async dispose(): Promise<void> {
     this.disposed = true;
     this.autoTurns.clear();
+    for (const timer of this.unsentRetryTimers.values()) clearTimeout(timer);
+    this.unsentRetryTimers.clear();
     for (const timer of this.lateJobTimers.values()) clearTimeout(timer);
     this.lateJobTimers.clear();
     for (const controller of this.deletedRuns.values()) controller.abort();
@@ -3485,15 +3658,37 @@ export class DshExecution {
     const path = await realpath(cwd);
     assertLive();
     const b = this.store.beginBinding(requestId, taskId, rowVersion, path, info);
+    return this.completeWorkerBinding(b, assertLive);
+  }
+  private async completeWorkerBinding(
+    b: Binding,
+    authorize: () => void,
+    retryConfirmedAbsent = false,
+  ): Promise<Binding> {
     const current = this.store.getBinding(b.id);
     if (current.state === 'ready') return current;
     const active = this.creating.get(b.id);
     if (active) return active;
-    if (!this.store.claimBindingCreation(b.id)) return this.reconcileBinding(b.id, authorize);
+    const claimed = this.store.claimBindingCreation(b.id);
+    if (!claimed && (!retryConfirmedAbsent || this.store.get(`native-create-mismatch:${b.id}`)))
+      return this.reconcileBinding(b.id, authorize);
     const promise = (async () => {
       try {
+        if (!claimed) {
+          const id = SessionId(b.requestedSessionId);
+          const existing = await this.ctx.sessionController.resolveAgent(id);
+          authorize();
+          if (
+            !('error' in existing) ||
+            existing.error.code !== 'session/not-found' ||
+            (await this.ctx.sessionPersistence.stat(id)) ||
+            this.ctx.agents.get(id)
+          )
+            return await this.reconcileBinding(b.id, authorize);
+          authorize();
+        }
         const workspace = await this.ctx.workspaceRegistry.create(b.cwd, basename(b.cwd));
-        assertLive();
+        authorize();
         const result = await this.ctx.sessionController.create({
           workspaceId: workspace.id,
           sessionId: SessionId(b.requestedSessionId),

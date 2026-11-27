@@ -5,6 +5,8 @@ import type {} from '@deepseek-ai/dsh-permission-presets';
 import type {} from '@deepseek-ai/dsh-session-projection';
 import type { WorkdirConfig } from './workdir.ts';
 
+export const WORKER_SESSION_RETRY_MS = 30_000;
+
 export interface RuntimeOptions extends WorkdirConfig {
   fullAccess?: boolean;
   managerModel?: ModelSelection;

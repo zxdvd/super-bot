@@ -36,6 +36,7 @@ async function fixture() {
     removed: string[] = [],
     released = false,
     deferStop = false,
+    workerInRegistry = true,
     finish!: () => void;
   const idle = new Promise<void>((resolve) => {
     finish = resolve;
@@ -103,7 +104,7 @@ async function fixture() {
     workingDirectory: { get: () => directory },
     jobs: { list: () => (external === 'job' ? [{ owner: agent.id, status: 'running' }] : []) },
     agents: {
-      get: (id: string) => (id === agent.id ? agent : undefined),
+      get: (id: string) => (workerInRegistry && id === agent.id ? agent : undefined),
       list: () => (external === 'child' ? [{}] : []),
       isOwnedBy: () => external === 'child',
     },
@@ -179,6 +180,9 @@ async function fixture() {
     beforeResolve: (fn: () => Promise<void>) => {
       beforeResolve = fn;
     },
+    setWorkerInRegistry: (value: boolean) => {
+      workerInRegistry = value;
+    },
     setFlush: (fn: () => Promise<boolean>) => {
       flush = fn;
     },
@@ -218,7 +222,7 @@ test('one explicit owner message closes an active attempt after durable settleme
     const chat = f.chat(),
       text = '不做了，关闭这个任务';
     const args = {
-      action: 'close',
+      action: 'cancel',
       userInstruction: text,
       expectedRowVersion: f.store.getTask(f.task.id).rowVersion,
     };
@@ -230,7 +234,7 @@ test('one explicit owner message closes an active attempt after durable settleme
     assert.equal(started.run?.state, 'cancelling');
     assert.equal(started.closeRequest?.runId, f.run.id);
     assert.equal(f.cancels(), 1);
-    assert.deepEqual(await chat.call('close', args), started);
+    assert.deepEqual(await chat.call('close', { ...args, action: 'close' }), started);
     assert.throws(() => f.store.controlTask('resume', f.task.id, started.task.rowVersion, 'auto'), {
       code: 'task-closing',
     });
@@ -312,6 +316,60 @@ test('a stopped opaque CLI cannot resolve its own external effects even with a s
     await f.close();
   }
 });
+
+for (const kind of ['ready', 'failed'] as const)
+  test(`a normally settled ${kind} Run with a pending follow-up can close without reading old Bash`, async () => {
+    const f = await fixture();
+    try {
+      const chat = f.chat();
+      await f.emit('user/message', JSON.parse(f.store.getRunInput(f.run.id).messageJson!));
+      await f.emit('tool/call', {
+        turn: 1,
+        step: 1,
+        callId: 'unfinished-history',
+        name: 'bash',
+        arguments: JSON.stringify({ command: 'synthetic-fixture' }),
+      });
+      const file = resolve(f.directory, 'result.md');
+      writeFileSync(file, 'Candidate');
+      f.store.workerReport(f.run.id, 'final', {
+        kind,
+        summary: 'The original run ended',
+        ...(kind === 'ready'
+          ? { checks: 'Read', evidence: await collectEvidence(f.directory, [file]) }
+          : {}),
+      });
+      const { instruction } = f.store.saveRecoveryInstruction(
+        f.task.id,
+        f.store.getTask(f.task.id).rowVersion,
+        {
+          sessionId: chat.manager.requestedSessionId,
+          seq: 1,
+          messageId: 'follow-up',
+          text: 'Update it.',
+        },
+        'authorized-work',
+      );
+      await f.emit('turn/end', { turn: 1, reason: { kind: 'completed' } });
+      f.finishIdle();
+      assert.equal(
+        f.store.taskDetail(f.task.id).settledBlocker,
+        kind === 'ready' ? 'verified-end' : 'settled-failure',
+      );
+      const text = 'Close the entire task.';
+      await chat.human(text);
+      const out = await chat.call('close-old-superseded-run', {
+        action: 'close',
+        userInstruction: text,
+      });
+      assert.equal(out.task.lifecycle, 'cancelled');
+      assert.equal(out.closeRequest, null);
+      assert.equal(f.store.recoveryDirectionStatus(instruction), 'archived');
+      assert.equal(f.store.taskRuns(f.task.id).length, 1);
+    } finally {
+      await f.close();
+    }
+  });
 
 for (const durable of [true, false])
   test(`restart ${durable ? 'replays verified settlement' : 'keeps a concrete blocker'} for a pending close`, async () => {
@@ -656,10 +714,7 @@ test('chat stop targets an exact run; task cancellation waits for settlement and
     await f.emit('user/message', JSON.parse(input.messageJson!));
     const chat = f.chat();
     f.deferStop();
-    await chat.human('Cancel the documentation task.');
     const cancel = { action: 'cancel', userInstruction: 'Cancel the documentation task.' };
-    await assert.rejects(chat.call('cancel-running', cancel), { code: 'session-busy' });
-    await chat.end();
     await chat.human('Stop the current documentation run.');
     const stop = {
       action: 'stop',
@@ -911,51 +966,36 @@ test('chat controls reject notices, non-owner prompts, edits, expired turns and 
   }
 });
 
-test('chat cancellation rechecks native human authority, signal and task version after resolving the Worker', async () => {
+test('chat cancellation remains authorized after it is saved and the owner turn ends', async () => {
   const f = await fixture();
   try {
-    // This fixture has no external work. Settle its synthetic Run before exercising cancellation.
-    f.store.requestStop('fixture-stop', f.task.id, f.store.getTask(f.task.id).rowVersion);
-    f.store.settleCancelled(f.run.id);
+    await f.emit('user/message', JSON.parse(f.store.getRunInput(f.run.id).messageJson!));
+    f.store.workerReport(f.run.id, 'final', { kind: 'failed', summary: 'The old run finished' });
+    await f.emit('turn/end', { turn: 1, reason: { kind: 'completed' } });
     f.finishIdle();
     const chat = f.chat(),
       text = 'Cancel the documentation task.',
       cancel = { action: 'cancel', userInstruction: text };
     await chat.human(text);
-    f.beforeResolve(chat.end);
-    await assert.rejects(chat.call('turn-ended-during-lookup', cancel), {
-      code: 'human-message-required',
-    });
-    await chat.human(text);
     const abort = new AbortController();
-    f.beforeResolve(async () => abort.abort());
-    await assert.rejects(chat.call('aborted-during-lookup', cancel, abort.signal), {
-      name: 'AbortError',
-    });
+    let lookedUp = false;
+    f.setWorkerInRegistry(false);
     f.beforeResolve(async () => {
-      f.store.controlTask('ui-race', f.task.id, f.store.getTask(f.task.id).rowVersion, 'auto');
+      lookedUp = true;
+      assert.ok(f.store.taskClose(f.task.id));
+      const task = f.store.getTask(f.task.id);
+      assert.equal(task.controlMode, 'paused');
+      assert.throws(() => f.store.controlTask('resume', task.id, task.rowVersion, 'auto'), {
+        code: 'task-closing',
+      });
+      await chat.end();
+      abort.abort();
+      f.setWorkerInRegistry(true);
     });
-    await assert.rejects(chat.call('row-changed-during-lookup', cancel), {
-      code: 'version-conflict',
-    });
-    f.beforeResolve(async () => {
-      f.store.detachSession('ui-detach', f.task.id, f.store.getTask(f.task.id).rowVersion);
-    });
-    await assert.rejects(chat.call('binding-released-during-lookup', cancel), {
-      code: 'version-conflict',
-    });
-    const binding = f.store.beginBinding(
-      'ui-prepare',
-      f.task.id,
-      f.store.getTask(f.task.id).rowVersion,
-      f.directory,
-    );
-    f.store.confirmBinding(binding.id, binding.requestedSessionId);
-    f.beforeResolve(async () => {
-      f.store.releaseManager('release', f.bot.id, chat.manager.generation);
-    });
-    await assert.rejects(chat.call('released-during-lookup', cancel), { code: 'manager-scope' });
-    assert.equal(f.store.getTask(f.task.id).lifecycle, 'open');
+    const outcome = await chat.call('cancel-before-lookup', cancel, abort.signal);
+    assert.equal(lookedUp, true);
+    assert.equal(outcome.task.lifecycle, 'cancelled');
+    assert.equal(outcome.closeRequest, null);
     assert.equal(f.cancels(), 0);
   } finally {
     await f.close();

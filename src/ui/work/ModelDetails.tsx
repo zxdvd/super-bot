@@ -11,6 +11,7 @@ import { time } from './format.ts';
 
 const sourceLabels: Record<WorkerModelPlan['source'], string> = {
   'role-override': 'Super Bot Worker 角色覆盖',
+  'host-default': '宿主当前模型',
   'native-selection': 'Worker 原生会话选择',
   'manager-inheritance': '由 Bot 派发时继承当前 Bot 会话的原生选择',
 };
@@ -68,8 +69,8 @@ export function ModelPreview({
           description={`下次派发预计 Worker 模型：${expected(next)}`}
         />
       )}
-      {canStartManually && next?.source !== 'role-override' && !current && (
-        <span className="muted">手动开始前请在 Worker 会话选择模型</span>
+      {canStartManually && !next && !current && (
+        <span className="muted">可使用宿主配置的模型，或在 Worker 会话中指定</span>
       )}
     </div>
   );

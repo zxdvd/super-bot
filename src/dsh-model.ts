@@ -27,12 +27,13 @@ export function workerModelPlan(
   current: ModelRoute | null,
   override?: ModelSelection,
   manager?: { sessionId: string; model: ModelRoute | null },
+  host?: ModelSelection,
 ): WorkerModelPlan | null {
   if (override) return { ...modelRoute(override), source: 'role-override' };
   if (current) return { ...current, source: 'native-selection' };
-  return manager?.model
-    ? { ...manager.model, source: 'manager-inheritance', sourceSessionId: manager.sessionId }
-    : null;
+  if (manager?.model)
+    return { ...manager.model, source: 'manager-inheritance', sourceSessionId: manager.sessionId };
+  return host ? { ...modelRoute(host), source: 'host-default' } : null;
 }
 
 export function nativeModel(ctx: Context, session: Session) {

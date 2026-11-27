@@ -307,7 +307,7 @@ test('reinstalled execution adapter cannot revive authority while the old Agent 
   const idle = new Promise<void>((resolve) => {
     release = resolve;
   });
-  let selection: { provider: string; model: string } | null = null;
+  const selection = null;
   const agent: any = {
     id: 'synthetic-worker',
     status: 'idle',
@@ -364,13 +364,8 @@ test('reinstalled execution adapter cannot revive authority while the old Agent 
     store.claimBindingCreation(binding.id);
     store.confirmBinding(binding.id, binding.requestedSessionId);
     agent.id = binding.requestedSessionId;
-    await assert.rejects(old.dispatch('unselected', task.id, store.getTask(task.id).rowVersion), {
-      code: 'model-required',
-    });
-    assert.equal(store.latestRun(task.id), null);
-    assert.equal(deliveries, 0);
-    selection = { provider: 'fake', model: 'fake' };
     const run = await old.dispatch('dispatch', task.id, store.getTask(task.id).rowVersion);
+    assert.equal(store.runModelPlan(run.id)?.source, 'host-default');
     store.inputEntered(run.id, store.getRunInput(run.id).messageId!, 1);
     replacement.install();
     assert.equal(agent.status, 'running');

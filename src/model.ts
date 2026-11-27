@@ -2,6 +2,7 @@
 import type { WorkdirRequest, WorkdirInfo } from './workdir.ts';
 import type { ClusterProbe, PriorTools, ProbeResult } from './read-only-recovery.ts';
 import type { WorkStage } from './work-stage.ts';
+import type { ReleaseReceipt } from './gitlab-release.ts';
 export type { WorkdirRequest, WorkdirInfo };
 export interface WorkspaceStatus {
   product: 'Super Bot';
@@ -264,7 +265,7 @@ export interface ModelRoute {
 }
 export type WorkerModelPlan = ModelRoute &
   (
-    | { source: 'role-override' | 'native-selection' }
+    | { source: 'role-override' | 'native-selection' | 'host-default' }
     | { source: 'manager-inheritance'; sourceSessionId: string }
   );
 export interface ActualModelRequest extends ModelRoute {
@@ -417,6 +418,7 @@ export interface RecoveryInstruction {
   runId?: string;
 }
 export interface RecoveryWorkContext {
+  priorRelease?: Pick<ReleaseReceipt, 'url' | 'state'>;
   priorRunId: string;
   mode: NonNullable<RecoveryInstruction['mode']>;
   priorDirection?: string;

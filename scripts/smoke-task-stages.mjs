@@ -4,6 +4,7 @@ import { once } from 'node:events';
 import { readFile, writeFile } from 'node:fs/promises';
 import { createServer } from 'node:https';
 import { join } from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
 import { pathToFileURL } from 'node:url';
 import {
   closeTask,
@@ -157,6 +158,14 @@ export async function smokeTaskStages({
     assert.equal(supplemented.stage.deadlineAt, waiting.stage.deadlineAt);
     assert.equal(supplemented.stage.nextStep, waiting.stage.nextStep);
     const firstManager = await probe(host, 'inspect-session', bot.managerId);
+    assert.ok(
+      firstManager.managerAttempts.some(
+        (attempt) =>
+          attempt.action === 'continue' &&
+          attempt.userInstruction === stageSupplement &&
+          attempt.stageFollowUp === undefined,
+      ),
+    );
     const ownerInput = firstManager.events.find(
       (event) =>
         event.type === 'user/message' &&
@@ -164,6 +173,22 @@ export async function smokeTaskStages({
     );
     assert.equal(ownerInput?.seq, supplemented.recoveryInstruction.source.seq);
     await stop('web');
+    const ledger = new DatabaseSync(
+      join(base, 'web/super-bot/.runtime/dsh/super-bot/ledger.sqlite'),
+    );
+    try {
+      const now = Date.now();
+      assert.equal(
+        ledger
+          .prepare(
+            "UPDATE work_stages SET nextCheckAt=?,details=json_set(details,'$.deadlineAt',?) WHERE runId=?",
+          )
+          .run(now - 1, now - 2, waiting.stage.runId).changes,
+        1,
+      );
+    } finally {
+      ledger.close();
+    }
     pipelineStatus = 'success';
     host = await launch('web', 'task-stages-restarted', { testCa: cert });
     const done = await wait(
@@ -276,7 +301,7 @@ export async function smokeTaskStages({
       'PASS an in-flight HTTPS success after owner chat withdrawal did not reach a Worker',
     );
     console.log(
-      'PASS stage addition from the original chat survived restart and entered exactly one of four runs on the same Worker; one final chat delivery',
+      'PASS the default stage addition survived restart and the observation deadline, entered exactly one of four runs on the original Worker, and produced one final chat delivery',
     );
   }
 

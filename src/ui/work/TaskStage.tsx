@@ -64,8 +64,8 @@ function StageDetails({ milestone }: { milestone: WorkStage }) {
         <p className="full-text">{milestone.reason}</p>
       )}
       {milestone.nextStep && <p className="full-text">下一步 · {milestone.nextStep}</p>}
-      {(milestone.state === 'waiting' || milestone.state === 'ready') && milestone.deadlineAt && (
-        <p className="muted">期限 · {time(milestone.deadlineAt)}</p>
+      {milestone.state === 'waiting' && milestone.deadlineAt && !milestone.expired && (
+        <p className="muted">首次核对期限 · {time(milestone.deadlineAt)}</p>
       )}
       <details>
         <summary>阶段依据</summary>
