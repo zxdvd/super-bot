@@ -822,3 +822,7 @@ ELECTRON_RUN_AS_NODE=1 '/Applications/DeepSeek Harness.app/Contents/MacOS/DeepSe
 - 在真实 Web 输入框内，Worker 运行期间连续发送两条具名的只读要求。原 Worker 下一轮收到两条指示，分别读取了两份不同的回执。macOS Worker 的 Git 工作区查询同时经过原生工具执行、持久回执和恢复核对。旧基线文件只读了一次。[聊天续跑验收](../../../scripts/smoke-req005.mjs)
 - 给同一项交付登记四个外部链接，并指定其中一个为首要入口。在 Web 和 Desktop 原聊天中，展开前可直接打开首要链接；完整交付仍指向本次成果。飞书模拟传输也取得同一首要链接。修改次要链接后，正式发送回执保持原样。[原生浏览器验收](../../../scripts/smoke-chat-result-links.mjs) · [飞书转发验收](../../../scripts/smoke-feishu.mjs)
 - Web 和 Desktop 的工作面板均可关闭任务。适配层覆盖了关闭过程中重启、停止回执缺失和普通 Shell 成功返回但外部效果仍未确认三种情况。[工作面板验收](../../../scripts/smoke-work-activity.mjs) · [关闭核对回归](../../../test/adapter/intervention.test.ts)
+
+## 2026-11-27 · 切换 Bot 后恢复会话和工作页
+
+在 `994e35c` 的 Web 宿主上，从 Alpha 的任务详情打开 Worker，再从侧栏切到 Beta、切回 Alpha，原生会话选择落在 Alpha 的 Manager。`SUPER_BOT_TEST_BOT_LOCATION=1 node scripts/smoke-mirror.mjs` 使用两个隔离 Bot，在 Edge 中重放同一路径，核对 DSH 实际选中的 Worker ID。还交替打开了两个 Bot 各自的任务详情，分别从聊天旁面板和整页工作台切回。首页「继续聊天」和整页「返回这个 Bot 聊天」均打开指定 Manager 并收起工作侧栏。该用例使用暂停的合成任务，无需启动 Worker。

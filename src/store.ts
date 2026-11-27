@@ -2757,10 +2757,10 @@ export class Store {
       },
     );
   }
-  workerTaskForSession(sessionId: string): string | undefined {
+  workerTaskForSession(sessionId: string, historical = false): string | undefined {
     return this.db
-      .prepare("SELECT taskId FROM bindings WHERE sessionId=? AND state='ready'")
-      .get(sessionId)?.taskId as string | undefined;
+      .prepare('SELECT taskId FROM bindings WHERE sessionId=? AND state=?')
+      .get(sessionId, historical ? 'released' : 'ready')?.taskId as string | undefined;
   }
   pendingWorkerTaskForSession(sessionId: string): string | undefined {
     return this.db

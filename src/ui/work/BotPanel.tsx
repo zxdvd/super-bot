@@ -4,7 +4,7 @@ import type { Bot } from '../../model.ts';
 import type { BackupInfo } from '../../backups.ts';
 import { ConfirmAction, Hint, Section } from '../kit.tsx';
 import { FeishuPanel } from './FeishuPanel.tsx';
-import { forgetView, rememberBot, rememberedBot, rememberedView } from './storage.ts';
+import { forgetView, rememberBot, rememberedBot } from './storage.ts';
 import { managerOpener } from './SystemIssues.tsx';
 import type { WorkspaceState } from './useWorkspace.ts';
 import { WorkerCapacityPanel } from './WorkerCapacityPanel.tsx';
@@ -177,7 +177,7 @@ function BotDeletion({
       },
       (value) => {
         if (rememberedBot() === value.botId) rememberBot('');
-        if (rememberedView()?.botId === value.botId) forgetView();
+        forgetView(value.botId);
         onDeleted(bot);
       },
       (cause) =>

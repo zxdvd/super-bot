@@ -569,6 +569,9 @@ try {
   } else if (process.env.SUPER_BOT_TEST_WORK_ACTIVITY === '1') {
     const { smokeWorkActivity } = await import('./smoke-work-activity.mjs');
     await smokeWorkActivity({ configure, launch, call, makeBot, probe, wait });
+  } else if (process.env.SUPER_BOT_TEST_BOT_LOCATION === '1') {
+    const { smokeBotLocation } = await import('./smoke-bot-location.mjs');
+    await smokeBotLocation({ configure, launch, call, makeBot });
   } else if (process.env.SUPER_BOT_TEST_CHAT_LINKS === '1') {
     const { smokeChatResultLinks } = await import('./smoke-chat-result-links.mjs');
     await smokeChatResultLinks({ base, configure, launch, stop, rpc, call, makeBot, probe, wait });

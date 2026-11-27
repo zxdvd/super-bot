@@ -5,6 +5,7 @@ import type { MainPanelId } from '@deepseek-ai/dsh-client-ui-layout/client';
 import type {} from '@deepseek-ai/dsh-client-ui-sidebar/client';
 import type {} from '@deepseek-ai/dsh-client-ui-workspace/client';
 import type { SessionId } from '@deepseek-ai/dsh-session/types';
+import type {} from '@deepseek-ai/dsh-api-session-controller/client';
 import type { WorkspaceApi } from './ui/Workspace.tsx';
 import type {} from '@deepseek-ai/dsh-client-ui-conversation/client';
 import type {} from '@deepseek-ai/dsh-client-ui-session/client';
@@ -22,6 +23,7 @@ import { returningToReloadSettings } from './ui/DeveloperSettings.tsx';
 import { createWorkFeed, SessionBadge } from './ui/work/activity.tsx';
 import { BotHome } from './ui/BotHome.tsx';
 import { installBotSidebar } from './ui/BotSidebar.tsx';
+import { createBotNavigation } from './ui/bot-navigation.ts';
 import { ChatDeliveryLinks, type ChatDeliverySlot } from './ui/ChatDeliveryLinks.tsx';
 import { parseWorkLink, RESULT_FILE_PATH, workUrl } from './work-links.ts';
 
@@ -29,6 +31,7 @@ export const inject = [
   'slots',
   'uiWorkspace',
   'connection',
+  'sessions',
   'layout',
   'sidebarRight',
   'sidebarRightTabs',
@@ -55,6 +58,17 @@ function Icon({ size = 20 }: { size?: number }) {
 export function apply(context: Context): void {
   const ctx = context as unknown as ClientContext;
   const panel = 'super-bot' as MainPanelId;
+  const clearWorkHash = () => {
+    if (typeof location !== 'undefined' && parseWorkLink(location.hash))
+      history.replaceState(history.state, '', location.pathname + location.search);
+  };
+  let chatOnly: string | undefined;
+  const hideWork = (sessionId: string) => {
+    if (chatOnly !== sessionId || ctx.sidebarRight.mounted.getSnapshot() !== sessionId) return;
+    for (const tab of ctx.sidebarRight.tabsIn(sessionId as SessionId)) {
+      if (tab.kind === WORK_TAB) ctx.sidebarRight.hide(tab.id);
+    }
+  };
   const api: WorkspaceApi = {
     async call<T>(
       action: string,
@@ -71,19 +85,55 @@ export function apply(context: Context): void {
         throw Object.assign(new Error(result.error.message), { code: result.error.code });
       return result.value as T;
     },
-    openSession: (id) => ctx.uiWorkspace.openSession(id as SessionId),
-    openChildSession: (parentId, childId) =>
+    openSession: (id) => {
+      clearWorkHash();
+      ctx.uiWorkspace.openSession(id as SessionId);
+    },
+    openChildSession: (parentId, childId) => {
+      clearWorkHash();
       ctx.uiWorkspace.openSession({
         parentSessionId: parentId as SessionId,
         childSessionId: childId as SessionId,
         mode: 'unknown',
-      }),
+      });
+    },
     beginNavigation: () => ctx.layout.beginNavigation(),
     currentSession: () => ctx.sidebarRight.mounted.getSnapshot(),
     watchCurrentSession: (listener) => ctx.sidebarRight.mounted.subscribe(listener),
     openBot: (botId, navigation = ctx.layout.beginNavigation()) =>
-      openBotConversation(api, botId, navigation),
+      openBotConversation(api, botId, navigation, (id) => {
+        chatOnly = id;
+        api.openSession(id);
+        api.botNavigation.rememberManager(botId);
+        hideWork(id);
+      }),
     openHome: () => ctx.layout.selectPanel(panel),
+    botNavigation: createBotNavigation(
+      {
+        call: (...args) => api.call(...args),
+        openSession: (id) => api.openSession(id),
+        openChildSession: (parent, child) => api.openChildSession?.(parent, child),
+      },
+      {
+        openManager: (id, signal, managerOnly) =>
+          managerOnly ? api.openBot(id, signal) : openBotConversation(api, id, signal),
+        async hasSession(id, parentSessionId) {
+          const sessionId = id as SessionId;
+          const has = () =>
+            parentSessionId
+              ? ctx.sessions.subagentAddress(sessionId)?.parentSessionId === parentSessionId
+              : ctx.sessions.list.getSnapshot().ids.includes(sessionId);
+          if (!has()) await ctx.sessions.refresh();
+          if (ctx.sessions.list.getSnapshot().phase !== 'ready')
+            throw new Error('暂时无法核对 Worker 会话，请重试。');
+          return has();
+        },
+        showMainPanel() {
+          clearWorkHash();
+          ctx.layout.selectPanel(panel);
+        },
+      },
+    ),
   };
   api.workFeed = createWorkFeed(api);
   const row = 'sidebar.session.row.trailing';
@@ -113,8 +163,13 @@ export function apply(context: Context): void {
     };
     const unsubscribe = ctx.sidebarRight.mounted.subscribe(() => {
       intent?.abort();
+      if (chatOnly !== ctx.sidebarRight.mounted.getSnapshot()) chatOnly = undefined;
       if (nativeHash && location.hash === nativeHash) replaceHash('');
       nativeHash = undefined;
+    });
+    const unwatchPanel = ctx.layout.panelInfo.subscribe(() => {
+      if (ctx.layout.panelInfo.getSnapshot().activePanelId !== panel)
+        api.botNavigation.setMainWork(null);
     });
     const click = (event: MouseEvent) => {
       const link = event.target instanceof Element ? event.target.closest('a') : null;
@@ -183,6 +238,7 @@ export function apply(context: Context): void {
       disposed = true;
       intent?.abort();
       unsubscribe();
+      unwatchPanel();
       for (const name of mouseEvents) document.removeEventListener(name, click, true);
       window.removeEventListener('hashchange', hashChanged);
     };
@@ -208,7 +264,15 @@ export function apply(context: Context): void {
   ] as const) {
     ctx.slots.inject(name, () =>
       ctx.slots.register({ name, id: WORK_TAB, order: 20 }, (props: { sessionId: SessionId }) => (
-        <WorkButton api={api} sessionId={props.sessionId} sidebar={ctx.sidebarRight} />
+        <WorkButton
+          api={api}
+          sessionId={props.sessionId}
+          sidebar={ctx.sidebarRight}
+          onChatReady={() => {
+            hideWork(props.sessionId);
+            if (chatOnly === props.sessionId) chatOnly = undefined;
+          }}
+        />
       )),
     );
     ctx.slots.inject(name, () =>

@@ -98,7 +98,9 @@ export function RecoveryPanel({
       </dl>
       {worker && (
         <div className="actions">
-          <button onClick={() => w.api.openSession(worker.sessionId)}>查看原 Worker 会话</button>
+          <button onClick={() => w.api.botNavigation.openWorker(detail.task, worker.sessionId)}>
+            查看原 Worker 会话
+          </button>
         </div>
       )}
       {!automatic && attentionId && (

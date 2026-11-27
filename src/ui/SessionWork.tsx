@@ -1,4 +1,4 @@
-import { useEffect, useState, useSyncExternalStore } from 'react';
+import { useEffect, useLayoutEffect, useState, useSyncExternalStore } from 'react';
 import type { ISidebarRight } from '@deepseek-ai/dsh-client-ui-sidebar-right/client';
 import type { TabId } from '@deepseek-ai/dsh-client-ui-sidebar-right/client';
 import type { LocaleRuntime } from '@deepseek-ai/dsh-client-locale/client';
@@ -53,13 +53,23 @@ export function WorkButton({
   api,
   sessionId,
   sidebar,
+  onChatReady,
 }: {
   api: WorkspaceApi;
   sessionId: string;
   sidebar: ISidebarRight;
+  onChatReady?: () => void;
 }) {
   const resolved = useSessionBot(api, sessionId, sidebar);
   const feed = useWorkFeed(api);
+  useLayoutEffect(() => {
+    onChatReady?.();
+  }, [onChatReady]);
+  const botId = resolved?.bot?.id;
+  useEffect(() => {
+    if (botId && sidebar.mounted.getSnapshot() === sessionId)
+      api.botNavigation.rememberManager(botId);
+  }, [api, botId, sidebar, sessionId]);
   if (!resolved?.bot) return null;
   const counts = feed.failed
     ? undefined
@@ -184,11 +194,13 @@ export function SessionWork({
       initialBotId={resolved.bot.id}
       sessionId={sessionId}
       initialLink={target?.link}
+      linkSource={target ? `${tabId}:${target.revision}` : undefined}
       compact
       onReturn={back}
       onBotDeleted={
         api.openHome &&
         (() => {
+          api.botNavigation.forget(resolved.bot!.id);
           back();
           api.openHome?.();
         })

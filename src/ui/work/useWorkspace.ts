@@ -1,9 +1,9 @@
 /** All Workspace state, the polling loop and guarded mutations. Views receive the returned object read-only. */
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useLayoutEffect, useRef, useState } from 'react';
 import type { Bot, TaskInboxPage, TaskPage, WorkspaceStatus } from '../../model.ts';
 import { ownerLabel, type MirrorDetail, type MirrorSelection } from '../../mirror.ts';
 import type { BackupInfo } from '../../backups.ts';
-import type { WorkLink } from '../../work-links.ts';
+import { parseWorkLink, workUrl, type WorkLink } from '../../work-links.ts';
 import type { WorkspaceApi } from './api.ts';
 import type { Detail, FormKind, ManagerInfo } from './types.ts';
 import {
@@ -14,6 +14,7 @@ import {
   rememberedView,
   rememberView,
   seenResults,
+  type SavedView,
   type WorkView,
 } from './storage.ts';
 
@@ -21,11 +22,13 @@ export interface WorkspaceProps {
   api: WorkspaceApi;
   initialBotId?: string;
   initialLink?: WorkLink;
+  linkSource?: string;
   sessionId?: string;
   compact?: boolean;
   onReturn?: () => void;
   mirror?: MirrorSelection;
   focusFeishu?: boolean;
+  onPickBot?: (botId: string) => void;
   onBotDeleted?: (bot: Bot) => void;
 }
 export const PAGE_SIZE = 25;
@@ -45,16 +48,18 @@ export function useWorkspace({
   api,
   initialBotId,
   initialLink,
+  linkSource,
   sessionId,
   mirror,
   focusFeishu,
+  onPickBot,
 }: WorkspaceProps) {
   const preferredBot = useRef(initialBotId ?? rememberedBot());
-  const savedView = useRef(sessionId || mirror || focusFeishu ? undefined : rememberedView());
-  const restoredView = useRef(
-    !initialLink && savedView.current?.botId === initialBotId ? savedView.current : undefined,
-  );
-  const pendingSelection = useRef(restoredView.current?.selected ?? '');
+  const [restored] = useState(() => {
+    if (!initialBotId || mirror || focusFeishu) return;
+    const saved = rememberedView(initialBotId, sessionId);
+    if (!initialLink || (linkSource && saved?.linkSource === linkSource)) return saved;
+  });
   const alive = useRef(true),
     viewScope = useRef(''),
     scroller = useRef<HTMLDivElement>(null);
@@ -73,23 +78,23 @@ export function useWorkspace({
   const [botId, setBotId] = useState(mirror?.bot.id ?? initialBotId ?? '');
   const [page, setPage] = useState<Page>();
   const [view, setViewState] = useState<WorkView>(
-    mirror ? 'list' : focusFeishu ? 'settings' : (restoredView.current?.view ?? 'inbox'),
+    mirror ? 'list' : focusFeishu ? 'settings' : (restored?.view ?? 'inbox'),
   );
   const [seen, setSeen] = useState(() => (mirror ? {} : seenResults()));
   const [now, setNow] = useState(Date.now);
-  const [selected, setSelected] = useState(initialLink?.taskId ?? '');
+  const [selected, setSelected] = useState(restored?.selected ?? initialLink?.taskId ?? '');
   const [loaded, setDetail] = useState<Detail>();
   const [remoteDetail, setRemoteDetail] = useState<MirrorDetail>();
   const mirrorDetail =
     remoteDetail?.task.id === selected && remoteDetail.task.botId === botId
       ? remoteDetail
       : undefined;
-  const [link, setLink] = useState(initialLink),
+  const [link, setLink] = useState(() => (restored ? savedLink(restored) : initialLink)),
     [missingLink, setMissingLink] = useState(false);
   const detail = loaded?.task.id === selected && loaded.task.botId === botId ? loaded : undefined;
-  const [query, setQuery] = useState(restoredView.current?.query ?? '');
-  const [filter, setFilter] = useState(restoredView.current?.filter ?? '');
-  const [offset, setOffset] = useState(restoredView.current?.offset ?? 0);
+  const [query, setQuery] = useState(restored?.query ?? '');
+  const [filter, setFilter] = useState(restored?.filter ?? '');
+  const [offset, setOffset] = useState(restored?.offset ?? 0);
   const [online, setOnline] = useState(false);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
@@ -103,18 +108,14 @@ export function useWorkspace({
     if (backupInfo) backupNotice.current?.scrollIntoView({ block: 'nearest' });
   }, [backupInfo]);
   viewScope.current = `${botId}:${selected}`;
-  useEffect(() => {
-    if (botId && !sessionId && !mirror && (!focusFeishu || view !== 'settings')) {
-      rememberView({
-        botId,
-        selected,
-        query,
-        filter,
-        offset,
-        view: view === 'settings' ? 'inbox' : view,
-      });
+  useLayoutEffect(() => {
+    if (botId && !mirror && (!sessionId || api.currentSession?.() === sessionId)) {
+      rememberView(
+        { botId, selected, query, filter, offset, view, href: link && workUrl(link), linkSource },
+        sessionId,
+      );
     }
-  }, [botId, selected, query, filter, offset, sessionId, view, mirror, focusFeishu]);
+  }, [api, botId, selected, query, filter, offset, sessionId, view, mirror, link, linkSource]);
   const showingCurrentResult =
     !link ||
     link.kind === 'task' ||
@@ -131,6 +132,15 @@ export function useWorkspace({
     setRemoteDetail(undefined);
     setLink(undefined);
     setMissingLink(false);
+  };
+  const restore = (id: string) => {
+    const view = initialLink ? undefined : rememberedView(id);
+    setViewState(view?.view ?? 'inbox');
+    setOffset(view?.offset ?? 0);
+    setFilter(view?.filter ?? '');
+    setQuery(view?.query ?? '');
+    setSelected(view?.selected ?? '');
+    setLink(view && savedLink(view));
   };
 
   useEffect(() => {
@@ -211,19 +221,15 @@ export function useWorkspace({
       });
     function switchToAvailableBot(list: Bot[]) {
       const id = sessionId ? '' : (list[0]?.id ?? '');
-      pendingSelection.current = '';
-      savedView.current = undefined;
+      forgetView(botId);
       preferredBot.current = id;
       setBotId(id);
       if (!sessionId) rememberBot(id);
       setPage(undefined);
       deselect();
       setManagerInfo(undefined);
-      setOffset(0);
-      setFilter('');
-      setQuery('');
+      restore(id);
       setForm(null);
-      if (!id && !sessionId) forgetView();
     }
     function adoptFirstBot(list: Bot[]) {
       const id = list.some((bot) => bot.id === preferredBot.current)
@@ -231,14 +237,7 @@ export function useWorkspace({
         : list[0]!.id;
       setBotId(id);
       rememberBot(id);
-      const view = savedView.current;
-      if (!initialLink && view?.botId === id) {
-        setQuery(view.query);
-        setFilter(view.filter);
-        setOffset(view.offset);
-        pendingSelection.current = view.selected;
-      }
-      savedView.current = undefined;
+      restore(id);
     }
     const listQuery = { botId, q: query, lifecycle: filter, offset, limit: PAGE_SIZE };
     const detailQuery = {
@@ -273,11 +272,6 @@ export function useWorkspace({
         setPage(p);
         setManagerInfo(m);
         setConnectionError('');
-        if (p && pendingSelection.current) {
-          if (p.items.some((t) => t.id === pendingSelection.current))
-            setSelected(pendingSelection.current);
-          pendingSelection.current = '';
-        }
         if (
           (d && ACTIVE.includes(d.task.status)) ||
           p?.items.some((t) => ACTIVE.includes(t.status))
@@ -386,15 +380,17 @@ export function useWorkspace({
     }
   }
   function pickBot(id: string) {
+    if (onPickBot) {
+      onPickBot(id);
+      return;
+    }
     preferredBot.current = id;
     rememberBot(id);
     setBotId(id);
     setManagerInfo(undefined);
     setPage(undefined);
     deselect();
-    setOffset(0);
-    setFilter('');
-    setQuery('');
+    restore(id);
     setForm(null);
   }
   /** Opens one task or an exact result; list and filter changes use resetView instead. */
@@ -479,3 +475,8 @@ export function useWorkspace({
   };
 }
 export type WorkspaceState = ReturnType<typeof useWorkspace>;
+
+function savedLink(view: SavedView) {
+  const link = view.href?.startsWith('/#') ? parseWorkLink(view.href.slice(1)) : undefined;
+  return link?.taskId === view.selected ? link : undefined;
+}

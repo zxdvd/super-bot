@@ -144,6 +144,7 @@ test('client openBot reuses the ready native chat and follows its replacement', 
   const f = fixture();
   try {
     const opened: string[] = [];
+    const hidden: string[] = [];
     let api: WorkspaceApi | undefined;
     let navigation = new AbortController();
     applyClient({
@@ -175,6 +176,14 @@ test('client openBot reuses the ready native chat and follows its replacement', 
           return navigation.signal;
         },
       },
+      sidebarRight: {
+        mounted: { getSnapshot: () => opened.at(-1) },
+        tabsIn: (id: string) => [
+          { id: `work:${id}`, kind: 'super-bot-work' },
+          { id: `files:${id}`, kind: 'files' },
+        ],
+        hide: (id: string) => hidden.push(id),
+      },
       uiWorkspace: { openSession: (id: string) => opened.push(id) },
     } as unknown as Context);
     assert.ok(api);
@@ -189,6 +198,10 @@ test('client openBot reuses the ready native chat and follows its replacement', 
     assert.notEqual(next.sessionId, first.sessionId);
     await api.openBot(f.bot.id);
     assert.deepEqual(opened, [first.sessionId, first.sessionId, next.sessionId]);
+    assert.deepEqual(
+      hidden,
+      opened.map((id) => `work:${id}`),
+    );
     assert.equal(f.counts().creates, 2);
   } finally {
     await f.close();

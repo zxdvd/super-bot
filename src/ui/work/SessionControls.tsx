@@ -176,7 +176,9 @@ function Bound({ w, detail }: { w: WorkspaceState; detail: Detail }) {
       <p className="muted wrap">{binding.cwd}</p>
       {binding.state === 'ready' ? (
         <>
-          <button onClick={() => w.api.openSession(binding.sessionId!)}>打开任务会话</button>{' '}
+          <button onClick={() => w.api.botNavigation.openWorker(task, binding.sessionId!)}>
+            打开任务会话
+          </button>{' '}
           {canStartTask(detail) && (
             <button className="primary" disabled={w.locked} onClick={dispatch}>
               开始执行
@@ -232,7 +234,7 @@ export function SessionControls({ w, detail }: { w: WorkspaceState; detail: Deta
             .filter((old) => old.sessionId)
             .map((old) => (
               <p key={old.id}>
-                <button onClick={() => w.api.openSession(old.sessionId!)}>
+                <button onClick={() => w.api.botNavigation.openWorker(task, old.sessionId!, true)}>
                   打开第 {old.generation} 个会话
                 </button>
                 <span className="muted"> · 目标版本 {old.taskRevision}</span>

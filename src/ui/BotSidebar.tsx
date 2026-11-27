@@ -38,11 +38,14 @@ function BotList({
   const [opening, setOpening] = useState<{ id: string; navigation: AbortSignal }>();
   async function open(id: string) {
     if (lifetime.aborted) return;
+    const sessionId = api.currentSession?.();
+    const currentBot = sessionId && bots?.find((bot) => bot.sessionId === sessionId);
+    if (currentBot) api.botNavigation.rememberManager(currentBot.id);
     const navigation = AbortSignal.any([api.beginNavigation(), lifetime]);
     setError('');
     setOpening({ id, navigation });
     try {
-      await api.openBot(id, navigation);
+      await api.botNavigation.select(id, navigation);
     } catch (error) {
       if (!navigation.aborted)
         setError(error instanceof Error ? error.message : '暂时无法打开对话，请重试。');

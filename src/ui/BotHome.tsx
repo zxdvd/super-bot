@@ -1,26 +1,19 @@
-import { useEffect, useRef, useState, type FormEvent } from 'react';
+import { useEffect, useRef, useState, useSyncExternalStore, type FormEvent } from 'react';
 import type { Bot } from '../model.ts';
-import { ownerLabel, type MirrorCatalog, type MirrorSelection } from '../mirror.ts';
+import { ownerLabel, type MirrorCatalog } from '../mirror.ts';
 import { Workspace, type WorkspaceApi } from './Workspace.tsx';
 import { styles } from './styles.ts';
 import { readTaskLink, workLinkForUrl } from './work-navigation.ts';
-import { workUrl, type WorkLink } from '../work-links.ts';
+import { workUrl } from '../work-links.ts';
 import { activityLabel, useWorkFeed, WorkBadges } from './work/activity.tsx';
 import { reloadSettingsKey, returningToReloadSettings } from './DeveloperSettings.tsx';
 import { FeishuSettings } from './FeishuSettings.tsx';
+import type { MainWork } from './bot-navigation.ts';
 
 const DEFAULT_INSTRUCTIONS =
   '你是我的长期助手。自然地与我交流，理解我的目标，必要时澄清，主动安排已授权的工作，并回来交付结果。';
 const message = (error: unknown, fallback: string) =>
   error instanceof Error ? error.message : fallback;
-
-type Work = {
-  botId: string;
-  link?: WorkLink;
-  revision?: number;
-  mirror?: MirrorSelection;
-  focusFeishu?: boolean;
-};
 
 function WorkFrame({
   api,
@@ -30,7 +23,7 @@ function WorkFrame({
   close,
 }: {
   api: WorkspaceApi;
-  work: Work;
+  work: MainWork;
   error: string;
   setError: (text: string) => void;
   close: (deleted?: Bot) => void;
@@ -71,8 +64,14 @@ function WorkFrame({
           initialLink={work.link}
           mirror={work.mirror}
           focusFeishu={work.focusFeishu}
+          onPickBot={(botId) => {
+            api.beginNavigation();
+            clearHash();
+            api.botNavigation.setMainWork({ botId });
+          }}
           onBotDeleted={(bot) => {
             api.beginNavigation();
+            api.botNavigation.forget(bot.id);
             clearHash();
             close(bot);
           }}
@@ -91,7 +90,8 @@ export function BotHome({ api }: { api: WorkspaceApi }) {
   const [error, setError] = useState(''),
     [busy, setBusy] = useState(false);
   const [deletedName, setDeletedName] = useState('');
-  const [work, setWork] = useState<Work | null>(null);
+  const { mainWork, setMainWork: setWork } = api.botNavigation;
+  const work = useSyncExternalStore(mainWork.subscribe, mainWork.getSnapshot);
   const [showSettings, setShowSettings] = useState(returningToReloadSettings);
   const settingsEntry = useRef<HTMLButtonElement>(null);
   const [creating, setCreating] = useState(false),
@@ -177,7 +177,7 @@ export function BotHome({ api }: { api: WorkspaceApi }) {
       controller?.abort();
       window.removeEventListener('hashchange', navigate);
     };
-  }, [api]);
+  }, [api, setWork]);
   async function chat(bot: Bot) {
     if (locked.current) return;
     locked.current = true;

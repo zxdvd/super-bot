@@ -1,4 +1,4 @@
-/** Optional browser memory for the last Bot and list view; every access tolerates disabled storage. */
+/** Optional browser storage for the remembered Bot, work views, and result reads. */
 const BOT_KEY = 'super-bot:bot',
   VIEW_KEY = 'super-bot:view',
   SEEN_KEY = 'super-bot:seen',
@@ -12,7 +12,11 @@ export type SavedView = {
   filter: string;
   offset: number;
   view?: WorkView;
+  href?: string;
+  linkSource?: string;
 };
+const views = new Map<string, SavedView>();
+const viewKey = (botId: string, sessionId?: string) => `${VIEW_KEY}:${botId}:${sessionId ?? ''}`;
 
 export function rememberedBot(): string {
   try {
@@ -28,20 +32,27 @@ export function rememberBot(id: string): void {
     /* Browser storage is optional. */
   }
 }
-export function rememberedView(): SavedView | undefined {
+export function rememberedView(botId: string, sessionId?: string): SavedView | undefined {
+  const key = viewKey(botId, sessionId);
+  const stored = views.get(key);
+  if (stored) return stored;
   try {
-    const value = JSON.parse(sessionStorage.getItem(VIEW_KEY) ?? 'null') as SavedView | null;
+    const item =
+      sessionStorage.getItem(key) ?? (!sessionId ? sessionStorage.getItem(VIEW_KEY) : null);
+    const value = JSON.parse(item ?? 'null') as SavedView | null;
     const filters = ['', 'open', 'review', 'completed', 'cancelled'];
     if (
       value &&
-      typeof value.botId === 'string' &&
+      value.botId === botId &&
       typeof value.selected === 'string' &&
       typeof value.query === 'string' &&
       value.query.length <= 200 &&
       filters.includes(value.filter) &&
       Number.isSafeInteger(value.offset) &&
       value.offset >= 0 &&
-      (value.view === undefined || WORK_VIEWS.includes(value.view))
+      (value.view === undefined || WORK_VIEWS.includes(value.view)) &&
+      (value.href === undefined || typeof value.href === 'string') &&
+      (value.linkSource === undefined || typeof value.linkSource === 'string')
     ) {
       return value;
     }
@@ -49,16 +60,23 @@ export function rememberedView(): SavedView | undefined {
     /* Browser storage is optional. */
   }
 }
-export function rememberView(view: SavedView): void {
+export function rememberView(view: SavedView, sessionId?: string): void {
+  const key = viewKey(view.botId, sessionId);
+  views.set(key, view);
   try {
-    sessionStorage.setItem(VIEW_KEY, JSON.stringify(view));
+    sessionStorage.setItem(key, JSON.stringify(view));
   } catch {
     /* Browser storage is optional. */
   }
 }
-export function forgetView(): void {
+export function forgetView(botId: string): void {
+  const prefix = viewKey(botId);
+  for (const key of views.keys()) if (key.startsWith(prefix)) views.delete(key);
   try {
-    sessionStorage.removeItem(VIEW_KEY);
+    for (const key of Object.keys(sessionStorage))
+      if (key.startsWith(prefix)) sessionStorage.removeItem(key);
+    if (JSON.parse(sessionStorage.getItem(VIEW_KEY) ?? 'null')?.botId === botId)
+      sessionStorage.removeItem(VIEW_KEY);
   } catch {
     /* Optional view memory. */
   }

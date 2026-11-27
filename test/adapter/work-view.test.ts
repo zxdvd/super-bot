@@ -39,6 +39,7 @@ import { parseMirrorQuery } from '../../src/mirror-host.ts';
 import { readLocalMirror } from '../../src/mirror-queries.ts';
 import type { SessionOrigin } from '../../src/mirror.ts';
 import { resultHeading, workGroup, type WorkspaceApi } from '../../src/ui/Workspace.tsx';
+import { createBotNavigation } from '../../src/ui/bot-navigation.ts';
 import {
   WORK_TAB,
   chatDeliveryLink,
@@ -105,13 +106,18 @@ function source(initial?: string) {
   };
 }
 function apiWith(call: WorkspaceApi['call'], opened: string[] = []): WorkspaceApi {
+  const openSession = (id: string) => {
+    opened.push(id);
+  };
   return {
     call,
-    openSession: (id) => {
-      opened.push(id);
-    },
+    openSession,
     beginNavigation: () => new AbortController().signal,
     openBot: async () => {},
+    botNavigation: createBotNavigation(
+      { call, openSession },
+      { openManager: async () => {}, hasSession: async () => true, showMainPanel() {} },
+    ),
   };
 }
 

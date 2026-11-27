@@ -1,4 +1,4 @@
-import type { ChildWaitDetail, ChildWaitMember } from '../../model.ts';
+import type { ChildWaitDetail, ChildWaitMember, Task } from '../../model.ts';
 import { Section } from '../kit.tsx';
 import type { WorkspaceApi } from './api.ts';
 import type { Detail } from './types.ts';
@@ -34,13 +34,14 @@ function Member({
   child,
   api,
   current,
+  task,
 }: {
   child: ChildWaitMember;
   api: WorkspaceApi;
   current: boolean;
+  task: Task;
 }) {
   const { sessionId, parentSessionId, stopReason, endedAt } = child;
-  const open = api.openChildSession;
   const state =
     endedAt === null
       ? current
@@ -51,8 +52,11 @@ function Member({
         : '结局未知';
   return (
     <li className="full-text">
-      {sessionId && open ? (
-        <button className="small" onClick={() => open(parentSessionId, sessionId)}>
+      {sessionId && api.openChildSession ? (
+        <button
+          className="small"
+          onClick={() => api.botNavigation.openChildWorker(task, parentSessionId, sessionId)}
+        >
           打开子会话 <code>{sessionId}</code>
         </button>
       ) : (
@@ -120,6 +124,7 @@ export function CurrentChildWaits({
               key={child.nativeRunId}
               child={child}
               api={api}
+              task={detail.task}
               current={online && wait.outcome !== 'unknown'}
             />
           ))}
@@ -171,7 +176,13 @@ export function ChildWaitHistory({
           {wait.children.length > 0 && (
             <ul>
               {wait.children.map((child) => (
-                <Member key={child.nativeRunId} child={child} api={api} current={false} />
+                <Member
+                  key={child.nativeRunId}
+                  child={child}
+                  api={api}
+                  task={detail.task}
+                  current={false}
+                />
               ))}
             </ul>
           )}

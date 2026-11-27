@@ -220,6 +220,7 @@ export async function openBotConversation(
   api: WorkspaceApi,
   botId: string,
   navigation: AbortSignal,
+  open = api.openSession,
 ): Promise<void> {
   if (navigation.aborted) return;
   let binding: ManagerBinding;
@@ -235,7 +236,7 @@ export async function openBotConversation(
   if (navigation.aborted) return;
   if (binding.botId !== botId || binding.state !== 'ready' || !binding.sessionId)
     throw new Error('对话尚未准备好，请在“工作”的设置（⋯）中查看状态。');
-  api.openSession(binding.sessionId);
+  open(binding.sessionId);
 }
 
 /** A delivery link resolves its real task owner, but cannot outlive navigation away. */

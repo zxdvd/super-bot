@@ -239,6 +239,8 @@ export async function smokeChatResultLinks({
       const row = page.locator('.sb-compact button.task').filter({ hasText: task.goal }).first();
       if (!(await row.isVisible()))
         await page.getByRole('button', { name: '打开或收起当前 Bot 的工作' }).click();
+      await row.waitFor();
+      if (await drawer.isVisible()) await close();
       await row.click();
       await drawer.getByRole('heading', { name: task.goal, exact: true }).waitFor();
       assert.equal(

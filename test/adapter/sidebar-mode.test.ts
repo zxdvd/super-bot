@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import type { Context } from '@deepseek-ai/cordis';
+import { createBotNavigation } from '../../src/ui/bot-navigation.ts';
 import type { ReactElement } from 'react';
 import { installBotSidebar } from '../../src/ui/BotSidebar.tsx';
 import type { WorkspaceApi } from '../../src/ui/work/api.ts';
@@ -41,6 +42,10 @@ test('sidebar mode switches only its own workspaces registration and keeps one f
     openSession: unexpected,
     beginNavigation: unexpected,
     openBot: unexpected,
+    botNavigation: createBotNavigation(
+      { call: unexpected, openSession: unexpected },
+      { openManager: unexpected, hasSession: unexpected, showMainPanel: unexpected },
+    ),
   };
   const dispose = installBotSidebar(slots, api);
   const visibleList = () =>

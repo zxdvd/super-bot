@@ -78,7 +78,10 @@ function AttentionBox({
       </details>
       {attention.kind === 'approval' && binding?.sessionId && (
         <p>
-          <button disabled={w.locked} onClick={() => w.api.openSession(binding.sessionId!)}>
+          <button
+            disabled={w.locked}
+            onClick={() => w.api.botNavigation.openWorker(task, binding.sessionId!)}
+          >
             打开会话处理审批
           </button>
         </p>
@@ -252,7 +255,9 @@ export function TaskDetailHeader({
         <div className="actions">
           <PrimaryAction w={w} detail={detail} />
           {binding?.sessionId && !recoveryPanel && (
-            <button onClick={() => w.api.openSession(binding.sessionId!)}>打开 Worker 会话</button>
+            <button onClick={() => w.api.botNavigation.openWorker(task, binding.sessionId!)}>
+              打开 Worker 会话
+            </button>
           )}
         </div>
       )}

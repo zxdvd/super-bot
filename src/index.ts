@@ -357,6 +357,32 @@ export async function apply(
           ok: true,
           value: store.botForSession(requiredText(payload.sessionId, '会话标识', 200)),
         };
+      if (endpoint === 'session.worker-owner') {
+        const sessionId = requiredText(payload.sessionId, '会话标识', 200);
+        if (payload.parentSessionId !== undefined) {
+          const task = store.getTask(requiredText(payload.taskId, '任务标识', 200));
+          store.getBot(task.botId);
+          const parentSessionId = requiredText(payload.parentSessionId, '父会话标识', 200);
+          const known = store
+            .taskChildWaits(task.id)
+            .some((wait) =>
+              wait.children.some(
+                (child) =>
+                  child.parentSessionId === parentSessionId && child.sessionId === sessionId,
+              ),
+            );
+          return { ok: true, value: known ? { taskId: task.id, botId: task.botId } : null };
+        }
+        const historical = payload.historical === true;
+        const taskId = store.workerTaskForSession(sessionId, historical);
+        if (!taskId) return { ok: true, value: null };
+        const task = store.getTask(taskId);
+        store.getBot(task.botId);
+        return {
+          ok: true,
+          value: historical || task.sessionId === sessionId ? { taskId, botId: task.botId } : null,
+        };
+      }
       if (endpoint === 'bot.capacity.get' || endpoint === 'bot.capacity.set') {
         const keys =
           endpoint === 'bot.capacity.get'
