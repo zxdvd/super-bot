@@ -1,6 +1,7 @@
 import type { Agent } from '@deepseek-ai/dsh-agent';
 import { createUserMessage, type UserMessage } from '@deepseek-ai/dsh-llm';
 import type { Session } from '@deepseek-ai/dsh-session';
+import { isNativeOwner } from './dsh-chat-events.ts';
 import { materialPrompt } from './materials.ts';
 import type {
   Binding,
@@ -10,6 +11,7 @@ import type {
   Task,
   TaskBotContext,
   WorkerPriorInput,
+  WorkerSupplement,
 } from './model.ts';
 import { workdirSummary } from './workdir.ts';
 
@@ -26,6 +28,7 @@ declare module '@deepseek-ai/dsh-llm' {
       bindingId?: string;
       promptMode?: 'full' | 'delta';
       carriedInputIds?: string[];
+      carriedSupplementIds?: string[];
       ownerDirectionIds?: string[];
     };
   }
@@ -121,9 +124,25 @@ function previousInputText(input: WorkerPriorInput): string {
 const inputLabel = (kind: string) =>
   kind === 'stage' ? 'Authorized stage continuation' : 'Additional user input';
 
+const supplementText = (supplement: WorkerSupplement) =>
+  `Prior user message from the Worker chat (within the existing task scope):\n${supplement.text}`;
+
+function restoredInputs(
+  inputs: readonly WorkerPriorInput[],
+  supplements: readonly WorkerSupplement[],
+): string[] {
+  return [
+    ...inputs.map((input) => ({ at: input.createdAt ?? 0, text: previousInputText(input) })),
+    ...supplements.map((input) => ({ at: input.createdAt, text: supplementText(input) })),
+  ]
+    .sort((left, right) => left.at - right.at)
+    .map(({ text }) => text);
+}
+
 type WorkerPromptPlan = {
   mode: 'full' | 'delta';
   carried: readonly WorkerPriorInput[];
+  supplements?: readonly WorkerSupplement[];
   inputOrder: number;
 };
 
@@ -131,13 +150,13 @@ export function createWorkerRunMessage(
   run: Run,
   input: RunInput,
   standing: string,
-  { mode, carried, inputOrder }: WorkerPromptPlan,
+  { mode, carried, supplements = [], inputOrder }: WorkerPromptPlan,
   recovery?: { note: string | null },
   context?: RecoveryWorkContext & { outputDirectory?: string },
 ): UserMessage {
   const sections = [runHeader(run.id)];
   if (mode === 'full') sections.push(standing);
-  sections.push(...carried.map(previousInputText));
+  sections.push(...restoredInputs(carried, supplements));
   if (recovery) {
     sections.push(
       'The user confirmed recovery and requested this new attempt. Check the current files and the prior blocker before proceeding within the same authorized scope.',
@@ -198,7 +217,7 @@ export function createWorkerRunMessage(
     sections.push(
       input.kind === 'stage'
         ? 'Perform only the recorded next step within the existing scope. Preserve earlier results and observed effects. Do not repeat completed work or broaden authorization. Recheck relevant facts before acting.'
-        : 'Continue from the current state and apply this input within the existing authorized scope. Use waiting if the input requires clarification or exceeds that scope.',
+        : 'Continue from the current state and apply this input within the existing authorized scope. Where directions conflict, apply the latest user instruction. Use waiting if the input requires clarification or exceeds that scope.',
     );
   } else {
     sections.push('Continue from the current verified state within the existing authorized scope.');
@@ -218,6 +237,7 @@ export function createWorkerRunMessage(
       promptMode: mode,
       ...(context?.directionIds?.length ? { ownerDirectionIds: context.directionIds } : {}),
       ...(carried.length ? { carriedInputIds: carried.map((prior) => prior.id) } : {}),
+      ...(supplements.length ? { carriedSupplementIds: supplements.map(({ id }) => id) } : {}),
     },
     content: [{ type: 'text', text: sections.join('\n\n') }],
   });
@@ -274,6 +294,32 @@ function hasPreviousInput(
   });
 }
 
+function hasSupplement(
+  messages: ReturnType<Session['deriveMessages']>,
+  run: Run,
+  supplement: WorkerSupplement,
+): boolean {
+  return messages.some((message) => {
+    if (message.role !== 'user') return false;
+    if (
+      run.sessionId === supplement.sessionId &&
+      message.id === supplement.messageId &&
+      isNativeOwner(message)
+    )
+      return true;
+    const source = message.source;
+    const block = message.content[0];
+    return (
+      source.kind === 'super-bot' &&
+      source.taskId === run.taskId &&
+      source.taskRevision === run.taskRevision &&
+      !!source.carriedSupplementIds?.includes(supplement.id) &&
+      block?.type === 'text' &&
+      block.text.includes(`\n\n${supplementText(supplement)}\n\n`)
+    );
+  });
+}
+
 function canRefreshWorkerContext(agent: Agent): boolean {
   if (typeof agent.session?.deriveMessages !== 'function') return false;
   try {
@@ -290,6 +336,7 @@ export function workerPromptPlan(
   run: Run,
   standing: string,
   previous: readonly WorkerPriorInput[] = [],
+  supplements: readonly WorkerSupplement[] = [],
 ): WorkerPromptPlan {
   const inputOrder = previous.length + 1;
   if (canRefreshWorkerContext(agent) && agent.session.id === run.sessionId) {
@@ -297,12 +344,20 @@ export function workerPromptPlan(
       const messages = agent.session.deriveMessages();
       const carried = previous.filter((prior) => !hasPreviousInput(messages, run, prior));
       const mode = hasStandingContext(messages, run, standing) ? 'delta' : 'full';
-      return { mode, carried, inputOrder };
+      const retained = supplements.filter(
+        (supplement) => !hasSupplement(messages, run, supplement),
+      );
+      return { mode, carried, inputOrder, ...(retained.length ? { supplements: retained } : {}) };
     } catch {
       // A missing or unreadable native projection is no proof of continuity.
     }
   }
-  return { mode: 'full', carried: previous, inputOrder };
+  return {
+    mode: 'full',
+    carried: previous,
+    inputOrder,
+    ...(supplements.length ? { supplements } : {}),
+  };
 }
 
 export function registerWorkerContext(
@@ -313,6 +368,7 @@ export function registerWorkerContext(
   previous: readonly WorkerPriorInput[],
   entered: () => boolean,
   authorized: () => boolean,
+  supplements: () => readonly WorkerSupplement[] = () => [],
 ): () => void {
   if (
     message.source.kind !== 'super-bot' ||
@@ -343,9 +399,12 @@ export function registerWorkerContext(
       if (!inputVisible) messages.push(message);
       const missing = [];
       if (!hasStandingContext(messages, run, standing)) missing.push(standing);
-      for (const prior of previous) {
-        if (!hasPreviousInput(messages, run, prior)) missing.push(previousInputText(prior));
-      }
+      missing.push(
+        ...restoredInputs(
+          previous.filter((prior) => !hasPreviousInput(messages, run, prior)),
+          supplements().filter((supplement) => !hasSupplement(messages, run, supplement)),
+        ),
+      );
       if (wasEntered && !inputVisible) missing.push(block.text);
       return missing.join('\n\n');
     },

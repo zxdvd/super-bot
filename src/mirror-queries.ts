@@ -1,4 +1,4 @@
-import { AppError, type Result, type Task } from './model.ts';
+import { AppError, settledRunOutcome, type Result, type Task } from './model.ts';
 import type { MirrorQuery } from './mirror-host.ts';
 import type { MirrorDetail, MirrorEvent, ResultRecord } from './mirror.ts';
 import type { Store } from './store.ts';
@@ -23,6 +23,7 @@ function taskRecord(task: Task, detail: boolean): Task {
     stageState,
     managerReviewed,
     blockingAttention,
+    lastRunOutcome,
     deliveredAt,
     botConfigRevision,
   } = task;
@@ -43,6 +44,7 @@ function taskRecord(task: Task, detail: boolean): Task {
     status,
     managerReviewed,
     blockingAttention,
+    ...(lastRunOutcome ? { lastRunOutcome } : {}),
     ...(activity !== undefined ? { activity, ...(stageState ? { stageState } : {}) } : {}),
     ...(task.waitingForPrerequisite && { waitingForPrerequisite: true }),
     deliveredAt,
@@ -97,9 +99,13 @@ function auditRecord({ id, kind, createdAt, data }: MirrorEvent): MirrorEvent {
       }),
     };
   }
-  if (kind !== 'work.report' && kind !== 'manager.delivered' && kind !== 'approval.decided')
+  if (!['work.report', 'manager.delivered', 'approval.decided', 'run.settled'].includes(kind))
     return event;
   const fields = JSON.parse(data) as Record<string, unknown>;
+  if (kind === 'run.settled') {
+    const outcome = settledRunOutcome(fields.kind);
+    return outcome ? { ...event, data: JSON.stringify({ kind: outcome }) } : event;
+  }
   if (
     kind === 'work.report' &&
     typeof fields.kind === 'string' &&
@@ -154,6 +160,7 @@ export function readLocalMirror(store: Store, query: MirrorQuery) {
       state: run.state,
       createdAt: run.createdAt,
       finishedAt: run.finishedAt,
+      ...(run.outcome ? { outcome: run.outcome } : {}),
     },
     result: result && resultRecord(result),
     deliveredResult: deliveredResult && {

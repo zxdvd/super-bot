@@ -12,7 +12,6 @@ type ClarificationOption = {
 };
 
 const OPEN_TASK_ACTIONS: readonly ClarificationAction[] = [
-  'continue',
   'respond',
   'revise',
   'recover-and-continue',
@@ -51,9 +50,12 @@ export function clarificationOptions(
     const task = store.getTask(requestedResult?.taskId ?? requiredText(id, '候选任务标识', 200));
     const open = task.lifecycle === 'open';
     const review = task.lifecycle === 'review';
+    const continuation =
+      action === 'continue' && !open && (review || task.lifecycle === 'completed');
     if (
       task.botId !== botId ||
       (selectsResult && !review) ||
+      (action === 'continue' && !open && !continuation) ||
       (OPEN_TASK_ACTIONS.includes(action) && !open) ||
       (UNFINISHED_TASK_ACTIONS.includes(action) && !open && !review) ||
       (action === 'stop' && store.latestRun(task.id)?.finishedAt !== null) ||
@@ -63,10 +65,14 @@ export function clarificationOptions(
     }
 
     const choice = { taskId: task.id, name: task.goal, rowVersion: task.rowVersion };
-    if (selectsResult) {
-      const { result } = store.taskDetail(task.id);
-      if (!result || (requestedResult && result.id !== requestedResult.id)) {
-        throw new AppError('result-stale', '请重新核对当前待验收的候选成果。');
+    if (selectsResult || continuation) {
+      const { result, deliveredResult } = store.taskDetail(task.id);
+      if (
+        !result ||
+        (requestedResult && result.id !== requestedResult.id) ||
+        (continuation && deliveredResult?.id !== result.id)
+      ) {
+        throw new AppError('result-stale', '请重新核对当前成果版本。');
       }
       return {
         ...choice,

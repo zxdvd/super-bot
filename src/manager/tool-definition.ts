@@ -63,6 +63,12 @@ export const MANAGER_TOOL = {
           ...OWNER_WORK_ACTIONS,
         ],
       },
+      reviewPolicy: {
+        type: 'string',
+        enum: ['bot', 'human'],
+        description:
+          'For create only. Bot checks and accepts an ordinary result by default. Set human only when the authenticated owner explicitly asks to sign off on the final result personally. This does not authorize approval, merge, or release actions.',
+      },
       nextStep: {
         type: 'string',
         description:
@@ -256,7 +262,11 @@ export const MANAGER_TOOL = {
       scope: { type: 'string' },
       acceptance: { type: 'string' },
       expectedRowVersion: { type: 'integer' },
-      resultId: { type: 'string' },
+      resultId: {
+        type: 'string',
+        description:
+          'For continue after delivery, the exact current delivered resultId and a concrete new owner instruction are required.',
+      },
       verdict: { type: 'string', enum: ['accept', 'rework', 'human'] },
       note: { type: 'string' },
       offset: { type: 'integer' },

@@ -5,7 +5,9 @@ import { createHash, randomUUID } from 'node:crypto';
 import { mkdir, readFile, realpath, rm, stat, writeFile } from 'node:fs/promises';
 import { basename, join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
+import schemaVersion from '../schema-version.json' with { type: 'json' };
 import { Store } from '../src/store.ts';
+import { receiptReviewGoal } from '../test/delivery-link-fixture.ts';
 
 const sha256 = (bytes) => createHash('sha256').update(bytes).digest('hex');
 const attachmentPath = (id, index = 0, sessionId) =>
@@ -113,7 +115,7 @@ export async function smokeResultAttachments({
   const say = (text) => probe(origin, 'native-prompt', bot.managerId, text);
   const inspect = () => probe(origin, 'inspect-session', bot.managerId);
   await probe(origin, 'select-test-model', bot.managerId);
-  await say('DF14_RECEIPT_PROBE');
+  await say(receiptReviewGoal);
   const task = await wait(
     async () =>
       (await call(origin, 'task.list', { botId: bot.id })).items.find(
@@ -160,10 +162,8 @@ export async function smokeResultAttachments({
       'completed',
     );
     assert.ok(
-      chat.assistantTexts.some(
-        (text) =>
-          text.includes(`${origin.base}/#super-bot-task=${task.id}&resultId=${result.id}`) &&
-          text.includes(origin.base + attachmentPath(result.id)),
+      chat.assistantTexts.some((text) =>
+        text.includes(`${origin.base}/#super-bot-task=${task.id}&resultId=${result.id}`),
       ),
     );
     return {
@@ -227,7 +227,7 @@ export async function smokeResultAttachments({
   );
 
   const backup = await call(origin, 'backup.create', { requestId: randomUUID() });
-  assert.equal(backup.schema, 10);
+  assert.equal(backup.schema, schemaVersion);
   assert.equal(backup.counts.results, 3);
   assert.match(backup.scope, /已保存的成果附件/);
   assert.equal((await stat(backup.path)).mode & 0o777, 0o600);

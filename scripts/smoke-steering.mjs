@@ -161,9 +161,7 @@ try {
     }, 'worker/native converged');
     await until(async () => {
       const d = await call('task.detail', { id: t.id });
-      return {
-        ok: d.run?.finishedAt !== null && (scenario !== 'queue' || d.task.controlMode === 'manual'),
-      };
+      return { ok: d.run?.finishedAt !== null };
     }, 'durable automatic reconciliation');
     const end = await snapshot(t, `${scenario}: after auto end`);
     if (scenario === 'steer') {
@@ -184,7 +182,9 @@ try {
         'settled',
         'automatic ready must settle before native follow-up',
       );
-      assert.equal(end.d.task.controlMode, 'manual');
+      assert.equal(end.d.task.controlMode, 'auto');
+      assert.ok(end.d.result);
+      assert.equal(end.d.events.filter((e) => e.kind === 'input.worker-supplement').length, 1);
       assert.equal(end.s.stalledAborted, false);
       await probe('release-stalled-model', t.sid);
     }
@@ -205,7 +205,7 @@ try {
     }, 'native after unresolved background');
     const after = await snapshot(t, 'background: native starts with old resource held');
     assert.equal(after.d.run.state, 'interrupted');
-    assert.equal(after.d.task.controlMode, 'manual');
+    assert.equal(after.d.task.controlMode, 'auto');
     assert.equal(after.s.stalledAborted, false);
     await probe('release-stalled-model', t.sid);
     await probe('ready-job-cancel', t.sid);
@@ -261,7 +261,7 @@ try {
     const after = await snapshot(t, 'handoff: native turn running');
     assert.equal(after.d.run.state, 'cancelled');
     assert.equal(after.d.run.state, 'cancelled');
-    assert.equal(after.d.task.controlMode, 'manual');
+    assert.equal(after.d.task.controlMode, 'paused');
     assert.equal(after.s.stalledAborted, false);
     await call('task.stop', stop);
     assert.equal(

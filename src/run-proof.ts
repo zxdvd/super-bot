@@ -1,4 +1,4 @@
-/** Pure durable-prefix verifier: never infers external convergence from a new host. */
+/** Verify a Run's exact native input and turn against the durable Session prefix. */
 import { AppError, type Run, type RunInput, type RunTurn } from './model.ts';
 export interface RunEvent {
   seq: number;
@@ -33,6 +33,56 @@ export function verifyRunTurn(
 
 function refuse(note: string): never {
   throw new AppError('run-proof', note);
+}
+
+export function verifyUnobservedRunEnd(
+  run: Run,
+  input: RunInput,
+  proof: RunTurn,
+  events: readonly RunEvent[],
+): { endSeq: number; endKind: string } {
+  if (proof.inputSeq === null || proof.endSeq !== null) refuse('缺少可读回的原轮坐标，保留占用。');
+  const end = events
+    .slice(proof.inputSeq + 1)
+    .find((event) => event.type === 'turn/end' || event.type === 'turn/start');
+  const endKind = end?.data.reason?.kind;
+  // A synthetic interrupted or forked closer does not attest that the original turn ended.
+  if (end?.type !== 'turn/end' || !['completed', 'error', 'aborted'].includes(endKind))
+    refuse('缺少持久保存的原轮结束事件，保留占用。');
+  const observed = { endSeq: end.seq, endKind };
+  verifyRunBoundary(run, input, { ...proof, ...observed }, events);
+  const jobs = new Map<string, RunEvent>();
+  const approvals = new Set<string>();
+  for (const event of events.slice(proof.startSeq! + 1)) {
+    if (event.type === 'approval/asked') approvals.add(event.data.id);
+    if (event.type === 'approval/decided') approvals.delete(event.data.id);
+    if (event.type === 'job/registered' && event.data.owner === run.sessionId)
+      jobs.set(event.data.jobId, event);
+    if (event.type === 'job/settled' && matchesJobSettlement(jobs.get(event.data.jobId), event))
+      jobs.delete(event.data.jobId);
+  }
+  const job = jobs.keys().next().value;
+  if (job) throw new AppError('job-unknown', `原生作业 ${job} 缺少生产者的终态回执，保留占用。`);
+  if (approvals.size) throw new AppError('recovery-pending', '原生审批尚无决定回执，保留占用。');
+  return observed;
+}
+
+export function matchesJobSettlement(registered: RunEvent | undefined, settled: RunEvent) {
+  const original = registered?.data,
+    terminal = settled.data;
+  return (
+    !!original &&
+    registered.seq < settled.seq &&
+    terminal.jobId === original.jobId &&
+    terminal.owner === original.owner &&
+    terminal.startedAt === original.startedAt &&
+    terminal.kind === original.kind &&
+    terminal.label === original.label &&
+    terminal.toolCall?.callId === original.toolCall?.callId &&
+    terminal.toolCall?.rootCallId === original.toolCall?.rootCallId &&
+    ['completed', 'failed', 'killed'].includes(terminal.status) &&
+    terminal.producerReported === true
+  );
 }
 
 export function verifyRunBoundary(

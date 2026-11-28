@@ -136,6 +136,48 @@ test('first dispatch is full, while proven answer, rework and bare continuation 
   }
 });
 
+test('native Worker follow-up and newer Bot directions retain their precedence after context loss', () => {
+  const { agent, append, replace } = fixture();
+  const native = createUserMessage({
+    source: { kind: 'user', rpcId: 'synthetic-native-followup' },
+    content: [{ type: 'text', text: 'Include a bar chart in the report.' }],
+  });
+  const supplement = {
+    id: 'worker-supplement',
+    sessionId,
+    messageId: native.id,
+    text: 'Include a bar chart in the report.',
+    createdAt: 10,
+  };
+  const newer = {
+    id: 'newer',
+    kind: 'rework' as const,
+    content: 'Replace the chart with a table.',
+    messageId: null,
+    order: 1,
+    createdAt: 20,
+  };
+  const nativeEvent = append(native);
+  const build = () =>
+    buildMessage(
+      next,
+      input(next, 'rework', 'Check totals and retain the updated format.'),
+      standing,
+      workerPromptPlan(agent, next, standing, [newer], [supplement]),
+    );
+  assert.doesNotMatch(textOf(build()), /bar chart/, 'native input is already visible');
+  replace(nativeEvent.seq);
+  const restored = build();
+  const body = textOf(restored);
+  assert.equal(body.split(supplement.text).length, 2);
+  assert.ok(body.indexOf(supplement.text) < body.indexOf(newer.content));
+  assert.ok(
+    body.indexOf(newer.content) < body.indexOf('Check totals and retain the updated format.'),
+  );
+  append(restored);
+  assert.doesNotMatch(textOf(build()), /bar chart/, 'restored input is already visible');
+});
+
 test('prior task text in the log or in a different binding never proves usable native context', () => {
   const { agent, session, append, replace } = fixture();
   const full = createWorkerRunMessage(initial, input(initial), standing, 'full');
@@ -464,6 +506,7 @@ test('dispatch reuses the exact persisted input on retry and carries an entered 
       kind: 'answer',
       content: answer.content,
       messageId: saved.messageId,
+      createdAt: answer.createdAt,
       order: 1,
     },
   ]);

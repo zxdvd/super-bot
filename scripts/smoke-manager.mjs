@@ -79,7 +79,7 @@ await probe({
 await waitFor(async () => {
   const page = await call('task.list', { botId: bot.id });
   return {
-    ok: page.total === 3 && page.items.filter((t) => t.lifecycle === 'review').length === 2,
+    ok: page.total === 3 && page.items.filter((t) => t.lifecycle === 'completed').length === 2,
     page,
   };
 }, 'manager chat creation');

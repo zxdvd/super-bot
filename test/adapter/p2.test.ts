@@ -23,6 +23,7 @@ import { Managers } from '../../src/manager.ts';
 import { DshExecution } from '../../src/dsh.ts';
 import { Store } from '../../src/store.ts';
 import { readEvidence } from '../../src/evidence.ts';
+import { canReviewResult, resultHeading } from '../../src/ui/work/format.ts';
 
 function fixture(
   t: TestContext,
@@ -131,7 +132,13 @@ function fixture(
           idle = Promise.resolve();
         const agent: any = {
           id: sessionId,
-          session: { id: sessionId, header: { cwd: workspaceId } },
+          session: {
+            id: sessionId,
+            header: { cwd: workspaceId },
+            get seq() {
+              return workerEvents.get(sessionId)?.length ?? 0;
+            },
+          },
           status: 'idle',
           model: {
             current: () => ({ provider: 'synthetic', model: 'synthetic' }),
@@ -322,6 +329,227 @@ function fixture(
     },
   };
 }
+
+for (const expectedStage of ['waiting', 'dispatched'] as const)
+  test(`native stage advancement and replay return the same ${expectedStage} decision`, async (t) => {
+    const origin = 'https://gitlab.example.invalid';
+    const f = fixture(t, false, () => ({ gitLabObserverOrigin: origin }));
+    try {
+      await f.native('request', 1, '写说明，等指定流水线通过后核对产物。');
+      const created = await f.nativeCall('create', { action: 'create', goal: '说明' });
+      const run = f.store.latestRun(created.task.id)!;
+      await f.emit({ type: 'user/message', data: f.delivered() }, run.sessionId);
+      f.store.workerReport(run.id, 'checkpoint', {
+        kind: 'stage',
+        stage: '说明已写',
+        evidenceRef: 'pipeline/42',
+        summary: '说明已写，流水线结果待查',
+        checks: '回读说明',
+      });
+      await f.agents.get(run.sessionId).finish();
+      const before = await f.nativeCall('before', { action: 'detail', taskId: created.task.id });
+      assert.equal(before.stage.state, 'awaiting-decision');
+      const args = {
+        action: 'advance_stage',
+        taskId: created.task.id,
+        expectedRowVersion: before.task.rowVersion,
+        runId: run.id,
+        nextStep: '核对流水线产物',
+        ...(expectedStage === 'waiting'
+          ? {
+              condition: {
+                kind: 'gitlab-pipeline',
+                sourceOrigin: origin,
+                project: 'fixture/docs',
+                number: 42,
+              },
+            }
+          : {}),
+      };
+      const first = await f.nativeResult('advance', args);
+      const replay = await f.nativeCall('advance', args);
+      const after = await f.nativeCall('after', { action: 'detail', taskId: created.task.id });
+      assert.equal(replay.stage.state, expectedStage);
+      assert.equal(after.result, null);
+      assert.equal(after.events.filter((event: any) => event.kind === 'stage.decided').length, 1);
+      if (expectedStage === 'waiting') {
+        assert.equal(after.runHeld, false);
+        assert.deepEqual(replay.stage, after.stage);
+      } else {
+        assert.equal(after.runHeld, true);
+        assert.equal(replay.stage.dispatchedRunId, after.run.id);
+        assert.equal(replay.run.id, after.run.id);
+        assert.equal(replay.run.sessionId, run.sessionId);
+        assert.equal(
+          after.events.filter((event: any) => event.kind === 'stage.dispatched').length,
+          1,
+        );
+      }
+      assert.ok(!first.isError, JSON.stringify(first.error));
+      assert.deepEqual(first.value, replay);
+    } finally {
+      await f.close();
+    }
+  });
+
+for (const policy of ['bot', 'human'] as const)
+  test(`native chat creates a task for ${policy} acceptance and delivers the reviewed result`, async (t) => {
+    const f = fixture(t);
+    try {
+      await f.native(
+        'request',
+        1,
+        policy === 'human' ? '写一份说明，最后由我亲自验收。' : '写一份说明，完成后把文件给我。',
+      );
+      const created = await f.nativeCall('create', {
+        action: 'create',
+        goal: '说明',
+        acceptance: '正文包含两项事实',
+        ...(policy === 'human' ? { reviewPolicy: 'human' } : {}),
+      });
+      const taskId = created.task.id;
+      assert.equal(created.task.reviewPolicy, policy);
+      const file = join(f.store.activeBinding(taskId)!.cwd, 'outline.md');
+      writeFileSync(file, '事实一\n事实二\n');
+      await f.finish(taskId, [file]);
+      const before = await f.nativeCall('detail', { action: 'detail', taskId });
+      assert.equal(before.task.lifecycle, 'review');
+      assert.equal(before.delivery.botReviewPending, true);
+      assert.equal(before.delivery.humanAcceptanceRequired, policy === 'human');
+      assert.equal(before.evidenceValidation.status, 'verified');
+      assert.match(before.files[0].text, /事实一\n事实二/);
+      const resultId = before.result.id;
+      const delivery = { action: 'deliver', taskId, resultId, text: '说明已回读，包含两项事实。' };
+      if (policy === 'bot') {
+        const early = await f.nativeResult('early-delivery', delivery);
+        assert.ok(early.isError);
+        assert.match(JSON.stringify(early.error), /请先按任务的验收条件/);
+      }
+      const reviewed = await f.nativeCall('review', {
+        action: 'review',
+        taskId,
+        resultId,
+        expectedRowVersion: before.task.rowVersion,
+        verdict: 'accept',
+        note: '已逐项回读正文中两项事实。',
+      });
+      assert.equal(reviewed.task.lifecycle, policy === 'bot' ? 'completed' : 'review');
+      assert.equal(reviewed.humanAcceptanceRequired, policy === 'human');
+      const delivered = (await f.nativeCall('deliver', delivery)).delivery;
+      assert.equal(delivered.humanAcceptanceRequired, policy === 'human');
+      assert.match(delivered.markdown, new RegExp(`resultId=${resultId}`));
+      await f.emit({ type: 'turn/start', data: { turn: 2 } });
+      await f.native('continue', 2, '继续。');
+      const noNewDirection = await f.nativeResult('continue', {
+        action: 'continue',
+        taskId,
+        expectedRowVersion: reviewed.task.rowVersion,
+        userInstruction: '继续。',
+        useLatestDirection: true,
+      });
+      assert.ok(noNewDirection.isError);
+      assert.equal(f.store.getTask(taskId).lifecycle, reviewed.task.lifecycle);
+      const result = f.store.resultById(resultId)!;
+      assert.equal(result.humanAcceptedAt, null);
+      assert.equal(
+        f.store.taskDetail(taskId).progress.acceptance?.actor,
+        policy === 'bot' ? 'bot' : undefined,
+      );
+    } finally {
+      await f.close();
+    }
+  });
+
+test('pausing a Bot review preserves optional owner acceptance and resumes Bot review', async (t) => {
+  const f = fixture(t);
+  try {
+    await f.native('request', 1, '写一份说明，完成后把文件给我。');
+    const { task } = await f.nativeCall('create', {
+      action: 'create',
+      goal: '说明',
+      acceptance: '回读事实',
+    });
+    const file = join(f.store.activeBinding(task.id)!.cwd, 'result.md');
+    writeFileSync(file, '合成事实');
+    await f.finish(task.id, [file]);
+    const before = await f.nativeCall('before', { action: 'detail', taskId: task.id });
+    assert.equal(canReviewResult(before.task), false);
+    await f.native('pause', 2, '先暂停说明任务的自动管理。');
+    await f.nativeCall('pause', {
+      action: 'pause',
+      taskId: task.id,
+      expectedRowVersion: before.task.rowVersion,
+      userInstruction: '先暂停说明任务的自动管理。',
+    });
+    const paused = await f.nativeCall('paused', { action: 'detail', taskId: task.id });
+    assert.equal(paused.task.controlMode, 'paused');
+    assert.equal(paused.task.lifecycle, 'review');
+    assert.equal(paused.result.id, before.result.id);
+    assert.equal(paused.progress.acceptance, null);
+    assert.equal(paused.delivery.humanAcceptanceRequired, false);
+    assert.equal(paused.delivery.botReviewPending, true);
+    assert.equal(canReviewResult(paused.task), true);
+    assert.equal(resultHeading(paused.task), '成果 · Bot 验收已暂停');
+    assert.match(
+      paused.attentions.find((item: any) => item.kind === 'review')?.question,
+      /Bot 验收已暂停/,
+    );
+    const review = {
+      action: 'review',
+      taskId: task.id,
+      resultId: before.result.id,
+      verdict: 'accept',
+      note: '已回读合成事实。',
+    };
+    const early = await f.nativeResult('review-paused', {
+      ...review,
+      expectedRowVersion: paused.task.rowVersion,
+    });
+    assert.ok(early.isError);
+    await f.native('resume', 3, '恢复说明任务的自动管理。');
+    const resumed = await f.nativeCall('resume', {
+      action: 'resume',
+      taskId: task.id,
+      expectedRowVersion: paused.task.rowVersion,
+      userInstruction: '恢复说明任务的自动管理。',
+    });
+    assert.equal(resumed.task.controlMode, 'auto');
+    assert.equal(resumed.task.lifecycle, 'review');
+    assert.equal(canReviewResult(resumed.task), false);
+    const accepted = await f.nativeCall('review-resumed', {
+      ...review,
+      expectedRowVersion: resumed.task.rowVersion,
+    });
+    assert.equal(accepted.task.lifecycle, 'completed');
+    assert.equal(f.store.taskDetail(task.id).progress.acceptance?.actor, 'bot');
+  } finally {
+    await f.close();
+  }
+});
+
+test('replaying an older native create retains its stored human review policy', async (t) => {
+  const f = fixture(t);
+  try {
+    const text = '写一份介绍，稍后补充范围。';
+    const source = { sessionId: f.manager.requestedSessionId, messageId: 'old', seq: 1, text };
+    const old = f.store.createTask(
+      `manager:${f.manager.id}:create-before-upgrade`,
+      { botId: f.bot.id, goal: '旧任务', scope: '', acceptance: '', reviewPolicy: 'human' },
+      source,
+    );
+    await f.reload();
+    await f.native(source.messageId, source.seq, text);
+    const args = { action: 'create', goal: old.goal, dispatch: false };
+    for (const callId of ['create-before-upgrade', 'replayed-intent']) {
+      const { task } = await f.nativeCall(callId, args);
+      assert.equal(task.id, old.id);
+      assert.equal(task.reviewPolicy, 'human');
+    }
+    assert.equal(f.store.listTasks({ botId: f.bot.id }).total, 1);
+  } finally {
+    await f.close();
+  }
+});
 
 for (const [label, fields] of Object.entries({
   omitted: {},
@@ -671,7 +899,7 @@ test('P2 incomplete unbound task can be completed by a real chat answer and disp
     assert.equal(completed.task.taskRevision, 2);
     assert.equal(completed.task.rowVersion, before.task.rowVersion + 1);
     assert.equal(completed.task.status, 'unscheduled');
-    assert.equal(completed.task.reviewPolicy, 'human');
+    assert.equal(completed.task.reviewPolicy, 'bot');
     const after = await f.call('after', { action: 'detail', taskId: created.task.id });
     assert.equal(after.attentions.find((a: any) => a.id === attention.id).state, 'resolved');
     assert.deepEqual(
@@ -1990,6 +2218,213 @@ test('create dispatches in one step with inferred fields and retries reuse the s
   }
 });
 
+for (const boundary of [
+  'ended',
+  'missing-end',
+  'synthetic-end',
+  'denied-quiet',
+  'active-job',
+  'pending-approval',
+  'unknown-write',
+] as const)
+  test(`saved owner directions recover an orphaned Run with ${boundary} native evidence`, async (t) => {
+    const f = fixture(t, true);
+    try {
+      f.store.setBotCapacity('one-slot', f.bot.id, null, 1);
+      await f.native('orphan-owner', 1, '查看测试目录中的资料。');
+      const { task, run } = await f.nativeCall('orphan-create', {
+        action: 'create',
+        goal: '查看测试资料',
+      });
+      const worker = f.agents.get(run.sessionId);
+      const restrict = t.mock.method(worker.ctx.tools, 'restrict');
+      await f.emit({ type: 'user/message', data: worker.messages[0] }, worker.id);
+      await endOwnerTurn(f, 2);
+
+      const directions =
+        boundary === 'unknown-write'
+          ? ['先读取现有的样例。', '然后仅回报是否有缺项。']
+          : ['先整理已有的样例。', '然后汇总缺失的条目。'];
+      for (const [i, direction] of directions.entries()) {
+        await askOnOwnerTurn(f, i + 2, i + 3, direction);
+        const saved = await f.nativeCall(`orphan-direction-${i}`, {
+          action: 'continue',
+          taskId: task.id,
+          expectedRowVersion: f.store.getTask(task.id).rowVersion,
+          userInstruction: direction,
+          continuationMode: boundary === 'unknown-write' ? 'read-only' : 'authorized-work',
+        });
+        assert.equal(saved.status, 'waiting');
+        await endOwnerTurn(f, i + 4);
+      }
+      const olderWaiter =
+        boundary === 'unknown-write'
+          ? f.store.createTask('older-capacity-waiter', {
+              botId: f.bot.id,
+              goal: '先排队的独立任务',
+              scope: '测试目录',
+              acceptance: '回读',
+              reviewPolicy: 'human',
+            })
+          : null;
+      if (olderWaiter) {
+        const binding = f.store.beginBinding(
+          'older-binding',
+          olderWaiter.id,
+          olderWaiter.rowVersion,
+          f.directory,
+        );
+        f.store.confirmBinding(binding.id, binding.requestedSessionId);
+        f.store.recordCapacityWait(
+          'older-wait',
+          olderWaiter.id,
+          f.store.getTask(olderWaiter.id).rowVersion,
+        );
+      }
+      const job = {
+        jobId: 'fixture-job',
+        owner: worker.id,
+        startedAt: 1,
+        kind: 'shell',
+        label: 'Example job',
+      };
+      if (boundary === 'active-job' || boundary === 'ended')
+        await f.emit({ type: 'job/registered', data: job }, worker.id);
+      if (boundary === 'pending-approval')
+        await f.emit(
+          { type: 'approval/asked', data: { id: 'pending', toolName: 'bash' } },
+          worker.id,
+        );
+      if (boundary === 'unknown-write')
+        await f.emit(
+          {
+            type: 'tool/call',
+            data: { turn: 1, step: 1, callId: 'missing-result', name: 'bash', arguments: '{}' },
+          },
+          worker.id,
+        );
+      const ledgerEnd = boundary === 'denied-quiet' ? worker.session.seq : null;
+      if (ledgerEnd !== null) f.store.observeRunEnd(run.id, ledgerEnd, 'completed', false);
+      // Preserve the native log while simulating loss of the plugin's turn/end observation.
+      await f.execution.dispose();
+      if (boundary === 'synthetic-end')
+        await f.emit(
+          { type: 'turn/end', data: { turn: 1, reason: { kind: 'interrupted' } } },
+          worker.id,
+        );
+      else if (boundary !== 'missing-end') await worker.finish();
+      const workerSupplement = '保留 Worker 会话里的这条补充。';
+      if (boundary === 'ended') {
+        await f.emit(
+          { type: 'job/settled', data: { ...job, status: 'completed', producerReported: true } },
+          worker.id,
+        );
+        await f.emit(
+          { type: 'model/selection', data: { provider: 'synthetic', model: 'synthetic' } },
+          worker.id,
+        );
+        worker.turn++;
+        await f.emit({ type: 'turn/start', data: { turn: worker.turn } }, worker.id);
+        await f.emit(
+          {
+            type: 'user/message',
+            data: {
+              id: 'worker-owner-supplement',
+              source: { kind: 'user', rpcId: 'fixture-owner' },
+              content: [{ type: 'text', text: workerSupplement }],
+            },
+          },
+          worker.id,
+        );
+        await worker.finish();
+      }
+      assert.equal(f.store.runTurn(run.id)?.endSeq, ledgerEnd);
+      assert.equal(f.store.heldRuns()[0]?.id, run.id);
+
+      await f.ctx.sessionController.create({
+        workspaceId: f.directory as any,
+        sessionId: f.manager.requestedSessionId as any,
+      });
+      const pump = () => (f.managers as unknown as { pump(): Promise<void> }).pump();
+      await f.reload();
+      await pump();
+
+      if (olderWaiter) {
+        assert.equal(f.store.latestRun(task.id)?.id, run.id);
+        assert.deepEqual(f.store.heldRuns(), []);
+        assert.equal(f.store.dispatchWait(task.id)?.holderTaskId, olderWaiter.id);
+        await f.reload();
+        assert.match(f.store.verifiedEndUncertainty(run.id) ?? '', /bash/);
+        f.store.controlTask(
+          'pause-waiter',
+          olderWaiter.id,
+          f.store.getTask(olderWaiter.id).rowVersion,
+          'paused',
+        );
+        await pump();
+      }
+
+      const starts = boundary === 'ended' || boundary === 'unknown-write';
+      const next = f.store.latestRun(task.id)!;
+      if (starts) {
+        assert.notEqual(next.id, run.id);
+        assert.equal(next.sessionId, run.sessionId);
+        assert.deepEqual(
+          f.store.heldRuns().map(({ id }) => id),
+          [next.id],
+        );
+        assert.equal(f.store.recoveryInstruction(task.id)?.runId, next.id);
+        assert.equal(f.store.getRun(run.id).state, 'interrupted');
+        assert.equal(f.store.runTurn(run.id)?.endSeq, null);
+        assert.equal(f.store.getTask(task.id).controlMode, 'auto');
+        if (boundary === 'ended') {
+          assert.deepEqual(
+            f.store.workerSupplements(run).map(({ text }) => text),
+            [workerSupplement],
+          );
+        } else {
+          const work = f.store.recoveryWorkPlan(next.id)?.context;
+          assert.equal(work?.effectUncertain, true);
+          assert.match(work?.priorEffectUncertainty ?? '', /bash/);
+          assert.deepEqual(restrict.mock.calls.at(-1)?.arguments[0], {
+            allow: ['read', 'super_bot_report', 'super_bot_query'],
+          });
+        }
+        assert.equal(worker.messages.length, 2);
+        const text = worker.messages[1].content[0].text;
+        assert.ok(text.indexOf(directions[0]) < text.indexOf(directions[1]));
+        for (const direction of directions) assert.equal(text.split(direction).length, 2);
+        await f.emit({ type: 'user/message', data: worker.messages[1] }, worker.id);
+        assert.equal(f.store.getRunInput(next.id).state, 'entered');
+      } else {
+        assert.equal(next.id, run.id);
+        assert.equal(f.store.heldRuns()[0]?.id, run.id);
+        assert.equal(f.store.recoveryInstruction(task.id)?.runId, undefined);
+      }
+
+      await f.reload();
+      await pump();
+      assert.equal(f.store.latestRun(task.id)?.id, next.id);
+      assert.equal(worker.messages.length, starts ? 2 : 1);
+      if (boundary === 'active-job') {
+        const managerAgent = f.agents.get(f.manager.requestedSessionId);
+        managerAgent.cancel();
+        await f.emit(
+          { type: 'job/settled', data: { ...job, status: 'completed', producerReported: true } },
+          worker.id,
+        );
+        await pump();
+        const resumed = f.store.latestRun(task.id)!;
+        assert.notEqual(resumed.id, run.id);
+        assert.equal(resumed.sessionId, run.sessionId);
+        assert.equal(f.store.recoveryInstruction(task.id)?.runId, resumed.id);
+        assert.equal(worker.messages.length, 2);
+      }
+    } finally {
+      await f.close();
+    }
+  });
+
 test('one-step create keeps explicit Bot fields and queues instead of failing when capacity is full', async (t) => {
   const f = fixture(t, true);
   try {
@@ -2671,6 +3106,14 @@ test('code delivery from native chat preserves a dirty Git baseline and reports 
   assert.equal(git('diff', '--cached', '--binary'), indexBefore);
   assert.equal(git('rev-parse', 'HEAD').trim(), head);
 
+  const reviewed = await f.nativeCall('review-code', {
+    action: 'review',
+    taskId: task.id,
+    resultId: report.resultId,
+    expectedRowVersion: detail.task.rowVersion,
+    verdict: 'accept',
+    note: '已核对开工状态、任务修改、保留的本地变更和实际检查。',
+  });
   const { delivery } = await f.nativeCall('deliver-code', {
     action: 'deliver',
     taskId: task.id,
@@ -2685,7 +3128,7 @@ test('code delivery from native chat preserves a dirty Git baseline and reports 
     delivery.files.map((file: { name: string }) => file.name),
     ['facts.md', 'app.mjs'],
   );
-  assert.equal(detail.task.lifecycle, 'review');
+  assert.equal(reviewed.task.lifecycle, 'completed');
   assert.equal(detail.result.humanAcceptedAt, null);
 });
 

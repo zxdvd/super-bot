@@ -20,6 +20,7 @@ import { fileURLToPath } from 'node:url';
 import { setTimeout as delay } from 'node:timers/promises';
 import { build } from 'esbuild';
 import { authenticateHost } from './host-client.mjs';
+import { mirrorReviewGoal } from '../test/delivery-link-fixture.ts';
 
 const root = fileURLToPath(new URL('..', import.meta.url));
 const base = resolve(
@@ -349,7 +350,7 @@ async function newTask(host, bot, goal) {
 }
 async function chatWork(host, bot) {
   await probe(host, 'select-test-model', bot.managerId);
-  await probe(host, 'native-prompt', bot.managerId, 'MIRROR_PROGRESS_PROBE');
+  await probe(host, 'native-prompt', bot.managerId, mirrorReviewGoal);
   const task = await wait(
     async () =>
       (await call(host, 'task.list', { botId: bot.id, q: 'MIRROR_PROGRESS_PROBE' })).items.find(

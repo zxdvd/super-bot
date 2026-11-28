@@ -233,6 +233,7 @@ export async function smokeTaskStages({
     );
     assert.equal(attempts.filter((attempt) => attempt.action === 'review').length, 1);
     assert.equal(attempts.filter((attempt) => attempt.action === 'rework').length, 0);
+    assert.equal(done.task.reviewPolicy, 'human');
     assert.equal(done.deliveredResult.id, done.result.id);
     assert.equal((await tasks()).total, 1);
     await probe(host, 'native-prompt', bot.managerId, ownerAcceptance);

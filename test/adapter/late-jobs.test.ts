@@ -192,7 +192,7 @@ function suspendedJob(store: Store) {
   store.observeRunEnd(old.id, 6, 'aborted', false, jobs);
   store.runRecovery(old.id, 'Background work active');
   const getTask = () => store.getTask(task.id);
-  const control = (mode: 'paused' | 'auto') =>
+  const control = (mode: 'paused' | 'auto' | 'manual') =>
     store.controlTask(mode, task.id, getTask().rowVersion, mode);
   return { old, binding, bot, manager, getTask, control };
 }
@@ -337,7 +337,7 @@ test('owner takeover, closure and a new plan rule out carrying the old Job conti
       const { old, bot, manager, getTask, control } = suspendedJob(store);
       assert.equal(control('paused').controlMode, 'paused');
       store.updateLateJob(old.id, { proof: laterProof });
-      if (interrupt === 'takeover') store.nativeIntervention(old.sessionId, 'human-input');
+      if (interrupt === 'takeover') control('manual');
       else if (interrupt === 'closure')
         store.requestTaskClose('close', old.taskId, getTask().rowVersion);
       else

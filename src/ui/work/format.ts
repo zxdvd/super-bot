@@ -1,5 +1,13 @@
 /** Pure labels and grouping for tasks; no React so tests can import it directly. */
-import { isTestTask, RESULT_FRESH_MS, type Task, type WorkdirInfo } from '../../model.ts';
+import {
+  isTestTask,
+  requiresHumanAcceptance,
+  RESULT_FRESH_MS,
+  settledRunOutcome,
+  type RunOutcome,
+  type Task,
+  type WorkdirInfo,
+} from '../../model.ts';
 import type { Detail } from './types.ts';
 
 export function canStartTask({ binding, task, wait, autoDispatchPending }: Detail): boolean {
@@ -39,6 +47,7 @@ const eventLabels: Record<string, string> = {
   'run.recovery': '执行需要核对',
   'result.accepted': '用户接受成果',
   'native.intervention': '原生会话人工介入',
+  'input.worker-supplement': '原生 Worker 补充指示',
   'run.stop-requested': '已请求停止',
   'run.cancelled': '已核对停止',
   'attention.answered': '回答已保存',
@@ -68,8 +77,17 @@ const approvalOutcomes: Record<string, string> = {
   cancelled: '原生审批：已撤回',
   unavailable: '原生审批：当前无可用处理入口',
 };
+export const runOutcomeLabel = (outcome: RunOutcome): string =>
+  outcome === 'blocked' ? '任务受阻' : '执行失败';
 
 export function eventTitle(event: { kind: string; data: string }): string {
+  if (event.kind === 'run.settled')
+    try {
+      const outcome = settledRunOutcome(JSON.parse(event.data).kind);
+      if (outcome) return runOutcomeLabel(outcome);
+    } catch {
+      /* Older audit entries may not contain detail. */
+    }
   if (event.kind === 'manager.delivered') {
     try {
       const data = JSON.parse(event.data);
@@ -105,10 +123,16 @@ export function eventTitle(event: { kind: string; data: string }): string {
     }
   return eventLabels[event.kind] ?? event.kind;
 }
-export function recoveryEventMessage(event: { kind: string; data: string }): string | undefined {
-  if (!['run.recovery-confirmed', 'run.recovery-observed'].includes(event.kind)) return;
+export function auditEventMessage(event: { kind: string; data: string }): string | undefined {
+  if (
+    !['run.recovery-confirmed', 'run.recovery-observed', 'input.worker-supplement'].includes(
+      event.kind,
+    )
+  )
+    return;
   try {
     const data = JSON.parse(event.data);
+    if (event.kind === 'input.worker-supplement' && typeof data.text === 'string') return data.text;
     if (data.actor === 'manager' && typeof data.result?.message === 'string')
       return data.result.message;
   } catch {
@@ -116,7 +140,15 @@ export function recoveryEventMessage(event: { kind: string; data: string }): str
   }
 }
 export const taskLabel = (task: Task) =>
-  task.lifecycle === 'review' && task.status === 'paused' ? '待验收 · 已暂停' : labels[task.status];
+  task.lifecycle === 'review' && task.status === 'paused'
+    ? requiresHumanAcceptance(task)
+      ? '待验收 · 已暂停'
+      : resultReviewLabel(task)
+    : task.status === 'review' && !requiresHumanAcceptance(task)
+      ? 'Bot 正在验收'
+      : task.status === 'blocked' && task.lastRunOutcome
+        ? runOutcomeLabel(task.lastRunOutcome)
+        : labels[task.status];
 export const time = (value: number) =>
   new Date(value).toLocaleString('zh-CN', {
     month: 'numeric',
@@ -143,12 +175,18 @@ export const reviewLabel = (task: Task, long = false) =>
 export const canReviewResult = (task: Task) =>
   !task.blockingAttention &&
   !['blocked', 'recovery'].includes(task.status) &&
-  task.lifecycle === 'review';
+  task.lifecycle === 'review' &&
+  (requiresHumanAcceptance(task) || task.controlMode !== 'auto');
+
+export function resultReviewLabel(task: Task): string {
+  if (requiresHumanAcceptance(task)) return '待你验收';
+  return task.controlMode === 'auto' ? '待 Bot 验收' : 'Bot 验收已暂停';
+}
 
 export function resultHeading(task: Task): string {
   if (task.lifecycle === 'completed') return '成果 · 已接受';
   if (task.lifecycle === 'cancelled') return '历史报告 · 任务已取消';
-  if (task.lifecycle === 'review') return '成果 · 待你验收';
+  if (task.lifecycle === 'review') return `成果 · ${resultReviewLabel(task)}`;
   return '候选报告 · 当前不可验收';
 }
 
@@ -233,6 +271,7 @@ export function stage(task: Task): Stage {
 }
 /** The short status a row shows: the stage, refined by the concrete reason where that helps. */
 export function stageText(task: Task, readOnly = false): string {
+  if (task.status === 'blocked' && task.lastRunOutcome) return runOutcomeLabel(task.lastRunOutcome);
   const s = stage(task);
   if (s === 'needs-you') {
     const status = blocker(task) ?? task.status;
@@ -247,8 +286,11 @@ export function stageText(task: Task, readOnly = false): string {
   )
     return 'Bot 正在核对下一步';
   if (task.activity === 'working' && s === 'done') return 'Bot 正在交付';
-  if (task.activity === 'working' && s === 'review')
-    return task.managerReviewed ? 'Bot 正在交付' : 'Bot 跟进中';
+  if (s === 'review') {
+    if (task.activity === 'working' && task.managerReviewed) return 'Bot 正在交付';
+    if (!requiresHumanAcceptance(task)) return resultReviewLabel(task);
+    if (task.activity === 'working') return 'Bot 跟进中';
+  }
   if (task.activity === 'working' && s === 'waiting') return '等待自动跟进';
   if (s === 'waiting' && task.controlMode === 'paused') return labels.paused;
   if (s === 'waiting' && task.waitingForPrerequisite) return '任务受阻';

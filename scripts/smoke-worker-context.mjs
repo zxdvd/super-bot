@@ -5,6 +5,7 @@ import { join } from 'node:path';
 
 const answer = '读者是新同事，保持简短。';
 const rework = '再加一句结论。';
+const supplement = '补充：保留合成运行编号。';
 const fullOnly = process.env.SUPER_BOT_TEST_EXPECT_FULL_CONTEXT === '1';
 const role = process.env.SUPER_BOT_TEST_CONTEXT_HOST === 'desktop' ? 'desktop' : 'web';
 
@@ -16,7 +17,7 @@ export async function smokeWorkerContext({ base, configure, launch, call, makeBo
   const inspect = (id) => probe(host, 'inspect-session', id);
   const list = () => call(host, 'task.list', { botId: bot.id });
   await probe(host, 'select-test-model', bot.managerId);
-  await say('请写一份说明，先确认读者。');
+  await say('请写一份说明，先确认读者。请留给我最终验收。');
   const task = await wait(
     async () => (await list()).items.find((item) => item.status === 'needs-input'),
     'initial Worker question',
@@ -51,6 +52,18 @@ export async function smokeWorkerContext({ base, configure, launch, call, makeBo
   await say(answer);
   const answered = await reviewedAfter(waiting.run.id, 'answer reaches same Worker');
   assert.equal(answered.input.attentionId, waiting.pendingQuestions[0].id);
+  await probe(host, 'native-prompt', session, supplement);
+  const added = await detail();
+  assert.equal(added.task.controlMode, 'auto');
+  assert.equal(added.task.rowVersion, answered.task.rowVersion);
+  assert.equal(added.result.id, answered.result.id);
+  assert.deepEqual(added.attentions, answered.attentions);
+  const matchingSupplements = added.events
+    .filter((event) => event.kind === 'input.worker-supplement')
+    .map((event) => JSON.parse(event.data));
+  assert.equal(matchingSupplements.length, 1);
+  assert.equal(matchingSupplements[0].text, supplement);
+  const nativeId = matchingSupplements[0].messageId;
   await say(rework);
   const revised = await reviewedAfter(answered.run.id, 'rework reaches same Worker');
   assert.notEqual(revised.result.id, answered.result.id);
@@ -110,6 +123,16 @@ export async function smokeWorkerContext({ base, configure, launch, call, makeBo
         'continuation contains latest user text',
       );
     const carriedInputs = event.data.source.carriedInputIds ?? [];
+    const carriedSupplements = event.data.source.carriedSupplementIds ?? [];
+    if (index === 2) {
+      assert.equal(body.includes(supplement), false);
+      assert.equal(seen.nativeUserMessageIds.filter((id) => id === nativeId).length, 1);
+      assert.deepEqual(carriedSupplements, []);
+    } else if (index === 3) {
+      assert.deepEqual(carriedSupplements, [matchingSupplements[0].id]);
+      assert.equal(body.split(supplement).length, 2);
+      assert.equal(seen.nativeUserMessageIds.includes(nativeId), false);
+    }
     if (!fullOnly && index === 3) {
       assert.deepEqual(carriedInputs, [answered.input.id, revised.input.id]);
       assert.ok(body.includes(`Previously received task input (answer): ${answer}`));

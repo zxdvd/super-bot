@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import { setTimeout as delay } from 'node:timers/promises';
 import { hostClient } from './host-client.mjs';
+import { receiptReviewGoal } from '../test/delivery-link-fixture.ts';
 
 assert.ok(process.argv[2], 'Pass the isolated host startup log');
 const client = await hostClient(process.argv[2]);
@@ -42,7 +43,7 @@ const say = (text) => probe('native-prompt', { sessionId, text });
 const inspect = () => probe('inspect-session', { sessionId });
 const status = () => call('manager.status', { botId: bot.id });
 await probe('select-test-model', { sessionId });
-await say('DF14_RECEIPT_PROBE');
+await say(receiptReviewGoal);
 const task = await waitFor(async () => {
   const { items } = await call('task.list', { botId: bot.id });
   return items.find((item) => item.managerReviewed);

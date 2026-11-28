@@ -73,6 +73,8 @@ import {
   artifactPortProbeText,
   artifactReference,
   artifactRevision,
+  mirrorReviewGoal,
+  receiptReviewGoal,
   replacementMr,
   supplementalDoc,
 } from './delivery-link-fixture.ts';
@@ -193,6 +195,7 @@ interface WorkerContextObservation {
   inputId: string;
   previousRunIds: string[];
   previousFullRunIds: string[];
+  nativeUserMessageIds: string[];
   characters: number;
   bytes: number;
   taskInputBytes: number;
@@ -816,6 +819,7 @@ class ProbeAdapter extends LlmAdapter {
             scope:
               '在当前任务目录中生成目录、引用、附录和最终说明，只读核对 fixture/docs 的 42 号引用检查流水线',
             acceptance: '最终说明已生成并回读',
+            reviewPolicy: 'human',
           };
         else if (foreign) plan = { action: 'detail', taskId: foreign };
         else if (
@@ -830,13 +834,14 @@ class ProbeAdapter extends LlmAdapter {
           };
         else if (
           trigger?.source?.kind === 'user' &&
-          ['DF14_RECEIPT_PROBE', 'MIRROR_PROGRESS_PROBE'].includes(text)
+          [receiptReviewGoal, mirrorReviewGoal].includes(text)
         )
           plan = {
             action: 'create',
             goal: text,
             scope: '专用任务目录，不访问网络',
             acceptance: 'result.md 包含两项合成事实并已回读',
+            reviewPolicy: 'human',
           };
         else if (
           trigger?.source?.kind === 'user' &&
@@ -847,6 +852,7 @@ class ProbeAdapter extends LlmAdapter {
             goal: text,
             scope: '隔离合成链接和本地证据',
             acceptance: '报告明确的交付物和回读记录',
+            reviewPolicy: 'human',
           };
         else if (editTarget) plan = { action: 'detail', taskId: editTarget[1] };
         else if (trigger?.source?.kind === 'user' && text.startsWith('DF14_SHOW_RESULT:'))
@@ -855,13 +861,15 @@ class ProbeAdapter extends LlmAdapter {
           trigger?.source?.kind === 'user' &&
           (text.includes('MANAGER_PROBE') ||
             text === '请写一份简短的说明，包含两项事实，完成后给我文件。' ||
-            text === '请写一份说明，先确认读者。')
+            text === '请写一份说明，先确认读者。' ||
+            text === '请写一份说明，先确认读者。请留给我最终验收。')
         )
           plan = {
             action: 'create',
             goal: text.includes('先确认读者') ? 'ASK_PROBE' : 'Manager 生成合成说明',
             scope: '专用任务目录，不访问网络',
             acceptance: 'result.md 包含两项事实并已回读',
+            ...(text.endsWith('请留给我最终验收。') ? { reviewPolicy: 'human' } : {}),
           };
         else if (
           trigger?.source?.kind === 'user' &&
@@ -884,7 +892,11 @@ class ProbeAdapter extends LlmAdapter {
           trigger?.source?.kind === 'user' &&
           (text === '读者是新同事，保持简短。' || text === '再加一句结论。');
         const target = feedback
-          ? tasks.find((t) => t.status === (text === '再加一句结论。' ? 'review' : 'needs-input'))
+          ? tasks.find((t) =>
+              text === '再加一句结论。'
+                ? ['completed', 'review'].includes(t.status)
+                : t.status === 'needs-input',
+            )
           : undefined;
         const review = tasks.find(
           (t) => t.status === 'review' && t.controlMode === 'auto' && !t.managerReviewed,
@@ -935,10 +947,12 @@ class ProbeAdapter extends LlmAdapter {
           };
         else if (trigger?.source?.kind === 'user' && text === '再加一句结论。' && value.result)
           plan = {
-            action: 'rework',
             taskId: value.task.id,
             expectedRowVersion: value.task.rowVersion,
             resultId: value.result.id,
+            ...(value.task.lifecycle === 'completed'
+              ? { action: 'continue', userInstruction: text, continuationMode: 'authorized-work' }
+              : { action: 'rework' }),
           };
         else if (
           trigger?.source?.kind === 'user' &&
@@ -988,7 +1002,7 @@ class ProbeAdapter extends LlmAdapter {
             verdict: rework ? 'rework' : 'accept',
             note: rework
               ? '请补充修订说明后重新提交。'
-              : '已通过 detail 读取文件内容：含标题、两项事实，并有回读记录。默认提交用户最终验收。',
+              : '已通过 detail 读取文件内容：含标题、两项事实，并有回读记录。',
           };
         } else if (value.task.status === 'unscheduled')
           plan = {
@@ -997,7 +1011,7 @@ class ProbeAdapter extends LlmAdapter {
             expectedRowVersion: value.task.rowVersion,
           };
       }
-      if (prior?.action === 'review' && value?.task?.goal === 'DF14_RECEIPT_PROBE') {
+      if (prior?.action === 'review' && value?.task?.goal === receiptReviewGoal) {
         plan = {
           action: 'deliver',
           taskId: prior.taskId,
@@ -1166,7 +1180,7 @@ class ProbeAdapter extends LlmAdapter {
         detail?.delivery &&
         (prior?.action === 'review' || text.startsWith('DF14_SHOW_RESULT:'))
       ) {
-        reply = `等待你确认。\n${detail.delivery.chatMarkdown}`;
+        reply = `${(value?.humanAcceptanceRequired ?? detail.delivery.humanAcceptanceRequired) ? '等待你确认。' : '已按验收条件完成。'}\n${detail.delivery.chatMarkdown}`;
       } else if (workerQuestion) reply = `${workerQuestion.question}\n${workerQuestion.markdown}`;
       else if (clarification) reply = clarification.question;
       else if (
@@ -1228,7 +1242,8 @@ class ProbeAdapter extends LlmAdapter {
       const fullInput = previousFull.at(-1);
       const context = /^Goal: /m.test(body) ? body : fullInput ? messageText(fullInput) : '';
       const goal = context.match(/^Goal: ([^\n]*)/m)?.[1] ?? '';
-      const revised = body.includes('Additional user input (rework):');
+      const revised =
+        body.includes('Additional user input (rework):') || body.includes('再加一句结论。');
       if (options.sessionId) {
         const observations =
           this.workerContexts.get(options.sessionId) ?? new Map<string, WorkerContextObservation>();
@@ -1238,6 +1253,11 @@ class ProbeAdapter extends LlmAdapter {
             inputId,
             previousRunIds: previous.map((message) => message.source.runId),
             previousFullRunIds: previousFull.map((message) => message.source.runId),
+            nativeUserMessageIds: options.messages.flatMap((message) =>
+              message.role === 'user' && message.source?.kind === 'user' && message.id
+                ? [message.id]
+                : [],
+            ),
             characters: [...body].length,
             bytes: Buffer.byteLength(body),
             taskInputBytes: previous.reduce(

@@ -1,4 +1,6 @@
-export const artifactGoal = '请核对两条合成 MR、一个 CR 和联调方案，完成后登记到任务交付物。';
+export const receiptReviewGoal = 'DF14_RECEIPT_PROBE：生成合成说明，交付后由我亲自验收。';
+export const mirrorReviewGoal = 'MIRROR_PROGRESS_PROBE：整理合成材料，交付后由我亲自验收。';
+export const artifactGoal = '请核对两条合成 MR、一个 CR 和联调方案，登记为交付物，由我亲自验收。';
 export const artifactDeliveryText = '已核对两条 MR、客户端 CR 和联调方案，等待你确认。';
 export const artifactEditReply = '已按要求更新这项任务的交付物。';
 export const artifactLinks = {
@@ -11,7 +13,7 @@ export const artifactPrimary = '客户端 CR 1842763';
 export const supplementalDoc = 'https://example.feishu.cn/docx/synthetic-notes';
 export const replacementMr = 'https://gitlab.example.invalid/team/service/-/merge_requests/1092';
 export const artifactReference = 'https://reference.example.invalid/guide';
-export const artifactPortProbeGoal = '请联调并交付这项隔离任务的合成评审和方案。';
+export const artifactPortProbeGoal = '请联调并交付这项隔离任务的合成评审和方案，由我最终验收。';
 export const artifactPortProbeTail = '确认后可把本轮核对的结论作为下一次联调的起点。';
 export const artifactPortProbeText = [
   `${artifactDeliveryText} [核对后端评审](${artifactLinks['后端 MR']})`,

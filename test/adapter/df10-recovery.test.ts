@@ -575,16 +575,20 @@ test('native consumption of preserved results permits a fresh continuation after
   f.agent.inbox.nextStep.shift();
   await f.emit({
     type: 'user/message',
-    data: { id: 'read-native', source: { kind: 'user', rpcId: 'user-read' }, content: [] },
+    surfaceOp: 'append',
+    data: {
+      id: 'read-native',
+      source: { kind: 'user', rpcId: 'user-read' },
+      content: [{ type: 'text', text: 'Keep the checked totals' }],
+    },
     seq: 2,
   });
-  assert.equal((await f.call(CONTINUE, initial)).error.code, 'version-conflict');
-  const refreshed = await f.recoveryArgs();
-  const restarted = await f.call(CONTINUE, refreshed);
+  const restarted = await f.call(CONTINUE, initial);
   assert.ok(restarted.ok, JSON.stringify(restarted));
   assert.deepEqual(f.removed, ['old-message']);
   assert.equal(f.sent.length, 1);
   assert.doesNotMatch(JSON.stringify(f.sent[0]), /native-notice|SYNTHETIC OUTPUT|old-message/);
+  assert.equal(JSON.stringify(f.sent[0]).split('Keep the checked totals').length, 2);
   assert.equal((await f.detail()).task.status, 'queued');
 });
 
@@ -750,7 +754,7 @@ test('continue schedules and delivers one new Run despite duplicate and competin
   assert.equal(f.sent.length, 1);
 });
 
-test('version is checked again after asynchronous native resolution and after native human takeover', async (t) => {
+test('version is checked again after asynchronous native resolution and explicit pause', async (t) => {
   const f = await fixture(t, 'interrupted'),
     args = await f.recoveryArgs();
   let unblock!: () => void, entered!: () => void;
@@ -766,17 +770,18 @@ test('version is checked again after asynchronous native resolution and after na
   await started;
   assert.equal(f.resolves(), 1);
   try {
-    await f.emit({
-      type: 'user/message',
-      seq: 30,
-      data: { id: 'intervention', source: { kind: 'user', rpcId: 'native' }, content: [] },
+    const paused = await f.call('task.control', {
+      requestId: 'pause-during-native-resolution',
+      expectedRowVersion: args.expectedRowVersion,
+      mode: 'paused',
     });
+    assert.ok(paused.ok, JSON.stringify(paused));
   } finally {
     unblock();
   }
   assert.equal((await command).error.code, 'version-conflict');
   const current = await f.detail();
-  assert.equal(current.task.controlMode, 'manual');
+  assert.equal(current.task.controlMode, 'paused');
   assert.equal(current.run.id, f.run.id);
   assert.equal(current.runHeld, true);
   assert.equal(f.sent.length, 0);

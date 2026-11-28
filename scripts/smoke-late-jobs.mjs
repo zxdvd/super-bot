@@ -264,20 +264,24 @@ try {
 
   const takeover = await start('TAKEOVER');
   await releaseJob(takeover);
-  await probe('queue-native', takeover.binding.sessionId, { text: '用户直接接管原 Worker。' });
+  await control('暂停', takeover);
+  await probe('queue-native', takeover.binding.sessionId, { text: '补充：保留现有资料。' });
   assert.equal((await detail(takeover.task.id)).run.id, takeover.run.id);
   await finishNotice(takeover);
-  await wait(
-    async () => (await detail(takeover.task.id)).task.controlMode === 'manual',
-    'new native owner input takes over',
-  );
+  await wait(async () => {
+    const current = await detail(takeover.task.id);
+    return (
+      current.task.controlMode === 'paused' &&
+      current.events.some((event) => event.kind === 'input.worker-supplement')
+    );
+  }, 'native input is recorded while paused');
   await control('恢复', takeover);
   const afterTakeover = await detail(takeover.task.id);
   assert.equal(afterTakeover.run.id, takeover.run.id);
   assert.equal(
     afterTakeover.lateJobRecovery.state,
     'blocked',
-    'restoring management cannot revive an owner takeover',
+    'restoring management still requires native Job activity to be attributable',
   );
 
   const closing = await start('CLOSE');

@@ -226,7 +226,16 @@ test('detach preserves binding history, pauses work, and allows a new goal and g
     assert.equal(replacement.generation, 2);
     assert.notEqual(replacement.requestedSessionId, old.sessionId);
     assert.equal(store.getBinding(old.id).state, 'released');
-    assert.equal(store.nativeIntervention(old.sessionId!, 'old-message'), false);
+    store.recordWorkerSupplement({
+      sessionId: old.sessionId!,
+      messageId: 'old-message',
+      seq: 1,
+      text: 'Historical session',
+    });
+    assert.deepEqual(
+      store.workerSupplements({ taskId: task.id, taskRevision: task.taskRevision }),
+      [],
+    );
   } finally {
     store.close();
   }
@@ -403,21 +412,32 @@ test('dispatch control and unknown effects keep resource ownership', () => {
     store.close();
   }
 });
-test('manual native intervention invalidates candidate review and late reports', () => {
+test('native supplement keeps candidate review and rejects late reports', () => {
   const store = new Store(':memory:');
   try {
     const { task, run } = entered(store);
     const report = store.workerReport(run.id, 'tool', ready);
     store.settleRun(run.id);
-    store.nativeIntervention(run.sessionId, 'human-message');
-    store.nativeIntervention(run.sessionId, 'human-message');
-    assert.equal(store.getTask(task.id).controlMode, 'manual');
-    assert.equal(store.getTask(task.id).lifecycle, 'open');
-    assert.throws(
-      () =>
-        store.acceptResult('accept', task.id, store.getTask(task.id).rowVersion, report.resultId!),
-      /不能验收/,
+    const source = {
+      sessionId: run.sessionId,
+      messageId: 'human-message',
+      seq: 3,
+      text: 'Check details',
+    };
+    store.recordWorkerSupplement(source);
+    store.recordWorkerSupplement(source);
+    const current = store.getTask(task.id);
+    assert.equal(current.controlMode, 'auto');
+    assert.equal(current.lifecycle, 'review');
+    assert.equal(store.workerSupplements(run).length, 1);
+    assert.equal(
+      store.acceptResult('accept', task.id, current.rowVersion, report.resultId!).lifecycle,
+      'completed',
     );
+    const completed = store.getTask(task.id);
+    store.recordWorkerSupplement({ ...source, messageId: 'completed-followup', seq: 4 });
+    assert.equal(store.workerSupplements(run).length, 2);
+    assert.deepEqual(store.getTask(task.id), completed);
     assert.throws(() => store.workerReport(run.id, 'late', ready), /执行或目标已改变/);
     assert.throws(() => store.workerReport(run.id, 'late', ready), /执行或目标已改变/);
     assert.equal(
@@ -454,19 +474,31 @@ test('stop request does not release resources until convergence and refuses late
     store.close();
   }
 });
-test('resuming management after native input cannot revive the previous run authority', () => {
+test('native supplement leaves an active automatic run and its approval intact', () => {
   const store = new Store(':memory:');
   try {
     const { task, run } = entered(store);
-    store.workerReport(run.id, 'ready-before-human', ready);
-    assert.equal(store.nativeIntervention(run.sessionId, 'native'), true);
-    assert.equal(store.nativeIntervention(run.sessionId, 'native'), false);
-    store.controlTask('resume', task.id, store.getTask(task.id).rowVersion, 'auto');
+    store.nativeApprovalAsked(run.id, 'approval', 'read', 'Confirm');
+    const before = store.taskDetail(task.id);
+    const source = {
+      sessionId: run.sessionId,
+      messageId: 'native',
+      seq: 3,
+      text: 'Check test data',
+    };
+    store.recordWorkerSupplement(source);
+    store.recordWorkerSupplement(source);
+    const after = store.taskDetail(task.id);
+    assert.deepEqual(after.attentions, before.attentions);
+    assert.deepEqual(after.task, before.task);
+    assert.deepEqual(after.run, before.run);
+    assert.equal(store.workerSupplements(run).length, 1);
+    store.nativeApprovalDecided(run.sessionId, 'approval', 'allowed');
+    store.workerReport(run.id, 'ready-after-human', ready);
     store.settleRun(run.id);
-    assert.equal(store.getTask(task.id).lifecycle, 'open');
-    assert.equal(store.getRun(run.id).state, 'interrupted');
-    assert.equal(store.heldRuns().length, 1);
-    assert.throws(() => store.workerReport(run.id, 'late', ready), /执行或目标已改变/);
+    assert.equal(store.getTask(task.id).lifecycle, 'review');
+    assert.equal(store.getRun(run.id).state, 'settled');
+    assert.equal(store.heldRuns().length, 0);
   } finally {
     store.close();
   }

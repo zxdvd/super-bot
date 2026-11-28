@@ -8,7 +8,7 @@ import {
   canStartTask,
   eventTitle,
   inboxGroups,
-  recoveryEventMessage,
+  auditEventMessage,
   stage,
   stageText,
   workGroup,
@@ -81,14 +81,62 @@ test('a settled business blocker has no owner action in the local or mirrored wo
     id: task.id,
     botId: bot.id,
   }) as MirrorDetail;
-  for (const row of [store.getTask(task.id), mirror.task]) {
+  const detail = store.taskDetail(task.id);
+  const summary = store.listTasks({ botId: bot.id }).items.find(({ id }) => id === task.id);
+  assert.ok(summary);
+  for (const row of [detail.task, mirror.task, summary]) {
     assert.equal(row.status, 'blocked');
+    assert.equal(row.lastRunOutcome, 'blocked');
     assert.equal(stageText(row), '任务受阻');
     assert.equal(stage(row), 'waiting');
     assert.equal(workGroup(row), 'doing');
   }
+  assert.equal(detail.run?.state, 'failed', 'the legacy settlement is retained');
+  for (const view of [detail, mirror]) {
+    assert.equal(view.run?.outcome, 'blocked');
+    assert.equal(eventTitle(view.events.find(({ kind }) => kind === 'run.settled')!), '任务受阻');
+  }
   assert.equal(botWorkSummaries(store.db)[0]?.attention, 0);
   assert.equal(canStartTask(store.taskDetail(task.id)), false);
+});
+
+test('a genuine legacy execution failure is labeled from its settled report in all work views', (t) => {
+  const store = new Store(':memory:');
+  t.after(() => store.close());
+  const bot = store.createBot('bot', { name: 'Failure', instructions: 'Synthetic only' });
+  const task = store.createTask('task', {
+    botId: bot.id,
+    goal: 'Generate report',
+    scope: 'Local task directory',
+    acceptance: 'Output present',
+    reviewPolicy: 'human',
+  });
+  const binding = store.beginBinding('bind', task.id, task.rowVersion, '/synthetic/failure');
+  store.confirmBinding(binding.id, binding.requestedSessionId);
+  const run = store.reserveRun('dispatch', task.id, store.getTask(task.id).rowVersion);
+  store.saveRunMessage(run.id, 'm', JSON.stringify({ id: 'm' }));
+  store.claimDispatch(run.id);
+  store.inputEntered(run.id, 'm', 1);
+  store.workerReport(run.id, 'report', { kind: 'failed', summary: 'Renderer exited with code 1' });
+  assert.equal(store.taskDetail(task.id).run?.outcome, undefined, 'a report alone is provisional');
+  store.settleRun(run.id);
+  const detail = store.taskDetail(task.id);
+  const mirror = readLocalMirror(store, {
+    op: 'detail',
+    id: task.id,
+    botId: bot.id,
+  }) as MirrorDetail;
+  const summary = store.listTasks({ botId: bot.id }).items.find(({ id }) => id === task.id);
+  assert.ok(summary);
+  for (const row of [detail.task, mirror.task, summary]) {
+    assert.equal(row.lastRunOutcome, 'failed');
+    assert.equal(stageText(row), '执行失败');
+    assert.equal(row.waitingForPrerequisite, undefined);
+  }
+  for (const view of [detail, mirror]) {
+    assert.equal(view.run?.outcome, 'failed');
+    assert.equal(eventTitle(view.events.find(({ kind }) => kind === 'run.settled')!), '执行失败');
+  }
 });
 
 test('summary excludes inactive and folded work, scopes manager rows and includes actionable work beyond the inbox window', (t) => {
@@ -295,7 +343,7 @@ test('a verified prerequisite blocker stays visible after recovery closes and mi
     .taskDetail(task.id)
     .events.filter((event) => event.kind === 'run.recovery-confirmed');
   assert.equal(eventTitle(sourceEvents[0]), 'Bot 确认前提未满足');
-  assert.equal(recoveryEventMessage(sourceEvents[0]), message);
+  assert.equal(auditEventMessage(sourceEvents[0]), message);
   assert.equal(eventTitle(sourceEvents[1]), '用户完成恢复核对');
   const mirror = readLocalMirror(store, {
     op: 'detail',
@@ -308,5 +356,5 @@ test('a verified prerequisite blocker stays visible after recovery closes and mi
     [{ actor: 'manager', outcome: 'not-ready' }, { actor: 'user' }],
   );
   assert.equal(eventTitle(mirrored[0]), 'Bot 确认前提未满足');
-  assert.equal(recoveryEventMessage(mirrored[0]), undefined);
+  assert.equal(auditEventMessage(mirrored[0]), undefined);
 });

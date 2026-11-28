@@ -16,14 +16,15 @@
 | Git 工作区只读回执 | 已验证 macOS Full Access Worker | `super_bot_query` 在原任务目录内用系统只读沙箱和 Apple 工具链 Git 读取 HEAD 及暂存、未暂存和未跟踪状态。子模块仅报告已记录的提交变化。继续时匹配原轮、工具请求和持久结果。普通 Shell 的历史记录缺少此证明时仍按外部效果待核对处理。 |
 | files 模式工具范围 | 已验证 | read/write/edit 与报告；绝对路径、实际目录、符号链接检查；额外 scoped 工具再由执行 guard 拒绝。`smoke-directory.mjs`、`smoke-scoped-tools.mjs` |
 | Worker Full Access 的 Shell、子 Agent | 默认开放，显式 false 才使用 files | 普通 DSH Session 的原生工具已实际执行 Bash 和子 Agent；由现有宿主配置能力，不额外裁剪工具。不能因此推断任意外部进程可停止 |
-| ready 与最终验收 | 已验证 | ready 只是候选；执行收敛和文件完整哈希均需核对。默认人工；显式 Bot 授权保持独立审计。`smoke:execution`、`smoke:workflow`、`smoke:manager` |
+| ready 与最终验收 | 已验证 | 执行收敛后，Bot 按新任务的验收条件和文件证据检查。通过后交付并完成。请求亲自验收时，由用户确认确切版本。两种决定分别审计。`smoke:chat`、`smoke-task-stages.mjs` |
 | 长文件验收 | 限制明确且已验证 | 每项只预览前 12,000 字节；完整文件用于哈希核验。超出预览范围必须人工检查全文。`smoke-manager-rework.mjs` |
 | 原生工具审批 | 已验证文件写入三路径 | 允许一次、拒绝、等待时停止；工作台只显示待办和跳转，决定来自原生 UI。独立 UI 第 13～14 轮、`smoke-approvals.mjs` |
-| 人工接管 | 已验证；排队/插话语义已按适配层回归修正 | 执行中的排队（下一轮）或插话（下一步）不撤销当前 Run，插话进入当前自动轮次。自动轮次在自身 turn/end 核对最终报告及后台作业/子 Agent 后结算，不依赖整段会话 whenIdle；排队开启的人工轮次不会打断旧 Run 的正常结算。新人工轮次会切到 manual 并解除旧限制，不 cancel 用户自己的轮次。旧 Stop 回执不取消新工作。`smoke-handoff.mjs`、`test/adapter/intervention.test.ts` |
+| Worker 聊天补充与暂停 | 已验证原生输入、同会话接续及压缩后的恢复 | 在原生 Worker 发言、插话或排队，输入进入会话后自动记入原任务，保留当前成果、审批及管理方式。后续自动轮次沿用已有原生消息，缺失的文字从账本恢复。接手后续安排时，在原 Bot 对话明确暂停自动管理。停止当前尝试使用单独的停止动作。`SUPER_BOT_TEST_WORKER_CONTEXT=1 node scripts/smoke-mirror.mjs`、`test/adapter/intervention.test.ts` |
 | 普通停止与未知停止 | 已验证 | cancel 回执不算结束；真实 10 秒不响应取消转恢复；迟到收敛不伪造成功。`smoke:execution`、`smoke-stop-timeout.mjs` |
+| 执行结论 | 本地与只读镜像已验证 | 收尾回执和最终报告相符时，列表、详情和审计显示「任务受阻」或「执行失败」。明确登记了观察条件的阶段可以显示「等待外部条件」。旧账本可直接读取。 |
 | Worker 预算 | Full Access 不附加预算；files 已验证 | 以下只适用于旧 files 模式：每 Run 最多 40 步或 10 分钟；实际 40 步和 600,026 ms 计时通过。预算后暂停并核对，不自动重试。`smoke-budget.mjs` |
 | Manager 约束 | 已验证 | 单 Bot 一轮、全局两轮；实际 12 步、自动轮次 5 分钟、每小时 20 次唤醒及换会话不重置额度均通过 `smoke-manager-budget.mjs`。files 模式手动管理对话受 12 步限制，Full Access 为 24 步，没有自动轮次计时器；`smoke-manager-capacity.mjs` 真实两轮占位、第三轮排队与释放后进入通过 |
-| Manager 迟到命令 | 已验证 | 模型读取后暂停，用户改目标或在 Worker 原生输入；迟到 dispatch/review 被拒绝。`smoke-manager-stale.mjs` |
+| Manager 迟到命令 | 已验证 | 用户已修改目标时，旧派工不能启动 Worker。用户明确暂停自动管理后，迟到的派工或验收不能生效。`smoke-manager-stale.mjs` |
 | Manager 更换回执 | 已验证 | 重试只对应原准备代数；配置变化后的新 Manager 不被旧请求选择模型。首次继承在原生解析后重新核对当前身份。`smoke-manager-lifecycle.mjs`、5 项适配层回归 |
 | Worker 并发 | 按 Bot 独立计数，默认各 5 个 | 在 Bot 的「工作 → 设置与维护 → Worker 并发」修改上限。使用 `node scripts/smoke-bot-capacity.mjs` 验证两个 Bot 同时各占 5 个名额、排队和调额补位。浏览器参数与飞书烟测相同。 |
 | Worker 同目录并行 | Bot 内按队列补位 | `smoke-capacity.mjs` 为测试 Bot 设置上限 2，验证两个 Worker 同时运行、第三项在其中一个结束后启动。可用 `SUPER_BOT_TEST_SHARED_WORKDIR` 指定同一隔离目录，用 `SUPER_BOT_TEST_LOG` 指定测试宿主日志。 |

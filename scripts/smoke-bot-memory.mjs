@@ -73,7 +73,7 @@ export async function smokeBotMemory({
     const task = await wait(
       async () =>
         (await call(web, 'task.list', { botId: bot.id, q: `MEMORY_WORK_${label}` })).items.find(
-          (item) => item.lifecycle === 'review' && item.managerReviewed,
+          (item) => item.lifecycle === 'completed' && item.managerReviewed,
         ),
       `chat task ${label} settles`,
     );

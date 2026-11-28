@@ -1,4 +1,11 @@
-/** Run alias `latest`. The original settlement receipt also exists in older ledgers. */
+/** Run alias `latest`. Match the final report to the original settlement receipt. */
+export const settledReportOutcomeSql = `(SELECT f.kind FROM reports f
+  JOIN events e ON e.taskId=latest.taskId AND e.kind='run.settled'
+  WHERE f.runId=latest.id AND f.kind IN ('failed','blocked')
+    AND json_extract(e.data,'$.runId')=f.runId AND json_extract(e.data,'$.kind')=f.kind
+  LIMIT 1)`;
+
+/** The original settlement receipt also exists in older ledgers. */
 export const settledBlockerSql = `CASE
   WHEN latest.finishedAt IS NOT NULL AND latest.state IN ('failed','interrupted','settled')
     AND NOT EXISTS (SELECT 1 FROM resources WHERE runId=latest.id)
@@ -7,10 +14,6 @@ export const settledBlockerSql = `CASE
     WHEN latest.state IN ('interrupted','settled') AND EXISTS (
       SELECT 1 FROM metadata WHERE key='run-verified-end:' || latest.id
     ) THEN 'verified-end'
-    WHEN latest.state='failed' AND EXISTS (
-      SELECT 1 FROM reports f JOIN events e ON e.taskId=latest.taskId AND e.kind='run.settled'
-      WHERE f.runId=latest.id AND f.kind IN ('failed','blocked')
-        AND json_extract(e.data,'$.runId')=latest.id AND json_extract(e.data,'$.kind')=f.kind
-    ) THEN 'settled-failure'
+    WHEN latest.state='failed' AND ${settledReportOutcomeSql} IS NOT NULL THEN 'settled-failure'
   END
 END`;

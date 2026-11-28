@@ -149,7 +149,7 @@ export function TaskForm({
   const [goal, setGoal] = useState(task?.goal ?? '');
   const [scope, setScope] = useState(task?.scope ?? '');
   const [acceptance, setAcceptance] = useState(task?.acceptance ?? '');
-  const [autoReview, setAutoReview] = useState(task?.reviewPolicy === 'bot');
+  const [humanReview, setHumanReview] = useState(task?.reviewPolicy === 'human');
   const [startPaused, setStartPaused] = useState(false);
   const { request, validation, setValidation, changed } = useRequest();
   async function save(e: FormEvent) {
@@ -163,7 +163,7 @@ export function TaskForm({
       goal,
       scope,
       acceptance,
-      reviewPolicy: autoReview ? 'bot' : 'human',
+      reviewPolicy: humanReview ? 'human' : 'bot',
       startPaused,
       expectedRowVersion: expectedRowVersion.current,
     });
@@ -215,13 +215,13 @@ export function TaskForm({
           <input
             disabled={busy}
             type="checkbox"
-            checked={autoReview}
+            checked={humanReview}
             onChange={(e) => {
               changed();
-              setAutoReview(e.target.checked);
+              setHumanReview(e.target.checked);
             }}
           />
-          允许 Bot 最终验收这个低风险任务
+          由我最终验收
         </label>
       )}
       {!task && (

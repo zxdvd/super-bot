@@ -73,7 +73,7 @@ await say(request);
 const task = await wait(async () => {
   const p = await page();
   assert.ok(p.total <= 1);
-  return p.items.find((t) => t.lifecycle === 'review' && t.managerReviewed);
+  return p.items.find((t) => t.lifecycle === 'completed' && t.managerReviewed);
 }, 'chat creates and completes one task');
 let detail = await call('task.detail', { id: task.id });
 const source = JSON.parse(detail.events.find((e) => e.kind === 'task.created').data).source;
@@ -84,17 +84,21 @@ const resultLink = (taskId, resultId) =>
   `${client.base}/#super-bot-task=${taskId}&resultId=${resultId}`;
 await wait(async () => {
   const session = await inspect();
+  const current = await call('task.detail', { id: task.id });
   return (
     session.status === 'idle' &&
+    current.chatDelivery?.state === 'delivered' &&
     session.assistantTexts.some(
       (text) =>
         !text.includes(client.base + download) &&
         text.includes(resultLink(task.id, detail.result.id)) &&
-        text.includes('等待你确认'),
+        text.includes('已按验收条件完成'),
     )
   );
 }, 'versioned delivery in original chat');
 assert.equal(detail.result.humanAcceptedAt, null);
+assert.equal(detail.progress.acceptance.actor, 'bot');
+assert.equal(task.reviewPolicy, 'bot');
 const file = await client.get(download);
 assert.equal(file.status, 200);
 const original = await file.text();
@@ -106,10 +110,13 @@ const oldResult = detail.result.id;
 await say('再加一句结论。');
 detail = await wait(async () => {
   const d = await call('task.detail', { id: task.id });
-  return d.result?.id !== oldResult && d.task.lifecycle === 'review' && d.task.managerReviewed && d;
-}, 'chat rework returns a new result');
+  return (
+    d.result?.id !== oldResult && d.task.lifecycle === 'completed' && d.task.managerReviewed && d
+  );
+}, 'chat direction continues the completed task and returns a new result');
 assert.equal((await page()).total, 1);
 assert.equal(detail.result.humanAcceptedAt, null);
+assert.equal(detail.progress.acceptance.actor, 'bot');
 assert.equal(detail.input.content, '再加一句结论。');
 await wait(async () => {
   const s = await inspect();
@@ -146,14 +153,10 @@ assert.equal(await oldDownload.text(), original, 'old file URL retains the origi
 const newFile = await client.get(`/api/super-bot-file?resultId=${detail.result.id}&index=0`);
 assert.equal(newFile.status, 200);
 assert.match(await newFile.text(), /已按返工要求补充说明/);
-await call('result.accept', {
-  requestId: prefix + ':accept',
-  sessionId: manager.sessionId,
-  id: task.id,
-  expectedRowVersion: detail.task.rowVersion,
-  resultId: detail.result.id,
-});
-assert.ok((await call('task.detail', { id: task.id })).result.humanAcceptedAt);
+assert.ok(detail.events.some((event) => event.kind === 'run.continued'));
+assert.ok(
+  detail.events.every((event) => !['result.accepted', 'result.rejected'].includes(event.kind)),
+);
 await say('请写一份说明，先确认读者。');
 const questionTask = await wait(async () => {
   const p = await page();
@@ -187,7 +190,7 @@ await wait(async () => {
 await say('读者是新同事，保持简短。');
 const answered = await wait(async () => {
   const d = await call('task.detail', { id: questionTask.id });
-  return d.task.lifecycle === 'review' && d.task.managerReviewed && d;
+  return d.task.lifecycle === 'completed' && d.task.managerReviewed && d;
 }, 'chat answer continues execution');
 assert.equal(answered.input.content, '读者是新同事，保持简短。');
 assert.equal(answered.input.attentionId, question.id);
@@ -208,7 +211,7 @@ await say('请用 Shell 运行本机命令，把合成检查结果保存成文�
 const cliTask = await wait(async () => {
   const p = await page();
   return p.items.find(
-    (t) => t.goal === 'LOCAL_CLI_PROBE' && t.lifecycle === 'review' && t.managerReviewed,
+    (t) => t.goal === 'LOCAL_CLI_PROBE' && t.lifecycle === 'completed' && t.managerReviewed,
   );
 }, 'CLI request delegates to Worker');
 const cliDetail = await call('task.detail', { id: cliTask.id });
@@ -222,7 +225,10 @@ assert.ok(worker.modelTools.includes('bash'));
 assert.ok(
   (await inspect()).executedTools.every((name) => name === 'super_bot_manage' || name === 'bash'),
 );
-assert.deepEqual((await inspect()).modelTools.slice().sort(), managerTools);
+assert.deepEqual(
+  (await inspect()).modelTools.slice().sort(),
+  querySession.modelTools.slice().sort(),
+);
 assert.equal(
   await (await client.get(`/api/super-bot-file?resultId=${cliDetail.result.id}&index=0`)).text(),
   'LOCAL_CLI_OK\n',
@@ -257,8 +263,8 @@ const result = {
     'chat request automatically dispatches',
     'readable delivery and verified download in same chat',
     'unauthenticated file access denied',
-    'chat rework reuses task with a new versioned link and old file URL rejects changed bytes',
-    'acceptance remains an explicit user action',
+    'a new chat direction reuses the completed task and delivers a new version',
+    'ordinary results are reviewed and completed by the Bot',
     'Worker question and human answer stay in Bot chat with the exact attentionId',
     'CLI result uses the same versioned chat receipt',
   ],

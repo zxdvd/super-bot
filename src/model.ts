@@ -105,6 +105,7 @@ export interface Task {
   activityQuestion?: string;
   managerReviewed?: boolean;
   blockingAttention?: 'input' | 'approval' | 'recovery' | null;
+  lastRunOutcome?: RunOutcome;
   /** The Worker ended with a blocker and no concrete action is assigned to the owner. */
   waitingForPrerequisite?: true;
   stageState?: WorkStage['state'];
@@ -150,7 +151,7 @@ export interface NewTask {
   goal: string;
   scope: string;
   acceptance: string;
-  reviewPolicy: 'human' | 'bot';
+  reviewPolicy?: Task['reviewPolicy'];
   startPaused?: boolean;
   workdir?: WorkdirRequest;
 }
@@ -228,6 +229,10 @@ export type TaskProgress = {
   acceptance: { actor: 'user' | 'bot'; at: number } | null;
   reload: ReloadReceipt | null;
 };
+export type RunOutcome = 'blocked' | 'failed';
+export const settledRunOutcome = (kind: unknown): RunOutcome | undefined =>
+  kind === 'blocked' || kind === 'failed' ? kind : undefined;
+
 export interface Run {
   id: string;
   taskId: string;
@@ -241,6 +246,7 @@ export interface Run {
   finishedAt: number | null;
   note: string;
 }
+export type RunDetail = Run & { outcome?: RunOutcome };
 export interface RunInput {
   id: string;
   taskId: string;
@@ -255,6 +261,7 @@ export interface RunInput {
 export type WorkerPriorInput = Pick<RunInput, 'id' | 'content' | 'messageId'> & {
   kind: 'answer' | 'rework' | 'continuation';
   order: number;
+  createdAt?: number;
   priorDirections?: string[];
 };
 
@@ -357,6 +364,12 @@ export interface Attention {
   createdAt: number;
 }
 
+export function requiresHumanAcceptance(task: Task): boolean {
+  return (
+    task.lifecycle === 'review' && (task.reviewPolicy === 'human' || task.managerReviewed === true)
+  );
+}
+
 export function taskStatus(
   task: Pick<Task, 'lifecycle' | 'controlMode' | 'scope' | 'acceptance'>,
 ): Task['status'] {
@@ -389,6 +402,11 @@ export interface ChatSource {
   text: string;
   messages?: { messageId: string; seq: number; text: string }[];
 }
+
+export type WorkerSupplement = Pick<ChatSource, 'sessionId' | 'messageId' | 'text'> & {
+  id: string;
+  createdAt: number;
+};
 
 export type RecoveryDirection = {
   id: string;
@@ -431,6 +449,7 @@ export interface RecoveryWorkContext {
   lateJobs?: string[];
   priorProgress?: string;
   effectUncertain: boolean;
+  priorEffectUncertainty?: string;
   probes: ClusterProbe[];
 }
 

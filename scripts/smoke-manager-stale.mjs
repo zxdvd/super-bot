@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import { setTimeout as delay } from 'node:timers/promises';
 import { hostClient } from './host-client.mjs';
-const client = await hostClient(),
+const client = await hostClient(process.argv[2] ?? process.env.SUPER_BOT_TEST_LOG),
   prefix = `manager-stale:${randomUUID()}`;
 async function call(action, payload = {}) {
   const r = (
@@ -86,12 +86,12 @@ for (const mode of ['revise', 'native-dispatch', 'native-review']) {
     } else {
       binding = before.binding;
       assert.ok(binding);
-      await probe('queue-native', binding.sessionId, {
-        text: '人工接管此任务，请暂时停止自动管理。',
+      await call('task.control', {
+        requestId: prefix + ':pause:' + mode,
+        id: task.id,
+        expectedRowVersion: task.rowVersion,
+        mode: 'paused',
       });
-      await wait(async () => ({
-        ok: (await call('task.detail', { id: task.id })).task.controlMode === 'manual',
-      }));
     }
     await probe('release-stalled-model', manager.sessionId);
     const native = await wait(async () => {
@@ -112,15 +112,15 @@ for (const mode of ['revise', 'native-dispatch', 'native-review']) {
     assert.notEqual(after.task.lifecycle, 'completed');
     assert.equal(after.result?.humanAcceptedAt ?? null, null);
     if (mode === 'native-review') {
-      assert.equal(after.task.controlMode, 'manual');
-      assert.equal(after.task.lifecycle, 'open');
+      assert.equal(after.task.controlMode, 'paused');
+      assert.equal(after.task.lifecycle, 'review');
     } else {
       assert.equal(after.run, null);
       if (mode === 'revise') {
         assert.equal(after.task.goal, '人工更新后的目标');
         assert.equal(after.task.taskRevision, 2);
         assert.equal(after.binding, null);
-      } else assert.equal(after.task.controlMode, 'manual');
+      } else assert.equal(after.task.controlMode, 'paused');
     }
     results.push({
       mode,
@@ -141,8 +141,8 @@ console.log(
       ok: true,
       checks: [
         'old dispatch after user goal edit cannot prepare a session or create a Run',
-        'native user takeover rejects delayed Manager dispatch',
-        'native user takeover rejects delayed Manager automatic acceptance',
+        'explicit pause rejects delayed Manager dispatch',
+        'explicit pause rejects delayed Manager automatic acceptance and preserves review',
       ],
       results,
     },

@@ -1,5 +1,9 @@
 /** One task in a drawer: header with the one main action, open questions, result, workdir, definition, session and audit. */
-import type { Attention, RecoveryDirectionStatus } from '../../model.ts';
+import {
+  requiresHumanAcceptance,
+  type Attention,
+  type RecoveryDirectionStatus,
+} from '../../model.ts';
 import { ownerLabel, type MirrorDetail, type MirrorEvent } from '../../mirror.ts';
 import { useEffect, useRef } from 'react';
 import { workUrl, type WorkLink } from '../../work-links.ts';
@@ -8,7 +12,9 @@ import {
   canReviewResult,
   canStartTask,
   eventTitle,
-  recoveryEventMessage,
+  resultReviewLabel,
+  auditEventMessage,
+  runOutcomeLabel,
   reviewLabel,
   stageText,
   stageTone,
@@ -70,7 +76,11 @@ function AttentionBox({
   const canReply = detail.pendingQuestions.some((question) => question.id === attention.id);
   return (
     <div className="attention-box" id={`sb-attention-${attention.id}`}>
-      <strong>{attentionTitles[attention.kind]}</strong>
+      <strong>
+        {attention.kind === 'review' && !requiresHumanAcceptance(task)
+          ? resultReviewLabel(task)
+          : attentionTitles[attention.kind]}
+      </strong>
       <p className="clamp prose-preview">{attention.question}</p>
       <details className="prose-details">
         <summary>完整说明</summary>
@@ -384,7 +394,7 @@ function Audit({
         <dt>{readOnly ? '最近 50 条关键事件' : '关键事件'}</dt>
         <dd>
           {detail.events.map((e) => {
-            const summary = e.report?.summary ?? (!readOnly ? recoveryEventMessage(e) : undefined);
+            const summary = e.report?.summary ?? (!readOnly ? auditEventMessage(e) : undefined);
             return (
               <div className="event" key={e.id}>
                 {time(e.createdAt)} ·{' '}
@@ -409,7 +419,9 @@ function RecoveryFinding({ detail }: { detail: Detail }) {
   if (!message && task.status === 'blocked' && detail.settledBlocker && detail.run?.note) {
     return (
       <section className="attention-box">
-        <strong>上轮已结束，任务受阻</strong>
+        <strong>
+          {detail.run.outcome ? runOutcomeLabel(detail.run.outcome) : '上轮已结束，任务受阻'}
+        </strong>
         <p className="full-text">{detail.run.note}</p>
       </section>
     );
@@ -586,7 +598,9 @@ function Progress({ detail }: { detail: Detail | MirrorDetail }) {
             已安排 {time(currentRun.createdAt)}
             {progress?.inputEnteredAt && ` · 输入进入模型 ${time(progress.inputEnteredAt)}`}
             {' · '}
-            {runLabels[currentRun.state] ?? currentRun.state}
+            {currentRun.outcome
+              ? runOutcomeLabel(currentRun.outcome)
+              : (runLabels[currentRun.state] ?? currentRun.state)}
             {currentRun.finishedAt && ` ${time(currentRun.finishedAt)}`}
           </dd>
           {result && (
@@ -606,7 +620,7 @@ function Progress({ detail }: { detail: Detail | MirrorDetail }) {
                 {accepted
                   ? `${accepted.actor === 'user' ? '用户' : 'Bot'}接受 ${time(accepted.at)}`
                   : task.lifecycle === 'review'
-                    ? '待验收'
+                    ? resultReviewLabel(task)
                     : '暂无验收记录'}
               </dd>
             </>
@@ -637,7 +651,9 @@ function MirrorTaskContent({
   const heading = reworking
     ? '交付 · 返工中'
     : task.lifecycle === 'review'
-      ? '成果 · 待来源端验收'
+      ? requiresHumanAcceptance(task)
+        ? '成果 · 待来源端验收'
+        : `成果 · ${resultReviewLabel(task)}`
       : task.lifecycle === 'completed'
         ? '成果 · 已接受'
         : '成果记录';

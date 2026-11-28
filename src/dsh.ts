@@ -33,7 +33,13 @@ import {
   type UserMessage,
 } from '@deepseek-ai/dsh-llm';
 import type { Session } from '@deepseek-ai/dsh-session';
-import { verifyRunBoundary, verifyRunTurn } from './run-proof.ts';
+import { isNativeOwner, messageText } from './dsh-chat-events.ts';
+import {
+  verifyRunBoundary,
+  verifyRunTurn,
+  verifyUnobservedRunEnd,
+  type RunEvent,
+} from './run-proof.ts';
 import { verifyLateJobs, verifyLateJobScope } from './dsh-late-job-proof.ts';
 import { SessionId } from '@deepseek-ai/dsh-session/types';
 import { realpath } from 'node:fs/promises';
@@ -233,7 +239,6 @@ export class DshExecution {
   private lateJobTimers = new Map<string, ReturnType<typeof setTimeout>>();
   private lateJobChecks = new Map<string, Promise<void>>();
   private closing = new Map<string, Promise<void>>();
-  private pendingHuman = new Map<string, string[]>();
   private recoveryTreeChecks = new WeakMap<Agent, Promise<boolean>>();
   private deletedRuns = new Map<string, AbortController>();
   private disposed = false;
@@ -793,31 +798,8 @@ export class DshExecution {
         this.scheduleLateJobForSession(session.id);
       if (event.type === 'job/settled' || event.type === 'model/selection')
         this.resumeUnsentForSession(session.id);
-      // Queue/steer must not look like takeover. Only a human user/message that
-      // starts a new turn while no automatic turn is running marks intervention.
-      // Do not cancel: that would abort the user's own turn. Release immediately;
-      // whenIdle() may follow the new driver, so the idle listener would be late.
-      if (
-        event.type === 'user/message' &&
-        event.data.source.kind === 'user' &&
-        'rpcId' in event.data.source
-      ) {
-        const previous = this.store
-          .heldRuns()
-          .find((run) => run.sessionId === session.id && run.finishedAt === null);
-        if (previous && this.autoTurns.has(previous.id)) return;
-        if (previous && this.finishing.has(previous.id)) {
-          const ids = this.pendingHuman.get(previous.id) ?? [];
-          ids.push(event.data.id);
-          this.pendingHuman.set(previous.id, ids);
-          return;
-        }
-        const changed = this.store.nativeIntervention(session.id, event.data.id);
-        if (changed && previous) {
-          this.running.get(previous.id)?.release();
-          this.running.delete(previous.id);
-        }
-      }
+      if (event.type === 'user/message' && event.surfaceOp === 'append')
+        this.recordWorkerSupplement(session.id, event.seq, event.time, event.data);
     });
     this.ctx.on('agent/status', ({ agent, status }) => {
       if (status === 'idle') {
@@ -848,6 +830,27 @@ export class DshExecution {
       if (!runId || !this.finishing.has(runId)) void this.advanceClose(taskId, true, true);
     }
     this.stopDeletedBot();
+  }
+  private recordWorkerSupplement(
+    sessionId: string,
+    seq: number,
+    time: number,
+    message: UserMessage,
+  ): void {
+    if (!isNativeOwner(message) || !message.content?.length) return;
+    const text = messageText(message);
+    if (text.trim())
+      this.store.recordWorkerSupplement({ sessionId, messageId: message.id, seq, text }, time);
+  }
+  private readBackWorkerSupplements(
+    sessionId: string,
+    events: Awaited<ReturnType<typeof readRunEvents>>,
+    startSeq: number,
+  ): void {
+    for (const event of events.slice(startSeq + 1)) {
+      if (event.type === 'user/message' && event.surfaceOp === 'append')
+        this.recordWorkerSupplement(sessionId, event.seq, event.time, event.data);
+    }
   }
   private gitLabReleaseScope(agent: Agent, signal: AbortSignal): GitLabReleaseScope | undefined {
     const run = this.store
@@ -1043,10 +1046,6 @@ export class DshExecution {
           );
       })
       .finally(async () => {
-        if (!this.disposed)
-          for (const id of this.pendingHuman.get(runId) ?? [])
-            this.store.nativeIntervention(this.store.getRun(runId).sessionId, id);
-        this.pendingHuman.delete(runId);
         this.finishing.delete(runId);
         const agent = !this.disposed && session && this.ctx.agents.get?.(session.id);
         if (!this.disposed && (!agent || agent.status === 'idle'))
@@ -1059,12 +1058,8 @@ export class DshExecution {
     if (run.finishedAt !== null || this.disposed) return;
     const proof = this.store.runTurn(runId);
     if (!proof) throw new AppError('run-proof', '旧版执行没有可归属的持久证据。');
-    const followups = verifyRunTurn(
-      run,
-      this.store.getRunInput(runId),
-      proof,
-      await readRunEvents(this.ctx, run, session),
-    );
+    const events = await readRunEvents(this.ctx, run, session);
+    verifyRunTurn(run, this.store.getRunInput(runId), proof, events);
     const current = this.store.getRun(runId);
     if (
       this.disposed ||
@@ -1086,11 +1081,10 @@ export class DshExecution {
       binding.sessionId !== run.sessionId
     )
       throw new AppError('run-proof', '任务或会话绑定已改变，不能补结算。');
-    // No awaits between settlement and native takeover: later human work cannot
-    // become an automatic scheduling/review opportunity in between these writes.
+    // Recover owner input that reached the native log before this process recorded it.
+    this.readBackWorkerSupplements(run.sessionId, events, proof.startSeq!);
     if (current.state === 'cancelling') this.store.settleCancelled(runId, !!session);
     else this.store.settleRun(runId, !!session);
-    for (const id of followups) this.store.nativeIntervention(run.sessionId, id);
   }
   private scheduleLateJobForSession(sessionId: string): void {
     if (this.disposed) return;
@@ -1650,7 +1644,13 @@ export class DshExecution {
     let input = this.store.getRunInput(run.id);
     const previous = this.store.previousWorkerInputs(run);
     if (!input.messageJson) {
-      const prompt = workerPromptPlan(agent, run, standing, previous);
+      const prompt = workerPromptPlan(
+        agent,
+        run,
+        standing,
+        previous,
+        this.store.workerSupplements(run),
+      );
       const context = folder ? { ...work!.context, outputDirectory: folder } : work?.context;
       const message = createWorkerRunMessage(run, input, standing, prompt, recovery, context);
       input = this.store.saveRunMessage(run.id, message.id, JSON.stringify(message));
@@ -1913,6 +1913,7 @@ export class DshExecution {
             !this.store.isBotDeleted(task.botId)
           );
         },
+        () => this.store.workerSupplements(run),
       );
       if (!this.store.claimDispatch(run.id)) {
         release();
@@ -2598,6 +2599,9 @@ export class DshExecution {
           '原生后台作业已停止或缺少成功回执，其外部效果尚未确认。请检查 Worker 会话中的作业结果。',
         );
     }
+    return this.inspectRecoveryTools(run, cwd, proof, events);
+  }
+  private inspectRecoveryTools(run: Run, cwd: string, proof: RunTurn, events: readonly RunEvent[]) {
     return inspectPriorTools(events, cwd, proof.turn!, proof.startSeq!, proof.endSeq!, (call) => {
       const receipt = this.store.readQueryReceipt(run.id, call.callId);
       if (
@@ -2873,6 +2877,37 @@ export class DshExecution {
       !activity.jobs?.some((job) => job.status === 'running' || job.status === 'stopping')
     );
   }
+  private async readInterruptedBoundary(run: Run, agent: Agent, cwd: string) {
+    const proof = this.store.runTurn(run.id),
+      input = this.store.getRunInput(run.id);
+    if (input.state !== 'entered' || !proof)
+      throw new AppError('recovery-unproven', '尚未找到可归属的旧轮结束证据，保留旧轮占用。');
+    if (proof.endSeq !== null && proof.quiet !== 1)
+      throw new AppError('recovery-unproven', run.note ?? '原轮已经结束，后台或子树收敛尚未确认。');
+    const events = await readRunEvents(this.ctx, run, agent.session);
+    if (proof.endSeq !== null) {
+      verifyRunBoundary(run, input, proof, events);
+      return;
+    }
+
+    const end = verifyUnobservedRunEnd(run, input, proof, events);
+    const checks = this.inspectRecoveryTools(run, cwd, { ...proof, ...end }, events);
+    // A successful native file operation has its own result. Other possible effects
+    // are carried into continuation separately from whether the old process ended.
+    checks.potentialEffects = checks.potentialEffects.filter(
+      ({ tool, result }) => !(['write', 'edit'].includes(tool) && result === 'reported-success'),
+    );
+    const effectUncertainty = unknownPriorEffects(
+      checks,
+      this.boundPreflightReceipts(run.id, checks.clusters).some((call) => !call.receipt),
+      this.store.recoveryWorkPlan(run.id)?.context.effectUncertain,
+    );
+    return {
+      end: { ...end, ...(effectUncertainty && { effectUncertainty }) },
+      events,
+      startSeq: proof.startSeq!,
+    };
+  }
   async continueRecovery(
     taskId: string,
     rowVersion: number,
@@ -2981,17 +3016,10 @@ export class DshExecution {
           this.assertDirectory(agent, binding.cwd);
           const mode = instruction.mode;
           if (!mode) return { status: 'blocked', message: '当前没有新的已授权后续指示。' };
-          if (interrupted) {
-            const proof = this.store.runTurn(run.id),
-              input = this.store.getRunInput(run.id);
-            if (input.state !== 'entered' || !proof?.quiet || proof.endSeq === null)
-              throw new AppError(
-                'recovery-unproven',
-                '尚未找到可归属的旧轮结束证据，保留旧轮占用。',
-              );
-            verifyRunBoundary(run, input, proof, await readRunEvents(this.ctx, run, agent.session));
-            validate();
-          }
+          const readback = interrupted
+            ? await this.readInterruptedBoundary(run, agent, binding.cwd)
+            : undefined;
+          validate();
           await this.confirmRecoveryTree(agent);
           validate();
           this.assertRecoveryQuiet(agent, run.id);
@@ -2999,7 +3027,15 @@ export class DshExecution {
           if (tree !== originalService(this.nativeSubagents()))
             throw new AppError('child-unknown', '原生子树服务已变更，请重新核对。');
           if (interrupted) {
-            this.store.verifyInterruptedEnd(taskId, rowVersion, managerId);
+            if (readback) {
+              if (agent.id !== run.sessionId || agent.session.seq !== readback.events.length)
+                throw new AppError(
+                  'session-unavailable',
+                  '原生会话核对期间发生变化，已保存指示将稍后重试。',
+                );
+              this.readBackWorkerSupplements(run.sessionId, readback.events, readback.startSeq);
+            }
+            this.store.verifyInterruptedEnd(taskId, rowVersion, managerId, readback?.end);
             rowVersion = this.store.getTask(taskId).rowVersion;
           }
           if (this.store.dispatchBlocker(taskId)) return waitForCapacity();
@@ -3031,6 +3067,8 @@ export class DshExecution {
               : []),
           ]);
           const release = this.store.gitLabReleaseDetail(task);
+          const priorEffectUncertainty =
+            this.store.verifiedEndUncertainty(run.id) ?? priorWork?.context.priorEffectUncertainty;
           const work: RecoveryWorkContext = {
             ...(release && { priorRelease: { url: release.url, state: release.state } }),
             priorRunId: run.id,
@@ -3038,7 +3076,10 @@ export class DshExecution {
             priorReport: this.store.runFinalReport(run.id),
             priorCheck: priorCheck?.resolution ?? priorWork?.context.priorCheck,
             effectUncertain:
-              priorCheck?.effectUncertain === true || priorWork?.context.effectUncertain === true,
+              !!priorEffectUncertainty ||
+              priorCheck?.effectUncertain === true ||
+              priorWork?.context.effectUncertain === true,
+            ...(priorEffectUncertainty && { priorEffectUncertainty }),
             priorDirections: instruction.directions
               ?.filter((direction) => direction.id !== instruction.id)
               .map(({ id, source }) => ({ id, text: source.text })),

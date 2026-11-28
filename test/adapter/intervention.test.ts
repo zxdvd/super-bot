@@ -11,7 +11,7 @@ import { Managers } from '../../src/manager.ts';
 import type { Run, Task, TaskCloseRequest } from '../../src/model.ts';
 import { workUrl } from '../../src/work-links.ts';
 
-async function fixture() {
+async function fixture(reviewPolicy: 'human' | 'bot' = 'human') {
   let external: 'job' | 'child' | undefined;
   let flush: () => Promise<boolean> = async () => true;
   let beforeResolve: () => Promise<void> = async () => {};
@@ -26,7 +26,7 @@ async function fixture() {
     goal: '写说明',
     scope: '任务目录',
     acceptance: '回读',
-    reviewPolicy: 'human',
+    reviewPolicy,
   });
   const binding = store.beginBinding('bind', task.id, task.rowVersion, directory);
   store.confirmBinding(binding.id, binding.requestedSessionId);
@@ -417,6 +417,7 @@ test('a queued next-turn message during an automatic run does not interrupt or c
   try {
     await f.emit('user/message', JSON.parse(f.store.getRunInput(f.run.id).messageJson!));
     await f.emit('agent/inbox/spliced', { inserted: [user('queued', '下一轮再看目录')] });
+    assert.deepEqual(f.store.workerSupplements(f.run), []);
     assert.equal(f.cancels(), 0);
     assert.equal(f.removed().length, 0);
     assert.equal(f.store.getTask(f.task.id).controlMode, 'auto');
@@ -440,6 +441,10 @@ test('a mid-turn steer claimed as user/message does not take over or cancel', as
     );
     await f.emit('agent/inbox/spliced', { inserted: [user('steer', '先检查测试')] });
     await f.emit('user/message', user('steer', '先检查测试'));
+    assert.deepEqual(
+      f.store.workerSupplements(f.run).map(({ text }) => text),
+      ['先检查测试'],
+    );
     assert.equal(f.cancels(), 0);
     assert.equal(f.store.getTask(f.task.id).controlMode, 'auto');
     assert.equal(f.store.getRun(f.run.id).finishedAt, null);
@@ -449,7 +454,7 @@ test('a mid-turn steer claimed as user/message does not take over or cancel', as
   }
 });
 
-test('a human new turn after the automatic turn ends records takeover without cancelling', async () => {
+test('a native follow-up preserves the existing recovery and control mode', async () => {
   const f = await fixture();
   try {
     await f.emit('user/message', JSON.parse(f.store.getRunInput(f.run.id).messageJson!));
@@ -466,7 +471,11 @@ test('a human new turn after the automatic turn ends records takeover without ca
     await f.emit('user/message', user('next', '自动轮结束后再说'));
     assert.equal(f.cancels(), 0);
     assert.equal(f.removed().length, 0);
-    assert.equal(f.store.getTask(f.task.id).controlMode, 'manual');
+    assert.equal(f.store.getTask(f.task.id).controlMode, 'auto');
+    assert.deepEqual(
+      f.store.workerSupplements(f.run).map(({ text }) => text),
+      ['自动轮结束后再说'],
+    );
     assert.equal(f.store.getRun(f.run.id).state, 'interrupted');
     assert.ok(f.store.getRun(f.run.id).finishedAt);
     assert.equal(
@@ -483,7 +492,7 @@ test('a human new turn after the automatic turn ends records takeover without ca
   }
 });
 
-test('ready settles at its own turn/end before queued human work, without waiting for whole-session idle', async () => {
+test('ready and current review survive queued human work, and the next attempt gets the input once', async () => {
   const f = await fixture();
   try {
     await f.emit('user/message', JSON.parse(f.store.getRunInput(f.run.id).messageJson!));
@@ -502,16 +511,88 @@ test('ready settles at its own turn/end before queued human work, without waitin
     assert.equal(f.store.heldRuns().length, 0);
     assert.equal(f.released(), true);
     await f.emit('turn/start', { turn: 2 });
-    await f.emit('user/message', user('followup', 'New work'));
+    const before = f.store.taskDetail(f.task.id);
+    const supplement = user('followup', 'Add the verified totals');
+    await f.emit('user/message', supplement);
+    await f.emit('user/message', supplement);
+    const after = f.store.taskDetail(f.task.id);
     assert.equal(f.store.getRun(f.run.id).state, 'settled');
-    assert.equal(f.store.getTask(f.task.id).controlMode, 'manual');
+    assert.deepEqual(after.task, before.task);
+    assert.equal(after.task.controlMode, 'auto');
+    assert.equal(after.result?.id, before.result?.id);
+    assert.deepEqual(after.attentions, before.attentions);
+    assert.deepEqual(
+      f.store.workerSupplements(f.run).map(({ text }) => text),
+      ['Add the verified totals'],
+    );
     assert.equal(f.cancels(), 0);
     assert.equal(
       f.store.taskDetail(f.task.id).attentions.some((a) => a.kind === 'recovery'),
       false,
     );
-    await f.execution.dispose();
-    assert.equal(f.cancels(), 0, 'disposing old execution cannot cancel the human turn');
+    f.agent.status = 'idle';
+    await f.emit('turn/end', { turn: 2, reason: { kind: 'completed' } });
+    f.store.rejectResult(
+      'new-rework',
+      f.task.id,
+      after.task.rowVersion,
+      after.result!.id,
+      'New pass',
+    );
+    const next = await f.execution.dispatch(
+      'next',
+      f.task.id,
+      f.store.getTask(f.task.id).rowVersion,
+    );
+    assert.equal(next.sessionId, f.run.sessionId);
+    const message = JSON.parse(f.store.getRunInput(next.id).messageJson!);
+    assert.equal(message.content[0].text.split('Add the verified totals').length, 2);
+    await f.emit('turn/start', { turn: 3 });
+    await f.emit('user/message', message);
+    assert.equal(f.store.getRun(next.id).state, 'running');
+    assert.equal(f.store.getTask(f.task.id).controlMode, 'auto');
+  } finally {
+    await f.close();
+  }
+});
+
+test('a native message after Bot acceptance remains in the completed task history', async () => {
+  const f = await fixture('bot');
+  try {
+    await f.emit('user/message', JSON.parse(f.store.getRunInput(f.run.id).messageJson!));
+    const file = resolve(f.directory, 'result.md');
+    writeFileSync(file, 'Synthetic evidence');
+    const report = f.store.workerReport(f.run.id, 'ready', {
+      kind: 'ready',
+      summary: 'Checked',
+      checks: 'Read file',
+      evidence: await collectEvidence(f.directory, [file]),
+    });
+    await f.emit('turn/end', { turn: 1, reason: { kind: 'completed' } });
+    const version = f.store.getTask(f.task.id).rowVersion;
+    f.store.managerReview(
+      'approve',
+      f.bot.id,
+      f.task.id,
+      version,
+      report.resultId!,
+      'accept',
+      'Checked',
+    );
+    const before = f.store.taskDetail(f.task.id);
+    assert.equal(before.task.lifecycle, 'completed');
+    await f.emit('turn/start', { turn: 2 });
+    await f.emit('user/message', user('followup', 'Keep this caveat with the report.'));
+    const after = f.store.taskDetail(f.task.id);
+    assert.deepEqual(after.task, before.task);
+    assert.deepEqual(after.result, before.result);
+    assert.deepEqual(after.attentions, before.attentions);
+    assert.equal(after.run?.id, before.run?.id);
+    assert.equal(f.store.heldRuns().length, 0);
+    assert.deepEqual(
+      f.store.workerSupplements(f.run).map(({ text }) => text),
+      ['Keep this caveat with the report.'],
+    );
   } finally {
     await f.close();
   }
@@ -557,7 +638,7 @@ test('stopped automatic turn settles cancellation before the native follow-up', 
     await f.emit('turn/start', { turn: 2 });
     await f.emit('user/message', user('takeover', 'Continue manually'));
     assert.equal(f.store.getRun(f.run.id).state, 'cancelled');
-    assert.equal(f.store.getTask(f.task.id).controlMode, 'manual');
+    assert.equal(f.store.getTask(f.task.id).controlMode, 'paused');
     assert.equal(f.released(), true);
     assert.equal(f.cancels(), 0);
   } finally {
@@ -638,13 +719,17 @@ test('Stop racing the durability barrier cancels only the old Run, never the fol
     const ending = f.emit('turn/end', { turn: 1, reason: { kind: 'completed' } });
     await new Promise<void>((resolve) => setImmediate(resolve));
     const next = f.emit('turn/start', { turn: 2 }),
-      human = f.emit('user/message', user('native-during-finalizing', 'Take over'));
+      human = f.emit('user/message', user('native-during-finalizing', 'Check the draft'));
     await new Promise<void>((resolve) => setImmediate(resolve));
     await f.execution.stop('stop-finalizing', f.task.id, f.store.getTask(f.task.id).rowVersion);
     assert.equal(f.cancels(), 0);
     resume();
     await Promise.all([ending, next, human]);
-    assert.equal(f.store.getTask(f.task.id).controlMode, 'manual');
+    assert.equal(f.store.getTask(f.task.id).controlMode, 'paused');
+    assert.deepEqual(
+      f.store.workerSupplements(f.run).map(({ text }) => text),
+      ['Check the draft'],
+    );
     assert.equal(f.store.getRun(f.run.id).state, 'cancelled');
     assert.equal(f.store.heldRuns().length, 0);
   } finally {

@@ -1,5 +1,5 @@
 import { applyTaskActivity, inboxActivity, taskActivities } from './work-activity.ts';
-import { settledBlockerSql } from './settled-blocker.ts';
+import { settledBlockerSql, settledReportOutcomeSql } from './settled-blocker.ts';
 import {
   readStageCondition,
   stageConditionText,
@@ -46,6 +46,7 @@ import {
   AppError,
   requiredText,
   optionalText,
+  requiresHumanAcceptance,
   taskStatus,
   type ChatSource,
   type Bot,
@@ -58,7 +59,10 @@ import {
   type Attention,
   type Binding,
   type Run,
+  type RunDetail,
   type RunInput,
+  type RunOutcome,
+  settledRunOutcome,
   type WorkReport,
   type Result,
   type ManagerBinding,
@@ -87,6 +91,7 @@ import {
   type UncertainDelivery,
   type WorkerModelPlan,
   type WorkerPriorInput,
+  type WorkerSupplement,
   type RecoveryDirection,
   type RecoveryDirectionChange,
   type RecoveryDirectionStatus,
@@ -137,7 +142,7 @@ export type BotDeletionReceipt = {
   feishuBindingId: string | null;
 };
 
-function directionId(source: ChatSource): string {
+function directionId(source: Pick<ChatSource, 'sessionId' | 'messageId'>): string {
   return createHash('sha256')
     .update(JSON.stringify([source.sessionId, source.messageId]))
     .digest('hex');
@@ -1162,6 +1167,12 @@ export class Store {
       !['review', 'completed'].includes(task.lifecycle)
     )
       throw new AppError('result-stale', '交付成果已经改变。');
+    if (
+      task.lifecycle === 'review' &&
+      task.controlMode === 'auto' &&
+      !requiresHumanAcceptance(task)
+    )
+      throw new AppError('review-pending', '请先按任务的验收条件检查这份成果。');
     this.assertNoTaskClose(task.id);
     const links =
       initial?.links === undefined ? undefined : readDeliveryLinks(initial.links, false);
@@ -1457,41 +1468,49 @@ export class Store {
   ): Task {
     if (input.startPaused !== undefined && typeof input.startPaused !== 'boolean')
       throw new AppError('invalid-input', '初始暂停状态必须是布尔值。');
-    const payload: NewTask = {
+    const { reviewPolicy = 'bot' } = input;
+    if (reviewPolicy !== 'human' && reviewPolicy !== 'bot')
+      throw new AppError('invalid-input', '请选择有效的验收方式。');
+    const workdir = parseWorkdirRequest(input.workdir);
+    const intent = {
       botId: requiredText(input.botId, 'Bot 标识', 200),
       goal: requiredText(input.goal, '任务目标'),
       scope: optionalText(input.scope, '任务范围'),
       acceptance: optionalText(input.acceptance, '验收条件'),
-      reviewPolicy: input.reviewPolicy,
+      reviewPolicy,
       ...(input.startPaused ? { startPaused: true } : {}),
-    };
-    const workdir = parseWorkdirRequest(input.workdir);
-    if (workdir) payload.workdir = workdir;
-    if (!['human', 'bot'].includes(payload.reviewPolicy))
-      throw new AppError('invalid-input', '请选择有效的验收方式。');
-    // Native provenance, not a model-provided call ID, identifies one human request.
-    // Keep the normal call receipt too: reusing a call ID with changed content must still fail.
-    const intent = {
-      ...payload,
+      ...(workdir ? { workdir } : {}),
       ...(conventionOverride === undefined ? {} : { conventionOverride }),
       ...(release ? { release } : {}),
     };
-    const intentHash = source
-      ? createHash('sha256')
-          .update(
-            JSON.stringify({
-              action: 'task.create-intent',
-              payload: intent,
-              source: {
-                sessionId: source.sessionId,
-                messages: (source.messages ?? [source])
-                  .map(({ messageId, seq }) => ({ messageId, seq }))
-                  .sort((a, b) => a.seq - b.seq),
-              },
-            }),
-          )
-          .digest('hex')
-      : undefined;
+    // Native provenance identifies the same intent even when a new tool call ID is used.
+    const intentSource = source && {
+      sessionId: source.sessionId,
+      messages: (source.messages ?? [source])
+        .map(({ messageId, seq }) => ({ messageId, seq }))
+        .sort((a, b) => a.seq - b.seq),
+    };
+    const hashIntent = (policy: Task['reviewPolicy']) =>
+      createHash('sha256')
+        .update(
+          JSON.stringify({
+            action: 'task.create-intent',
+            payload: { ...intent, reviewPolicy: policy },
+            source: intentSource,
+          }),
+        )
+        .digest('hex');
+    let intentHash = intentSource ? hashIntent(reviewPolicy) : undefined;
+    if (intentSource && input.reviewPolicy === undefined) {
+      // A native create replay from before the default changed keeps its original task and policy.
+      const previousDefault = hashIntent('human');
+      if (
+        this.db.prepare('SELECT 1 FROM requests WHERE id=?').get(`task-intent:${previousDefault}`)
+      ) {
+        intentHash = previousDefault;
+        intent.reviewPolicy = 'human';
+      }
+    }
     const intentId = intentHash ? `task-intent:${intentHash}` : undefined;
     return this.command(
       requestId,
@@ -1520,8 +1539,8 @@ export class Store {
           ? this.db.prepare('SELECT result FROM requests WHERE id=?').get(intentId)
           : undefined;
         if (prior) return JSON.parse(String(prior.result)) as Task;
-        const bot = this.getBot(payload.botId),
-          context = this.currentBotContext(payload.botId);
+        const bot = this.getBot(intent.botId),
+          context = this.currentBotContext(intent.botId);
         const convention = conventionOverride ?? this.memory?.defaultConvention(bot.id);
         if (convention !== undefined)
           context.workConvention = {
@@ -1536,33 +1555,33 @@ export class Store {
           )
           .run(
             id,
-            payload.botId,
-            payload.goal,
-            payload.scope,
-            payload.acceptance,
-            payload.reviewPolicy,
-            payload.startPaused ? 'paused' : 'auto',
+            intent.botId,
+            intent.goal,
+            intent.scope,
+            intent.acceptance,
+            intent.reviewPolicy,
+            intent.startPaused ? 'paused' : 'auto',
             now,
             now,
             bot.configRevision,
             JSON.stringify(context),
-            payload.workdir ? JSON.stringify(payload.workdir) : null,
+            intent.workdir ? JSON.stringify(intent.workdir) : null,
           );
         this.db
           .prepare('INSERT INTO inputs(id,taskId,kind,content,createdAt) VALUES (?,?,?,?,?)')
-          .run(randomUUID(), id, 'goal', payload.goal, now);
+          .run(randomUUID(), id, 'goal', intent.goal, now);
         this.event('task.created', id, {
           taskRevision: 1,
           ...(source ? { source } : {}),
           ...(release ? { release } : {}),
         });
         this.enqueueManager(
-          payload.botId,
+          intent.botId,
           `created:${id}`,
           '有新任务，请检查授权范围与验收条件后安排。',
           id,
         );
-        if (!payload.scope || !payload.acceptance)
+        if (!intent.scope || !intent.acceptance)
           this.db
             .prepare(
               'INSERT INTO attentions(id,taskId,kind,question,taskRevision,createdAt) VALUES (?,?,?,?,?,?)',
@@ -1651,13 +1670,20 @@ export class Store {
       (!!resolution &&
         (['denied', 'missing'].includes(resolution.status) ||
           resolution.observed?.ready === false));
+    const lastRunOutcome =
+      run?.taskRevision === task.taskRevision && run.sessionId === task.sessionId
+        ? this.runOutcome(run)
+        : undefined;
     return {
       ...task,
       status,
       managerReviewed,
       blockingAttention,
+      ...(lastRunOutcome ? { lastRunOutcome } : {}),
       ...(stage ? { stageState: stage.state } : {}),
-      ...(status === 'blocked' && !needsDecision ? { waitingForPrerequisite: true as const } : {}),
+      ...(status === 'blocked' && lastRunOutcome !== 'failed' && !needsDecision
+        ? { waitingForPrerequisite: true as const }
+        : {}),
     };
   }
   private withDelivery(task: Task): Task {
@@ -1761,8 +1787,19 @@ export class Store {
     const attentions = this.db
       .prepare('SELECT * FROM attentions WHERE taskId=? ORDER BY createdAt,id')
       .all(id) as unknown as Attention[];
+    if (
+      task.lifecycle === 'review' &&
+      task.controlMode !== 'auto' &&
+      !requiresHumanAcceptance(task)
+    ) {
+      const pending = attentions.find((item) => item.kind === 'review' && item.state === 'open');
+      if (pending)
+        pending.question = '成果已提交，Bot 验收已暂停。恢复自动管理后，Bot 将按条件检查。';
+    }
     const currentRun =
       run?.taskRevision === task.taskRevision && run.bindingId === binding?.id ? run : null;
+    const outcome = run && (currentRun ? task.lastRunOutcome : this.runOutcome(run));
+    const runDetail: RunDetail | null = run && (outcome ? { ...run, outcome } : run);
     const late = run ? this.lateJobRecovery(run.id) : null;
     const currentLate = run && this.lateJobTarget(run.id, true);
     const invalidated = late && ['waiting', 'ready'].includes(late.state) && !currentLate;
@@ -1810,7 +1847,7 @@ export class Store {
         )
         .all(id)
         .map((row) => this.toBinding(row)),
-      run,
+      run: runDetail,
       input: this.pendingInput(id) ?? (run ? this.getRunInput(run.id) : null),
       result,
       deliveredResult,
@@ -2451,7 +2488,7 @@ export class Store {
   /** Past entered inputs can inform a new run without changing their delivery state. */
   previousWorkerInputs(run: Run): WorkerPriorInput[] {
     const inputs = this.db
-      .prepare(`SELECT i.id,i.kind,i.content,i.messageId,r.id AS previousRunId FROM runs r JOIN inputs i ON i.id=r.inputId
+      .prepare(`SELECT i.id,i.kind,i.content,i.messageId,i.createdAt,r.id AS previousRunId FROM runs r JOIN inputs i ON i.id=r.inputId
       WHERE r.taskId=? AND r.taskRevision=? AND r.rowid<(SELECT rowid FROM runs WHERE id=?)
       AND i.id<>? AND i.kind IN ('answer','rework','continuation') AND i.state='entered'
       GROUP BY i.id ORDER BY MAX(r.rowid)`)
@@ -2528,6 +2565,14 @@ export class Store {
         .prepare("SELECT id,kind FROM reports WHERE runId=? AND kind!='progress' LIMIT 1")
         .get(runId) as { id: string; kind: string }) ?? null
     );
+  }
+  private runOutcome(run: Run): RunOutcome | undefined {
+    if (run.state !== 'failed' || run.finishedAt === null) return;
+    // The settlement is the receipt. A candidate report can exist on a cancelled or interrupted run.
+    const receipt = this.db
+      .prepare(`SELECT ${settledReportOutcomeSql} AS kind FROM runs latest WHERE latest.id=?`)
+      .get(run.id);
+    return settledRunOutcome(receipt?.kind);
   }
   runFinalReport(runId: string): RecoveryWorkContext['priorReport'] | undefined {
     const row = this.db
@@ -2769,60 +2814,39 @@ export class Store {
       )
       .get(sessionId)?.taskId as string | undefined;
   }
-  nativeIntervention(sessionId: string, messageId: string): boolean {
-    const binding = this.db
-      .prepare("SELECT * FROM bindings WHERE sessionId=? AND state='ready'")
-      .get(sessionId) as unknown as Binding | undefined;
-    if (!binding) return false;
-    const task = this.getTask(binding.taskId);
-    if (!['open', 'review'].includes(task.lifecycle)) return false;
-    if (
-      this.commandReceipt(`native:${sessionId}:${messageId}`, 'task.native', {
-        sessionId,
-        messageId,
-      })
-    )
-      return false;
-    this.command(
-      `native:${sessionId}:${messageId}`,
-      'task.native',
-      { sessionId, messageId },
-      () => {
-        this.db
-          .prepare(
-            "UPDATE tasks SET controlMode='manual',lifecycle='open',rowVersion=rowVersion+1,updatedAt=? WHERE id=?",
-          )
-          .run(Date.now(), task.id);
-        this.db
-          .prepare(
-            "UPDATE attentions SET state='stale' WHERE taskId=? AND kind='review' AND state='open'",
-          )
-          .run(task.id);
-        this.db
-          .prepare(
-            "UPDATE attentions SET state='stale' WHERE taskId=? AND kind='approval' AND state='open'",
-          )
-          .run(task.id);
-        const run = this.latestRun(task.id);
-        if (run && run.finishedAt === null) {
-          const note = '原生会话已人工介入，旧执行授权终止。请核对原生会话后结束本次尝试。';
-          this.db
-            .prepare("UPDATE runs SET state='interrupted',finishedAt=?,note=? WHERE id=?")
-            .run(Date.now(), note, run.id);
-          this.db
-            .prepare("UPDATE inputs SET state='unknown' WHERE id=? AND state!='entered'")
-            .run(run.inputId);
-          this.db
-            .prepare(
-              'INSERT OR IGNORE INTO attentions(id,taskId,kind,question,taskRevision,createdAt) VALUES (?,?,?,?,?,?)',
-            )
-            .run(`run:${run.id}`, task.id, 'recovery', note, task.taskRevision, Date.now());
-        }
-        this.event('native.intervention', task.id, { sessionId, messageId });
-        return {};
-      },
-    );
-    return true;
+  /** This input already entered the native conversation. Record it without creating work. */
+  recordWorkerSupplement(
+    { sessionId, messageId, seq, text }: ChatSource,
+    createdAt = Date.now(),
+  ): void {
+    const taskId = this.workerTaskForSession(sessionId);
+    if (!taskId) return;
+    const task = this.getTask(taskId),
+      binding = this.activeBinding(taskId);
+    if (!binding || task.lifecycle === 'cancelled' || this.isBotDeleted(task.botId)) return;
+    const id = directionId({ sessionId, messageId });
+    const source = { sessionId, messageId };
+    this.command(`worker-supplement:${id}`, 'input.worker-supplement', source, () => {
+      this.event('input.worker-supplement', taskId, {
+        id,
+        ...source,
+        seq,
+        text,
+        createdAt,
+        taskRevision: task.taskRevision,
+        generation: binding.generation,
+      });
+      return {};
+    });
+  }
+  workerSupplements(run: Pick<Run, 'taskId' | 'taskRevision'>): WorkerSupplement[] {
+    return this.db
+      .prepare(`SELECT json_extract(data,'$.id') AS id, json_extract(data,'$.sessionId') AS sessionId,
+        json_extract(data,'$.messageId') AS messageId, json_extract(data,'$.text') AS text,
+        json_extract(data,'$.createdAt') AS createdAt
+        FROM events WHERE taskId=? AND kind='input.worker-supplement' AND json_extract(data,'$.taskRevision')=?
+        ORDER BY json_extract(data,'$.generation'),json_extract(data,'$.seq'),events.id`)
+      .all(run.taskId, run.taskRevision) as unknown as WorkerSupplement[];
   }
   dispatchBlocker(taskId: string): 'capacity' | null {
     return this.dispatchWait(taskId)?.code ?? null;
@@ -3467,7 +3491,11 @@ export class Store {
           `run:${id}`,
           run.taskId,
           kind,
-          last.kind === 'ready' ? '成果与执行已核对，请检查证据并验收。' : report.summary,
+          last.kind === 'ready' && task.reviewPolicy === 'bot'
+            ? '成果已提交，Bot 将按任务验收条件检查。'
+            : last.kind === 'ready'
+              ? '成果已提交，请检查证据并验收。'
+              : report.summary,
           run.taskRevision,
           Date.now(),
         );
@@ -4187,7 +4215,8 @@ export class Store {
         });
         this.settleManagerEvent(`manager-event:stage-settled:${runId}`);
         if (decision === 'ready') this.enqueueStageReady(botId, taskId, details);
-        return { task: this.getTask(taskId), stage: { ...details, state: decision } };
+        const updatedTask = this.getTask(taskId);
+        return { task: updatedTask, stage: this.currentStage(updatedTask, this.getRun(runId))! };
       },
     );
   }
@@ -5049,6 +5078,7 @@ export class Store {
       onlyWhileActive?: boolean;
       stageFollowUp?: StageFollowUp;
       lateJobFollowUp?: 'append';
+      resultId?: string;
     },
   ) {
     const id = directionId(source);
@@ -5067,13 +5097,32 @@ export class Store {
         requiredText(source.text, '用户指令原文', 32_000);
         if (mode !== undefined && mode !== 'read-only' && mode !== 'authorized-work')
           throw new AppError('invalid-input', '后续授权范围无效。');
+        const resultId = extra?.resultId;
+        const deliveredFollowUp =
+          resultId &&
+          ['review', 'completed'].includes(task.lifecycle) &&
+          run?.state === 'settled' &&
+          run.sessionId === task.sessionId &&
+          this.runResult(run.id)?.id === resultId &&
+          readDeliveryReceipt(this.db, task, resultId)?.runId === run.id;
         if (
-          task.lifecycle !== 'open' ||
+          resultId &&
+          (!deliveredFollowUp ||
+            !mode ||
+            keepPendingDirection ||
+            change ||
+            extra?.stageFollowUp ||
+            extra?.lateJobFollowUp)
+        )
+          throw new AppError('result-stale', '接着处理已交付成果需要针对当前版本的具体新指示。');
+        if (
           !run ||
           run.taskRevision !== task.taskRevision ||
-          (run.finishedAt !== null &&
-            !['blocked', 'recovery', 'paused', 'manual'].includes(task.status) &&
-            task.stageState !== 'ready')
+          (!deliveredFollowUp &&
+            (task.lifecycle !== 'open' ||
+              (run.finishedAt !== null &&
+                !['blocked', 'recovery', 'paused', 'manual'].includes(task.status) &&
+                task.stageState !== 'ready')))
         ) {
           throw new AppError('recovery-stale', '没有需要后续指示的当前执行。');
         }
@@ -5230,9 +5279,22 @@ export class Store {
             stageFollowUp,
           });
         }
+        if (deliveredFollowUp)
+          this.db
+            .prepare(
+              "UPDATE attentions SET state='resolved' WHERE id=? AND kind='review' AND state='open'",
+            )
+            .run(`run:${run.id}`);
         this.db
-          .prepare('UPDATE tasks SET controlMode=?,rowVersion=rowVersion+1,updatedAt=? WHERE id=?')
-          .run(resumeManagement ? 'auto' : task.controlMode, Date.now(), taskId);
+          .prepare(
+            'UPDATE tasks SET lifecycle=?,controlMode=?,rowVersion=rowVersion+1,updatedAt=? WHERE id=?',
+          )
+          .run(
+            deliveredFollowUp ? 'open' : task.lifecycle,
+            resumeManagement ? 'auto' : task.controlMode,
+            Date.now(),
+            taskId,
+          );
         if (late && (appendLate || (keepPendingDirection && !change && !resumeManagement))) {
           this.set(
             `late-job:${run.id}`,
@@ -5264,6 +5326,7 @@ export class Store {
           resumeManagement,
           change: instruction.change,
           stageFollowUp,
+          ...(resultId ? { resultId } : {}),
         });
         return {};
       },
@@ -5332,27 +5395,51 @@ export class Store {
     }
     return { task, run, binding, instruction };
   }
-  verifyInterruptedEnd(taskId: string, rowVersion: number, managerId: string): void {
+  verifyInterruptedEnd(
+    taskId: string,
+    rowVersion: number,
+    managerId: string,
+    readback?: { endSeq: number; endKind: string; effectUncertainty?: string },
+  ): void {
     const { task, run } = this.continuationTarget(taskId, rowVersion, managerId);
     const proof = this.runTurn(run.id);
+    const claimedEnd =
+      readback &&
+      proof?.endSeq === null &&
+      proof.inputSeq !== null &&
+      Number.isSafeInteger(readback.endSeq) &&
+      readback.endSeq > proof.inputSeq;
+    const end = claimedEnd ? readback : proof?.quiet === 1 ? proof : undefined;
     if (
       run.state !== 'interrupted' ||
       this.getRunInput(run.id).state !== 'entered' ||
-      proof?.quiet !== 1 ||
-      proof.endSeq === null ||
-      !['completed', 'error', 'aborted'].includes(proof.endKind ?? '')
+      !end ||
+      end.endSeq === null ||
+      !['completed', 'error', 'aborted'].includes(end.endKind ?? '')
     ) {
       throw new AppError('recovery-unproven', '没有可归属的原轮结束证据，保留占用。');
     }
     this.command(`verified-end:${run.id}`, 'run.end-verified', { taskId, runId: run.id }, () => {
       this.db.prepare('DELETE FROM resources WHERE runId=?').run(run.id);
-      this.set(`run-verified-end:${run.id}`, String(proof.endSeq));
+      this.set(
+        `run-verified-end:${run.id}`,
+        claimedEnd ? JSON.stringify(readback) : String(end.endSeq),
+      );
       this.db
         .prepare('UPDATE tasks SET rowVersion=rowVersion+1,updatedAt=? WHERE id=?')
         .run(Date.now(), task.id);
-      this.event('run.end-verified', task.id, { runId: run.id, managerId, endSeq: proof.endSeq });
+      this.event('run.end-verified', task.id, {
+        runId: run.id,
+        managerId,
+        endSeq: end.endSeq,
+        ...(claimedEnd ? { evidence: 'native-readback', endKind: end.endKind } : {}),
+      });
       return {};
     });
+  }
+  verifiedEndUncertainty(runId: string): string | undefined {
+    const value = this.get(`run-verified-end:${runId}`);
+    return value ? JSON.parse(value)?.effectUncertainty : undefined;
   }
   reserveRecoveryContinuation(
     taskId: string,
@@ -6028,7 +6115,10 @@ export class Store {
     const check = settled && run ? this.recoveryCheck(run.id) : null;
     if (
       (check && (check.effectUncertain || !check.resolution)) ||
-      (settled && run && this.recoveryWorkPlan(run.id)?.context.effectUncertain)
+      (settled &&
+        run &&
+        (this.verifiedEndUncertainty(run.id) ||
+          this.recoveryWorkPlan(run.id)?.context.effectUncertain))
     ) {
       throw new AppError('effect-uncertain', '旧轮外部操作或核对结果仍未确认，暂未取消任务。');
     }

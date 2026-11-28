@@ -12,6 +12,7 @@ import { ResultFilePreview } from './ResultFilePreview.tsx';
 import { WorkMarkdown } from './WorkMarkdown.tsx';
 
 function Review({ w, task, result }: { w: WorkspaceState; task: Task; result: Result }) {
+  const canAccept = canReviewResult(task);
   const accept = () =>
     w.mutate('result.accept', {
       requestId: `accept:${result.id}:${task.rowVersion}`,
@@ -29,12 +30,14 @@ function Review({ w, task, result }: { w: WorkspaceState; task: Task; result: Re
     });
   return (
     <>
-      <p className="muted">
-        接受前会重新核对文件是否改变。
-        {task.controlMode === 'paused' && '当前暂停的是自动管理，你仍可检查并接受成果。'}
-      </p>
+      {canAccept && (
+        <p className="muted">
+          接受前会重新核对文件是否改变。
+          {task.controlMode === 'paused' && '当前暂停的是自动管理，你仍可检查并接受成果。'}
+        </p>
+      )}
       <div className="actions result-actions">
-        {canReviewResult(task) && (
+        {canAccept && (
           <button className="primary" disabled={w.locked} onClick={accept}>
             接受成果
           </button>
@@ -272,7 +275,7 @@ export function ResultCard({
         !reworking &&
         !reviewing &&
         (task.lifecycle === 'completed' ? (
-          <p>{result.humanAcceptedAt ? '已由你接受。' : '已由 Bot 按授权接受。'}</p>
+          <p>{result.humanAcceptedAt ? '已由你接受。' : '已由 Bot 验收。'}</p>
         ) : (
           <p className="muted">这份结果尚不可验收，请查看当前任务状态。</p>
         ))}

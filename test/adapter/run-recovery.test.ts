@@ -414,7 +414,7 @@ test('a settled ledger before process-local cleanup is never replayed or settled
   }
 });
 
-test('native follow-up after durable automatic end preserves settled Run while invalidating old review', async () => {
+test('native follow-up after durable automatic end is recovered without invalidating review', async () => {
   const store = new Store(':memory:');
   try {
     const f = attempt(store);
@@ -425,15 +425,23 @@ test('native follow-up after durable automatic end preserves settled Run while i
         seq: 4,
         type: 'user/message',
         surfaceOp: 'append',
-        data: { id: 'native', source: { kind: 'user', rpcId: 'synthetic' } },
+        data: {
+          id: 'native',
+          source: { kind: 'user', rpcId: 'synthetic' },
+          content: [{ type: 'text', text: 'Keep the verified detail.' }],
+        },
       },
     );
     const a = adapter(store, f.events, f.run.sessionId);
     await a.execution.whenReconciled();
     await a.execution.dispose();
     assert.equal(store.getRun(f.run.id).state, 'settled');
-    assert.equal(store.getTask(f.task.id).controlMode, 'manual');
-    assert.equal(store.getTask(f.task.id).lifecycle, 'open');
+    assert.equal(store.getTask(f.task.id).controlMode, 'paused');
+    assert.equal(store.getTask(f.task.id).lifecycle, 'review');
+    assert.deepEqual(
+      store.workerSupplements(f.run).map(({ text }) => text),
+      ['Keep the verified detail.'],
+    );
     assert.equal(store.runResult(f.run.id)?.humanAcceptedAt, null);
   } finally {
     store.close();

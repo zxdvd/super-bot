@@ -15,6 +15,7 @@ import {
   AppError,
   requiredText,
   optionalText,
+  requiresHumanAcceptance,
   type Binding,
   type ChatSource,
   type ManagerBinding,
@@ -579,7 +580,8 @@ export class Managers {
       !option ||
       option.taskId !== task.id ||
       (data.action === 'respond' && option.attentionId !== data.attentionId) ||
-      ((data.action === 'accept' || data.action === 'rework') && option.resultId !== data.resultId)
+      (['accept', 'rework', 'continue'].includes(String(data.action)) &&
+        option.resultId !== data.resultId)
     ) {
       throw new AppError('clarification-selection', '所选项目与已展示的候选不一致。');
     }
@@ -1213,7 +1215,7 @@ export class Managers {
           goal: requiredText(data.goal, '目标'),
           scope,
           acceptance,
-          reviewPolicy: 'human',
+          reviewPolicy: data.reviewPolicy as Task['reviewPolicy'] | undefined,
           ...(workdir ? { workdir } : {}),
         },
         releaseSource ?? source,
@@ -1417,22 +1419,26 @@ export class Managers {
       );
       if (release?.selection) this.store.set(this.gitLabQuestionKey(manager), '');
       if (saved.stage.state !== 'ready') return saved;
-      const latest = this.store.taskDetail(task.id);
-      if (latest.task.rowVersion !== saved.task.rowVersion) {
+      const stageReceipt = () => {
+        const latest = this.store.taskDetail(task.id);
         const stage = latest.stages.find((item) => item.runId === runId) ?? saved.stage;
+        const run = stage.dispatchedRunId ? this.store.getRun(stage.dispatchedRunId) : null;
         return {
           task: latest.task,
           stage,
-          ...(stage.dispatchedRunId ? { run: this.store.getRun(stage.dispatchedRunId) } : {}),
+          ...(run
+            ? { run, workdir: this.runWorkdir(run), expectedModel: this.store.runModelPlan(run.id) }
+            : {}),
         };
-      }
+      };
+      if (this.store.getTask(task.id).rowVersion !== saved.task.rowVersion) return stageReceipt();
       const dispatched = await this.runPrepared(
         `${requestId}:stage-dispatch`,
         saved.task,
         agent,
         check,
       );
-      return { ...saved, ...dispatched, task: this.store.getTask(task.id) };
+      return { ...dispatched, ...stageReceipt() };
     }
     const checkRecoveryNotice = () => {
       authorize();
@@ -1542,13 +1548,16 @@ export class Managers {
       }
       if (!useEarlier && instruction !== owner.text.trim())
         throw new AppError('control-human-text', '请使用当前用户消息的完整原文。');
-      this.checkWorkLinks(instruction, task.id);
+      const resultId =
+        data.resultId === undefined ? undefined : requiredText(data.resultId, '成果标识', 200);
+      this.checkWorkLinks(instruction, task.id, undefined, resultId);
       const source = useEarlier
         ? this.earlierDirections([{ text: instruction, continuationMode: mode }], owner, task)![0]!
             .source
         : data.choice !== undefined
           ? this.clarifiedSource(manager, task, data, owner)
           : chatSource(owner);
+      if (resultId) this.checkWorkLinks(source.text, task.id, undefined, resultId);
       if (data.earlierDirections !== undefined && (change || data.choice !== undefined)) {
         throw new AppError('invalid-input', '合并同轮的补充消息仅适用于已确定任务的追加指示。');
       }
@@ -1607,8 +1616,14 @@ export class Managers {
         keepDirection,
         data.resumeManagement === true,
         change,
-        earlier || useEarlier || stageFollowUp || lateJobFollowUp
-          ? { earlier, onlyWhileActive: useEarlier || undefined, stageFollowUp, lateJobFollowUp }
+        earlier || useEarlier || stageFollowUp || lateJobFollowUp || resultId
+          ? {
+              earlier,
+              onlyWhileActive: useEarlier || undefined,
+              stageFollowUp,
+              lateJobFollowUp,
+              resultId,
+            }
           : undefined,
       );
       if (saved.instruction.source.messageId !== source.messageId) {
@@ -1854,7 +1869,7 @@ export class Managers {
         (question) => !questionEvent || question.id === questionEvent,
       );
       const result = current.result,
-        humanAcceptanceRequired = current.task.lifecycle === 'review';
+        humanAcceptanceRequired = requiresHumanAcceptance(current.task);
       const links = result
         ? deliveryLinks(
             task.id,
@@ -1901,6 +1916,8 @@ export class Managers {
                 checks: result.checks,
                 ...links,
                 humanAcceptanceRequired,
+                botReviewPending:
+                  current.task.lifecycle === 'review' && !current.task.managerReviewed,
                 ...(current.deliveredResult?.id !== result.id
                   ? { artifacts: this.store.reportedDeliveryArtifacts(result.runId) }
                   : {}),
@@ -1990,7 +2007,7 @@ export class Managers {
       )
         throw new AppError('result-stale', '只能交付当前任务已报告、待确认或已完成的成果。');
       authorize();
-      const humanAcceptanceRequired = task.lifecycle === 'review',
+      const humanAcceptanceRequired = requiresHumanAcceptance(task),
         links = deliveryLinks(
           task.id,
           resultId,
@@ -2096,7 +2113,7 @@ export class Managers {
         },
       );
       if (receipt)
-        return { task: receipt, humanAcceptanceRequired: receipt.lifecycle === 'review' };
+        return { task: receipt, humanAcceptanceRequired: requiresHumanAcceptance(receipt) };
       current();
       const detail = this.store.taskDetail(task.id);
       if (!detail.result || !detail.binding || detail.result.id !== resultId)
@@ -2114,7 +2131,7 @@ export class Managers {
         requested,
         { reviewSessionId: agent.id, reviewCallId: exec.rootCallId ?? exec.callId },
       );
-      return { task: result, humanAcceptanceRequired: result.lifecycle === 'review' };
+      return { task: result, humanAcceptanceRequired: requiresHumanAcceptance(result) };
     }
     throw new AppError('unknown-action', '不支持的管理操作。');
   }
@@ -2160,7 +2177,12 @@ export class Managers {
       if (this.closed) return;
       const scope = this.scopes.get(_session.id);
       if (scope && scope.agent.session !== _session) return;
-      if (event.type === 'model/selection' || event.type === 'working-directory/change')
+      if (
+        event.type === 'model/selection' ||
+        event.type === 'working-directory/change' ||
+        (['turn/end', 'job/settled', 'approval/decided'].includes(event.type) &&
+          this.store.workerTaskForSession(_session.id))
+      )
         retryContinuationsFor(_session.id);
       const nativeTurn = scope?.nativeTurn;
       const liveTurn = this.nativeTurns.get(_session.id);
@@ -3409,7 +3431,15 @@ export class Managers {
     );
     const savedText =
       typeof draft === 'string' ? `\nRegistered delivery draft (use as context): ${draft}` : '';
-    return `Finish the handoff here with a short outcome and this one exact result link. Copy the link verbatim into your final visible reply. Use detail for facts if needed. Use detail.progress.reload for any code load claim. There is no need to call deliver again.${savedText}\n${resultLink}`;
+    const status =
+      task.lifecycle === 'completed'
+        ? 'The task is completed. Report its actual outcome and checks with the link.'
+        : requiresHumanAcceptance(task)
+          ? 'The current result still needs an owner decision. State the specific decision.'
+          : task.controlMode === 'auto'
+            ? 'The current result is still awaiting Bot review.'
+            : 'Bot review is paused until automatic management resumes.';
+    return `Finish the handoff here with a short outcome and this one exact result link. ${status} Copy the link verbatim into your final visible reply. Use detail for facts if needed. Use detail.progress.reload for any code load claim. There is no need to call deliver again.${savedText}\n${resultLink}`;
   }
   private endedInputs = new Map<string, string>();
   private wakeTimers = new Map<string, ReturnType<typeof setTimeout>>();

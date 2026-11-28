@@ -1051,8 +1051,8 @@ async function runFeishuSmoke() {
   await receive(host, groupA, answer, { messageId: answerId, receiptKind: 'bot-mention' });
   const ready = await wait(async () => {
     const value = await detail();
-    return value.task.lifecycle === 'review' && value.task.managerReviewed && value;
-  }, 'same task reaches final review after Feishu answer');
+    return value.task.lifecycle === 'completed' && value.task.managerReviewed && value;
+  }, 'same task reaches Bot acceptance after Feishu answer');
   assert.equal(ready.input?.content, answer);
   assert.equal(ready.input?.attentionId, before.pendingQuestions[0].id);
   assert.equal((await page()).total, 1);
@@ -1100,7 +1100,7 @@ async function runFeishuSmoke() {
     try {
       await flow.getByText(answer, { exact: true }).waitFor({ timeout: 10000 });
       await flow
-        .getByText(/等待你确认。/)
+        .getByText(/已按验收条件完成。/)
         .last()
         .waitFor({ timeout: 10000 });
     } catch (error) {

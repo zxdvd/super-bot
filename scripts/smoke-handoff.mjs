@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import { setTimeout as delay } from 'node:timers/promises';
 import { hostClient } from './host-client.mjs';
-const client = await hostClient(),
+const client = await hostClient(process.argv[2] ?? process.env.SUPER_BOT_TEST_LOG),
   prefix = `handoff:${randomUUID()}`;
 async function call(action, payload = {}) {
   const response = await client.post('/api/super-bot', {
@@ -68,11 +68,11 @@ try {
     expectedRowVersion: detail.task.rowVersion,
   };
   await call('task.stop', stop);
-  await probe('queue-native', binding.sessionId, '人工接管，不重放旧任务。');
+  await probe('queue-native', binding.sessionId, '补充：保留旧任务记录。');
   await probe('queue-native', binding.sessionId, 'SCOPED_TOOL_PROBE NATIVE_HOLD_PROBE');
   detail = await call('task.detail', { id: task.id });
-  assert.equal(detail.task.controlMode, 'manual');
-  assert.equal(detail.run.state, 'interrupted');
+  assert.equal(detail.task.controlMode, 'paused');
+  assert.equal(detail.run.state, 'cancelling');
   const pending = await probe('inspect-session', binding.sessionId);
   assert.equal(pending.stalled, true);
   assert.ok(pending.pending >= 2);
@@ -95,16 +95,14 @@ try {
   assert.equal(replayed.status, 'running');
   await probe('release-stalled-model', binding.sessionId);
   await nativeUntil(binding.sessionId, (state) => state.status === 'idle');
-  detail = await call('task.detail', { id: task.id });
-  assert.equal(detail.run.state, 'interrupted');
+  for (let n = 0; n < 150; n++) {
+    detail = await call('task.detail', { id: task.id });
+    if (detail.run.state === 'cancelled') break;
+    await delay(100);
+  }
+  assert.equal(detail.run.state, 'cancelled');
   assert.equal(detail.result, null);
-  assert.equal(detail.task.controlMode, 'manual');
-  await call('run.recover', {
-    requestId: prefix + ':recover',
-    id: task.id,
-    expectedRowVersion: detail.task.rowVersion,
-    acknowledged: true,
-  });
+  assert.equal(detail.task.controlMode, 'paused');
   console.log(
     JSON.stringify(
       {
@@ -116,7 +114,7 @@ try {
           'native queued messages survive handoff',
           'new human turn has native tools after old driver settles',
           'duplicate old stop does not cancel new human turn',
-          'old Run stays interrupted until explicit recovery',
+          'old Run settles cancellation after its native end',
         ],
       },
       null,

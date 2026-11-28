@@ -130,8 +130,9 @@ test('distinct evidence advances the same Worker without final review or correct
         undefined,
         origin,
       );
-    assert.equal(decision().stage.state, 'ready');
-    assert.equal(decision().stage.state, 'ready');
+    const receipt = decision();
+    assert.equal(receipt.stage.state, 'ready');
+    assert.deepEqual(decision(), receipt);
     const prior = run;
     run = enter(store, task.id, `stage-${i + 1}`);
     assert.equal(run.bindingId, binding.id);

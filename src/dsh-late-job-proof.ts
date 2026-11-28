@@ -1,5 +1,5 @@
 import { AppError, type LateJobProof, type Run, type RunInput, type RunTurn } from './model.ts';
-import { verifyRunBoundary, type RunEvent } from './run-proof.ts';
+import { matchesJobSettlement, verifyRunBoundary, type RunEvent } from './run-proof.ts';
 
 const mismatch = (message: string): never => {
   throw new AppError('late-job-unproven', message);
@@ -79,17 +79,9 @@ export function verifyLateJobs(
       const id = event.data.jobId;
       const original = registered.get(id);
       if (
-        !original ||
         settled.has(id) ||
-        event.data.owner !== run.sessionId ||
-        event.data.startedAt !== original.data.startedAt ||
-        event.data.kind !== original.data.kind ||
-        event.data.label !== original.data.label ||
-        event.data.toolCall?.callId !== original.data.toolCall?.callId ||
-        event.data.toolCall?.rootCallId !== original.data.toolCall?.rootCallId ||
-        expected.has(id) !== event.seq > turn.endSeq! ||
-        !['completed', 'failed', 'killed'].includes(event.data.status) ||
-        event.data.producerReported !== true
+        !matchesJobSettlement(original, event) ||
+        expected.has(id) !== event.seq > turn.endSeq!
       ) {
         mismatch('后台 Job 的终态没有匹配的原生生产者回执。');
       }

@@ -8,7 +8,7 @@ import type {
   ManagerBinding,
   RecoveryDetail,
   Result,
-  Run,
+  RunDetail,
   LateJobRecovery,
   RecoveryDirectionStatus,
   RunInput,
@@ -29,7 +29,7 @@ export type Detail = {
   task: Task;
   binding: Binding | null;
   bindingHistory: Binding[];
-  run: Run | null;
+  run: RunDetail | null;
   input: RunInput | null;
   stage?: WorkStage | null;
   stages?: WorkStage[];

@@ -1,4 +1,4 @@
-import type { Bot, DeliveredResult, Result, Task, TaskProgress } from './model.ts';
+import type { Bot, DeliveredResult, Result, RunDetail, Task, TaskProgress } from './model.ts';
 
 export type BotOwner = 'web' | 'desktop';
 export const ownerLabel: Record<BotOwner, string> = { web: 'Web', desktop: 'Desktop' };
@@ -51,5 +51,5 @@ export type MirrorDetail = {
     reload: Pick<NonNullable<TaskProgress['reload']>, 'build' | 'at'> | null;
   };
   chatDelivery: 'awaiting-review' | 'pending' | 'uncertain' | 'delivered' | 'handled' | null;
-  run: { id: string; state: string; createdAt: number; finishedAt: number | null } | null;
+  run: (Pick<RunDetail, 'id' | 'createdAt' | 'finishedAt' | 'outcome'> & { state: string }) | null;
 };
